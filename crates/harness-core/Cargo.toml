@@ -10,3 +10,6 @@ publish = false
 
 [dependencies]
 harness-protocol = { path = "../harness-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+rust_decimal.workspace = true
