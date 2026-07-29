@@ -1,0 +1,13 @@
+[package]
+name = "harness-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-protocol = { path = "../harness-protocol" }
