@@ -1,0 +1,49 @@
+{
+  "description": "Cancelled run: StartRun then Cancel — the agent transitions to Cancelled and emits CancelBackend.",
+  "initial_agent": {
+    "status": "Idle",
+    "system_prompt": "You are a helpful assistant.",
+    "transition_sequence": 0
+  },
+  "commands": [
+    {
+      "StartRun": {
+        "input": {
+          "text": "run then cancel",
+          "attachments": []
+        }
+      }
+    },
+    {
+      "Cancel": null
+    }
+  ],
+  "expected_effects_per_command": [
+    [
+      {
+        "variant": "Emit",
+        "inner": { "variant": "StateChanged", "from": "Idle", "to": "PreparingContext" }
+      },
+      {
+        "variant": "ExecuteBackend"
+      },
+      {
+        "variant": "Emit",
+        "inner": { "variant": "RunStarted" }
+      }
+    ],
+    [
+      {
+        "variant": "CancelBackend"
+      },
+      {
+        "variant": "Emit",
+        "inner": { "variant": "StateChanged", "from": "PreparingContext", "to": "Cancelled" }
+      },
+      {
+        "variant": "Emit",
+        "inner": { "variant": "Completed", "outcome": "Cancelled" }
+      }
+    ]
+  ]
+}

@@ -4,7 +4,7 @@ use harness_protocol::usage::{ModelUsage, UsageRecord};
 
 use crate::agent::UsageLedger;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentUsageSummary {
     pub self_usage: ModelUsage,
     pub descendant_usage: ModelUsage,
@@ -121,5 +121,12 @@ mod tests {
         assert_eq!(first.descendant_usage.input_tokens.value(), Some(1));
         assert_eq!(first.inclusive_usage.input_tokens.value(), Some(3));
         assert_eq!(second.self_usage.input_tokens.value(), Some(2));
+    }
+
+    #[test]
+    fn default_summary_is_all_unknown() {
+        let summary = AgentUsageSummary::default();
+        assert!(summary.self_usage.input_tokens.is_unknown());
+        assert!(summary.inclusive_usage.total_tokens.is_unknown());
     }
 }

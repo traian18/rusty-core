@@ -7,3 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-protocol = { path = "../harness-protocol" }
+harness-runtime = { path = "../harness-runtime" }
+tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio-util = { workspace = true }

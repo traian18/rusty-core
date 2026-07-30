@@ -1,0 +1,31 @@
+{
+  "description": "Happy path: StartRun triggers StateChanged(Idle→PreparingContext), ExecuteBackend, and RunStarted.",
+  "initial_agent": {
+    "status": "Idle",
+    "system_prompt": "You are a helpful assistant.",
+    "transition_sequence": 0
+  },
+  "commands": [
+    {
+      "StartRun": {
+        "input": {
+          "text": "hello from test",
+          "attachments": []
+        }
+      }
+    }
+  ],
+  "expected_effects": [
+    {
+      "variant": "Emit",
+      "inner": { "variant": "StateChanged", "from": "Idle", "to": "PreparingContext" }
+    },
+    {
+      "variant": "ExecuteBackend"
+    },
+    {
+      "variant": "Emit",
+      "inner": { "variant": "RunStarted" }
+    }
+  ]
+}
