@@ -14,36 +14,28 @@ use tokio::net::TcpListener;
 use harness_engine::Harness;
 use harness_integration_anthropic::{AnthropicBackend, AnthropicConfig, AnthropicFactory};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
-use harness_protocol::tools::{ToolCall, ToolDescriptor, ToolError, ToolResult};
-use harness_runtime::traits::{ToolExecutor, ToolRegistry};
+use harness_tools::{ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult};
+use harness_tools::registry::ToolRegistry;
 
 const TEXT_RESPONSE_SSE: &str = "\
-event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250513\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\
-\n\
-event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
-\n\
-event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello, \"}}\n\
-\n\
-event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world!\"}}\n\
-\n\
-event: content_block_stop\n\
-data: {\"type\":\"content_block_stop\",\"index\":0}\n\
-\n\
-event: message_delta\n\
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\
-\n\
-event: message_stop\n\
-data: {\"type\":\"message_stop\"}\n\
-\n";
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250513\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\
+\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello, \"}}\n\
+\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"world!\"}}\n\
+\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\
+\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\
+\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\
+";
 
 struct NoTools;
 
+#[async_trait]
 impl ToolRegistry for NoTools {
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn ToolExecutor>> {
+    fn register(&self, _executor: Arc<dyn ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+        Ok(())
+    }
+
+    fn get_executor(&self, _tool_id: &str) -> Option<Arc<dyn ToolExecutor>> {
         None
     }
 
@@ -227,13 +219,27 @@ struct Calculator;
 
 #[async_trait]
 impl ToolExecutor for Calculator {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            id: ToolId::new("calculator"),
+            name: "calculator".to_string(),
+            description: "Evaluate a basic arithmetic expression".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"]
+            }),
+        }
+    }
+
     async fn execute(
         &self,
-        call: ToolCall,
+        _input: ToolInput,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ToolResult, ToolError> {
+        // In a real calculator tool, we'd parse and evaluate the expression from _input.arguments
         Ok(ToolResult {
-            call_id: call.id,
+            call_id: "toolu_fixture".to_string(),
             output: serde_json::json!({"value": 4}),
             is_error: false,
         })
@@ -242,14 +248,19 @@ impl ToolExecutor for Calculator {
 
 struct CalculatorTools;
 
+#[async_trait]
 impl ToolRegistry for CalculatorTools {
-    fn lookup(&self, name: &str) -> Option<Arc<dyn ToolExecutor>> {
-        (name == "calculator").then(|| Arc::new(Calculator) as Arc<dyn ToolExecutor>)
+    fn register(&self, _executor: Arc<dyn ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+        Ok(())
+    }
+
+    fn get_executor(&self, tool_id: &str) -> Option<Arc<dyn ToolExecutor>> {
+        (tool_id == "calculator").then(|| Arc::new(Calculator) as Arc<dyn ToolExecutor>)
     }
 
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         vec![ToolDescriptor {
-            id: harness_protocol::ids::ToolId::new(),
+            id: ToolId::new("calculator"),
             name: "calculator".to_string(),
             description: "Evaluate a basic arithmetic expression".to_string(),
             input_schema: serde_json::json!({

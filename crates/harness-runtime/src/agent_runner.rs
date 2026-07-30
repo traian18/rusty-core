@@ -321,19 +321,45 @@ impl AgentRunner {
     fn execute_tool(&mut self, request: ToolRequest) {
         let call_id = request.call.id;
         let name = request.call.name.clone();
-        let call = request.call;
+        let arguments = request.call.arguments.clone();
         let token = self.cancel.child_token();
         self.tool_tokens.insert(call_id, token.clone());
         let commands = self.task.commands_tx.clone();
 
-        match self.tool_registry.lookup(&name) {
+        match self.tool_registry.get_executor(&name) {
             Some(executor) => {
                 tokio::spawn(async move {
-                    match executor.execute(call, token).await {
-                        Ok(result) => {
+                    // Convert protocol ToolCall to harness-tools ToolInput
+                    let input = harness_tools::ToolInput {
+                        arguments,
+                    };
+
+                    match executor.execute(input, token).await {
+                        Ok(tool_result) => {
+                            // Convert harness-tools ToolResult to protocol ToolResult
+                            let result = harness_protocol::tools::ToolResult {
+                                call_id,
+                                output: tool_result.output,
+                                is_error: tool_result.is_error,
+                            };
                             let _ = commands.send(AgentCommand::ToolCompleted { call_id, result }).await;
                         }
-                        Err(error) => {
+                        Err(tool_error) => {
+                            // Convert harness-tools ToolError to protocol ToolError
+                            let error = match tool_error {
+                                harness_tools::ToolError::ExecutionFailed => {
+                                    harness_protocol::tools::ToolError::ExecutionFailed
+                                }
+                                harness_tools::ToolError::PermissionDenied => {
+                                    harness_protocol::tools::ToolError::PermissionDenied
+                                }
+                                harness_tools::ToolError::Timeout => {
+                                    harness_protocol::tools::ToolError::Timeout
+                                }
+                                harness_tools::ToolError::Internal => {
+                                    harness_protocol::tools::ToolError::Internal
+                                }
+                            };
                             let _ = commands.send(AgentCommand::ToolFailed { call_id, error }).await;
                         }
                     }
@@ -449,7 +475,7 @@ mod tests {
 
         let (task, sender) = AgentTask::new(agent_id);
         let backend = Arc::new(FakeBackend::new().blocking_until_cancelled());
-        let tool_registry = Arc::new(FakeToolRegistry::new(StdHashMap::new(), Vec::new()));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
         let cancel = CancellationToken::new();
         let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
 

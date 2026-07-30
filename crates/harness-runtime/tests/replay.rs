@@ -12,7 +12,6 @@
 //! golden-record test of the deterministic core.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use harness_core::agent::Agent;
 use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
@@ -37,8 +36,8 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 struct Fixture {
     /// Optional human-readable description.
-    #[serde(default)]
-    description: Option<String>,
+    #[serde(default, rename = "description")]
+    _description: Option<String>,
     /// The initial agent state to construct before replay.
     initial_agent: FixtureAgent,
     /// Ordered list of [`AgentCommand`]s to apply serially.

@@ -11,10 +11,17 @@ publish = false
 [dependencies]
 harness-core = { path = "../harness-core" }
 harness-protocol = { path = "../harness-protocol" }
-harness-runtime = { path = "../harness-runtime" }
+harness-runtime = { path = "../harness-runtime", features = ["testing"] }
+harness-workspace = { path = "../harness-workspace" }
+harness-tools = { path = "../harness-tools" }
+harness-tool-filesystem = { path = "../tools/filesystem" }
+harness-tool-shell = { path = "../tools/shell" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "fs"] }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -155,7 +155,6 @@ impl SessionClient {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::time::Duration;
 
     use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
@@ -200,7 +199,7 @@ mod tests {
                     finish_reason: "end_turn".into(),
                 }),
         );
-        let tool_registry = Arc::new(FakeToolRegistry::new(HashMap::new(), Vec::new()));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
         let workspace = Arc::new(FakeWorkspace::new());
 
         let runtime = Arc::new(SessionRuntime::new(

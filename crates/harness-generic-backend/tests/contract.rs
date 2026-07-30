@@ -90,21 +90,6 @@ async fn run_execution(
     (result, events)
 }
 
-/// Create a [`FakeModelClient`] with a basic success scenario — one event
-/// followed by a completed result — wrapped in a [`GenericModelBackend`].
-fn make_scripted_backend() -> GenericModelBackend {
-    let client = FakeModelClient::new()
-        .with_events(vec![ModelEvent::TextDelta {
-            delta: "hello ".into(),
-        }])
-        .with_result(ModelResult {
-            stop_reason: "end_turn".into(),
-            usage: Default::default(),
-            cost: Default::default(),
-        });
-    GenericModelBackend::new(Arc::new(client))
-}
-
 // ===========================================================================
 // Individual test cases
 // ===========================================================================

@@ -5,18 +5,27 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest, ExecutionResult};
 use harness_protocol::commands::UserInput;
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
-use harness_protocol::tools::ToolDescriptor;
-use tokio_util::sync::CancellationToken;
+use harness_protocol::tools::{
+    AgentToolset, PermissionMode, ToolCapability, ToolPolicy,
+};
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
 use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
-use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
+use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
+
+use harness_tool_filesystem::{ReadTool, EditTool, SearchTool};
+use harness_tool_shell::ExecTool;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 struct BroadcastEventSink {
     tx: broadcast::Sender<AgentEventEnvelope>,
@@ -26,7 +35,7 @@ struct BroadcastEventSink {
 /// the backend even when the lower-level agent capability projection is empty.
 struct ToolAdvertisingBackend {
     inner: Arc<dyn ExecutionBackend>,
-    tools: Vec<ToolDescriptor>,
+    tools: Vec<harness_protocol::tools::ToolDescriptor>,
 }
 
 #[async_trait]
@@ -84,7 +93,11 @@ pub struct SessionBuilder {
     integration: Option<PendingIntegration>,
     integrations: Arc<IntegrationRegistry>,
     tool_registry: Option<Arc<dyn ToolRegistry>>,
-    workspace: Option<Arc<dyn Workspace>>,
+    workspace: Option<Arc<dyn harness_runtime::traits::Workspace>>,
+    /// The toolset to inject into the root agent's capabilities.
+    /// When set alongside `tool_registry`, the builder creates the registry
+    /// from the toolset's enabled descriptors via `build_executor_for()`.
+    root_toolset: Option<AgentToolset>,
 }
 
 impl SessionBuilder {
@@ -101,6 +114,7 @@ impl SessionBuilder {
             integrations,
             tool_registry: None,
             workspace: None,
+            root_toolset: None,
         }
     }
 
@@ -135,9 +149,72 @@ impl SessionBuilder {
     }
 
     /// Set the workspace, defaulting to an empty in-memory workspace.
-    pub fn workspace(mut self, workspace: Arc<dyn Workspace>) -> Self {
+    pub fn workspace(mut self, workspace: Arc<dyn harness_runtime::traits::Workspace>) -> Self {
         self.workspace = Some(workspace);
         self
+    }
+
+    /// Register an `AgentToolset` into the session.
+    ///
+    /// This is an alternative to [`tools`](Self::tools) that takes a
+    /// high-level tool policy set and a [`Workspace`] reference, creates
+    /// the appropriate [`ToolExecutor`] instances via
+    /// [`build_executor_for`](Self::build_executor_for), registers them
+    /// into a [`SimpleToolRegistry`], and wires both the registry and the
+    /// toolset into the root agent's capabilities.
+    ///
+    /// When this method is used, the builder will automatically populate
+    /// the tool registry — there is no need to also call [`tools`](Self::tools).
+    ///
+    /// The `workspace` argument provides the [`Workspace`] that filesystem
+    /// tools (`fs.read`, `fs.edit`, `workspace.search`) will delegate to.
+    /// Shell tools (`shell.exec`) ignore the workspace.
+    pub fn toolset(
+        mut self,
+        toolset: AgentToolset,
+        workspace: Arc<dyn harness_runtime::traits::Workspace>,
+    ) -> Self {
+        // 1. Register all tool executors into the registry.
+        let registry = harness_runtime::traits::SimpleToolRegistry::new();
+        for descriptor in toolset.enabled_descriptors() {
+            let executor = self.build_executor_for(descriptor, workspace.clone());
+            let _ = registry.register(executor);
+        }
+
+        // 2. Wire the registry + toolset into the root Agent's capabilities.
+        self.tool_registry = Some(Arc::new(registry));
+        self.root_toolset = Some(toolset);
+        self.workspace = Some(workspace);
+        self
+    }
+
+    /// Build the appropriate executor for a given tool descriptor.
+    ///
+    /// Maps known descriptor name strings to concrete tool implementations.
+    fn build_executor_for(
+        &self,
+        descriptor: &harness_protocol::tools::ToolDescriptor,
+        workspace: Arc<dyn harness_runtime::traits::Workspace>,
+    ) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
+        match descriptor.name.as_str() {
+            "fs.read" => Arc::new(ReadTool::new(workspace)),
+            "fs.edit" => Arc::new(EditTool::new(workspace)),
+            "workspace.search" => Arc::new(SearchTool::new(workspace)),
+            "shell.exec" => Arc::new(ExecTool::new()),
+            _ => {
+                // Create a fallback that always fails
+                // Convert protocol descriptor to harness-tools descriptor
+                let tool_desc = harness_tools::ToolDescriptor {
+                    id: harness_tools::ToolId::new(&descriptor.name),
+                    name: descriptor.name.clone(),
+                    description: descriptor.description.clone(),
+                    input_schema: descriptor.input_schema.clone(),
+                };
+                Arc::new(harness_tools::UnknownTool {
+                    descriptor: tool_desc,
+                })
+            }
+        }
     }
 
     /// Resolve configuration and create the live session.
@@ -154,11 +231,47 @@ impl SessionBuilder {
         let tool_registry = self
             .tool_registry
             .ok_or(HarnessError::MissingToolRegistry)?;
+        
+        // A high-level toolset carries explicit policy. For callers that
+        // provide a registry directly, derive an enabled/allowed toolset so
+        // registered tools are also executable by the root agent.
+        let root_toolset = self.root_toolset.unwrap_or_else(|| {
+            let tools = tool_registry
+                .descriptors()
+                .into_iter()
+                .map(|desc| {
+                    let id = harness_protocol::ids::ToolId::new();
+                    (
+                        id,
+                        ToolCapability {
+                            descriptor: harness_protocol::tools::ToolDescriptor {
+                                id,
+                                name: desc.id.to_string(),
+                                description: desc.description,
+                                input_schema: desc.input_schema,
+                            },
+                            policy: ToolPolicy {
+                                permission: PermissionMode::Allow,
+                                enabled: true,
+                            },
+                            delegatable: false,
+                        },
+                    )
+                })
+                .collect();
+            AgentToolset { tools }
+        });
+        let protocol_descriptors = root_toolset
+            .enabled_descriptors()
+            .into_iter()
+            .cloned()
+            .collect();
+        
         let backend: Arc<dyn ExecutionBackend> = Arc::new(ToolAdvertisingBackend {
             inner: backend,
-            tools: tool_registry.descriptors(),
+            tools: protocol_descriptors,
         });
-        let workspace: Arc<dyn Workspace> = self
+        let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
             .unwrap_or_else(|| Arc::new(FakeWorkspace::new()));
         let session_id = SessionId::new();
@@ -166,12 +279,13 @@ impl SessionBuilder {
         let event_sink = Arc::new(BroadcastEventSink {
             tx: event_tx.clone(),
         });
-        let runtime = Arc::new(SessionRuntime::new(
+        let runtime = Arc::new(SessionRuntime::new_with_toolset(
             session_id,
             backend,
             tool_registry,
             workspace,
             event_sink,
+            root_toolset,
         ));
 
         Ok(SessionHandle {

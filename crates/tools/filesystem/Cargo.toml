@@ -7,3 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+harness-tools = { path = "../../../crates/harness-tools" }
+harness-workspace = { path = "../../../crates/harness-workspace" }
+async-trait = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }

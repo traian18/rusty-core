@@ -8,6 +8,7 @@
 pub mod agent_runner;
 pub mod cancellation;
 pub mod integration;
+pub mod permissions;
 pub mod session_client;
 pub mod session_runtime;
 pub mod traits;

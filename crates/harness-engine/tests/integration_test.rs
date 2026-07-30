@@ -19,9 +19,10 @@ use harness_protocol::backend::{
 };
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome};
 use harness_protocol::ids::RequestId;
-use harness_protocol::tools::ToolDescriptor;
 use harness_protocol::usage::{Cost, ModelUsage};
-use harness_runtime::traits::{ExecutionBackend, ToolExecutor, ToolRegistry};
+use harness_runtime::traits::ExecutionBackend;
+use harness_tools::ToolDescriptor;
+use harness_tools::registry::ToolRegistry;
 
 // ---------------------------------------------------------------------------
 // ScriptedBackend
@@ -82,10 +83,16 @@ impl ExecutionBackend for ScriptedBackend {
 
 struct NoTools;
 
+#[async_trait]
 impl ToolRegistry for NoTools {
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn ToolExecutor>> {
+    fn register(&self, _executor: Arc<dyn harness_tools::ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+        Ok(())
+    }
+
+    fn get_executor(&self, _tool_id: &str) -> Option<Arc<dyn harness_tools::ToolExecutor>> {
         None
     }
+
     fn descriptors(&self) -> Vec<ToolDescriptor> {
         vec![]
     }

@@ -414,6 +414,40 @@ impl SessionRuntime {
         workspace: Arc<dyn Workspace>,
         event_sink: Arc<dyn EventSink>,
     ) -> Self {
+        Self::new_with_toolset(
+            session_id,
+            backend,
+            tool_registry,
+            workspace,
+            event_sink,
+            AgentToolset {
+                tools: HashMap::new(),
+            },
+        )
+    }
+
+    /// Create a session runtime whose root agent receives the supplied tool
+    /// capabilities.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_toolset(
+        session_id: SessionId,
+        backend: Arc<dyn ExecutionBackend>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        root_toolset: AgentToolset,
+    ) -> Self {
+        let enabled_tool_names: Vec<_> = root_toolset
+            .enabled_descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect();
+        let workspace_capabilities = WorkspaceCapabilities {
+            can_read: enabled_tool_names.contains(&"fs.read"),
+            can_write: enabled_tool_names.contains(&"fs.edit"),
+            can_search: enabled_tool_names.contains(&"workspace.search"),
+        };
+
         // ── 1. Root agent ───────────────────────────────────
         let root_agent_id = AgentId::new();
         let root_agent = Agent::new(
@@ -435,16 +469,10 @@ impl SessionRuntime {
                 },
             },
             AgentCapabilities {
-                tools: AgentToolset {
-                    tools: HashMap::new(),
-                },
+                tools: root_toolset,
                 can_spawn_agents: false,
                 max_child_depth: None,
-                workspace: WorkspaceCapabilities {
-                    can_read: false,
-                    can_write: false,
-                    can_search: false,
-                },
+                workspace: workspace_capabilities,
                 backend: BackendCapabilities::default(),
             },
             AgentBudget::default(),
@@ -618,13 +646,18 @@ impl SessionRuntime {
     }
 }
 
+impl Drop for SessionRuntime {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -633,7 +666,7 @@ mod tests {
     use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
     use harness_protocol::commands::UserInput;
     use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome};
-    use harness_protocol::ids::{AgentId, RequestId, SessionId};
+    use harness_protocol::ids::{RequestId, SessionId};
     use harness_protocol::usage::{Cost, ModelUsage};
 
     use crate::testing::{FakeBackend, FakeToolRegistry};
@@ -700,7 +733,7 @@ mod tests {
                 }),
         );
 
-        let tool_registry = Arc::new(FakeToolRegistry::new(HashMap::new(), Vec::new()));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
         let workspace = Arc::new(FakeWorkspace::new());
 
         // Use a no-op event sink for the external persistence/logging path.
@@ -832,7 +865,7 @@ mod tests {
                     finish_reason: "end_turn".into(),
                 }),
         );
-        let tool_registry = Arc::new(FakeToolRegistry::new(HashMap::new(), Vec::new()));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
         let workspace = Arc::new(FakeWorkspace::new());
 
         struct NoopSink;

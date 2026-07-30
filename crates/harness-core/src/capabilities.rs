@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use harness_protocol::backend::BackendCapabilities;
 use harness_protocol::effects::ToolInheritance;
 use harness_protocol::ids::ToolId;
-use harness_protocol::tools::{AgentToolset, ToolCapability};
+use harness_protocol::tools::AgentToolset;
 
 // ---------------------------------------------------------------------------
 // WorkspaceCapabilities

@@ -1,9 +1,8 @@
-//! In-memory [`Workspace`](crate::traits::Workspace) stub for Phase 2 (spec §68.2).
+//! In-memory [`Workspace`] stub for Phase 2 (spec §68.2).
 //!
 //! [`FakeWorkspace`] holds files entirely in memory behind a mutex. It exists
-//! so that [`SessionRuntime`](crate::session_runtime::SessionRuntime) always
-//! has a concrete `Arc<dyn Workspace>` to bind without requiring a real
-//! filesystem implementation, which arrives in Phase 4.
+//! so that [`SessionRuntime`] always has a concrete `Arc<dyn Workspace>` to
+//! bind without requiring a real filesystem implementation, which arrives in Phase 4.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,45 +10,46 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::traits::{SearchMatch, SearchQuery, SearchResult, Workspace, WorkspaceError, WorkspaceStatus};
+use harness_workspace::{
+    FileInfo, SearchMatch, SearchResult, Workspace, WorkspaceError, WorkspaceMode,
+};
 
 /// A purely in-memory [`Workspace`] implementation used for tests and as the
 /// default Phase 2 workspace binding.
 #[derive(Debug, Default)]
 pub struct FakeWorkspace {
-    files: Mutex<HashMap<PathBuf, Vec<u8>>>,
-    root: Option<PathBuf>,
+    files: Mutex<HashMap<String, String>>,
+    root: PathBuf,
     writable: bool,
 }
 
 impl FakeWorkspace {
-    /// Creates an empty, writable fake workspace with no configured root.
+    /// Creates an empty, writable fake workspace with a default root.
     pub fn new() -> Self {
         Self {
             files: Mutex::new(HashMap::new()),
-            root: None,
+            root: PathBuf::from("/fake"),
             writable: true,
         }
     }
 
-    /// Sets the workspace root reported by [`Workspace::status`].
+    /// Sets the workspace root reported by [`Workspace::root`].
     pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.root = Some(root.into());
+        self.root = root.into();
         self
     }
 
     /// Seeds the workspace with a file, available for `read`/`search` before
     /// any command is sent.
-    pub fn with_file(self, path: impl Into<PathBuf>, data: impl Into<Vec<u8>>) -> Self {
+    pub fn with_file(self, path: impl Into<String>, content: impl Into<String>) -> Self {
         self.files
             .lock()
             .expect("files mutex poisoned")
-            .insert(path.into(), data.into());
+            .insert(path.into(), content.into());
         self
     }
 
-    /// Marks the workspace as read-only; `write` calls will fail with
-    /// [`WorkspaceError::PermissionDenied`].
+    /// Marks the workspace as read-only; `write` calls will fail.
     pub fn read_only(mut self) -> Self {
         self.writable = false;
         self
@@ -58,64 +58,69 @@ impl FakeWorkspace {
 
 #[async_trait]
 impl Workspace for FakeWorkspace {
-    async fn read(&self, path: &Path) -> Result<Vec<u8>, WorkspaceError> {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn mode(&self) -> WorkspaceMode {
+        WorkspaceMode::Shared
+    }
+
+    async fn read(&self, relative_path: &str) -> Result<String, WorkspaceError> {
         self.files
             .lock()
             .expect("files mutex poisoned")
-            .get(path)
+            .get(relative_path)
             .cloned()
-            .ok_or_else(|| WorkspaceError::NotFound(path.display().to_string()))
+            .ok_or_else(|| WorkspaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("file not found: {}", relative_path),
+            )))
     }
 
-    async fn write(&self, path: &Path, data: &[u8]) -> Result<(), WorkspaceError> {
+    async fn write(&self, relative_path: &str, content: &str) -> Result<(), WorkspaceError> {
         if !self.writable {
-            return Err(WorkspaceError::PermissionDenied(path.display().to_string()));
+            return Err(WorkspaceError::Isolated);
         }
         self.files
             .lock()
             .expect("files mutex poisoned")
-            .insert(path.to_path_buf(), data.to_vec());
+            .insert(relative_path.to_string(), content.to_string());
         Ok(())
     }
 
-    async fn search(&self, query: SearchQuery) -> Result<SearchResult, WorkspaceError> {
+    async fn search(&self, query: &str) -> Result<SearchResult, WorkspaceError> {
         let files = self.files.lock().expect("files mutex poisoned");
         let mut matches = Vec::new();
+        let mut total_count = 0;
 
         for (path, contents) in files.iter() {
-            if let Some(prefix) = &query.path_prefix {
-                if !path.starts_with(prefix) {
-                    continue;
-                }
-            }
-
-            let text = String::from_utf8_lossy(contents);
-            for (idx, line) in text.lines().enumerate() {
-                if line.contains(&query.pattern) {
+            for (idx, line) in contents.lines().enumerate() {
+                if line.contains(query) {
+                    total_count += 1;
                     matches.push(SearchMatch {
-                        path: path.clone(),
-                        line: (idx + 1) as u64,
-                        preview: line.chars().take(200).collect(),
+                        file_path: PathBuf::from(path),
+                        line_number: idx + 1,
+                        line_content: line.to_string(),
                     });
-                    if let Some(max) = query.max_results {
-                        if matches.len() >= max {
-                            return Ok(SearchResult { matches });
-                        }
-                    }
                 }
             }
         }
 
-        Ok(SearchResult { matches })
+        Ok(SearchResult { matches, total_count })
     }
 
-    async fn status(&self) -> Result<WorkspaceStatus, WorkspaceError> {
+    async fn list_files(&self, _max_depth: usize) -> Result<Vec<FileInfo>, WorkspaceError> {
         let files = self.files.lock().expect("files mutex poisoned");
-        Ok(WorkspaceStatus {
-            root: self.root.clone(),
-            file_count: files.len(),
-            is_writable: self.writable,
-        })
+        let file_infos = files
+            .iter()
+            .map(|(path, content)| FileInfo {
+                path: PathBuf::from(path),
+                size_bytes: content.len() as u64,
+                is_directory: false,
+            })
+            .collect();
+        Ok(file_infos)
     }
 }
 
@@ -126,56 +131,41 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_round_trips() {
         let ws = FakeWorkspace::new();
-        let path = PathBuf::from("/src/main.rs");
-        let content: &[u8] = b"fn main() {}";
-        ws.write(&path, content).await.expect("write");
-        let data = ws.read(&path).await.expect("read");
-        assert_eq!(data, content.to_vec());
+        let path = "src/main.rs";
+        let content = "fn main() {}";
+        ws.write(path, content).await.expect("write");
+        let data = ws.read(path).await.expect("read");
+        assert_eq!(data, content);
     }
 
     #[tokio::test]
-    async fn read_missing_file_is_not_found() {
+    async fn read_missing_file_errors() {
         let ws = FakeWorkspace::new();
-        let err = ws.read(Path::new("/missing.txt")).await.unwrap_err();
-        assert!(matches!(err, WorkspaceError::NotFound(_)));
+        let err = ws.read("missing.txt").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Io(_)));
     }
 
     #[tokio::test]
     async fn read_only_workspace_rejects_writes() {
         let ws = FakeWorkspace::new().read_only();
-        let content: &[u8] = b"x";
-        let err = ws.write(Path::new("/a.txt"), content).await.unwrap_err();
-        assert!(matches!(err, WorkspaceError::PermissionDenied(_)));
+        let err = ws.write("a.txt", "x").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Isolated));
     }
 
     #[tokio::test]
     async fn search_finds_seeded_content() {
-        let content: &[u8] = b"pub fn parse() {}\nfn helper() {}";
-        let ws = FakeWorkspace::new().with_file("/src/lib.rs", content);
-        let result = ws
-            .search(SearchQuery {
-                pattern: "parse".into(),
-                path_prefix: None,
-                max_results: None,
-            })
-            .await
-            .expect("search");
+        let content = "pub fn parse() {}\nfn helper() {}";
+        let ws = FakeWorkspace::new().with_file("src/lib.rs", content);
+        let result = ws.search("parse").await.expect("search");
         assert_eq!(result.matches.len(), 1);
-        assert_eq!(result.matches[0].path, PathBuf::from("/src/lib.rs"));
-        assert_eq!(result.matches[0].line, 1);
+        assert_eq!(result.matches[0].file_path, PathBuf::from("src/lib.rs"));
+        assert_eq!(result.matches[0].line_number, 1);
     }
 
     #[tokio::test]
-    async fn status_reports_file_count_and_writability() {
-        let a: &[u8] = b"a";
-        let b: &[u8] = b"b";
-        let ws = FakeWorkspace::new()
-            .with_root("/project")
-            .with_file("/project/a.txt", a)
-            .with_file("/project/b.txt", b);
-        let status = ws.status().await.expect("status");
-        assert_eq!(status.root, Some(PathBuf::from("/project")));
-        assert_eq!(status.file_count, 2);
-        assert!(status.is_writable);
+    async fn root_and_mode_reported_correctly() {
+        let ws = FakeWorkspace::new().with_root("/project");
+        assert_eq!(ws.root(), Path::new("/project"));
+        assert_eq!(ws.mode(), WorkspaceMode::Shared);
     }
 }
