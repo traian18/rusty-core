@@ -14,6 +14,7 @@ use harness_protocol::effects::{AgentEffect, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
 
+use crate::scheduler::Scheduler;
 use crate::session_runtime::LiveStateTable;
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry};
 
@@ -70,6 +71,8 @@ pub struct AgentRunner {
     pub event_sink: Arc<dyn EventSink>,
     pub agent_sequence: u64,
     pub cancel: CancellationToken,
+    /// Concurrency throttle for backend requests, tool executions, etc.
+    pub scheduler: Arc<Scheduler>,
     /// Shared table that this runner publishes its live status/usage into
     /// after every transition, so external readers (e.g.
     /// `SessionRuntime::agent_live_state`) always see a pure, up-to-date
@@ -89,6 +92,7 @@ impl AgentRunner {
         event_sink: Arc<dyn EventSink>,
         cancel: CancellationToken,
         live_state: LiveStateTable,
+        scheduler: Arc<Scheduler>,
     ) -> Self {
         task.cancel = cancel.clone();
         Self {
@@ -99,6 +103,7 @@ impl AgentRunner {
             event_sink,
             agent_sequence: 0,
             cancel,
+            scheduler,
             live_state,
             backend_tokens: HashMap::new(),
             tool_tokens: HashMap::new(),
@@ -190,8 +195,8 @@ impl AgentRunner {
         let mut finish = false;
         for effect in effects {
             match effect {
-                AgentEffect::ExecuteBackend { request } => self.execute_backend(request),
-                AgentEffect::ExecuteTool { request } => self.execute_tool(request),
+                AgentEffect::ExecuteBackend { request } => self.execute_backend(request).await,
+                AgentEffect::ExecuteTool { request } => self.execute_tool(request).await,
                 AgentEffect::Emit { event } => self.emit(event),
                 AgentEffect::FinishRun { .. } => finish = true,
                 AgentEffect::CancelBackend { run_id } => self.cancel_backend(run_id),
@@ -241,6 +246,13 @@ impl AgentRunner {
 
     /// Dispatches a backend execution effect.
     ///
+    /// Acquires **both** a global backend permit from the [`Scheduler`] and a
+    /// backend-specific permit (concurrency + rate-limit guard) before
+    /// spawning the forwarding and driver tasks.  The permits are moved into
+    /// the driver task and held for the entire duration of the backend
+    /// request, throttling concurrent LLM API calls across all agents and
+    /// enforcing per-backend rate limits.
+    ///
     /// Two tasks cooperate here:
     ///
     /// 1. A **forwarding** task that drains `event_rx` and forwards each
@@ -263,7 +275,19 @@ impl AgentRunner {
     /// dropped once the agent's `active_run` guard clears on the terminal
     /// event. Waiting for the forwarding task to finish first eliminates
     /// that race regardless of scheduler ordering.
-    fn execute_backend(&mut self, request: ExecutionRequest) {
+    async fn execute_backend(&mut self, request: ExecutionRequest) {
+        // Acquire the global backend semaphore permit.
+        let global_permit = self.scheduler.acquire_backend_permit().await;
+
+        // Acquire the backend-specific permit (concurrency slot + rate-limit
+        // guard).  This is a no-op if no limits were configured for this
+        // backend via Scheduler::configure_backend_limits.
+        let backend_id = self.backend.descriptor().id;
+        let backend_guard = self
+            .scheduler
+            .acquire_backend_specific_permit(backend_id)
+            .await;
+
         let run_id = request.run_id;
         let request_id = request.request_id;
         let (event_tx, mut event_rx) = broadcast::channel(256);
@@ -301,6 +325,11 @@ impl AgentRunner {
         let result_commands = self.task.commands_tx.clone();
         let result_token = token.clone();
         tokio::spawn(async move {
+            // Hold both permits for the complete backend request lifecycle.
+            // The forwarding task must not lock these permits: it needs to
+            // receive events while the driver is executing the backend.
+            let _global_permit = global_permit;
+            let _backend_guard = backend_guard;
             let outcome = backend.execute(request, event_tx, result_token).await;
             // Ensure every already-streamed event has been forwarded to the
             // mailbox before injecting the synthesized terminal event (see
@@ -318,7 +347,16 @@ impl AgentRunner {
         });
     }
 
-    fn execute_tool(&mut self, request: ToolRequest) {
+    /// Dispatches a tool execution effect.
+    ///
+    /// Acquires a tool permit from the [`Scheduler`] before spawning the
+    /// execution task. The permit is moved into the spawned task and held
+    /// for the entire tool execution, throttling concurrent tool calls
+    /// across all agents.
+    async fn execute_tool(&mut self, request: ToolRequest) {
+        // Throttle tool executions — block if at capacity.
+        let permit = self.scheduler.acquire_tool_permit().await;
+
         let call_id = request.call.id;
         let name = request.call.name.clone();
         let arguments = request.call.arguments.clone();
@@ -329,6 +367,8 @@ impl AgentRunner {
         match self.tool_registry.get_executor(&name) {
             Some(executor) => {
                 tokio::spawn(async move {
+                    // Hold the permit for the duration of tool execution.
+                    let _permit = permit;
                     // Convert protocol ToolCall to harness-tools ToolInput
                     let input = harness_tools::ToolInput {
                         arguments,
@@ -367,6 +407,7 @@ impl AgentRunner {
             }
             None => {
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let _ = commands.send(AgentCommand::ToolFailed {
                         call_id,
                         error: harness_protocol::tools::ToolError::ExecutionFailed,
@@ -411,6 +452,7 @@ mod tests {
     use harness_protocol::tools::AgentToolset;
     use harness_protocol::usage::AgentBudget;
 
+    use crate::scheduler::{Scheduler, SchedulerConfig};
     use crate::testing::{FakeBackend, FakeToolRegistry};
 
     use super::*;
@@ -478,6 +520,7 @@ mod tests {
         let tool_registry = Arc::new(FakeToolRegistry::new());
         let cancel = CancellationToken::new();
         let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
 
         let mut runner = AgentRunner::new(
             agent,
@@ -487,6 +530,7 @@ mod tests {
             Arc::new(NoopSink),
             cancel.clone(),
             live_state.clone(),
+            scheduler,
         );
 
         let mut events_rx = runner.task.events.subscribe();

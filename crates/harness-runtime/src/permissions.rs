@@ -25,6 +25,7 @@ pub struct PermissionPolicy;
 ///
 /// The runner maps this outcome to either dispatching the tool, surfacing a
 /// permission-required signal, or failing the tool call.
+#[derive(Debug)]
 pub enum PermissionOutcome {
     /// No restriction — the executor may run the tool.
     Allow,

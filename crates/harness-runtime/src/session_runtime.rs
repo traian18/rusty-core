@@ -30,6 +30,7 @@ use rust_decimal::Decimal;
 
 use crate::agent_runner::{AgentRunner, AgentTask};
 use crate::cancellation::SessionCancellation;
+use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,8 @@ pub enum SessionStatus {
     Completed,
     /// The session was cancelled before all runs completed.
     Cancelled,
+    /// The root task panicked or encountered an unrecoverable error.
+    Failed,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +124,8 @@ pub struct SessionSnapshot {
     pub root_agent_id: AgentId,
     /// The number of agents in the session.
     pub agent_count: usize,
+    /// An optional error message, populated when the session is [`SessionStatus::Failed`].
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +141,8 @@ pub struct SessionState {
     pub root_agent_id: AgentId,
     /// The session's current status.
     pub status: SessionStatus,
+    /// An optional error message, populated when the session enters [`SessionStatus::Failed`].
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +307,11 @@ impl SessionEventBus {
     pub async fn run(&self, bus_cancel: CancellationToken) {
         loop {
             if bus_cancel.is_cancelled() {
+                // Drain any remaining events.  This is important when the
+                // cancellation token fires concurrently with a session
+                // cancel: the agent runner may emit its terminal event
+                // before we get to poll again, and we need to forward it.
+                self.poll_receivers();
                 break;
             }
 
@@ -368,12 +380,23 @@ impl SessionEventBus {
 ///
 /// Owns the session's identity, state, cancellation root, event bus, the
 /// session's default execution backend, workspace binding, tool registry,
-/// and event sink.
+/// event sink, and scheduler.
+///
+/// # Lifecycle
+///
+/// * [`cancel()`](SessionRuntime::cancel) stops all agent runners but keeps
+///   the event bus alive so subscribers can receive terminal events.
+/// * [`shutdown()`](SessionRuntime::shutdown) stops everything including the
+///   event bus — called by `close_session` and `Drop`.
 pub struct SessionRuntime {
     /// The session's unique identifier.
     pub session_id: SessionId,
     /// The session's mutable state (agents, status, root agent id).
-    pub state: SessionState,
+    ///
+    /// Wrapped in a [`Mutex`] so that [`mark_failed`](SessionRuntime::mark_failed)
+    /// can mutate the status and error fields through `&self` (required because
+    /// the supervisor task holds an `Arc<SessionRuntime>`).
+    pub state: Mutex<SessionState>,
     /// Hierarchical cancellation root for this session.
     pub cancellation: SessionCancellation,
     /// The event bus that aggregates agent event streams.
@@ -389,14 +412,28 @@ pub struct SessionRuntime {
     pub tool_registry: Arc<dyn ToolRegistry>,
     /// Sink for fully-enveloped agent events.
     pub event_sink: Arc<dyn EventSink>,
+    /// Concurrency throttle for this session's backend/tool/process requests.
+    pub scheduler: Arc<Scheduler>,
     /// Live per-agent status/usage projection, updated by every `AgentRunner`.
     live_state: LiveStateTable,
     /// Sender to the root agent's task command channel.
     root_agent_tx: mpsc::Sender<AgentCommand>,
+    /// Handle to the root agent's spawned task, captured so that a supervisor
+    /// can observe completion or panic.  Wrapped in a [`Mutex<Option>`] so it
+    /// can be taken exactly once from an `&self` method.
+    root_task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Independent cancellation token for the event bus background task.
+    ///
+    /// Kept separate from [`cancellation`] so that a session cancel does
+    /// **not** shut down the bus before subscribers can receive terminal
+    /// events (e.g. `Completed { Cancelled }`).  Only
+    /// [`shutdown()`](SessionRuntime::shutdown) and [`Drop`] cancel this
+    /// token.
+    bus_cancel: CancellationToken,
 }
 
 impl SessionRuntime {
-    /// Create a new session runtime.
+    /// Create a new session runtime with a default scheduler.
     ///
     /// This constructor:
     ///
@@ -427,7 +464,7 @@ impl SessionRuntime {
     }
 
     /// Create a session runtime whose root agent receives the supplied tool
-    /// capabilities.
+    /// capabilities, using a default scheduler.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_toolset(
         session_id: SessionId,
@@ -436,6 +473,33 @@ impl SessionRuntime {
         workspace: Arc<dyn Workspace>,
         event_sink: Arc<dyn EventSink>,
         root_toolset: AgentToolset,
+    ) -> Self {
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+        Self::new_with_scheduler(
+            session_id,
+            backend,
+            tool_registry,
+            workspace,
+            event_sink,
+            root_toolset,
+            scheduler,
+        )
+    }
+
+    /// Create a session runtime with an explicit scheduler and toolset.
+    ///
+    /// This is the most flexible constructor — it allows test code to inject
+    /// a custom [`Scheduler`] with specific permit limits (e.g., for testing
+    /// serialization under low concurrency).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_scheduler(
+        session_id: SessionId,
+        backend: Arc<dyn ExecutionBackend>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        root_toolset: AgentToolset,
+        scheduler: Arc<Scheduler>,
     ) -> Self {
         let enabled_tool_names: Vec<_> = root_toolset
             .enabled_descriptors()
@@ -481,21 +545,27 @@ impl SessionRuntime {
         // ── 2. Session state ────────────────────────────────
         let mut agents = HashMap::new();
         agents.insert(root_agent_id, root_agent.clone());
-        let state = SessionState {
+        let session_state = SessionState {
             agents,
             root_agent_id,
             status: SessionStatus::Idle,
+            error: None,
         };
 
         // ── 3. Cancellation ──────────────────────────────────
         let cancellation = SessionCancellation::new();
 
         // ── 4. Event bus ───────────────────────────────────
+        // NOTE: The event bus uses its own independent CancellationToken,
+        // NOT a child of the session cancellation.  This way, calling
+        // cancel() stops agent runners but leaves the bus alive so
+        // subscribers can receive terminal events before shutdown.
         let event_bus = Arc::new(SessionEventBus::new(256));
         let bus_handle = Arc::clone(&event_bus);
-        let bus_cancel = cancellation.child_token();
+        let bus_cancel = CancellationToken::new();
+        let bus_cancel_for_task = bus_cancel.clone();
         tokio::spawn(async move {
-            bus_handle.run(bus_cancel).await;
+            bus_handle.run(bus_cancel_for_task).await;
         });
 
         // ── 5. Live state table ─────────────────────────────
@@ -525,31 +595,64 @@ impl SessionRuntime {
             bridge_sink,
             agent_cancel,
             live_state.clone(),
+            scheduler.clone(),
         );
 
         // Register the agent's broadcast sender with the event bus
         // so the bus can read events from task.events.
         event_bus.register_agent(root_agent_id, runner.task.events.clone());
 
-        // Spawn the runner task.
-        tokio::spawn(async move {
+        // Spawn the runner task and capture its JoinHandle so a supervisor
+        // can observe completion or panic.
+        let root_join: tokio::task::JoinHandle<()> = tokio::spawn(async move {
             let mut runner = runner;
             runner.run().await;
         });
 
         // ── 7. Assemble ──────────────────────────────────
-        Self {
+        let runtime = Self {
             session_id,
-            state,
+            state: Mutex::new(session_state),
             cancellation,
             event_bus,
             default_backend: backend,
             workspace,
             tool_registry,
             event_sink,
+            scheduler,
             live_state,
             root_agent_tx,
-        }
+            root_task_handle: Mutex::new(None),
+            bus_cancel,
+        };
+
+        // Stash the root task handle so SessionManager can supervise it.
+        *runtime.root_task_handle.lock().expect("root_task_handle mutex poisoned") = Some(root_join);
+
+        runtime
+    }
+
+    /// Take the root task's [`JoinHandle`], if it has not been taken already.
+    ///
+    /// This allows a supervisor (e.g. [`SessionManager`]) to await the root
+    /// task and detect panics or unexpected terminations. The handle can only
+    /// be taken once; subsequent calls return `None`.
+    pub fn take_root_task_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.root_task_handle
+            .lock()
+            .expect("root_task_handle mutex poisoned")
+            .take()
+    }
+
+    /// Mark the session as failed with the given error message.
+    ///
+    /// This transitions the session's status to [`SessionStatus::Failed`] and
+    /// stores the error description. It is called by the supervisor task when
+    /// the root task's `JoinHandle` produces a [`JoinError`].
+    pub fn mark_failed(&self, error_msg: String) {
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        state.status = SessionStatus::Failed;
+        state.error = Some(error_msg);
     }
 
     /// Spawn an agent runner, register its event stream with the session bus,
@@ -580,6 +683,7 @@ impl SessionRuntime {
             bridge_sink,
             agent_cancel,
             self.live_state.clone(),
+            self.scheduler.clone(),
         );
 
         self.event_bus
@@ -596,9 +700,24 @@ impl SessionRuntime {
     /// Send a command to the root agent's task channel.
     ///
     /// In this Phase 2 implementation, only the root agent is supported.
+    ///
+    /// When a [`SessionCommand::Prompt`] is sent, the session-level status
+    /// transitions to [`SessionStatus::Running`] optimistically (the agent
+    /// runner processes the `StartRun` asynchronously).  This ensures that
+    /// [`state_snapshot`](SessionRuntime::state_snapshot) returns an accurate
+    /// active status from the moment the command is issued.
     pub async fn send_command(&self, command: SessionCommand) -> Result<(), SessionError> {
         let agent_command = match command {
-            SessionCommand::Prompt(input) => AgentCommand::StartRun { input },
+            SessionCommand::Prompt(input) => {
+                // Optimistically transition to Running so that state_snapshot
+                // reflects the session as active immediately.
+                let mut state = self.state.lock().expect("state mutex poisoned");
+                if state.status == SessionStatus::Idle {
+                    state.status = SessionStatus::Running;
+                }
+                drop(state);
+                AgentCommand::StartRun { input }
+            }
             SessionCommand::Cancel => AgentCommand::Cancel,
             SessionCommand::Pause => AgentCommand::Pause,
             SessionCommand::Resume => AgentCommand::Resume,
@@ -612,11 +731,38 @@ impl SessionRuntime {
 
     /// Cancel the entire session.
     ///
-    /// Triggers the hierarchical cancellation root and sends
+    /// Triggers the hierarchical cancellation root (stopping all agent
+    /// runners and spawned backend/tool tasks) and sends
     /// [`AgentCommand::Cancel`] to the root agent.
+    ///
+    /// The session status immediately transitions to [`SessionStatus::Cancelled`]
+    /// (this is an optimistic update — cancellation is deterministic once
+    /// the token fires, even though the agent runner processes it
+    /// asynchronously).
+    ///
+    /// The event bus is **not** shut down by this call — subscribers can
+    /// still receive terminal events (e.g. `Completed { Cancelled }`) after
+    /// cancellation returns.
     pub async fn cancel(&self) {
         self.cancellation.cancel();
         let _ = self.root_agent_tx.send(AgentCommand::Cancel).await;
+
+        // Optimistically transition the session-level status so that
+        // state_snapshot() returns Cancelled immediately.
+        let mut state = self.state.lock().expect("state mutex poisoned");
+        if state.status != SessionStatus::Failed {
+            state.status = SessionStatus::Cancelled;
+        }
+    }
+
+    /// Shutdown the entire session, including the event bus.
+    ///
+    /// This is the final teardown — called by [`SessionManager::close_session`]
+    /// and [`Drop`].  After this, no further events will be forwarded to
+    /// subscribers.
+    pub fn shutdown(&self) {
+        self.cancellation.cancel();
+        self.bus_cancel.cancel();
     }
 
     /// Returns a [`SessionSnapshot`] of the current session state.
@@ -624,11 +770,13 @@ impl SessionRuntime {
     /// This is a pure read — no stored copy, just a point-in-time projection
     /// of live state.
     pub fn state_snapshot(&self) -> SessionSnapshot {
+        let state = self.state.lock().expect("state mutex poisoned");
         SessionSnapshot {
             session_id: self.session_id,
-            status: self.state.status,
-            root_agent_id: self.state.root_agent_id,
-            agent_count: self.state.agents.len(),
+            status: state.status,
+            root_agent_id: state.root_agent_id,
+            agent_count: state.agents.len(),
+            error: state.error.clone(),
         }
     }
 
@@ -648,7 +796,7 @@ impl SessionRuntime {
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.shutdown();
     }
 }
 
@@ -881,7 +1029,7 @@ mod tests {
             Arc::new(NoopSink),
         );
 
-        let root_id = runtime.state.root_agent_id;
+        let root_id = runtime.state.lock().expect("state mutex poisoned").root_agent_id;
 
         // Before any command, live state is the default (Idle, no outcome).
         let before = runtime.agent_live_state(root_id);

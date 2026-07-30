@@ -155,13 +155,16 @@ impl SessionClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
     use harness_protocol::commands::UserInput;
     use harness_protocol::ids::RequestId;
+    use harness_protocol::tools::AgentToolset;
     use harness_protocol::usage::{Cost, ModelUsage, UsageValue};
 
+    use crate::scheduler::{Scheduler, SchedulerConfig};
     use crate::testing::{FakeBackend, FakeToolRegistry};
     use crate::traits::EventSink;
     use crate::workspace::FakeWorkspace;
@@ -180,6 +183,7 @@ mod tests {
     async fn snapshot_reflects_in_flight_then_completed_status() {
         let session_id = SessionId::new();
         let request_id = RequestId::new();
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
 
         let backend = Arc::new(
             FakeBackend::new()
@@ -202,12 +206,16 @@ mod tests {
         let tool_registry = Arc::new(FakeToolRegistry::new());
         let workspace = Arc::new(FakeWorkspace::new());
 
-        let runtime = Arc::new(SessionRuntime::new(
+        let runtime = Arc::new(SessionRuntime::new_with_scheduler(
             session_id,
             backend,
             tool_registry,
             workspace,
             Arc::new(NoopSink),
+            AgentToolset {
+                tools: std::collections::HashMap::new(),
+            },
+            scheduler,
         ));
         let client = SessionClient::new(runtime);
 

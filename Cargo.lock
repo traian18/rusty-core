@@ -500,6 +500,7 @@ dependencies = [
  "async-trait",
  "harness-core",
  "harness-protocol",
+ "harness-runtime",
  "harness-tools",
  "harness-workspace",
  "rust_decimal",

@@ -14,8 +14,9 @@ use harness_protocol::ids::SessionId;
 use harness_protocol::tools::{
     AgentToolset, PermissionMode, ToolCapability, ToolPolicy,
 };
+use harness_runtime::session_manager::SessionManager;
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
-use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
+use harness_runtime::session_runtime::{SessionCommand, SessionError};
 use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
@@ -98,15 +99,21 @@ pub struct SessionBuilder {
     /// When set alongside `tool_registry`, the builder creates the registry
     /// from the toolset's enabled descriptors via `build_executor_for()`.
     root_toolset: Option<AgentToolset>,
+    /// The shared [`SessionManager`] that owns all active sessions.
+    /// When `None`, a default manager is created in [`start`](Self::start).
+    session_manager: Option<Arc<SessionManager>>,
 }
 
 impl SessionBuilder {
-    /// Create a builder with an empty integration registry.
+    /// Create a builder with an empty integration registry and a default
+    /// [`SessionManager`].
     pub fn new() -> Self {
         Self::with_integrations(Arc::new(IntegrationRegistry::new()))
     }
 
-    /// Create a builder attached to a shared registry.
+    /// Create a builder attached to a shared integration registry.
+    ///
+    /// A fresh [`SessionManager`] is created internally.
     pub fn with_integrations(integrations: Arc<IntegrationRegistry>) -> Self {
         Self {
             backend: None,
@@ -115,6 +122,28 @@ impl SessionBuilder {
             tool_registry: None,
             workspace: None,
             root_toolset: None,
+            session_manager: None,
+        }
+    }
+
+    /// Create a builder attached to both a shared integration registry and
+    /// a shared [`SessionManager`].
+    ///
+    /// This is the constructor used by [`Harness`](crate::Harness) so that
+    /// all sessions created through the harness are tracked in the same
+    /// manager.
+    pub fn with_integrations_and_manager(
+        integrations: Arc<IntegrationRegistry>,
+        session_manager: Arc<SessionManager>,
+    ) -> Self {
+        Self {
+            backend: None,
+            integration: None,
+            integrations,
+            tool_registry: None,
+            workspace: None,
+            root_toolset: None,
+            session_manager: Some(session_manager),
         }
     }
 
@@ -218,6 +247,11 @@ impl SessionBuilder {
     }
 
     /// Resolve configuration and create the live session.
+    ///
+    /// Session creation is routed through the [`SessionManager`], which
+    /// handles ID generation, runtime construction, and supervisor task
+    /// spawning. The resulting `Arc<SessionRuntime>` is registered with
+    /// the manager for centralized lifecycle control.
     pub async fn start(self) -> Result<SessionHandle, HarnessError> {
         let backend = match (self.backend, self.integration) {
             (Some(backend), _) => backend,
@@ -231,7 +265,7 @@ impl SessionBuilder {
         let tool_registry = self
             .tool_registry
             .ok_or(HarnessError::MissingToolRegistry)?;
-        
+
         // A high-level toolset carries explicit policy. For callers that
         // provide a registry directly, derive an enabled/allowed toolset so
         // registered tools are also executable by the root agent.
@@ -266,7 +300,7 @@ impl SessionBuilder {
             .into_iter()
             .cloned()
             .collect();
-        
+
         let backend: Arc<dyn ExecutionBackend> = Arc::new(ToolAdvertisingBackend {
             inner: backend,
             tools: protocol_descriptors,
@@ -274,19 +308,26 @@ impl SessionBuilder {
         let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
             .unwrap_or_else(|| Arc::new(FakeWorkspace::new()));
-        let session_id = SessionId::new();
         let (event_tx, _) = broadcast::channel(256);
         let event_sink = Arc::new(BroadcastEventSink {
             tx: event_tx.clone(),
         });
-        let runtime = Arc::new(SessionRuntime::new_with_toolset(
-            session_id,
-            backend,
-            tool_registry,
-            workspace,
-            event_sink,
-            root_toolset,
-        ));
+
+        // Use the provided SessionManager or create a default one.
+        let session_manager = self
+            .session_manager
+            .unwrap_or_else(|| Arc::new(SessionManager::default()));
+
+        let runtime = session_manager
+            .create_session(
+                backend,
+                tool_registry,
+                workspace,
+                event_sink,
+                root_toolset,
+            )
+            .await;
+        let session_id = runtime.session_id;
 
         Ok(SessionHandle {
             client: SessionClient::new(runtime),
