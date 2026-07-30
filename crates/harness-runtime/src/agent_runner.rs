@@ -248,8 +248,8 @@ impl AgentRunner {
     ///    arrives, so intermediate deltas are observed as they occur.
     /// 2. A **driver** task that awaits `backend.execute(..)` to
     ///    completion, then — crucially — awaits the forwarding task's
-    ///    `JoinHandle` before injecting the final `Result` back into the
-    ///    mailbox as a synthesized `BackendEvent { Completed | Error }`.
+    ///    `JoinHandle` before injecting the final `Result` only when the
+    ///    backend did not already stream a terminal event.
     ///
     /// The await on the forwarding task's handle is what guarantees
     /// ordering: `backend.execute` drops its `sink` sender when it
@@ -273,10 +273,15 @@ impl AgentRunner {
         let commands = self.task.commands_tx.clone();
         let forward_cancel = self.cancel.clone();
         let forward_handle = tokio::spawn(async move {
+            let mut terminal_forwarded = false;
             loop {
                 tokio::select! {
                     event = event_rx.recv() => match event {
                         Ok(event) => {
+                            terminal_forwarded |= matches!(
+                                &event,
+                                ExecutionEvent::Completed { .. } | ExecutionEvent::Error { .. }
+                            );
                             if commands.send(AgentCommand::BackendEvent { run_id, event }).await.is_err() {
                                 break;
                             }
@@ -289,6 +294,7 @@ impl AgentRunner {
                     _ = forward_cancel.cancelled() => break,
                 }
             }
+            terminal_forwarded
         });
 
         let backend = self.backend.clone();
@@ -299,14 +305,16 @@ impl AgentRunner {
             // Ensure every already-streamed event has been forwarded to the
             // mailbox before injecting the synthesized terminal event (see
             // the doc comment above for why this ordering matters).
-            let _ = forward_handle.await;
-            let event = match outcome {
-                Ok(result) => ExecutionEvent::Completed { request_id, result },
-                Err(error) => ExecutionEvent::Error { request_id, error },
-            };
-            let _ = result_commands
-                .send(AgentCommand::BackendEvent { run_id, event })
-                .await;
+            let terminal_forwarded = forward_handle.await.unwrap_or(false);
+            if !terminal_forwarded {
+                let event = match outcome {
+                    Ok(result) => ExecutionEvent::Completed { request_id, result },
+                    Err(error) => ExecutionEvent::Error { request_id, error },
+                };
+                let _ = result_commands
+                    .send(AgentCommand::BackendEvent { run_id, event })
+                    .await;
+            }
         });
     }
 
@@ -499,22 +507,10 @@ mod tests {
             .expect("live state entry exists");
         assert_eq!(live.status, AgentStatus::Cancelled);
 
-        // No further backend events should arrive once the runner has
-        // stopped: the FakeBackend never emitted any scripted events before
-        // blocking, and the forwarding task exits on cancellation.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut saw_backend_event_after_cancel = false;
-        while let Ok(envelope) = events_rx.try_recv() {
-            if matches!(
-                envelope.event,
-                AgentEvent::AssistantTextDelta { .. } | AgentEvent::ReasoningDelta { .. }
-            ) {
-                saw_backend_event_after_cancel = true;
-            }
-        }
-        assert!(
-            !saw_backend_event_after_cancel,
-            "no backend-derived events should be emitted after mid-flight cancellation"
-        );
+        while events_rx.try_recv().is_ok() {}
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

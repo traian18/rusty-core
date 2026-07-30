@@ -11,7 +11,7 @@ use harness_protocol::ids::{
 };
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 use harness_protocol::tools::{PermissionMode, ToolCall, ToolError, ToolResult, ToolResultSummary};
-use harness_protocol::usage::{AgentUsageSummary, Cost, UsageRecord};
+use harness_protocol::usage::{AgentUsageSummary, UsageRecord};
 
 use crate::agent::Agent;
 use crate::agent_state::PendingToolCall;
@@ -164,20 +164,22 @@ impl Agent {
                 }]
             }
             ExecutionEvent::ToolCallRequested { call, .. } => self.tool_requested(call),
-            ExecutionEvent::UsageUpdate { usage, .. } => {
-                self.usage.records.push(UsageRecord {
-                    model_usage: usage,
-                    cost: Cost::default(),
-                    tool_usage: None,
-                });
-                Vec::new()
-            }
+            // Usage updates are cumulative snapshots for observability. The
+            // terminal result below is the single authoritative ledger record
+            // for a model request.
+            ExecutionEvent::UsageUpdate { .. } => Vec::new(),
             ExecutionEvent::Completed { result, .. } => {
+                let is_tool_turn = result.finish_reason == "tool_use";
                 self.usage.records.push(UsageRecord {
                     model_usage: result.usage,
                     cost: result.cost,
                     tool_usage: None,
                 });
+                if is_tool_turn {
+                    // The model request is complete, but the agent run is not:
+                    // tool results will trigger the next backend request.
+                    return Vec::new();
+                }
                 let from = self.state.status;
                 self.state.status = AgentStatus::Idle;
                 self.state.active_run = None;

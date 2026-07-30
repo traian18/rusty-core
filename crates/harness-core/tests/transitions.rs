@@ -210,6 +210,36 @@ fn scripted_vertical_slice() {
 }
 
 #[test]
+fn tool_use_completion_keeps_the_run_active() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    let call_id = ToolCallId::new();
+
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+
+    let mut result = completed_result();
+    result.finish_reason = "tool_use".into();
+    let effects = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result,
+        },
+    });
+
+    assert!(effects.is_empty());
+    assert_eq!(agent.state.active_run, Some(run_id));
+    assert_ne!(agent.state.status, AgentStatus::Idle);
+    assert_eq!(agent.usage.records.len(), 1);
+}
+
+#[test]
 fn cancel_stops_further_effects() {
     let mut agent = create_agent(PermissionMode::Allow);
     let run_id = start(&mut agent);
@@ -308,7 +338,11 @@ fn backend_delta_usage_and_error_events_are_covered() {
             usage: ModelUsage::default(),
         },
     });
-    assert_eq!(agent.usage.records.len(), 1);
+    assert_eq!(
+        agent.usage.records.len(),
+        0,
+        "cumulative usage snapshots must not become request ledger records"
+    );
     agent.apply(AgentCommand::BackendEvent {
         run_id,
         event: ExecutionEvent::Error {

@@ -20,7 +20,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }

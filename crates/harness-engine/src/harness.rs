@@ -1,35 +1,35 @@
-//! Top-level [`Harness`] entry point — the public API root.
-//!
-//! `Harness` is a zero‑state factory that creates [`SessionBuilder`]s.
-//! All session configuration (backend, tool registry, etc.) is done
-//! through the builder.
+//! Top-level public harness entry point.
+
+use std::sync::Arc;
+
+use harness_runtime::{IntegrationError, IntegrationFactory, IntegrationRegistry};
 
 use crate::session_builder::SessionBuilder;
 
-/// The top-level entry point for creating harness sessions.
-///
-/// This is a stateless singleton.  Call [`Harness::new()`] to get an
-/// instance, then chain `.session().backend(...).tools(...).start().await?`
-/// to create a live session.
-pub struct Harness;
+/// Public entry point for registering integrations and creating sessions.
+pub struct Harness {
+    integrations: Arc<IntegrationRegistry>,
+}
 
 impl Harness {
-    /// Create a new harness instance.
-    ///
-    /// Returns a zero‑state `Harness`.  All configuration happens on the
-    /// [`SessionBuilder`] obtained via [`session()`](Harness::session).
+    /// Create a harness with an empty integration registry.
     pub fn new() -> Self {
-        Self
+        Self {
+            integrations: Arc::new(IntegrationRegistry::new()),
+        }
     }
 
-    /// Begin building a new session.
-    ///
-    /// Returns a [`SessionBuilder`] that must be configured with
-    /// [`backend()`](SessionBuilder::backend) and
-    /// [`tools()`](SessionBuilder::tools) before calling
-    /// [`start()`](SessionBuilder::start).
+    /// Register a dynamically constructible integration family.
+    pub fn register_integration(
+        &self,
+        factory: Arc<dyn IntegrationFactory>,
+    ) -> Result<(), IntegrationError> {
+        self.integrations.register(factory)
+    }
+
+    /// Begin building a session using this harness's integration registry.
     pub fn session(&self) -> SessionBuilder {
-        SessionBuilder::new()
+        SessionBuilder::with_integrations(self.integrations.clone())
     }
 }
 

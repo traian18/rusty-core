@@ -43,7 +43,7 @@ pub struct ModelUsage {
     pub total_tokens: UsageValue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CostSource {
     ProviderReported,
     Calculated,
