@@ -9,9 +9,10 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use harness_core::agent::Agent;
-use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
+use harness_core::transcript::validate_transcript;
+use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus};
-use harness_protocol::effects::{AgentEffect, SpawnAgentSpec, ToolRequest};
+use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
 
@@ -92,6 +93,10 @@ pub struct AgentRunner {
     /// child's final [`AgentResult`] or [`AgentError`] after `run()` returns.
     final_result: Option<Result<AgentResult, AgentError>>,
     supervision: Option<AgentSupervision>,
+    /// Optional durable session store. When present, `AgentEffect::Persist`
+    /// mutations are routed through it (the transcript is validated first).
+    /// Injected via [`AgentRunner::with_session_store`].
+    session_store: Option<Arc<dyn harness_session_store::SessionStore>>,
 }
 
 /// Session-scoped services required to interpret child-agent effects.
@@ -188,6 +193,7 @@ impl AgentRunner {
             tool_tokens: HashMap::new(),
             final_result: None,
             supervision: None,
+            session_store: None,
         }
     }
 
@@ -201,6 +207,19 @@ impl AgentRunner {
             supervisor: Arc::new(supervisor),
             integrations,
         });
+        self
+    }
+
+    /// Enables durable persistence of `Persist` effects through `store`.
+    ///
+    /// Mirrors [`with_supervision`](Self::with_supervision): the store is
+    /// injected post-construction so `AgentRunner::new`'s argument list does
+    /// not grow. Without it, `Persist` mutations are dropped with a warning.
+    pub fn with_session_store(
+        mut self,
+        store: Arc<dyn harness_session_store::SessionStore>,
+    ) -> Self {
+        self.session_store = Some(store);
         self
     }
 
@@ -317,7 +336,7 @@ impl AgentRunner {
             match effect {
                 AgentEffect::ExecuteBackend { request } => self.execute_backend(request).await,
                 AgentEffect::ExecuteTool { request } => self.execute_tool(request).await,
-                AgentEffect::Emit { event } => self.emit(event),
+                AgentEffect::Emit { event } => self.emit(event).await,
                 AgentEffect::FinishRun { result } => {
                     // Capture the terminal result so a supervisor can retrieve
                     // it after `run()` returns via `take_final_result`. A
@@ -356,7 +375,7 @@ impl AgentRunner {
                     tracing::warn!(?request, "RequestPermission is not wired in Phase 2");
                 }
                 AgentEffect::Persist { mutation } => {
-                    tracing::warn!(?mutation, "Persist is not wired in Phase 2");
+                    self.persist(mutation).await;
                 }
             }
         }
@@ -408,7 +427,7 @@ impl AgentRunner {
         }
     }
 
-    fn emit(&mut self, event: AgentEvent) {
+    async fn emit(&mut self, event: AgentEvent) {
         match &event {
             AgentEvent::Completed { outcome } => self.publish_outcome(*outcome),
             AgentEvent::Failed { .. } => self.publish_outcome(AgentOutcome::Failed),
@@ -428,20 +447,84 @@ impl AgentRunner {
             event,
         };
         self.agent_sequence = self.agent_sequence.wrapping_add(1);
+
+        // Event emission is the centralized durable-event boundary. Persist
+        // the completed/lifecycle event before making it observable, while
+        // raw streaming deltas and progress ticks remain ephemeral. The
+        // `persist` call validates the authoritative in-memory transcript
+        // immediately before `SessionStore::append`.
+        if harness_session_store::is_durable(&envelope.event) {
+            self.persist(SessionMutation::AppendEvent(envelope.clone()))
+                .await;
+        }
+
         // Send to the agent's own event broadcast channel (read by SessionEventBus).
         let _ = self.task.events.send(envelope.clone());
         // Forward to the external event sink (persistence, logging, etc.).
         self.event_sink.send(envelope);
     }
 
+    /// Persists a session mutation through the injected
+    /// [`harness_session_store::SessionStore`].
+    ///
+    /// The transcript is validated **immediately before** the write, so an
+    /// invalid transcript (e.g. a dangling or orphaned tool call) is never
+    /// persisted as a durable event or snapshot. When no store is configured
+    /// the mutation is dropped with a warning.
+    async fn persist(&mut self, mutation: SessionMutation) {
+        let Some(store) = &self.session_store else {
+            tracing::warn!(?mutation, "Persist requested without a session store");
+            return;
+        };
+
+        if let Err(error) = validate_transcript(&self.agent.state.messages) {
+            tracing::error!(
+                ?error,
+                "refusing to persist mutation for invalid transcript"
+            );
+            return;
+        }
+
+        match mutation {
+            SessionMutation::AppendEvent(envelope) => {
+                if let Err(error) = store.append(envelope.into()).await {
+                    tracing::error!(?error, "failed to append durable session event");
+                }
+            }
+            SessionMutation::SaveSnapshot(payload) => {
+                match serde_json::from_value::<harness_session_store::DurableSessionSnapshot>(
+                    payload,
+                ) {
+                    Ok(snapshot) => {
+                        if let Err(error) = store.save_snapshot(snapshot).await {
+                            tracing::error!(?error, "failed to save session snapshot");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "dropping invalid session snapshot payload");
+                    }
+                }
+            }
+        }
+    }
+
     /// Dispatches a backend execution effect.
     ///
-    /// Acquires **both** a global backend permit from the [`Scheduler`] and a
-    /// backend-specific permit (concurrency + rate-limit guard) before
-    /// spawning the forwarding and driver tasks.  The permits are moved into
-    /// the driver task and held for the entire duration of the backend
-    /// request, throttling concurrent LLM API calls across all agents and
-    /// enforcing per-backend rate limits.
+    /// The agent's transcript is validated before anything is dispatched to
+    /// the backend: an invalid transcript (a tool call whose result is
+    /// missing or out of order) must never reach the backend as an
+    /// `ExecutionRequest`. On failure a
+    /// [`harness_core::transcript::TranscriptError`]-derived
+    /// `ExecutionEvent::Error` is fed back into the agent's mailbox instead,
+    /// so the agent observes a normal backend failure and can transition
+    /// (e.g. to `Failed`) rather than hang.
+    ///
+    /// Otherwise, acquires **both** a global backend permit from the
+    /// [`Scheduler`] and a backend-specific permit (concurrency + rate-limit
+    /// guard) before spawning the forwarding and driver tasks.  The permits
+    /// are moved into the driver task and held for the entire duration of the
+    /// backend request, throttling concurrent LLM API calls across all agents
+    /// and enforcing per-backend rate limits.
     ///
     /// Two tasks cooperate here:
     ///
@@ -466,6 +549,30 @@ impl AgentRunner {
     /// event. Waiting for the forwarding task to finish first eliminates
     /// that race regardless of scheduler ordering.
     async fn execute_backend(&mut self, request: ExecutionRequest) {
+        // Validate the transcript before constructing/dispatching the
+        // ExecutionRequest: never send an invalid transcript to the backend.
+        if let Err(error) = validate_transcript(&self.agent.state.messages) {
+            tracing::error!(
+                ?error,
+                "refusing to dispatch backend request with invalid transcript"
+            );
+            let event = ExecutionEvent::Error {
+                request_id: request.request_id,
+                error: ExecutionError::InvalidRequest {
+                    message: format!("invalid transcript: {error}"),
+                },
+            };
+            let _ = self
+                .task
+                .commands_tx
+                .send(AgentCommand::BackendEvent {
+                    run_id: request.run_id,
+                    event,
+                })
+                .await;
+            return;
+        }
+
         // Acquire the global backend semaphore permit.
         let global_permit = self.scheduler.acquire_backend_permit().await;
 

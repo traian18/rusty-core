@@ -7,13 +7,15 @@
 //! binding, and event bus.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use harness_core::agent::Agent;
+use harness_core::agent::{Agent, UsageLedger};
+use harness_core::agent_state::{AgentState, PendingToolCall};
 use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
 use harness_core::usage::AgentUsageSummary as CoreAgentUsageSummary;
 use harness_protocol::backend::{
@@ -26,7 +28,8 @@ use harness_protocol::effects::SpawnAgentSpec;
 use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
 use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
 use harness_protocol::tools::AgentToolset;
-use harness_protocol::usage::AgentBudget;
+use harness_protocol::usage::{AgentBudget, UsageRecord};
+use harness_session_store::{SessionStore, StoredAgentState};
 use rust_decimal::Decimal;
 
 use crate::agent_runner::{AgentRunner, AgentTask};
@@ -489,6 +492,7 @@ impl SessionRuntime {
             event_sink,
             root_toolset,
             scheduler,
+            None,
         )
     }
 
@@ -506,6 +510,7 @@ impl SessionRuntime {
         event_sink: Arc<dyn EventSink>,
         root_toolset: AgentToolset,
         scheduler: Arc<Scheduler>,
+        session_store: Option<Arc<dyn SessionStore>>,
     ) -> Self {
         let enabled_tool_names: Vec<_> = root_toolset
             .enabled_descriptors()
@@ -597,7 +602,7 @@ impl SessionRuntime {
             external_sink: Some(event_sink.clone()),
         });
 
-        let runner = AgentRunner::new(
+        let mut runner = AgentRunner::new(
             root_agent,
             task,
             backend.clone(),
@@ -609,6 +614,9 @@ impl SessionRuntime {
             scheduler.clone(),
         )
         .with_supervision(agent_supervisor.clone(), integrations.clone());
+        if let Some(store) = session_store {
+            runner = runner.with_session_store(store);
+        }
 
         // Register the agent's broadcast sender with the event bus
         // so the bus can read events from task.events.
@@ -620,6 +628,200 @@ impl SessionRuntime {
             let mut runner = runner;
             runner.run().await;
         });
+
+        // ── 7. Assemble ──────────────────────────────────
+        let runtime = Self {
+            session_id,
+            state: Mutex::new(session_state),
+            cancellation,
+            event_bus,
+            default_backend: backend,
+            workspace,
+            tool_registry,
+            event_sink,
+            scheduler,
+            agent_supervisor,
+            integrations,
+            live_state,
+            root_agent_tx,
+            root_task_handle: Mutex::new(None),
+            bus_cancel,
+        };
+
+        // Stash the root task handle so SessionManager can supervise it.
+        *runtime
+            .root_task_handle
+            .lock()
+            .expect("root_task_handle mutex poisoned") = Some(root_join);
+
+        runtime
+    }
+
+    /// Rebuilds a session runtime from a durable snapshot's stored agent
+    /// states.
+    ///
+    /// This is the restore-time counterpart of
+    /// [`new_with_scheduler`](Self::new_with_scheduler): instead of creating
+    /// a fresh root agent, it reconstructs every agent (root + descendants)
+    /// from its [`harness_session_store::StoredAgentState`] projection and
+    /// spawns a runner for each, mirroring the live-session lifecycle
+    /// (hierarchical cancellation, event bus, supervisor token registration,
+    /// live-state table, per-agent task channels).
+    ///
+    /// The root agent is identified as the stored agent with no parent; its
+    /// runner's command channel becomes the session's root command sender and
+    /// its `JoinHandle` is stashed so [`SessionManager`](crate::session_manager::SessionManager)
+    /// can supervise it, exactly like [`new_with_scheduler`](Self::new_with_scheduler).
+    /// The session starts in [`SessionStatus::Idle`] — a restored session
+    /// accepts new commands rather than resuming a mid-flight run.
+    ///
+    /// When `session_store` is `Some`, the handle is threaded into every
+    /// restored runner via
+    /// [`AgentRunner::with_session_store`](crate::agent_runner::AgentRunner::with_session_store)
+    /// so `Persist` effects keep flowing through the store after a restore.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stored(
+        session_id: SessionId,
+        stored_agents: Vec<StoredAgentState>,
+        backend: Arc<dyn ExecutionBackend>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        scheduler: Arc<Scheduler>,
+        integrations: Arc<IntegrationRegistry>,
+        session_store: Option<Arc<dyn SessionStore>>,
+    ) -> Self {
+        // ── 1. Reconstruct agents from their stored projections ────────────
+        let mut agents: HashMap<AgentId, Agent> = HashMap::new();
+        let mut root_agent: Option<Agent> = None;
+        for stored in stored_agents {
+            let agent = Agent {
+                id: stored.agent_id,
+                session_id,
+                parent_id: stored.parent_id,
+                state: AgentState {
+                    status: stored.status,
+                    current_operation: stored.current_operation,
+                    system_prompt: stored.system_prompt,
+                    messages: stored.messages,
+                    active_run: stored.active_run,
+                    pending_tools: stored
+                        .pending_tools
+                        .into_iter()
+                        .map(|(call_id, pending)| {
+                            (
+                                call_id,
+                                PendingToolCall {
+                                    call: pending.call,
+                                    started_at: pending.started_at,
+                                },
+                            )
+                        })
+                        .collect(),
+                    pending_permissions: stored.pending_permissions,
+                    children: stored.children,
+                    last_error: stored.last_error,
+                    transition_sequence: stored.transition_sequence,
+                    depth: stored.depth,
+                },
+                backend: stored.backend,
+                capabilities: capabilities_from_value(&stored.capabilities),
+                usage: usage_from_value(&stored.usage),
+                budget: stored.budget,
+            };
+            if agent.parent_id.is_none() {
+                root_agent = Some(agent.clone());
+            }
+            agents.insert(agent.id, agent.clone());
+        }
+
+        let root_agent = root_agent
+            .expect("a stored snapshot must contain exactly one root agent (parent_id = None)");
+        let root_agent_id = root_agent.id;
+
+        // ── 2. Cancellation ──────────────────────────────────
+        let cancellation = SessionCancellation::new();
+        let agent_supervisor = AgentSupervisor::new(session_id, cancellation.clone());
+
+        // ── 3. Event bus ───────────────────────────────────
+        // The bus uses its own independent CancellationToken (NOT a child of
+        // the session cancellation) so a session cancel leaves the bus alive
+        // for terminal events, matching new_with_scheduler.
+        let event_bus = Arc::new(SessionEventBus::new(256));
+        let bus_handle = Arc::clone(&event_bus);
+        let bus_cancel = CancellationToken::new();
+        let bus_cancel_for_task = bus_cancel.clone();
+        tokio::spawn(async move {
+            bus_handle.run(bus_cancel_for_task).await;
+        });
+
+        // ── 4. Live state table ─────────────────────────────
+        let live_state: LiveStateTable = Arc::new(Mutex::new(HashMap::new()));
+
+        // ── 5. Spawn one runner per restored agent ──────────
+        // Each runner registers its cancellation token with the supervisor,
+        // publishes live status/usage to the shared table, and — when a store
+        // is configured — receives the store handle so `Persist` effects keep
+        // flowing after the restore.
+        let spawn_restored = |agent: Agent| -> (
+            mpsc::Sender<AgentCommand>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
+            let command_tx = task.commands_tx.clone();
+            let agent_cancel = cancellation.child_token();
+            agent_supervisor.register_agent_token(agent.id, agent_cancel.clone());
+            live_state
+                .lock()
+                .expect("live_state mutex poisoned")
+                .insert(agent.id, AgentLiveState::default());
+
+            // Bridge to the external event sink (persistence, logging).
+            let bridge_sink = Arc::new(BridgeEventSink {
+                external_sink: Some(event_sink.clone()),
+            });
+
+            let mut runner = AgentRunner::new(
+                agent,
+                task,
+                backend.clone(),
+                tool_registry.clone(),
+                workspace.clone(),
+                bridge_sink,
+                agent_cancel,
+                live_state.clone(),
+                scheduler.clone(),
+            )
+            .with_supervision(agent_supervisor.clone(), integrations.clone());
+            if let Some(store) = session_store.clone() {
+                runner = runner.with_session_store(store);
+            }
+
+            event_bus.register_agent(runner.task.id, runner.task.events.clone());
+            let join = tokio::spawn(async move {
+                let mut runner = runner;
+                runner.run().await;
+            });
+            (command_tx, join)
+        };
+
+        let (root_agent_tx, root_join) = spawn_restored(root_agent);
+        for agent in agents.values() {
+            if agent.id == root_agent_id {
+                continue;
+            }
+            // Non-root runners run in the background; their JoinHandles are
+            // intentionally dropped, matching `spawn_agent_runner`.
+            let _ = spawn_restored(agent.clone());
+        }
+
+        // ── 6. Session state ────────────────────────────────
+        let session_state = SessionState {
+            agents,
+            root_agent_id,
+            status: SessionStatus::Idle,
+            error: None,
+        };
 
         // ── 7. Assemble ──────────────────────────────────
         let runtime = Self {
@@ -814,6 +1016,186 @@ impl SessionRuntime {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stored-state projection helpers (snapshot restore)
+// ---------------------------------------------------------------------------
+
+/// Restores an [`AgentCapabilities`] from its opaque JSON projection.
+///
+/// The canonical projection persisted at snapshot time (and produced
+/// symmetrically by a snapshot writer) has the shape:
+///
+/// ```json
+/// {
+///   "tools": { ... AgentToolset ... },
+///   "can_spawn_agents": true,
+///   "max_child_depth": 8,
+///   "workspace": { "can_read": true, "can_write": false, "can_search": false },
+///   "backend": { ... BackendCapabilities ... }
+/// }
+/// ```
+///
+/// `AgentToolset` and `BackendCapabilities` are protocol types that implement
+/// `Deserialize` themselves; only the wrapper fields are extracted here. A
+/// corrupt or missing projection logs an error and falls back to an empty,
+/// non-escalating capability set so a restore can still proceed.
+fn capabilities_from_value(value: &serde_json::Value) -> AgentCapabilities {
+    match try_capabilities(value) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "invalid stored agent capabilities projection; restoring with empty capabilities"
+            );
+            AgentCapabilities {
+                tools: AgentToolset {
+                    tools: HashMap::new(),
+                },
+                can_spawn_agents: false,
+                max_child_depth: None,
+                workspace: WorkspaceCapabilities {
+                    can_read: false,
+                    can_write: false,
+                    can_search: false,
+                },
+                backend: BackendCapabilities::default(),
+            }
+        }
+    }
+}
+
+fn try_capabilities(value: &serde_json::Value) -> Result<AgentCapabilities, String> {
+    let obj = value
+        .as_object()
+        .ok_or("capabilities projection is not an object")?;
+    let get = |key: &str| {
+        obj.get(key)
+            .cloned()
+            .ok_or_else(|| format!("missing field `{key}`"))
+    };
+
+    let tools: AgentToolset = serde_json::from_value(get("tools")?)
+        .map_err(|error| format!("invalid `tools` projection: {error}"))?;
+    let can_spawn_agents = get("can_spawn_agents")?
+        .as_bool()
+        .ok_or("`can_spawn_agents` is not a boolean")?;
+    let max_child_depth = match get("max_child_depth")? {
+        serde_json::Value::Null => None,
+        value => Some(
+            value
+                .as_u64()
+                .ok_or("`max_child_depth` is not an integer")? as u32,
+        ),
+    };
+
+    let workspace_obj = get("workspace")?
+        .as_object()
+        .ok_or("`workspace` is not an object")?
+        .clone();
+    let workspace_bool = |key: &str| {
+        workspace_obj
+            .get(key)
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| format!("`workspace.{key}` is not a boolean"))
+    };
+    let workspace = WorkspaceCapabilities {
+        can_read: workspace_bool("can_read")?,
+        can_write: workspace_bool("can_write")?,
+        can_search: workspace_bool("can_search")?,
+    };
+
+    let backend: BackendCapabilities = serde_json::from_value(get("backend")?)
+        .map_err(|error| format!("invalid `backend` projection: {error}"))?;
+
+    Ok(AgentCapabilities {
+        tools,
+        can_spawn_agents,
+        max_child_depth,
+        workspace,
+        backend,
+    })
+}
+
+/// Restores a [`UsageLedger`] from its opaque JSON projection.
+///
+/// Canonical shape persisted at snapshot time (and produced symmetrically by
+/// a snapshot writer):
+///
+/// ```json
+/// {
+///   "records": [ ... UsageRecord ... ],
+///   "child_usage": {
+///     "<agent-id>": {
+///       "self_usage": { ... ModelUsage ... },
+///       "descendant_usage": { ... ModelUsage ... },
+///       "inclusive_usage": { ... ModelUsage ... }
+///     }
+///   }
+/// }
+/// ```
+///
+/// `UsageRecord` and `ModelUsage` are protocol types that implement
+/// `Deserialize`; only the wrapper is extracted here. A corrupt or missing
+/// projection logs an error and falls back to an empty ledger.
+fn usage_from_value(value: &serde_json::Value) -> UsageLedger {
+    match try_usage(value) {
+        Ok(usage) => usage,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "invalid stored agent usage projection; restoring with an empty ledger"
+            );
+            UsageLedger::default()
+        }
+    }
+}
+
+fn try_usage(value: &serde_json::Value) -> Result<UsageLedger, String> {
+    let obj = value
+        .as_object()
+        .ok_or("usage projection is not an object")?;
+
+    let records: Vec<UsageRecord> = serde_json::from_value(
+        obj.get("records")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
+    .map_err(|error| format!("invalid `records` projection: {error}"))?;
+
+    let mut child_usage: HashMap<AgentId, CoreAgentUsageSummary> = HashMap::new();
+    if let Some(children) = obj.get("child_usage").and_then(|value| value.as_object()) {
+        for (agent_id, summary_value) in children {
+            let agent_id = AgentId::from_str(agent_id)
+                .map_err(|error| format!("invalid child_usage key {agent_id:?}: {error}"))?;
+            child_usage.insert(agent_id, usage_summary_from_value(summary_value)?);
+        }
+    }
+
+    Ok(UsageLedger {
+        records,
+        child_usage,
+    })
+}
+
+fn usage_summary_from_value(value: &serde_json::Value) -> Result<CoreAgentUsageSummary, String> {
+    let obj = value
+        .as_object()
+        .ok_or("child usage summary is not an object")?;
+    let get = |key: &str| {
+        obj.get(key)
+            .cloned()
+            .ok_or_else(|| format!("missing field `{key}`"))
+    };
+    Ok(CoreAgentUsageSummary {
+        self_usage: serde_json::from_value(get("self_usage")?)
+            .map_err(|error| format!("invalid `self_usage` projection: {error}"))?,
+        descendant_usage: serde_json::from_value(get("descendant_usage")?)
+            .map_err(|error| format!("invalid `descendant_usage` projection: {error}"))?,
+        inclusive_usage: serde_json::from_value(get("inclusive_usage")?)
+            .map_err(|error| format!("invalid `inclusive_usage` projection: {error}"))?,
+    })
 }
 
 impl Drop for SessionRuntime {

@@ -1,0 +1,66 @@
+{
+  "name": "duplicate-sequence-rejected",
+  "description": "Append-only invariant edge case: appending a second durable event that reuses an already-committed (session, session_sequence) pair. SqliteSessionStore enforces the invariant with a UNIQUE index and rejects the duplicate as StoreError::InvalidState at write time; JsonlSessionStore is an unindexed append-only file and legitimately accepts it. The divergence is recorded per store in each mutation's expect map.",
+  "captured_from": {
+    "phase": "Phase 7 (persistence, Tasks 7.2/7.3)",
+    "bug": "Without the UNIQUE index on durable_events(session_id, session_sequence), a duplicate session sequence was silently written, corrupting replay order: load_session could no longer distinguish two events at the same position in the stream and the snapshot+event restoration contract became ambiguous.",
+    "fix": "migrations/0001_init.sql adds idx_durable_events_session_sequence (UNIQUE on (session_id, session_sequence)); map_sqlite_error in sqlite.rs surfaces the constraint violation as StoreError::InvalidState at write time. The JSONL backend keeps its documented append-only semantics (no index), so the per-store expectation below is the contract.",
+    "replay": "Apply the mutation transcript to a fresh store and assert each write's outcome against the per-store expect map."
+  },
+  "mutations": [
+    {
+      "kind": "append",
+      "expect": {
+        "sqlite": { "ok": true },
+        "jsonl": { "ok": true }
+      },
+      "event": {
+        "session_sequence": 1,
+        "envelope": {
+          "event_id": "44444444-4444-4444-8444-444444444101",
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "agent_id": "22222222-2222-4222-8222-222222222222",
+          "parent_agent_id": null,
+          "run_id": "33333333-3333-4333-8333-333333333333",
+          "agent_sequence": 1,
+          "session_sequence": 1,
+          "timestamp": "2026-07-31T13:00:00.000000000Z",
+          "visibility": "User",
+          "event": {
+            "StateChanged": {
+              "from": "Idle",
+              "to": "PreparingContext"
+            }
+          }
+        }
+      }
+    },
+    {
+      "kind": "append",
+      "expect": {
+        "sqlite": { "error": "InvalidState" },
+        "jsonl": { "ok": true }
+      },
+      "event": {
+        "session_sequence": 1,
+        "envelope": {
+          "event_id": "44444444-4444-4444-8444-444444444102",
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "agent_id": "22222222-2222-4222-8222-222222222222",
+          "parent_agent_id": null,
+          "run_id": "33333333-3333-4333-8333-333333333333",
+          "agent_sequence": 2,
+          "session_sequence": 1,
+          "timestamp": "2026-07-31T13:00:01.000000000Z",
+          "visibility": "User",
+          "event": {
+            "StateChanged": {
+              "from": "PreparingContext",
+              "to": "WaitingForBackend"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

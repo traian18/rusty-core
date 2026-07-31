@@ -216,6 +216,7 @@ mod tests {
                 tools: std::collections::HashMap::new(),
             },
             scheduler,
+            None,
         ));
         let client = SessionClient::new(runtime);
 

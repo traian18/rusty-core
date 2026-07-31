@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{BackendReference, ExecutionRequest};
 use crate::commands::AgentResult;
-use crate::events::AgentEvent;
+use crate::events::{AgentEvent, AgentEventEnvelope};
 use crate::ids::{AgentId, PermissionId, RunId, ToolCallId, ToolId};
 use crate::tools::{AgentToolset, PermissionMode, ToolCall};
 use crate::usage::AgentBudget;
@@ -22,9 +22,29 @@ pub struct PermissionRequest {
     pub agent_id: AgentId,
 }
 
+/// A mutation to be applied to a session's durable store.
+///
+/// This is the minimal, self-contained payload shape that the deterministic
+/// core emits via [`AgentEffect::Persist`]. It is defined directly in the
+/// protocol crate so the core never depends on a concrete store
+/// implementation. The `harness-session-store` crate is responsible for
+/// converting these shapes into its own `DurableSessionEvent` /
+/// `DurableSessionSnapshot` types before writing them (spec §59).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMutation {
-    pub description: String,
+pub enum SessionMutation {
+    /// Append a fully-qualified agent event to the durable session history.
+    ///
+    /// The envelope carries the event payload plus all routing/ordering
+    /// metadata (`session_id`, `agent_id`, `session_sequence`, etc.)
+    /// required to reconstruct a `DurableSessionEvent` on the store side.
+    AppendEvent(AgentEventEnvelope),
+
+    /// Persist a serialized session snapshot.
+    ///
+    /// The payload is an opaque, self-contained JSON value (typically the
+    /// serialized form of the store's `DurableSessionSnapshot`) so the
+    /// protocol does not depend on the store's concrete snapshot type.
+    SaveSnapshot(serde_json::Value),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +124,8 @@ pub enum AgentEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventVisibility;
+    use crate::ids::{EventId, SessionId, Timestamp};
 
     #[test]
     fn inheritance_variants_are_serializable() {
@@ -120,6 +142,55 @@ mod tests {
                 serde_json::from_str::<WorkspacePolicy>(&json).unwrap(),
                 policy
             );
+        }
+    }
+
+    /// Helper: build a minimal fully-qualified event envelope for testing.
+    fn envelope_for(event: AgentEvent) -> AgentEventEnvelope {
+        AgentEventEnvelope {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            agent_id: crate::ids::AgentId::new(),
+            parent_agent_id: None,
+            run_id: None,
+            agent_sequence: 0,
+            session_sequence: None,
+            timestamp: Timestamp::now(),
+            visibility: EventVisibility::User,
+            event,
+        }
+    }
+
+    #[test]
+    fn session_mutation_append_event_round_trip() {
+        let mutation = SessionMutation::AppendEvent(envelope_for(AgentEvent::RunStarted {
+            run_id: RunId::new(),
+        }));
+        let json = serde_json::to_string(&mutation).expect("serialize append mutation");
+        let deserialized: SessionMutation =
+            serde_json::from_str(&json).expect("deserialize append mutation");
+        match deserialized {
+            SessionMutation::AppendEvent(envelope) => {
+                assert!(matches!(envelope.event, AgentEvent::RunStarted { .. }));
+            }
+            other => panic!("expected AppendEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_mutation_save_snapshot_round_trip() {
+        let mutation = SessionMutation::SaveSnapshot(serde_json::json!({
+            "session_id": "s1",
+            "status": "Running",
+        }));
+        let json = serde_json::to_string(&mutation).expect("serialize snapshot mutation");
+        let deserialized: SessionMutation =
+            serde_json::from_str(&json).expect("deserialize snapshot mutation");
+        match deserialized {
+            SessionMutation::SaveSnapshot(payload) => {
+                assert_eq!(payload["status"], "Running");
+            }
+            other => panic!("expected SaveSnapshot, got {other:?}"),
         }
     }
 }

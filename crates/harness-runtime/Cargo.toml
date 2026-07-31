@@ -14,6 +14,7 @@ testing = []
 [dependencies]
 harness-core = { path = "../harness-core" }
 harness-protocol = { path = "../harness-protocol" }
+harness-session-store = { path = "../harness-session-store" }
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }

@@ -15,8 +15,8 @@ use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
 use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolPolicy};
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
-use harness_runtime::session_manager::SessionManager;
-use harness_runtime::session_runtime::{SessionCommand, SessionError};
+use harness_runtime::session_manager::{SessionManager, SessionManagerError};
+use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
 use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
@@ -81,6 +81,10 @@ pub enum HarnessError {
     Integration(#[from] IntegrationError),
     #[error("session error: {0}")]
     Session(#[from] SessionError),
+    #[error("session manager error: {0}")]
+    SessionManager(#[from] SessionManagerError),
+    #[error("session store error: {0}")]
+    Store(#[from] harness_session_store::StoreError),
 }
 
 struct PendingIntegration {
@@ -344,6 +348,22 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Wraps an already-running session runtime as a live [`SessionHandle`].
+    ///
+    /// This is the restore path's counterpart to
+    /// [`SessionBuilder::start`](SessionBuilder::start): instead of creating
+    /// a fresh session, it exposes a runtime that was rebuilt from a
+    /// persisted snapshot (see
+    /// [`Harness::restore_session`](crate::Harness::restore_session)) through
+    /// the same handle API.
+    pub(crate) fn from_runtime(runtime: Arc<SessionRuntime>) -> Self {
+        let session_id = runtime.session_id;
+        Self {
+            client: SessionClient::new(runtime),
+            session_id,
+        }
+    }
+
     pub async fn send(&self, prompt: &str) -> Result<(), HarnessError> {
         self.client
             .send(SessionCommand::Prompt(UserInput {

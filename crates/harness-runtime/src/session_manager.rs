@@ -17,10 +17,13 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock};
 
+use harness_protocol::backend::BackendReference;
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
 use harness_protocol::tools::AgentToolset;
+use harness_session_store::{SessionStore, StoreError};
 
+use crate::integration::IntegrationRegistry;
 use crate::scheduler::Scheduler;
 use crate::session_runtime::SessionRuntime;
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
@@ -32,9 +35,28 @@ pub enum SessionManagerError {
     #[error("session {0} not found")]
     NotFound(SessionId),
 
-    /// Session persistence and restoration are reserved for Phase 7.
-    #[error("session restore is not yet supported (Phase 7)")]
+    /// Session restore was requested but no durable store is configured.
+    #[error("session restore requires a configured session store")]
     RestoreNotSupported,
+
+    /// The durable session store failed to load or write session data.
+    #[error("session store error: {0}")]
+    Store(#[from] StoreError),
+
+    /// The stored session exists but carries no snapshot checkpoint to
+    /// restore from (only an event log).
+    #[error("session {0} has no stored snapshot to restore from")]
+    NoSnapshot(SessionId),
+
+    /// A stored agent's backend could not be re-created through the
+    /// integration registry.
+    #[error("failed to re-create backend for integration {integration}: {message}")]
+    BackendCreation {
+        /// The integration family that failed to construct a backend.
+        integration: String,
+        /// The factory's error description.
+        message: String,
+    },
 }
 
 /// Thread-safe manager for all active agent sessions.
@@ -48,16 +70,51 @@ pub struct SessionManager {
     session_permits: RwLock<HashMap<SessionId, OwnedSemaphorePermit>>,
     /// Global concurrency throttle shared with all managed runtimes.
     scheduler: Arc<Scheduler>,
+    /// Optional durable session store.
+    ///
+    /// Consulted by [`restore_session`](Self::restore_session) to reload a
+    /// persisted session, and handed back into every restored runtime so its
+    /// agent runners keep routing `Persist` effects through the store. Set at
+    /// construction time via [`new_with_store`](Self::new_with_store) or the
+    /// builder-style [`with_session_store`](Self::with_session_store); `None`
+    /// disables persistence and makes restore fail with
+    /// [`SessionManagerError::RestoreNotSupported`].
+    store: Option<Arc<dyn SessionStore>>,
 }
 
 impl SessionManager {
-    /// Creates a new, empty manager with the given scheduler.
+    /// Creates a new, empty manager with the given scheduler and no session
+    /// store (restore is unavailable until a store is configured).
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
+        Self::new_with_store(scheduler, None)
+    }
+
+    /// Creates a new, empty manager with the given scheduler and an optional
+    /// durable session store.
+    ///
+    /// The store is retained for [`restore_session`](Self::restore_session)
+    /// and is threaded into every restored runtime so `Persist` effects
+    /// continue to be persisted after a restore.
+    pub fn new_with_store(
+        scheduler: Arc<Scheduler>,
+        store: Option<Arc<dyn SessionStore>>,
+    ) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             session_permits: RwLock::new(HashMap::new()),
             scheduler,
+            store,
         }
+    }
+
+    /// Builder-style setter for the durable session store.
+    ///
+    /// Mirrors [`crate::agent_runner::AgentRunner::with_session_store`] so the
+    /// manager can be assembled fluently. The store is consulted by
+    /// [`restore_session`](Self::restore_session) and by restored runners.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Creates and stores a new agent session.
@@ -87,6 +144,7 @@ impl SessionManager {
             event_sink,
             root_toolset,
             self.scheduler.clone(),
+            self.store.clone(),
         ));
 
         self.sessions.write().await.insert(session_id, runtime.clone());
@@ -149,12 +207,123 @@ impl SessionManager {
         }
     }
 
-    /// Restores a previously persisted session (not yet supported).
+    /// Restores a previously persisted session from the configured store.
+    ///
+    /// # Flow
+    ///
+    /// 1. `store.load_session(id)` fetches the latest durable snapshot (plus
+    ///    any durable events appended after it).
+    /// 2. For every distinct [`BackendReference`] in the snapshot, a fresh
+    ///    [`ExecutionBackend`] is created through
+    ///    [`IntegrationRegistry::create`] using the resolved, non-secret
+    ///    config JSON that was persisted alongside each agent's binding at
+    ///    snapshot time — no separate configuration registry is needed.
+    /// 3. The session runtime is rebuilt from the stored agent states via
+    ///    [`SessionRuntime::from_stored`], with the store handed back to the
+    ///    restored agent runners so `Persist` effects keep flowing.
+    ///
+    /// A restored session occupies a session slot, is registered with the
+    /// manager like any other session, and its root task is supervised for
+    /// panics. Restoring an already-active session returns the live handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionManagerError::RestoreNotSupported`] when no store is
+    /// configured, [`SessionManagerError::Store`] when the store cannot load
+    /// the session, [`SessionManagerError::NoSnapshot`] when the stored
+    /// session has no snapshot checkpoint, and
+    /// [`SessionManagerError::BackendCreation`] when an integration factory
+    /// cannot re-create one of the stored backends.
     pub async fn restore_session(
         &self,
-        _id: SessionId,
+        id: SessionId,
+        integrations: Arc<IntegrationRegistry>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
     ) -> Result<Arc<SessionRuntime>, SessionManagerError> {
-        Err(SessionManagerError::RestoreNotSupported)
+        let Some(store) = &self.store else {
+            tracing::warn!(%id, "restore_session called without a configured session store");
+            return Err(SessionManagerError::RestoreNotSupported);
+        };
+
+        // Restoring an already-active session is a no-op returning the live
+        // handle, so a client can safely re-issue restore after a reconnect.
+        if let Some(existing) = self.session_handle(id).await {
+            return Ok(existing);
+        }
+
+        let stored = store.load_session(id).await?;
+        let snapshot = stored
+            .snapshot
+            .ok_or(SessionManagerError::NoSnapshot(id))?;
+
+        // Re-create a fresh backend for every distinct BackendReference found
+        // in the snapshot. The resolved, non-secret config JSON was persisted
+        // next to the agent's binding at snapshot time, so restore does not
+        // need a ConfigurationRegistry.
+        let mut backends: HashMap<String, Arc<dyn ExecutionBackend>> = HashMap::new();
+        for agent in &snapshot.agents {
+            let reference = &agent.backend.reference;
+            let key = backend_reference_key(reference);
+            if backends.contains_key(&key) {
+                continue;
+            }
+            let backend = integrations
+                .create(&reference.integration.to_string(), agent.backend_config.clone())
+                .await
+                .map_err(|error| SessionManagerError::BackendCreation {
+                    integration: reference.integration.to_string(),
+                    message: error.to_string(),
+                })?;
+            backends.insert(key, backend);
+        }
+
+        // The root agent's backend becomes the session's default backend.
+        let root = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == snapshot.root_agent_id)
+            .ok_or(SessionManagerError::NoSnapshot(id))?;
+        let root_key = backend_reference_key(&root.backend.reference);
+        let default_backend = backends.remove(&root_key).ok_or_else(|| {
+            SessionManagerError::BackendCreation {
+                integration: root.backend.reference.integration.to_string(),
+                message: "root agent's backend was not re-created".into(),
+            }
+        })?;
+
+        // Rebuild the runtime from the snapshot's stored agent states.
+        let session_permit = self.scheduler.acquire_session_permit().await;
+        let runtime = Arc::new(SessionRuntime::from_stored(
+            id,
+            snapshot.agents,
+            default_backend,
+            tool_registry,
+            workspace,
+            event_sink,
+            self.scheduler.clone(),
+            integrations,
+            Some(store.clone()),
+        ));
+
+        self.sessions.write().await.insert(id, runtime.clone());
+        self.session_permits
+            .write()
+            .await
+            .insert(id, session_permit);
+
+        if let Some(handle) = runtime.take_root_task_handle() {
+            let runtime_for_supervisor = runtime.clone();
+            tokio::spawn(async move {
+                if let Err(join_err) = handle.await {
+                    tracing::error!(%id, error = %join_err, "restored session root task failed");
+                    runtime_for_supervisor.mark_failed(join_err.to_string());
+                }
+            });
+        }
+
+        Ok(runtime)
     }
 
     /// Returns a point-in-time snapshot of active session IDs in unspecified
@@ -162,6 +331,12 @@ impl SessionManager {
     pub async fn active_session_ids(&self) -> Vec<SessionId> {
         self.sessions.read().await.keys().copied().collect()
     }
+}
+
+/// Stable deduplication key for a [`BackendReference`]: integration +
+/// configuration, since the resolved config is keyed per configuration.
+fn backend_reference_key(reference: &BackendReference) -> String {
+    format!("{}::{}", reference.integration, reference.configuration)
 }
 
 impl Default for SessionManager {

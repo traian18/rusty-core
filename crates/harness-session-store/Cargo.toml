@@ -7,3 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "fs", "io-util"] }
+harness-protocol = { path = "../harness-protocol" }
+rusqlite = { workspace = true, features = ["bundled"] }
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
