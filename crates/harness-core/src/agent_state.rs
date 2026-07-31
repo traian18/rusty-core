@@ -27,4 +27,8 @@ pub struct AgentState {
     pub last_error: Option<AgentError>,
     /// Monotonic source for IDs and timestamps created by deterministic transitions.
     pub transition_sequence: u64,
+    /// Nesting depth in the agent tree: `0` for a root agent,
+    /// `parent.depth + 1` for a child. Read-only from the core's
+    /// perspective; the runtime supervisor enforces depth limits.
+    pub depth: u32,
 }

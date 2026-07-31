@@ -7,21 +7,21 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest, ExecutionResult};
+use harness_protocol::backend::{
+    ExecutionError, ExecutionEvent, ExecutionRequest, ExecutionResult,
+};
 use harness_protocol::commands::UserInput;
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
-use harness_protocol::tools::{
-    AgentToolset, PermissionMode, ToolCapability, ToolPolicy,
-};
-use harness_runtime::session_manager::SessionManager;
+use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolPolicy};
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
+use harness_runtime::session_manager::SessionManager;
 use harness_runtime::session_runtime::{SessionCommand, SessionError};
 use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 
-use harness_tool_filesystem::{ReadTool, EditTool, SearchTool};
+use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
 use harness_tool_shell::ExecTool;
 
 // ---------------------------------------------------------------------------
@@ -319,14 +319,9 @@ impl SessionBuilder {
             .unwrap_or_else(|| Arc::new(SessionManager::default()));
 
         let runtime = session_manager
-            .create_session(
-                backend,
-                tool_registry,
-                workspace,
-                event_sink,
-                root_toolset,
-            )
+            .create_session(backend, tool_registry, workspace, event_sink, root_toolset)
             .await;
+        runtime.integrations.extend_from(&self.integrations)?;
         let session_id = runtime.session_id;
 
         Ok(SessionHandle {

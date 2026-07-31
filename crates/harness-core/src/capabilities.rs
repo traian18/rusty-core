@@ -7,8 +7,9 @@
 //!
 //! > `ChildTools ⊆ ParentDelegatableTools`
 //!
-//! The entry points are [`AgentCapabilities::can_delegate`] and
-//! [`AgentCapabilities::derive_child_capabilities`].
+//! The entry points are [`AgentCapabilities::can_delegate`],
+//! [`AgentCapabilities::derive_child_capabilities`] and
+//! [`AgentCapabilities::derive_child_agent_capabilities`].
 
 use std::collections::HashMap;
 
@@ -42,7 +43,8 @@ pub struct WorkspaceCapabilities {
 /// its workspace permissions, and the capabilities advertised by its backend.
 ///
 /// The sub-agent non-escalation invariant (spec §23) is enforced by
-/// [`derive_child_capabilities`](AgentCapabilities::derive_child_capabilities).
+/// [`derive_child_capabilities`](AgentCapabilities::derive_child_capabilities)
+/// and [`derive_child_agent_capabilities`](AgentCapabilities::derive_child_agent_capabilities).
 #[derive(Debug, Clone)]
 pub struct AgentCapabilities {
     /// The tools this agent is allowed to use.
@@ -123,7 +125,13 @@ impl AgentCapabilities {
         inheritance: &ToolInheritance,
     ) -> Result<AgentToolset, CapabilityError> {
         let child_tools = match inheritance {
-            ToolInheritance::InheritAll => self.tools.tools.clone(),
+            ToolInheritance::InheritAll => self
+                .tools
+                .tools
+                .iter()
+                .filter(|(_, capability)| capability.delegatable && capability.policy.enabled)
+                .map(|(id, capability)| (*id, capability.clone()))
+                .collect(),
 
             ToolInheritance::Subset(ids) => {
                 let mut tools = HashMap::new();
@@ -132,7 +140,7 @@ impl AgentCapabilities {
                         .tools
                         .tools
                         .get(id)
-                        .ok_or_else(|| CapabilityError::ToolNotFound(*id))?;
+                        .ok_or(CapabilityError::ToolNotFound(*id))?;
                     if !capability.delegatable {
                         return Err(CapabilityError::NotDelegatable(*id));
                     }
@@ -145,7 +153,7 @@ impl AgentCapabilities {
             }
 
             ToolInheritance::Replace(toolset) => {
-                for (id, _) in &toolset.tools {
+                for id in toolset.tools.keys() {
                     if !self.can_delegate(id) {
                         return Err(CapabilityError::NotDelegatable(*id));
                     }
@@ -155,6 +163,58 @@ impl AgentCapabilities {
         };
 
         Ok(AgentToolset { tools: child_tools })
+    }
+
+    /// Derives a child agent's full [`AgentCapabilities`] from a parent while
+    /// enforcing the **non-escalation invariant** (spec §23).
+    ///
+    /// Unlike [`derive_child_capabilities`](Self::derive_child_capabilities),
+    /// which only derives the child's *toolset*, this method derives the
+    /// complete child capabilities:
+    ///
+    /// * **Tools** — derived via
+    ///   [`derive_child_capabilities`](Self::derive_child_capabilities) using
+    ///   the given [`ToolInheritance`] strategy.
+    /// * **`max_child_depth`** — decremented from the parent
+    ///   (`Some(d)` → `Some(d-1)`). A parent at `Some(0)` (unable to descend
+    ///   further) yields a child that is also at `Some(0)`, so
+    ///   `can_spawn_agents` stays `false` — never `None` (which means
+    ///   *unlimited* and would escalate). `None` stays `None` (unlimited).
+    /// * **`can_spawn_agents`** — a child may only spawn its own sub-agents if
+    ///   the parent could spawn agents **and** the child still has positive
+    ///   depth remaining (guarding against grandchildren).
+    /// * **Workspace/Backend** — copied from the parent unless explicitly
+    ///   overridden.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as
+    /// [`derive_child_capabilities`](Self::derive_child_capabilities).
+    pub fn derive_child_agent_capabilities(
+        &self,
+        inheritance: &ToolInheritance,
+        workspace_override: Option<WorkspaceCapabilities>,
+        backend_override: Option<BackendCapabilities>,
+    ) -> Result<AgentCapabilities, CapabilityError> {
+        let tools = self.derive_child_capabilities(inheritance)?;
+
+        let max_child_depth = match self.max_child_depth {
+            // A parent that cannot descend yields a child that cannot either.
+            // Keeping `Some(0)` (instead of `None`) preserves the
+            // non-escalation invariant: `None` means *unlimited* depth and
+            // would silently re-grant spawning.
+            Some(0) => Some(0),
+            Some(d) => Some(d - 1),
+            None => None,
+        };
+
+        Ok(AgentCapabilities {
+            tools,
+            can_spawn_agents: self.can_spawn_agents && max_child_depth != Some(0),
+            max_child_depth,
+            workspace: workspace_override.unwrap_or_else(|| self.workspace.clone()),
+            backend: backend_override.unwrap_or_else(|| self.backend.clone()),
+        })
     }
 }
 
@@ -305,12 +365,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn inherit_all_returns_all_parent_tools() {
-        let caps = parent_with_one_delegatable_tool();
+    fn inherit_all_returns_only_delegatable_enabled_parent_tools() {
+        let (caps, fs_read_id, shell_exec_id) = parent_with_mixed_tools();
         let result = caps.derive_child_capabilities(&ToolInheritance::InheritAll);
         assert!(result.is_ok());
         let child_set = result.unwrap();
-        assert_eq!(child_set.tools.len(), caps.tools.tools.len());
+        assert_eq!(child_set.tools.len(), 1);
+        assert!(child_set.tools.contains_key(&fs_read_id));
+        assert!(!child_set.tools.contains_key(&shell_exec_id));
     }
 
     // -----------------------------------------------------------------------
@@ -320,8 +382,7 @@ mod tests {
     #[test]
     fn subset_with_all_delegatable_succeeds() {
         let (caps, fs_read_id, _) = parent_with_mixed_tools();
-        let result = caps
-            .derive_child_capabilities(&ToolInheritance::Subset(vec![fs_read_id]));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Subset(vec![fs_read_id]));
         assert!(result.is_ok());
         let child_set = result.unwrap();
         assert_eq!(child_set.tools.len(), 1);
@@ -331,9 +392,7 @@ mod tests {
     #[test]
     fn subset_with_non_delegatable_is_rejected() {
         let (caps, _fs_read_id, shell_exec_id) = parent_with_mixed_tools();
-        let result = caps.derive_child_capabilities(&ToolInheritance::Subset(vec![
-            shell_exec_id,
-        ]));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Subset(vec![shell_exec_id]));
         assert!(result.is_err());
         match result {
             Err(CapabilityError::NotDelegatable(id)) => assert_eq!(id, shell_exec_id),
@@ -345,8 +404,7 @@ mod tests {
     fn subset_with_non_existent_tool_is_rejected() {
         let caps = parent_with_one_delegatable_tool();
         let unknown = ToolId::new();
-        let result = caps
-            .derive_child_capabilities(&ToolInheritance::Subset(vec![unknown]));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Subset(vec![unknown]));
         assert!(result.is_err());
         match result {
             Err(CapabilityError::ToolNotFound(id)) => assert_eq!(id, unknown),
@@ -387,8 +445,7 @@ mod tests {
             backend: BackendCapabilities::default(),
         };
 
-        let result = caps
-            .derive_child_capabilities(&ToolInheritance::Subset(vec![tool_id]));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Subset(vec![tool_id]));
         assert!(result.is_err());
         match result {
             Err(CapabilityError::NotEnabled(id)) => assert_eq!(id, tool_id),
@@ -407,16 +464,10 @@ mod tests {
 
         // Build a replacement toolset with the same delegatable tool
         let mut replacement = HashMap::new();
-        replacement.insert(
-            tool_id,
-            caps.tools.tools.get(&tool_id).unwrap().clone(),
-        );
-        let child_toolset = AgentToolset {
-            tools: replacement,
-        };
+        replacement.insert(tool_id, caps.tools.tools.get(&tool_id).unwrap().clone());
+        let child_toolset = AgentToolset { tools: replacement };
 
-        let result = caps
-            .derive_child_capabilities(&ToolInheritance::Replace(child_toolset));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Replace(child_toolset));
         assert!(result.is_ok());
         let child_set = result.unwrap();
         assert!(child_set.tools.contains_key(&tool_id));
@@ -432,16 +483,78 @@ mod tests {
             shell_exec_id,
             caps.tools.tools.get(&shell_exec_id).unwrap().clone(),
         );
-        let child_toolset = AgentToolset {
-            tools: replacement,
-        };
+        let child_toolset = AgentToolset { tools: replacement };
 
-        let result = caps
-            .derive_child_capabilities(&ToolInheritance::Replace(child_toolset));
+        let result = caps.derive_child_capabilities(&ToolInheritance::Replace(child_toolset));
         assert!(result.is_err());
         match result {
             Err(CapabilityError::NotDelegatable(id)) => assert_eq!(id, shell_exec_id),
             other => panic!("expected NotDelegatable, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_child_agent_capabilities — non-escalation enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn child_cannot_spawn_agents_when_parent_cannot() {
+        // (a) A parent that cannot spawn agents yields a child that cannot
+        // spawn agents either (no escalation).
+        let mut parent = parent_with_one_delegatable_tool();
+        parent.can_spawn_agents = false;
+
+        let child = parent
+            .derive_child_agent_capabilities(&ToolInheritance::InheritAll, None, None)
+            .unwrap();
+
+        assert!(!child.can_spawn_agents);
+    }
+
+    #[test]
+    fn grandchild_spawning_is_blocked_at_depth_one() {
+        // (b) A parent with max_child_depth = Some(1) yields a child with
+        // max_child_depth = Some(0) and can_spawn_agents = false (grandchildren
+        // blocked).
+        let mut parent = parent_with_one_delegatable_tool();
+        parent.max_child_depth = Some(1);
+
+        let child = parent
+            .derive_child_agent_capabilities(&ToolInheritance::InheritAll, None, None)
+            .unwrap();
+
+        assert_eq!(child.max_child_depth, Some(0));
+        assert!(!child.can_spawn_agents);
+    }
+
+    #[test]
+    fn zero_depth_parent_yields_zero_depth_child() {
+        // A parent at max_child_depth = Some(0) yields a child that is also
+        // at Some(0) and cannot spawn — NOT None (unlimited), which would
+        // escalate.
+        let mut parent = parent_with_one_delegatable_tool();
+        parent.max_child_depth = Some(0);
+
+        let child = parent
+            .derive_child_agent_capabilities(&ToolInheritance::InheritAll, None, None)
+            .unwrap();
+
+        assert_eq!(child.max_child_depth, Some(0));
+        assert!(!child.can_spawn_agents);
+    }
+
+    #[test]
+    fn subset_child_toolset_only_contains_delegatable_tools() {
+        // (c) Subset([fs.read]) from a parent with fs.read (delegatable) and
+        // shell.exec (not delegatable) yields a child toolset with only fs.read.
+        let (parent, fs_read_id, shell_exec_id) = parent_with_mixed_tools();
+
+        let child = parent
+            .derive_child_agent_capabilities(&ToolInheritance::Subset(vec![fs_read_id]), None, None)
+            .unwrap();
+
+        assert_eq!(child.tools.tools.len(), 1);
+        assert!(child.tools.tools.contains_key(&fs_read_id));
+        assert!(!child.tools.tools.contains_key(&shell_exec_id));
     }
 }

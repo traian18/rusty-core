@@ -19,17 +19,20 @@ use harness_core::usage::AgentUsageSummary as CoreAgentUsageSummary;
 use harness_protocol::backend::{
     BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
 };
-use harness_protocol::commands::{AgentCommand, AgentError, AgentOperation, AgentStatus, UserInput};
-use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
-use harness_protocol::ids::{
-    AgentId, BackendId, ConfigurationId, IntegrationId, SessionId,
+use harness_protocol::commands::{
+    AgentCommand, AgentError, AgentOperation, AgentStatus, UserInput,
 };
+use harness_protocol::effects::SpawnAgentSpec;
+use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
+use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::AgentBudget;
 use rust_decimal::Decimal;
 
 use crate::agent_runner::{AgentRunner, AgentTask};
+use crate::agent_supervisor::AgentSupervisor;
 use crate::cancellation::SessionCancellation;
+use crate::integration::IntegrationRegistry;
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
@@ -64,6 +67,8 @@ pub enum SessionStatus {
 pub enum SessionCommand {
     /// Start a new run with the given user input.
     Prompt(UserInput),
+    /// Spawn a child from the root agent through the normal effect path.
+    SpawnChild(SpawnAgentSpec),
     /// Cancel the entire session.
     Cancel,
     /// Pause the session.
@@ -336,10 +341,7 @@ impl SessionEventBus {
     fn poll_receivers(&self) -> bool {
         let mut had_data = false;
 
-        let mut receivers = self
-            .receivers
-            .lock()
-            .expect("receivers mutex poisoned");
+        let mut receivers = self.receivers.lock().expect("receivers mutex poisoned");
 
         // Drain all available events from each receiver.
         // `retain_mut` returns `true` to keep the receiver, `false` to
@@ -414,6 +416,10 @@ pub struct SessionRuntime {
     pub event_sink: Arc<dyn EventSink>,
     /// Concurrency throttle for this session's backend/tool/process requests.
     pub scheduler: Arc<Scheduler>,
+    /// Hierarchical supervisor used by every runner in this session.
+    pub agent_supervisor: AgentSupervisor,
+    /// Factories used to resolve explicit child backend policies.
+    pub integrations: Arc<IntegrationRegistry>,
     /// Live per-agent status/usage projection, updated by every `AgentRunner`.
     live_state: LiveStateTable,
     /// Sender to the root agent's task command channel.
@@ -518,6 +524,7 @@ impl SessionRuntime {
             root_agent_id,
             session_id,
             None,
+            0,
             String::new(),
             BackendBinding {
                 reference: BackendReference {
@@ -534,8 +541,8 @@ impl SessionRuntime {
             },
             AgentCapabilities {
                 tools: root_toolset,
-                can_spawn_agents: false,
-                max_child_depth: None,
+                can_spawn_agents: true,
+                max_child_depth: Some(8),
                 workspace: workspace_capabilities,
                 backend: BackendCapabilities::default(),
             },
@@ -554,6 +561,8 @@ impl SessionRuntime {
 
         // ── 3. Cancellation ──────────────────────────────────
         let cancellation = SessionCancellation::new();
+        let agent_supervisor = AgentSupervisor::new(session_id, cancellation.clone());
+        let integrations = Arc::new(IntegrationRegistry::new());
 
         // ── 4. Event bus ───────────────────────────────────
         // NOTE: The event bus uses its own independent CancellationToken,
@@ -577,6 +586,7 @@ impl SessionRuntime {
 
         // ── 6. Agent task + runner ───────────────────────────
         let agent_cancel = cancellation.child_token();
+        agent_supervisor.register_agent_token(root_agent_id, agent_cancel.clone());
         let (task, _commands_tx) = AgentTask::new_with_capacities(root_agent_id, 64, 256);
         let root_agent_tx = task.commands_tx.clone();
 
@@ -592,11 +602,13 @@ impl SessionRuntime {
             task,
             backend.clone(),
             tool_registry.clone(),
+            workspace.clone(),
             bridge_sink,
             agent_cancel,
             live_state.clone(),
             scheduler.clone(),
-        );
+        )
+        .with_supervision(agent_supervisor.clone(), integrations.clone());
 
         // Register the agent's broadcast sender with the event bus
         // so the bus can read events from task.events.
@@ -620,6 +632,8 @@ impl SessionRuntime {
             tool_registry,
             event_sink,
             scheduler,
+            agent_supervisor,
+            integrations,
             live_state,
             root_agent_tx,
             root_task_handle: Mutex::new(None),
@@ -627,7 +641,10 @@ impl SessionRuntime {
         };
 
         // Stash the root task handle so SessionManager can supervise it.
-        *runtime.root_task_handle.lock().expect("root_task_handle mutex poisoned") = Some(root_join);
+        *runtime
+            .root_task_handle
+            .lock()
+            .expect("root_task_handle mutex poisoned") = Some(root_join);
 
         runtime
     }
@@ -665,6 +682,8 @@ impl SessionRuntime {
         let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
         let command_tx = task.commands_tx.clone();
         let agent_cancel = self.cancellation.child_token();
+        self.agent_supervisor
+            .register_agent_token(agent.id, agent_cancel.clone());
 
         self.live_state
             .lock()
@@ -680,11 +699,13 @@ impl SessionRuntime {
             task,
             self.default_backend.clone(),
             self.tool_registry.clone(),
+            self.workspace.clone(),
             bridge_sink,
             agent_cancel,
             self.live_state.clone(),
             self.scheduler.clone(),
-        );
+        )
+        .with_supervision(self.agent_supervisor.clone(), self.integrations.clone());
 
         self.event_bus
             .register_agent(runner.task.id, runner.task.events.clone());
@@ -718,6 +739,7 @@ impl SessionRuntime {
                 drop(state);
                 AgentCommand::StartRun { input }
             }
+            SessionCommand::SpawnChild(spec) => AgentCommand::SpawnChild { spec },
             SessionCommand::Cancel => AgentCommand::Cancel,
             SessionCommand::Pause => AgentCommand::Pause,
             SessionCommand::Resume => AgentCommand::Resume,
@@ -1029,7 +1051,11 @@ mod tests {
             Arc::new(NoopSink),
         );
 
-        let root_id = runtime.state.lock().expect("state mutex poisoned").root_agent_id;
+        let root_id = runtime
+            .state
+            .lock()
+            .expect("state mutex poisoned")
+            .root_agent_id;
 
         // Before any command, live state is the default (Idle, no outcome).
         let before = runtime.agent_live_state(root_id);
@@ -1050,7 +1076,10 @@ mod tests {
         let mut completed = false;
         for _ in 0..50 {
             let batch = drain_events(&mut subscriber);
-            if batch.iter().any(|e| matches!(e, AgentEvent::Completed { .. })) {
+            if batch
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Completed { .. }))
+            {
                 completed = true;
                 break;
             }

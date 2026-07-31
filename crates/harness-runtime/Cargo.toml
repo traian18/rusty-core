@@ -27,3 +27,5 @@ serde_json = { workspace = true }
 [dev-dependencies]
 harness-runtime = { path = ".", features = ["testing"] }
 serde = { workspace = true }
+tempfile = "3"
+git2 = { workspace = true }

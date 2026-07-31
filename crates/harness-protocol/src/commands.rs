@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::backend::ExecutionEvent;
+use crate::effects::SpawnAgentSpec;
 use crate::ids::{AgentId, PermissionId, RunId, ToolCallId};
 use crate::tools::{ToolError, ToolResult};
 use crate::usage::AgentUsageSummary;
@@ -149,9 +150,7 @@ pub enum AgentOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentCommand {
     /// Start a new run with the given user input.
-    StartRun {
-        input: UserInput,
-    },
+    StartRun { input: UserInput },
 
     /// An event arrived from the execution backend for the active run.
     BackendEvent {
@@ -183,6 +182,16 @@ pub enum AgentCommand {
         id: PermissionId,
         /// The user's decision.
         decision: PermissionDecision,
+    },
+
+    /// Ask the runtime to create a child according to this policy.
+    SpawnChild { spec: SpawnAgentSpec },
+
+    /// A child was successfully created and registered by the runtime.
+    ChildSpawned {
+        agent_id: AgentId,
+        /// Whether the parent must pause until this child terminates.
+        awaiting: bool,
     },
 
     /// A child agent completed its run successfully.
@@ -235,8 +244,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::StartRun { input } => {
@@ -260,18 +268,15 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
-            AgentCommand::BackendEvent { run_id: _, event } => {
-                match event {
-                    ExecutionEvent::TextDelta { delta, .. } => {
-                        assert_eq!(delta, "test delta");
-                    }
-                    other => panic!("expected TextDelta, got {other:?}"),
+            AgentCommand::BackendEvent { run_id: _, event } => match event {
+                ExecutionEvent::TextDelta { delta, .. } => {
+                    assert_eq!(delta, "test delta");
                 }
-            }
+                other => panic!("expected TextDelta, got {other:?}"),
+            },
             other => panic!("expected BackendEvent, got {other:?}"),
         }
     }
@@ -289,8 +294,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::ToolCompleted { result, .. } => {
@@ -309,8 +313,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::ToolFailed { error, .. } => {
@@ -329,8 +332,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::PermissionResolved { decision, .. } => {
@@ -352,8 +354,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::ChildCompleted { result, .. } => {
@@ -376,8 +377,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&cmd).expect("serialize");
-        let deserialized: AgentCommand =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
 
         match deserialized {
             AgentCommand::ChildFailed { error, .. } => {
@@ -392,10 +392,13 @@ mod tests {
     /// Round-trip JSON serialization of unit variants.
     #[test]
     fn unit_variants_roundtrip() {
-        for cmd in [AgentCommand::Cancel, AgentCommand::Pause, AgentCommand::Resume] {
+        for cmd in [
+            AgentCommand::Cancel,
+            AgentCommand::Pause,
+            AgentCommand::Resume,
+        ] {
             let json = serde_json::to_string(&cmd).expect("serialize");
-            let deserialized: AgentCommand =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");
             let expected_tag = std::mem::discriminant(&cmd);
             let actual_tag = std::mem::discriminant(&deserialized);
             assert_eq!(
@@ -410,8 +413,7 @@ mod tests {
     fn permission_decision_denied_roundtrip() {
         let decision = PermissionDecision::Denied;
         let json = serde_json::to_string(&decision).expect("serialize");
-        let deserialized: PermissionDecision =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: PermissionDecision = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(deserialized, PermissionDecision::Denied));
     }
 
@@ -434,8 +436,7 @@ mod tests {
 
         for status in &statuses {
             let json = serde_json::to_string(status).expect("serialize");
-            let deserialized: AgentStatus =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: AgentStatus = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(*status, deserialized);
         }
     }
@@ -447,8 +448,7 @@ mod tests {
             request_id: crate::ids::RequestId::new(),
         };
         let json = serde_json::to_string(&op).expect("serialize");
-        let deserialized: AgentOperation =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentOperation = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             AgentOperation::BackendRequest { .. } => {}
             other => panic!("expected BackendRequest, got {other:?}"),
@@ -462,8 +462,7 @@ mod tests {
             calls: vec![ToolCallId::new(), ToolCallId::new()],
         };
         let json = serde_json::to_string(&op).expect("serialize");
-        let deserialized: AgentOperation =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentOperation = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             AgentOperation::Tools { calls } => {
                 assert_eq!(calls.len(), 2);
@@ -479,8 +478,7 @@ mod tests {
             agents: vec![AgentId::new()],
         };
         let json = serde_json::to_string(&op).expect("serialize");
-        let deserialized: AgentOperation =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentOperation = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             AgentOperation::Children { agents } => {
                 assert_eq!(agents.len(), 1);
@@ -496,8 +494,7 @@ mod tests {
             request_id: PermissionId::new(),
         };
         let json = serde_json::to_string(&op).expect("serialize");
-        let deserialized: AgentOperation =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentOperation = serde_json::from_str(&json).expect("deserialize");
         match deserialized {
             AgentOperation::Permission { .. } => {}
             other => panic!("expected Permission, got {other:?}"),

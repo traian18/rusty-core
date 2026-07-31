@@ -44,9 +44,9 @@ pub trait IntegrationFactory: Send + Sync {
 }
 
 /// Thread-safe registry of integration factories.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct IntegrationRegistry {
-    factories: RwLock<HashMap<String, Arc<dyn IntegrationFactory>>>,
+    factories: Arc<RwLock<HashMap<String, Arc<dyn IntegrationFactory>>>>,
 }
 
 impl IntegrationRegistry {
@@ -62,6 +62,21 @@ impl IntegrationRegistry {
             .write()
             .map_err(|_| IntegrationError::RegistryPoisoned)?;
         factories.insert(factory.id().to_string(), factory);
+        Ok(())
+    }
+
+    /// Copies all factories from another registry into this one.
+    /// Existing entries with the same identifier are replaced.
+    pub fn extend_from(&self, other: &Self) -> Result<(), IntegrationError> {
+        let factories = other
+            .factories
+            .read()
+            .map_err(|_| IntegrationError::RegistryPoisoned)?
+            .clone();
+        self.factories
+            .write()
+            .map_err(|_| IntegrationError::RegistryPoisoned)?
+            .extend(factories);
         Ok(())
     }
 

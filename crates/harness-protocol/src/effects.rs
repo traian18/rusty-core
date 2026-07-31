@@ -66,16 +66,39 @@ pub struct SpawnAgentSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentEffect {
-    ExecuteBackend { request: ExecutionRequest },
-    ExecuteTool { request: ToolRequest },
-    SpawnAgent { spec: SpawnAgentSpec },
-    RequestPermission { request: PermissionRequest },
-    CancelBackend { run_id: RunId },
-    CancelTool { call_id: ToolCallId },
-    CancelChild { agent_id: AgentId },
-    Persist { mutation: SessionMutation },
-    Emit { event: AgentEvent },
-    FinishRun { result: AgentResult },
+    ExecuteBackend {
+        request: ExecutionRequest,
+    },
+    ExecuteTool {
+        request: ToolRequest,
+    },
+    /// Requests the spawning of a child agent.
+    ///
+    /// The runtime resolves this through the session's `AgentSupervisor`.
+    SpawnAgent {
+        spec: SpawnAgentSpec,
+    },
+    RequestPermission {
+        request: PermissionRequest,
+    },
+    CancelBackend {
+        run_id: RunId,
+    },
+    CancelTool {
+        call_id: ToolCallId,
+    },
+    CancelChild {
+        agent_id: AgentId,
+    },
+    Persist {
+        mutation: SessionMutation,
+    },
+    Emit {
+        event: AgentEvent,
+    },
+    FinishRun {
+        result: AgentResult,
+    },
 }
 
 #[cfg(test)]
@@ -93,7 +116,10 @@ mod tests {
     fn policy_enums_round_trip() {
         for policy in [WorkspacePolicy::Inherit, WorkspacePolicy::ReadOnly] {
             let json = serde_json::to_string(&policy).expect("serialize policy");
-            assert_eq!(serde_json::from_str::<WorkspacePolicy>(&json).unwrap(), policy);
+            assert_eq!(
+                serde_json::from_str::<WorkspacePolicy>(&json).unwrap(),
+                policy
+            );
         }
     }
 }

@@ -17,6 +17,7 @@ fn agent() -> Agent {
         AgentId::new(),
         SessionId::new(),
         None,
+        0,
         "system".into(),
         BackendBinding {
             reference: BackendReference {

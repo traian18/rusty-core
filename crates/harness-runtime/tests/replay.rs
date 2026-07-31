@@ -138,6 +138,7 @@ fn build_agent(fixture: &FixtureAgent) -> Agent {
         agent_id,
         session_id,
         None,
+        0,
         fixture.system_prompt.clone(),
         BackendBinding {
             reference: BackendReference {

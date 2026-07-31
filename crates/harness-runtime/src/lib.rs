@@ -6,6 +6,7 @@
 //! provider-neutral data exchanged across those traits.
 
 pub mod agent_runner;
+pub mod agent_supervisor;
 pub mod cancellation;
 pub mod integration;
 pub mod permissions;

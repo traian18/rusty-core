@@ -3,20 +3,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use harness_core::agent::Agent;
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
-use harness_protocol::commands::{AgentCommand, AgentStatus};
-use harness_protocol::effects::{AgentEffect, ToolRequest};
+use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus};
+use harness_protocol::effects::{AgentEffect, SpawnAgentSpec, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
 
+use crate::agent_supervisor::{AgentSupervisor, SupervisorError};
+use crate::integration::IntegrationRegistry;
 use crate::scheduler::Scheduler;
 use crate::session_runtime::LiveStateTable;
-use crate::traits::{EventSink, ExecutionBackend, ToolRegistry};
+use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
 /// Mailbox and control handles for one agent.
 pub struct AgentTask {
@@ -68,6 +71,9 @@ pub struct AgentRunner {
     pub task: AgentTask,
     pub backend: Arc<dyn ExecutionBackend>,
     pub tool_registry: Arc<dyn ToolRegistry>,
+    /// The workspace this agent operates on (resolved by the supervisor
+    /// according to the spawn's `WorkspacePolicy`).
+    pub workspace: Arc<dyn Workspace>,
     pub event_sink: Arc<dyn EventSink>,
     pub agent_sequence: u64,
     pub cancel: CancellationToken,
@@ -80,6 +86,77 @@ pub struct AgentRunner {
     live_state: LiveStateTable,
     backend_tokens: HashMap<RunId, CancellationToken>,
     tool_tokens: HashMap<ToolCallId, CancellationToken>,
+    /// The outcome of the terminal `FinishRun` effect, captured when
+    /// [`dispatch_effects`](Self::dispatch_effects) observes it so a caller
+    /// (e.g. the supervisor's child completion handler) can retrieve the
+    /// child's final [`AgentResult`] or [`AgentError`] after `run()` returns.
+    final_result: Option<Result<AgentResult, AgentError>>,
+    supervision: Option<AgentSupervision>,
+}
+
+/// Session-scoped services required to interpret child-agent effects.
+#[derive(Clone)]
+pub struct AgentSupervision {
+    supervisor: Arc<dyn SupervisorControl>,
+    pub integrations: Arc<IntegrationRegistry>,
+}
+
+#[async_trait]
+trait SupervisorControl: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_child(
+        &self,
+        parent: &Agent,
+        parent_backend: Arc<dyn ExecutionBackend>,
+        integration_registry: &IntegrationRegistry,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        scheduler: Arc<Scheduler>,
+        parent_commands_tx: mpsc::Sender<AgentCommand>,
+        spec: SpawnAgentSpec,
+    ) -> Result<AgentId, SupervisorError>;
+
+    async fn await_child(&self, child_id: AgentId) -> Result<AgentResult, SupervisorError>;
+    async fn cancel_child(&self, child_id: AgentId) -> Result<(), SupervisorError>;
+}
+
+#[async_trait]
+impl SupervisorControl for AgentSupervisor {
+    async fn spawn_child(
+        &self,
+        parent: &Agent,
+        parent_backend: Arc<dyn ExecutionBackend>,
+        integration_registry: &IntegrationRegistry,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        scheduler: Arc<Scheduler>,
+        parent_commands_tx: mpsc::Sender<AgentCommand>,
+        spec: SpawnAgentSpec,
+    ) -> Result<AgentId, SupervisorError> {
+        AgentSupervisor::spawn_child(
+            self,
+            parent,
+            parent_backend,
+            integration_registry,
+            tool_registry,
+            workspace,
+            event_sink,
+            scheduler,
+            parent_commands_tx,
+            spec,
+        )
+        .await
+    }
+
+    async fn await_child(&self, child_id: AgentId) -> Result<AgentResult, SupervisorError> {
+        AgentSupervisor::await_child(self, child_id).await
+    }
+
+    async fn cancel_child(&self, child_id: AgentId) -> Result<(), SupervisorError> {
+        AgentSupervisor::cancel_child(self, child_id).await
+    }
 }
 
 impl AgentRunner {
@@ -89,6 +166,7 @@ impl AgentRunner {
         mut task: AgentTask,
         backend: Arc<dyn ExecutionBackend>,
         tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
         event_sink: Arc<dyn EventSink>,
         cancel: CancellationToken,
         live_state: LiveStateTable,
@@ -100,6 +178,7 @@ impl AgentRunner {
             task,
             backend,
             tool_registry,
+            workspace,
             event_sink,
             agent_sequence: 0,
             cancel,
@@ -107,7 +186,33 @@ impl AgentRunner {
             live_state,
             backend_tokens: HashMap::new(),
             tool_tokens: HashMap::new(),
+            final_result: None,
+            supervision: None,
         }
+    }
+
+    /// Enables production interpretation of `SpawnAgent` and `CancelChild`.
+    pub fn with_supervision(
+        mut self,
+        supervisor: AgentSupervisor,
+        integrations: Arc<IntegrationRegistry>,
+    ) -> Self {
+        self.supervision = Some(AgentSupervision {
+            supervisor: Arc::new(supervisor),
+            integrations,
+        });
+        self
+    }
+
+    /// Takes the captured outcome of the terminal `FinishRun` effect, if any.
+    ///
+    /// Returns `Some(Ok(result))` when the run finished successfully,
+    /// `Some(Err(error))` when it failed, and `None` when the runner
+    /// terminated without ever reaching a `FinishRun` (e.g. it was cancelled
+    /// before any run completed). The value is taken (consumed) so a caller
+    /// can retrieve it exactly once after `run()` returns.
+    pub fn take_final_result(&mut self) -> Option<Result<AgentResult, AgentError>> {
+        self.final_result.take()
     }
 
     /// Processes commands until completion, cancellation, or mailbox closure.
@@ -162,13 +267,28 @@ impl AgentRunner {
     /// Writes the agent's current status, operation, error, and usage into
     /// the shared live-state table.
     fn publish_status(&self) {
-        let usage = harness_core::usage::compute_agent_usage_summary(&self.agent.usage.records, &[]);
-        let total_cost_usd = self.agent.usage.records.iter().fold(None::<Decimal>, |acc, record| {
-            match record.cost.amount_usd {
-                Some(amount) => Some(acc.unwrap_or(Decimal::ZERO) + amount),
-                None => acc,
-            }
-        });
+        let child_usage = self
+            .agent
+            .usage
+            .child_usage
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let usage = harness_core::usage::compute_agent_usage_summary(
+            &self.agent.usage.records,
+            &child_usage,
+        );
+        let total_cost_usd =
+            self.agent
+                .usage
+                .records
+                .iter()
+                .fold(None::<Decimal>, |acc, record| {
+                    match record.cost.amount_usd {
+                        Some(amount) => Some(acc.unwrap_or(Decimal::ZERO) + amount),
+                        None => acc,
+                    }
+                });
 
         let mut table = self.live_state.lock().expect("live_state mutex poisoned");
         let entry = table.entry(self.agent.id).or_default();
@@ -198,14 +318,39 @@ impl AgentRunner {
                 AgentEffect::ExecuteBackend { request } => self.execute_backend(request).await,
                 AgentEffect::ExecuteTool { request } => self.execute_tool(request).await,
                 AgentEffect::Emit { event } => self.emit(event),
-                AgentEffect::FinishRun { .. } => finish = true,
+                AgentEffect::FinishRun { result } => {
+                    // Capture the terminal result so a supervisor can retrieve
+                    // it after `run()` returns via `take_final_result`. A
+                    // failed agent surfaces its error here; any other terminal
+                    // state (e.g. successful completion) is surfaced as `Ok`.
+                    finish = true;
+                    self.final_result = Some(match self.agent.state.status {
+                        AgentStatus::Failed => Err(self
+                            .agent
+                            .state
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| AgentError {
+                                message: result.summary.clone(),
+                                code: "FAILED".into(),
+                                details: None,
+                            })),
+                        _ => Ok(result),
+                    });
+                }
                 AgentEffect::CancelBackend { run_id } => self.cancel_backend(run_id),
                 AgentEffect::CancelTool { call_id } => self.cancel_tool(call_id),
                 AgentEffect::CancelChild { agent_id } => {
-                    tracing::warn!(?agent_id, "CancelChild is not wired in Phase 2");
+                    if let Some(supervision) = &self.supervision {
+                        if let Err(error) = supervision.supervisor.cancel_child(agent_id).await {
+                            tracing::warn!(?agent_id, %error, "failed to cancel child agent");
+                        }
+                    } else {
+                        tracing::warn!(?agent_id, "CancelChild requested without a supervisor");
+                    }
                 }
                 AgentEffect::SpawnAgent { spec } => {
-                    tracing::warn!(?spec, "SpawnAgent is not wired in Phase 2");
+                    self.spawn_agent(spec).await;
                 }
                 AgentEffect::RequestPermission { request } => {
                     tracing::warn!(?request, "RequestPermission is not wired in Phase 2");
@@ -216,6 +361,51 @@ impl AgentRunner {
             }
         }
         finish
+    }
+
+    async fn spawn_agent(&mut self, spec: harness_protocol::effects::SpawnAgentSpec) {
+        let Some(supervision) = self.supervision.clone() else {
+            tracing::warn!(?spec, "SpawnAgent requested without a supervisor");
+            return;
+        };
+        let mode = spec.mode;
+        match supervision
+            .supervisor
+            .spawn_child(
+                &self.agent,
+                self.backend.clone(),
+                supervision.integrations.as_ref(),
+                self.tool_registry.clone(),
+                self.workspace.clone(),
+                self.event_sink.clone(),
+                self.scheduler.clone(),
+                self.task.commands_tx.clone(),
+                spec,
+            )
+            .await
+        {
+            Ok(child_id) => {
+                let effects = self.apply_and_publish(AgentCommand::ChildSpawned {
+                    agent_id: child_id,
+                    awaiting: matches!(mode, harness_protocol::effects::SpawnMode::AwaitResult),
+                });
+                Box::pin(self.dispatch_effects(effects)).await;
+                if matches!(mode, harness_protocol::effects::SpawnMode::AwaitResult) {
+                    if let Err(error) = supervision.supervisor.await_child(child_id).await {
+                        let effects = self.apply_and_publish(AgentCommand::ChildFailed {
+                            agent_id: child_id,
+                            error: AgentError {
+                                message: error.to_string(),
+                                code: "CHILD_AWAIT_FAILED".into(),
+                                details: None,
+                            },
+                        });
+                        Box::pin(self.dispatch_effects(effects)).await;
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to spawn child agent"),
+        }
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -370,9 +560,7 @@ impl AgentRunner {
                     // Hold the permit for the duration of tool execution.
                     let _permit = permit;
                     // Convert protocol ToolCall to harness-tools ToolInput
-                    let input = harness_tools::ToolInput {
-                        arguments,
-                    };
+                    let input = harness_tools::ToolInput { arguments };
 
                     match executor.execute(input, token).await {
                         Ok(tool_result) => {
@@ -382,7 +570,9 @@ impl AgentRunner {
                                 output: tool_result.output,
                                 is_error: tool_result.is_error,
                             };
-                            let _ = commands.send(AgentCommand::ToolCompleted { call_id, result }).await;
+                            let _ = commands
+                                .send(AgentCommand::ToolCompleted { call_id, result })
+                                .await;
                         }
                         Err(tool_error) => {
                             // Convert harness-tools ToolError to protocol ToolError
@@ -400,7 +590,9 @@ impl AgentRunner {
                                     harness_protocol::tools::ToolError::Internal
                                 }
                             };
-                            let _ = commands.send(AgentCommand::ToolFailed { call_id, error }).await;
+                            let _ = commands
+                                .send(AgentCommand::ToolFailed { call_id, error })
+                                .await;
                         }
                     }
                 });
@@ -408,10 +600,12 @@ impl AgentRunner {
             None => {
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = commands.send(AgentCommand::ToolFailed {
-                        call_id,
-                        error: harness_protocol::tools::ToolError::ExecutionFailed,
-                    }).await;
+                    let _ = commands
+                        .send(AgentCommand::ToolFailed {
+                            call_id,
+                            error: harness_protocol::tools::ToolError::ExecutionFailed,
+                        })
+                        .await;
                 });
             }
         }
@@ -454,14 +648,21 @@ mod tests {
 
     use crate::scheduler::{Scheduler, SchedulerConfig};
     use crate::testing::{FakeBackend, FakeToolRegistry};
+    use crate::workspace::FakeWorkspace;
 
     use super::*;
 
     #[tokio::test]
     async fn send_command_through_mailbox() {
         let (mut task, sender) = AgentTask::new(AgentId::new());
-        sender.send(AgentCommand::Cancel).await.expect("send command");
-        assert!(matches!(task.commands.recv().await, Some(AgentCommand::Cancel)));
+        sender
+            .send(AgentCommand::Cancel)
+            .await
+            .expect("send command");
+        assert!(matches!(
+            task.commands.recv().await,
+            Some(AgentCommand::Cancel)
+        ));
     }
 
     struct NoopSink;
@@ -474,6 +675,7 @@ mod tests {
             agent_id,
             session_id,
             None,
+            0,
             String::new(),
             BackendBinding {
                 reference: BackendReference {
@@ -527,6 +729,7 @@ mod tests {
             task,
             backend,
             tool_registry,
+            Arc::new(FakeWorkspace::new()),
             Arc::new(NoopSink),
             cancel.clone(),
             live_state.clone(),
