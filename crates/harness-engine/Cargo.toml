@@ -12,11 +12,14 @@ publish = false
 harness-core = { path = "../harness-core" }
 harness-protocol = { path = "../harness-protocol" }
 harness-runtime = { path = "../harness-runtime", features = ["testing"] }
+harness-context = { path = "../harness-context" }
 harness-session-store = { path = "../harness-session-store" }
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
 harness-tool-filesystem = { path = "../tools/filesystem" }
 harness-tool-shell = { path = "../tools/shell" }
+harness-tool-git = { path = "../tools/git" }
+harness-tool-web = { path = "../tools/web" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

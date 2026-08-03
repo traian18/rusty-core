@@ -11,6 +11,7 @@ pub mod cancellation;
 pub mod integration;
 pub mod permissions;
 pub mod resource_manager;
+pub mod rpc;
 pub mod scheduler;
 pub mod session_client;
 pub mod session_manager;

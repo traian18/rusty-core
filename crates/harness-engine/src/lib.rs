@@ -12,6 +12,6 @@ pub use session_builder::{HarnessError, SessionBuilder, SessionHandle};
 
 // Re-export workspace types for convenience.
 pub use harness_workspace::{
-    FileInfo, ProgressPhase, SearchMatch, SearchResult, ToolProgress, ToolResult, Workspace,
-    WorkspaceError, WorkspaceMode,
+    FileInfo, FsWorkspace, ProgressPhase, SearchMatch, SearchResult, ToolProgress, ToolResult,
+    Workspace, WorkspaceError, WorkspaceMode,
 };

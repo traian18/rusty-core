@@ -7,3 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+harness-tools = { path = "../harness-tools" }
+harness-runtime = { path = "../harness-runtime" }
+harness-model = { path = "../harness-model" }
+harness-generic-backend = { path = "../harness-generic-backend" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

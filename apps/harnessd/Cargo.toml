@@ -7,3 +7,25 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-std"] }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+harness-engine = { path = "../../crates/harness-engine" }
+harness-protocol = { path = "../../crates/harness-protocol" }
+harness-runtime = { path = "../../crates/harness-runtime" }
+harness-session-store = { path = "../../crates/harness-session-store" }
+harness-transport-ipc = { path = "../../crates/transports/ipc" }
+harness-transport-websocket = { path = "../../crates/transports/websocket" }
+harness-transport-stdio = { path = "../../crates/transports/stdio" }
+harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

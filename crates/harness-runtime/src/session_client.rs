@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use harness_protocol::commands::AgentStatus;
+use harness_protocol::commands::{AgentStatus, PermissionDecision};
 use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
-use harness_protocol::ids::{AgentId, SessionId, Timestamp};
+use harness_protocol::ids::{AgentId, PermissionId, SessionId, Timestamp};
 use harness_protocol::usage::{
     AgentUsageMetrics, AgentUsageSnapshot, CumulativeUsage, SessionUsageSnapshot,
 };
@@ -99,6 +99,15 @@ impl SessionClient {
         self.runtime.send_command(command).await
     }
 
+    /// Resolve a permission request originating from the root agent.
+    pub async fn resolve_permission(
+        &self,
+        id: PermissionId,
+        decision: PermissionDecision,
+    ) -> Result<(), SessionError> {
+        self.runtime.resolve_permission(id, decision).await
+    }
+
     /// Take a lightweight snapshot of the session's current live state.
     ///
     /// No stored snapshot is kept; the projection is generated from the
@@ -109,7 +118,9 @@ impl SessionClient {
     /// `Completed` with populated usage.
     pub fn snapshot(&self) -> SessionSnapshot {
         let runtime_snapshot = self.runtime.state_snapshot();
-        let live = self.runtime.agent_live_state(runtime_snapshot.root_agent_id);
+        let live = self
+            .runtime
+            .agent_live_state(runtime_snapshot.root_agent_id);
         let status = session_status_from_live(&live, runtime_snapshot.status);
         let metrics = metrics_from_live(&live);
         let now = Timestamp::now();
@@ -241,13 +252,19 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert!(saw_running, "snapshot should show Running while the run is in flight");
+        assert!(
+            saw_running,
+            "snapshot should show Running while the run is in flight"
+        );
 
         // Drain until Completed is observed on the event stream.
         let mut completed = false;
         for _ in 0..50 {
             while let Ok(envelope) = subscriber.try_recv() {
-                if matches!(envelope.event, harness_protocol::events::AgentEvent::Completed { .. }) {
+                if matches!(
+                    envelope.event,
+                    harness_protocol::events::AgentEvent::Completed { .. }
+                ) {
                     completed = true;
                 }
             }

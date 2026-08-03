@@ -21,6 +21,7 @@ members = [
     "crates/tools/filesystem",
     "crates/tools/shell",
     "crates/tools/git",
+    "crates/tools/web",
     "crates/transports/websocket",
     "crates/transports/stdio",
     "crates/transports/ipc",
@@ -58,3 +59,6 @@ git2 = "0.18"
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
+clap = { version = "4", features = ["derive"] }
+tokio-tungstenite = "0.24"
+html2text = "0.12"

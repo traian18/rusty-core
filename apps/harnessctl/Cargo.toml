@@ -7,3 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+serde_json = { workspace = true }
+harness-protocol = { path = "../../crates/harness-protocol" }
+harness-transport-ipc = { path = "../../crates/transports/ipc" }

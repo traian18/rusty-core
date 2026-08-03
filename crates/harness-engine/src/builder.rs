@@ -27,7 +27,7 @@ use harness_runtime::scheduler::Scheduler;
 use harness_runtime::session_manager::SessionManager;
 use harness_runtime::{IntegrationFactory, IntegrationRegistry};
 use harness_session_store::{
-    DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoredSession, StoreError,
+    DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoreError, StoredSession,
 };
 
 use crate::harness::Harness;

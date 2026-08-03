@@ -8,5 +8,6 @@ pub mod effects;
 pub mod events;
 pub mod ids;
 pub mod messages;
+pub mod rpc;
 pub mod tools;
 pub mod usage;

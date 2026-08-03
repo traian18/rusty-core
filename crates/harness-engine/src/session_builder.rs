@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use harness_protocol::backend::{
     ExecutionError, ExecutionEvent, ExecutionRequest, ExecutionResult,
 };
-use harness_protocol::commands::UserInput;
+use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::events::AgentEventEnvelope;
-use harness_protocol::ids::SessionId;
+use harness_protocol::ids::{PermissionId, SessionId};
 use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolPolicy};
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
 use harness_runtime::session_manager::{SessionManager, SessionManagerError};
@@ -22,7 +22,9 @@ use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 
 use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
+use harness_tool_git::{GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
 use harness_tool_shell::ExecTool;
+use harness_tool_web::FetchTool;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -106,6 +108,9 @@ pub struct SessionBuilder {
     /// The shared [`SessionManager`] that owns all active sessions.
     /// When `None`, a default manager is created in [`start`](Self::start).
     session_manager: Option<Arc<SessionManager>>,
+    /// Optional context assembly/compaction provider — see
+    /// [`context_provider`](Self::context_provider).
+    context_provider: Option<Arc<dyn harness_context::ContextProvider>>,
 }
 
 impl SessionBuilder {
@@ -127,6 +132,7 @@ impl SessionBuilder {
             workspace: None,
             root_toolset: None,
             session_manager: None,
+            context_provider: None,
         }
     }
 
@@ -148,6 +154,7 @@ impl SessionBuilder {
             workspace: None,
             root_toolset: None,
             session_manager: Some(session_manager),
+            context_provider: None,
         }
     }
 
@@ -184,6 +191,20 @@ impl SessionBuilder {
     /// Set the workspace, defaulting to an empty in-memory workspace.
     pub fn workspace(mut self, workspace: Arc<dyn harness_runtime::traits::Workspace>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Install a context-assembly/compaction provider.
+    ///
+    /// When set, [`start`](Self::start) wraps the resolved backend in a
+    /// [`harness_context::ContextAssemblingBackend`] — every request's
+    /// `system_prompt`/`messages` are rewritten by `provider` before
+    /// reaching the backend. Mirrors how [`toolset`](Self::toolset) wraps
+    /// the backend in `ToolAdvertisingBackend`; see
+    /// `crates/harness-context/PLAN.md` for why this is a backend decorator
+    /// rather than a change to `harness-core`.
+    pub fn context_provider(mut self, provider: Arc<dyn harness_context::ContextProvider>) -> Self {
+        self.context_provider = Some(provider);
         self
     }
 
@@ -234,6 +255,14 @@ impl SessionBuilder {
             "fs.edit" => Arc::new(EditTool::new(workspace)),
             "workspace.search" => Arc::new(SearchTool::new(workspace)),
             "shell.exec" => Arc::new(ExecTool::new()),
+            // Git tools resolve the repo directly from the workspace root
+            // via git2::Repository::discover — they don't go through the
+            // Workspace trait's virtual filesystem access.
+            "git.status" => Arc::new(GitStatusTool::new(workspace.root().to_path_buf())),
+            "git.diff" => Arc::new(GitDiffTool::new(workspace.root().to_path_buf())),
+            "git.log" => Arc::new(GitLogTool::new(workspace.root().to_path_buf())),
+            "git.show" => Arc::new(GitShowTool::new(workspace.root().to_path_buf())),
+            "web.fetch" => Arc::new(FetchTool::new()),
             _ => {
                 // Create a fallback that always fails
                 // Convert protocol descriptor to harness-tools descriptor
@@ -312,6 +341,16 @@ impl SessionBuilder {
         let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
             .unwrap_or_else(|| Arc::new(FakeWorkspace::new()));
+
+        let backend: Arc<dyn ExecutionBackend> = match self.context_provider {
+            Some(provider) => Arc::new(harness_context::ContextAssemblingBackend::new(
+                backend,
+                provider,
+                workspace.clone(),
+            )),
+            None => backend,
+        };
+
         let (event_tx, _) = broadcast::channel(256);
         let event_sink = Arc::new(BroadcastEventSink {
             tx: event_tx.clone(),
@@ -371,6 +410,25 @@ impl SessionHandle {
                 attachments: vec![],
             }))
             .await?;
+        Ok(())
+    }
+
+    /// Cancel the active session run.
+    ///
+    /// This keeps frontends on the public engine API instead of requiring
+    /// access to runtime command types.
+    pub async fn cancel(&self) -> Result<(), HarnessError> {
+        self.client.send(SessionCommand::Cancel).await?;
+        Ok(())
+    }
+
+    /// Answer a pending tool permission request.
+    pub async fn resolve_permission(
+        &self,
+        id: PermissionId,
+        decision: PermissionDecision,
+    ) -> Result<(), HarnessError> {
+        self.client.resolve_permission(id, decision).await?;
         Ok(())
     }
 

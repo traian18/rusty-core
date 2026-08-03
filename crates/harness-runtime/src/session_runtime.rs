@@ -22,11 +22,13 @@ use harness_protocol::backend::{
     BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
 };
 use harness_protocol::commands::{
-    AgentCommand, AgentError, AgentOperation, AgentStatus, UserInput,
+    AgentCommand, AgentError, AgentOperation, AgentStatus, PermissionDecision, UserInput,
 };
 use harness_protocol::effects::SpawnAgentSpec;
 use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
-use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
+use harness_protocol::ids::{
+    AgentId, BackendId, ConfigurationId, IntegrationId, PermissionId, SessionId,
+};
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::{AgentBudget, UsageRecord};
 use harness_session_store::{SessionStore, StoredAgentState};
@@ -442,6 +444,17 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// Resolve a pending root-agent permission request.
+    pub async fn resolve_permission(
+        &self,
+        id: PermissionId,
+        decision: PermissionDecision,
+    ) -> Result<(), SessionError> {
+        self.root_agent_tx
+            .send(AgentCommand::PermissionResolved { id, decision })
+            .await
+            .map_err(|_| SessionError::ChannelClosed)
+    }
     /// Create a new session runtime with a default scheduler.
     ///
     /// This constructor:
@@ -763,47 +776,45 @@ impl SessionRuntime {
         // publishes live status/usage to the shared table, and — when a store
         // is configured — receives the store handle so `Persist` effects keep
         // flowing after the restore.
-        let spawn_restored = |agent: Agent| -> (
-            mpsc::Sender<AgentCommand>,
-            tokio::task::JoinHandle<()>,
-        ) {
-            let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
-            let command_tx = task.commands_tx.clone();
-            let agent_cancel = cancellation.child_token();
-            agent_supervisor.register_agent_token(agent.id, agent_cancel.clone());
-            live_state
-                .lock()
-                .expect("live_state mutex poisoned")
-                .insert(agent.id, AgentLiveState::default());
+        let spawn_restored =
+            |agent: Agent| -> (mpsc::Sender<AgentCommand>, tokio::task::JoinHandle<()>) {
+                let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
+                let command_tx = task.commands_tx.clone();
+                let agent_cancel = cancellation.child_token();
+                agent_supervisor.register_agent_token(agent.id, agent_cancel.clone());
+                live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .insert(agent.id, AgentLiveState::default());
 
-            // Bridge to the external event sink (persistence, logging).
-            let bridge_sink = Arc::new(BridgeEventSink {
-                external_sink: Some(event_sink.clone()),
-            });
+                // Bridge to the external event sink (persistence, logging).
+                let bridge_sink = Arc::new(BridgeEventSink {
+                    external_sink: Some(event_sink.clone()),
+                });
 
-            let mut runner = AgentRunner::new(
-                agent,
-                task,
-                backend.clone(),
-                tool_registry.clone(),
-                workspace.clone(),
-                bridge_sink,
-                agent_cancel,
-                live_state.clone(),
-                scheduler.clone(),
-            )
-            .with_supervision(agent_supervisor.clone(), integrations.clone());
-            if let Some(store) = session_store.clone() {
-                runner = runner.with_session_store(store);
-            }
+                let mut runner = AgentRunner::new(
+                    agent,
+                    task,
+                    backend.clone(),
+                    tool_registry.clone(),
+                    workspace.clone(),
+                    bridge_sink,
+                    agent_cancel,
+                    live_state.clone(),
+                    scheduler.clone(),
+                )
+                .with_supervision(agent_supervisor.clone(), integrations.clone());
+                if let Some(store) = session_store.clone() {
+                    runner = runner.with_session_store(store);
+                }
 
-            event_bus.register_agent(runner.task.id, runner.task.events.clone());
-            let join = tokio::spawn(async move {
-                let mut runner = runner;
-                runner.run().await;
-            });
-            (command_tx, join)
-        };
+                event_bus.register_agent(runner.task.id, runner.task.events.clone());
+                let join = tokio::spawn(async move {
+                    let mut runner = runner;
+                    runner.run().await;
+                });
+                (command_tx, join)
+            };
 
         let (root_agent_tx, root_join) = spawn_restored(root_agent);
         for agent in agents.values() {
