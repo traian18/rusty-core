@@ -25,6 +25,11 @@ harness-transport-ipc = { path = "../../crates/transports/ipc" }
 harness-transport-websocket = { path = "../../crates/transports/websocket" }
 harness-transport-stdio = { path = "../../crates/transports/stdio" }
 harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
+harness-integration-openai = { path = "../../crates/integrations/openai" }
+harness-integration-openai-compatible = { path = "../../crates/integrations/openai-compatible" }
+harness-integration-gemini = { path = "../../crates/integrations/gemini" }
+harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
+harness-integration-codex = { path = "../../crates/integrations/codex" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

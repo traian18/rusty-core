@@ -1096,8 +1096,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossterm",
  "harness-protocol",
  "harness-transport-ipc",
+ "ratatui",
  "serde_json",
  "tokio",
 ]
@@ -1111,6 +1113,11 @@ dependencies = [
  "clap",
  "harness-engine",
  "harness-integration-anthropic",
+ "harness-integration-claude-code",
+ "harness-integration-codex",
+ "harness-integration-gemini",
+ "harness-integration-openai",
+ "harness-integration-openai-compatible",
  "harness-protocol",
  "harness-runtime",
  "harness-session-store",

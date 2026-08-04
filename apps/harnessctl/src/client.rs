@@ -75,4 +75,13 @@ impl HarnessClient {
             None => Ok(None),
         }
     }
+
+    /// Consumes the client and returns the underlying stream, so a caller
+    /// that needs concurrent read/write access (e.g. `chat`'s background
+    /// event-reader task plus a foreground writer) can `.into_split()` it
+    /// itself rather than being limited to this client's request/response
+    /// shape.
+    pub fn into_stream(self) -> UnixStream {
+        self.stream
+    }
 }

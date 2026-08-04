@@ -5,6 +5,7 @@
 //! as a worked example for anyone writing a real IDE-side client against the
 //! same wire protocol (see `harness_protocol::rpc`).
 
+mod chat;
 mod client;
 
 use std::collections::HashMap;
@@ -15,9 +16,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use harness_protocol::commands::{PermissionDecision, UserInput};
-use harness_protocol::ids::{PermissionId, SessionId};
+use harness_protocol::ids::{PermissionId, SessionId, ToolId};
 use harness_protocol::rpc::{RpcRequestBody, RpcResponseBody};
-use harness_protocol::tools::AgentToolset;
+use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy};
 
 use client::HarnessClient;
 
@@ -37,6 +38,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a session and drop into an interactive TUI: type a prompt,
+    /// watch it stream, approve/reject permission prompts inline. For
+    /// manual testing — the CLI-scriptable equivalent is `session
+    /// create`/`send`/`events`.
+    Chat {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        integration: String,
+        /// Raw JSON config for the integration. Defaults to `{}`, which uses
+        /// the integration's environment-variable-based defaults (e.g.
+        /// `ANTHROPIC_API_KEY` for `--integration anthropic`).
+        #[arg(long, default_value = "{}")]
+        config_json: String,
+        /// Comma-separated tool names to enable — see `session create --help`
+        /// for the known list.
+        #[arg(long, value_delimiter = ',', conflicts_with = "all_tools")]
+        tools: Vec<String>,
+        /// Enable every known tool.
+        #[arg(long, conflicts_with = "tools")]
+        all_tools: bool,
+    },
     /// Session lifecycle and interaction commands.
     Session {
         #[command(subcommand)]
@@ -62,6 +85,17 @@ enum SessionCommand {
         /// `ANTHROPIC_API_KEY` for `--integration anthropic`).
         #[arg(long, default_value = "{}")]
         config_json: String,
+        /// Comma-separated tool names to enable, e.g.
+        /// "fs.read,fs.edit,shell.exec". Known tools: fs.read, fs.edit,
+        /// workspace.search, shell.exec, git.status, git.diff, git.log,
+        /// git.show, web.fetch. Omit for a toolless session (raw model
+        /// plumbing only).
+        #[arg(long, value_delimiter = ',', conflicts_with = "all_tools")]
+        tools: Vec<String>,
+        /// Enable every known tool — shorthand for `--tools` with the full
+        /// list above.
+        #[arg(long, conflicts_with = "tools")]
+        all_tools: bool,
     },
     /// Send a prompt to a session.
     Send { session_id: String, prompt: String },
@@ -109,14 +143,110 @@ fn parse_session_id(raw: &str) -> Result<SessionId> {
     SessionId::from_str(raw).with_context(|| format!("invalid session id: {raw}"))
 }
 
+/// Every tool `SessionBuilder::build_executor_for`
+/// (crates/harness-engine/src/session_builder.rs) knows how to construct,
+/// with the description and default permission used when building the
+/// toolset from `--tools`/`--all-tools`. Kept in one place so this list and
+/// that match statement don't silently drift apart.
+fn known_tool_specs() -> Vec<(&'static str, &'static str, PermissionMode)> {
+    vec![
+        ("fs.read", "Read a file from the workspace.", PermissionMode::Allow),
+        ("fs.edit", "Replace a workspace file.", PermissionMode::Ask),
+        ("workspace.search", "Search workspace files.", PermissionMode::Allow),
+        ("shell.exec", "Run a shell command.", PermissionMode::Ask),
+        (
+            "git.status",
+            "Show working-tree and index status for changed files.",
+            PermissionMode::Allow,
+        ),
+        (
+            "git.diff",
+            "Show a diff for a path or the whole tree (working tree or staged).",
+            PermissionMode::Allow,
+        ),
+        (
+            "git.log",
+            "List recent commits, optionally filtered to those touching a path.",
+            PermissionMode::Allow,
+        ),
+        (
+            "git.show",
+            "Show a single commit's metadata and diff by ref/SHA.",
+            PermissionMode::Allow,
+        ),
+        (
+            "web.fetch",
+            "Fetch a URL over HTTP(S) and return its text content.",
+            PermissionMode::Ask,
+        ),
+    ]
+}
+
+/// Resolves the `--tools`/`--all-tools` pair (shared by `session create` and
+/// `chat`) into a concrete list of tool names.
+fn resolve_tool_names(tools: Vec<String>, all_tools: bool) -> Vec<String> {
+    if all_tools {
+        known_tool_specs().into_iter().map(|(name, _, _)| name.to_string()).collect()
+    } else {
+        tools
+    }
+}
+
+fn build_toolset(names: &[String]) -> Result<AgentToolset> {
+    let known = known_tool_specs();
+    let mut tools = HashMap::new();
+    for name in names {
+        let (name, description, permission) = known
+            .iter()
+            .find(|(known_name, _, _)| known_name == name)
+            .cloned()
+            .with_context(|| {
+                let available: Vec<&str> = known.iter().map(|(n, _, _)| *n).collect();
+                format!("unknown tool '{name}'; known tools: {}", available.join(", "))
+            })?;
+        let id = ToolId::new();
+        tools.insert(
+            id,
+            ToolCapability {
+                descriptor: ToolDescriptor {
+                    id,
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                },
+                policy: ToolPolicy { permission, enabled: true },
+                delegatable: false,
+            },
+        );
+    }
+    Ok(AgentToolset { tools })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut client = HarnessClient::connect(&cli.socket).await?;
 
     match cli.command {
-        Command::Session { command } => run_session_command(&mut client, command).await,
-        Command::Permission { command } => run_permission_command(&mut client, command).await,
+        Command::Chat {
+            workspace,
+            integration,
+            config_json,
+            tools,
+            all_tools,
+        } => {
+            let integration_config: serde_json::Value = serde_json::from_str(&config_json)
+                .context("--config-json must be valid JSON")?;
+            let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
+            chat::run(&cli.socket, workspace, integration, integration_config, toolset).await
+        }
+        Command::Session { command } => {
+            let mut client = HarnessClient::connect(&cli.socket).await?;
+            run_session_command(&mut client, command).await
+        }
+        Command::Permission { command } => {
+            let mut client = HarnessClient::connect(&cli.socket).await?;
+            run_permission_command(&mut client, command).await
+        }
     }
 }
 
@@ -126,9 +256,12 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             workspace,
             integration,
             config_json,
+            tools,
+            all_tools,
         } => {
             let integration_config: serde_json::Value = serde_json::from_str(&config_json)
                 .context("--config-json must be valid JSON")?;
+            let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
             let response = client
                 .request(
                     None,
@@ -136,9 +269,7 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
                         workspace_root: workspace,
                         integration,
                         integration_config,
-                        toolset: AgentToolset {
-                            tools: HashMap::new(),
-                        },
+                        toolset,
                     },
                 )
                 .await?;

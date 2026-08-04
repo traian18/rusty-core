@@ -18,6 +18,11 @@ use clap::Parser;
 
 use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicFactory;
+use harness_integration_claude_code::ClaudeCodeFactory;
+use harness_integration_codex::CodexFactory;
+use harness_integration_gemini::GeminiFactory;
+use harness_integration_openai::OpenAiFactory;
+use harness_integration_openai_compatible::OpenAiCompatibleFactory;
 use harness_runtime::rpc::RpcHandler;
 use harness_session_store::JsonlSessionStore;
 use tokio_util::sync::CancellationToken;
@@ -77,6 +82,11 @@ async fn main() -> Result<()> {
 
     let harness = Harness::builder()
         .register_integration(Arc::new(AnthropicFactory))
+        .register_integration(Arc::new(OpenAiFactory))
+        .register_integration(Arc::new(OpenAiCompatibleFactory))
+        .register_integration(Arc::new(GeminiFactory))
+        .register_integration(Arc::new(ClaudeCodeFactory))
+        .register_integration(Arc::new(CodexFactory))
         .session_store(Arc::new(JsonlSessionStore::new(sessions_dir)))
         .build()
         .await
