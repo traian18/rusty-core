@@ -7,6 +7,7 @@
 
 use harness_protocol::ids::ToolCallId;
 use harness_protocol::usage::{Cost, ModelUsage};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Events emitted during a streaming model invocation.
@@ -86,8 +87,8 @@ pub enum ModelError {
     /// The request was rate-limited by the backend.
     #[error("rate limited")]
     RateLimited {
-        /// Number of seconds to wait before retrying, if advertised by the provider.
-        retry_after: Option<u64>,
+        /// Normalized delay to wait before retrying, if advertised by the provider.
+        retry_after: Option<Duration>,
     },
     /// The request was malformed or otherwise invalid.
     #[error("invalid request: {message}")]
@@ -101,10 +102,58 @@ pub enum ModelError {
     /// The request timed out.
     #[error("timeout")]
     Timeout,
+    /// The provider is temporarily unavailable because its circuit is open.
+    #[error("provider unavailable; retry after {retry_after:?}")]
+    CircuitOpen {
+        /// Remaining time before a probe request is permitted.
+        retry_after: Duration,
+    },
     /// A protocol-level error (e.g. deserialization failure, unexpected wire format).
     #[error("protocol error: {message}")]
     Protocol {
         /// Description of the protocol error.
         message: String,
     },
+}
+
+impl ModelError {
+    /// Whether retrying the unchanged request may recover from this error.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } | Self::Timeout => true,
+            Self::BackendError { code, .. } => {
+                code == "request_failed"
+                    || code == "408"
+                    || code.parse::<u16>().is_ok_and(|status| (500..600).contains(&status))
+            }
+            Self::InvalidRequest { .. }
+            | Self::Cancelled
+            | Self::CircuitOpen { .. }
+            | Self::Protocol { .. } => false,
+        }
+    }
+
+    /// A provider-advertised delay, when available.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelError;
+    use std::time::Duration;
+
+    #[test]
+    fn retryability_is_limited_to_transient_failures() {
+        assert!(ModelError::Timeout.is_retryable());
+        assert!(ModelError::RateLimited { retry_after: None }.is_retryable());
+        assert!(ModelError::BackendError { message: String::new(), code: "503".into() }.is_retryable());
+        assert!(!ModelError::InvalidRequest { message: String::new() }.is_retryable());
+        assert!(!ModelError::Protocol { message: String::new() }.is_retryable());
+        assert!(!ModelError::CircuitOpen { retry_after: Duration::from_secs(1) }.is_retryable());
+    }
 }

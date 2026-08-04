@@ -7,4 +7,4 @@ pub mod backend;
 /// Reusable test doubles and contract-test support for backend implementors.
 pub mod testing;
 
-pub use backend::GenericModelBackend;
+pub use backend::{GenericModelBackend, RecoveryPolicy};

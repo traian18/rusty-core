@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tracing::instrument;
@@ -173,9 +174,15 @@ impl ModelClient for AnthropicClient {
             .json(&anthropic_request)
             .send()
             .await
-            .map_err(|e| ModelError::BackendError {
-                message: format!("HTTP request failed: {e}"),
-                code: String::from("request_failed"),
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ModelError::Timeout
+                } else {
+                    ModelError::BackendError {
+                        message: format!("HTTP request failed: {error}"),
+                        code: String::from("request_failed"),
+                    }
+                }
             })?;
 
         // ------------------------------------------------------------------
@@ -216,8 +223,14 @@ impl AnthropicClient {
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(|error| ModelError::Protocol {
-                    message: format!("failed to read Anthropic SSE stream: {error}"),
+                chunk = response.chunk() => chunk.map_err(|error| {
+                    if error.is_timeout() {
+                        ModelError::Timeout
+                    } else {
+                        ModelError::Protocol {
+                            message: format!("failed to read Anthropic SSE stream: {error}"),
+                        }
+                    }
                 })?,
             };
             let Some(chunk) = chunk else {
@@ -246,11 +259,7 @@ impl AnthropicClient {
     fn handle_rate_limit(
         response: reqwest::Response,
     ) -> Result<ModelResult, ModelError> {
-        let retry_after = response
-            .headers()
-            .get("retry-after-ms")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+        let retry_after = retry_after(response.headers());
 
         Err(ModelError::RateLimited { retry_after })
     }
@@ -265,5 +274,41 @@ impl AnthropicClient {
             message: format!("HTTP {status}: {body}"),
             code: status.as_u16().to_string(),
         })
+    }
+}
+
+/// Normalize standard `Retry-After` (seconds) and Anthropic's millisecond hint.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .or_else(|| {
+            headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_after;
+    use std::time::Duration;
+
+    #[test]
+    fn retry_after_ms_is_normalized_to_duration() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1250".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_millis(1250)));
+    }
+
+    #[test]
+    fn standard_retry_after_uses_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(3)));
     }
 }
