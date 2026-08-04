@@ -1,4 +1,5 @@
-//! Dynamic integration factory and registry support.
+//! Dynamic integration factory and registry: lets backends be constructed at
+//! runtime from provider-specific JSON config, rather than compile time.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,16 +11,16 @@ use thiserror::Error;
 
 use crate::traits::ExecutionBackend;
 
-/// Error returned while registering or constructing an integration.
+/// Errors raised when registering or constructing an integration.
 #[derive(Debug, Error)]
 pub enum IntegrationError {
-    /// No factory was registered under the requested identifier.
+    /// Requested identifier has no registered factory.
     #[error("integration is not registered: {0}")]
     NotRegistered(String),
-    /// A registry lock was poisoned.
+    /// Registry lock poisoned by a panicking thread.
     #[error("integration registry lock was poisoned")]
     RegistryPoisoned,
-    /// The factory rejected its configuration or failed to construct a backend.
+    /// Factory rejected its config or failed to construct a backend.
     #[error("failed to create integration {integration}: {message}")]
     Creation {
         integration: String,
@@ -28,22 +29,21 @@ pub enum IntegrationError {
 }
 
 /// Provider-owned constructor for dynamically configured execution backends.
+/// Implementors own how their config maps to a running backend.
 #[async_trait]
 pub trait IntegrationFactory: Send + Sync {
-    /// Stable integration family identifier, such as `"anthropic"`.
+    /// Stable integration family identifier, e.g. `"anthropic"`.
     fn id(&self) -> &'static str;
-
     /// Descriptor for the backend family.
     fn descriptor(&self) -> BackendDescriptor;
-
-    /// Construct a fresh backend from provider-specific JSON configuration.
+    /// Build a fresh backend from provider-specific JSON configuration.
     async fn create(
         &self,
         config: Value,
     ) -> Result<Arc<dyn ExecutionBackend>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-/// Thread-safe registry of integration factories.
+/// Thread-safe registry of integration factories, keyed by factory `id`.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
     factories: Arc<RwLock<HashMap<String, Arc<dyn IntegrationFactory>>>>,
@@ -65,8 +65,8 @@ impl IntegrationRegistry {
         Ok(())
     }
 
-    /// Copies all factories from another registry into this one.
-    /// Existing entries with the same identifier are replaced.
+    /// Merge all factories from another registry into this one; entries with
+    /// the same identifier are replaced.
     pub fn extend_from(&self, other: &Self) -> Result<(), IntegrationError> {
         let factories = other
             .factories
@@ -80,7 +80,7 @@ impl IntegrationRegistry {
         Ok(())
     }
 
-    /// Return a registered factory without constructing a backend.
+    /// Look up a registered factory without constructing a backend.
     pub fn get(
         &self,
         integration: &str,
@@ -92,7 +92,7 @@ impl IntegrationRegistry {
         Ok(factories.get(integration).cloned())
     }
 
-    /// Resolve a factory and construct a fresh backend.
+    /// Resolve a factory and construct a fresh backend from the given config.
     pub async fn create(
         &self,
         integration: &str,

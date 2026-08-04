@@ -12,7 +12,7 @@ use harness_core::agent::Agent;
 use harness_core::transcript::validate_transcript;
 use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus};
-use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, ToolRequest};
+use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, SpawnMode, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
 
@@ -26,25 +26,16 @@ use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 pub struct AgentTask {
     pub id: AgentId,
     pub commands: mpsc::Receiver<AgentCommand>,
-    /// Retained by the runner so asynchronous effect tasks can report results.
+    /// Extra sender kept so background tasks can enqueue commands.
     pub commands_tx: mpsc::Sender<AgentCommand>,
     pub events: broadcast::Sender<AgentEventEnvelope>,
     pub cancel: CancellationToken,
 }
 
 impl AgentTask {
-    /// Creates a mailbox and returns its external command sender.
+    /// Creates a mailbox with default channel capacities.
     pub fn new(id: AgentId) -> (Self, mpsc::Sender<AgentCommand>) {
-        let (commands_tx, commands) = mpsc::channel(64);
-        let (events, _) = broadcast::channel(256);
-        let task = Self {
-            id,
-            commands,
-            commands_tx: commands_tx.clone(),
-            events,
-            cancel: CancellationToken::new(),
-        };
-        (task, commands_tx)
+        Self::new_with_capacities(id, 64, 256)
     }
 
     /// Creates a mailbox with caller-selected channel capacities.
@@ -66,36 +57,25 @@ impl AgentTask {
     }
 }
 
-/// Drives an agent state machine and dispatches its effects asynchronously.
+/// Drives an agent's state machine and dispatches its effects asynchronously.
 pub struct AgentRunner {
     pub agent: Agent,
     pub task: AgentTask,
     pub backend: Arc<dyn ExecutionBackend>,
     pub tool_registry: Arc<dyn ToolRegistry>,
-    /// The workspace this agent operates on (resolved by the supervisor
-    /// according to the spawn's `WorkspacePolicy`).
     pub workspace: Arc<dyn Workspace>,
     pub event_sink: Arc<dyn EventSink>,
     pub agent_sequence: u64,
     pub cancel: CancellationToken,
-    /// Concurrency throttle for backend requests, tool executions, etc.
     pub scheduler: Arc<Scheduler>,
-    /// Shared table that this runner publishes its live status/usage into
-    /// after every transition, so external readers (e.g.
-    /// `SessionRuntime::agent_live_state`) always see a pure, up-to-date
-    /// projection rather than a stale copy.
+    /// Shared per-agent live state published after every transition.
     live_state: LiveStateTable,
     backend_tokens: HashMap<RunId, CancellationToken>,
     tool_tokens: HashMap<ToolCallId, CancellationToken>,
-    /// The outcome of the terminal `FinishRun` effect, captured when
-    /// [`dispatch_effects`](Self::dispatch_effects) observes it so a caller
-    /// (e.g. the supervisor's child completion handler) can retrieve the
-    /// child's final [`AgentResult`] or [`AgentError`] after `run()` returns.
+    /// Terminal `FinishRun` outcome, retrieved via [`Self::take_final_result`].
     final_result: Option<Result<AgentResult, AgentError>>,
     supervision: Option<AgentSupervision>,
-    /// Optional durable session store. When present, `AgentEffect::Persist`
-    /// mutations are routed through it (the transcript is validated first).
-    /// Injected via [`AgentRunner::with_session_store`].
+    /// Optional durable store used by `Persist` effects.
     session_store: Option<Arc<dyn harness_session_store::SessionStore>>,
 }
 
@@ -211,10 +191,6 @@ impl AgentRunner {
     }
 
     /// Enables durable persistence of `Persist` effects through `store`.
-    ///
-    /// Mirrors [`with_supervision`](Self::with_supervision): the store is
-    /// injected post-construction so `AgentRunner::new`'s argument list does
-    /// not grow. Without it, `Persist` mutations are dropped with a warning.
     pub fn with_session_store(
         mut self,
         store: Arc<dyn harness_session_store::SessionStore>,
@@ -224,12 +200,6 @@ impl AgentRunner {
     }
 
     /// Takes the captured outcome of the terminal `FinishRun` effect, if any.
-    ///
-    /// Returns `Some(Ok(result))` when the run finished successfully,
-    /// `Some(Err(error))` when it failed, and `None` when the runner
-    /// terminated without ever reaching a `FinishRun` (e.g. it was cancelled
-    /// before any run completed). The value is taken (consumed) so a caller
-    /// can retrieve it exactly once after `run()` returns.
     pub fn take_final_result(&mut self) -> Option<Result<AgentResult, AgentError>> {
         self.final_result.take()
     }
@@ -239,10 +209,7 @@ impl AgentRunner {
         self.publish_status();
         loop {
             if self.cancel.is_cancelled() {
-                if !self.is_terminal() {
-                    let effects = self.apply_and_publish(AgentCommand::Cancel);
-                    self.dispatch_effects(effects).await;
-                }
+                self.cancel_run().await;
                 break;
             }
 
@@ -252,19 +219,13 @@ impl AgentRunner {
                     None => break,
                 },
                 _ = self.cancel.cancelled() => {
-                    if !self.is_terminal() {
-                        let effects = self.apply_and_publish(AgentCommand::Cancel);
-                        self.dispatch_effects(effects).await;
-                    }
+                    self.cancel_run().await;
                     break;
                 }
             };
 
             if self.cancel.is_cancelled() {
-                if !self.is_terminal() {
-                    let effects = self.apply_and_publish(AgentCommand::Cancel);
-                    self.dispatch_effects(effects).await;
-                }
+                self.cancel_run().await;
                 break;
             }
 
@@ -275,16 +236,20 @@ impl AgentRunner {
         }
     }
 
-    /// Applies `command` to the agent and immediately publishes the
-    /// resulting status/operation/usage to the shared live-state table.
+    /// Applies `Cancel` unless the agent already reached a terminal state.
+    async fn cancel_run(&mut self) {
+        if !self.is_terminal() {
+            let effects = self.apply_and_publish(AgentCommand::Cancel);
+            self.dispatch_effects(effects).await;
+        }
+    }
+
     fn apply_and_publish(&mut self, command: AgentCommand) -> Vec<AgentEffect> {
         let effects = self.agent.apply(command);
         self.publish_status();
         effects
     }
 
-    /// Writes the agent's current status, operation, error, and usage into
-    /// the shared live-state table.
     fn publish_status(&self) {
         let child_usage = self
             .agent
@@ -319,11 +284,6 @@ impl AgentRunner {
         entry.total_cost_usd = total_cost_usd;
     }
 
-    /// Records the outcome of a finished run (Success/Cancelled/Failed) in
-    /// the shared live-state table.
-    ///
-    /// `AgentStatus` returns to `Idle` after a successful run, so this is
-    /// the only durable record that a run finished versus never having run.
     fn publish_outcome(&self, outcome: AgentOutcome) {
         let mut table = self.live_state.lock().expect("live_state mutex poisoned");
         let entry = table.entry(self.agent.id).or_default();
@@ -338,10 +298,6 @@ impl AgentRunner {
                 AgentEffect::ExecuteTool { request } => self.execute_tool(request).await,
                 AgentEffect::Emit { event } => self.emit(event).await,
                 AgentEffect::FinishRun { result } => {
-                    // Capture the terminal result so a supervisor can retrieve
-                    // it after `run()` returns via `take_final_result`. A
-                    // failed agent surfaces its error here; any other terminal
-                    // state (e.g. successful completion) is surfaced as `Ok`.
                     finish = true;
                     self.final_result = Some(match self.agent.state.status {
                         AgentStatus::Failed => Err(self
@@ -382,7 +338,7 @@ impl AgentRunner {
         finish
     }
 
-    async fn spawn_agent(&mut self, spec: harness_protocol::effects::SpawnAgentSpec) {
+    async fn spawn_agent(&mut self, spec: SpawnAgentSpec) {
         let Some(supervision) = self.supervision.clone() else {
             tracing::warn!(?spec, "SpawnAgent requested without a supervisor");
             return;
@@ -404,12 +360,13 @@ impl AgentRunner {
             .await
         {
             Ok(child_id) => {
+                let awaiting = matches!(mode, SpawnMode::AwaitResult);
                 let effects = self.apply_and_publish(AgentCommand::ChildSpawned {
                     agent_id: child_id,
-                    awaiting: matches!(mode, harness_protocol::effects::SpawnMode::AwaitResult),
+                    awaiting,
                 });
                 Box::pin(self.dispatch_effects(effects)).await;
-                if matches!(mode, harness_protocol::effects::SpawnMode::AwaitResult) {
+                if awaiting {
                     if let Err(error) = supervision.supervisor.await_child(child_id).await {
                         let effects = self.apply_and_publish(AgentCommand::ChildFailed {
                             agent_id: child_id,
@@ -448,29 +405,16 @@ impl AgentRunner {
         };
         self.agent_sequence = self.agent_sequence.wrapping_add(1);
 
-        // Event emission is the centralized durable-event boundary. Persist
-        // the completed/lifecycle event before making it observable, while
-        // raw streaming deltas and progress ticks remain ephemeral. The
-        // `persist` call validates the authoritative in-memory transcript
-        // immediately before `SessionStore::append`.
         if harness_session_store::is_durable(&envelope.event) {
             self.persist(SessionMutation::AppendEvent(envelope.clone()))
                 .await;
         }
 
-        // Send to the agent's own event broadcast channel (read by SessionEventBus).
         let _ = self.task.events.send(envelope.clone());
-        // Forward to the external event sink (persistence, logging, etc.).
         self.event_sink.send(envelope);
     }
 
-    /// Persists a session mutation through the injected
-    /// [`harness_session_store::SessionStore`].
-    ///
-    /// The transcript is validated **immediately before** the write, so an
-    /// invalid transcript (e.g. a dangling or orphaned tool call) is never
-    /// persisted as a durable event or snapshot. When no store is configured
-    /// the mutation is dropped with a warning.
+    /// Persists a session mutation through the injected session store.
     async fn persist(&mut self, mutation: SessionMutation) {
         let Some(store) = &self.session_store else {
             tracing::warn!(?mutation, "Persist requested without a session store");
@@ -478,10 +422,7 @@ impl AgentRunner {
         };
 
         if let Err(error) = validate_transcript(&self.agent.state.messages) {
-            tracing::error!(
-                ?error,
-                "refusing to persist mutation for invalid transcript"
-            );
+            tracing::error!(?error, "refusing to persist mutation for invalid transcript");
             return;
         }
 
@@ -508,54 +449,17 @@ impl AgentRunner {
         }
     }
 
-    /// Dispatches a backend execution effect.
+    /// Streams a backend request into the agent's mailbox.
     ///
-    /// The agent's transcript is validated before anything is dispatched to
-    /// the backend: an invalid transcript (a tool call whose result is
-    /// missing or out of order) must never reach the backend as an
-    /// `ExecutionRequest`. On failure a
-    /// [`harness_core::transcript::TranscriptError`]-derived
-    /// `ExecutionEvent::Error` is fed back into the agent's mailbox instead,
-    /// so the agent observes a normal backend failure and can transition
-    /// (e.g. to `Failed`) rather than hang.
-    ///
-    /// Otherwise, acquires **both** a global backend permit from the
-    /// [`Scheduler`] and a backend-specific permit (concurrency + rate-limit
-    /// guard) before spawning the forwarding and driver tasks.  The permits
-    /// are moved into the driver task and held for the entire duration of the
-    /// backend request, throttling concurrent LLM API calls across all agents
-    /// and enforcing per-backend rate limits.
-    ///
-    /// Two tasks cooperate here:
-    ///
-    /// 1. A **forwarding** task that drains `event_rx` and forwards each
-    ///    streamed `ExecutionEvent` into the agent's own mailbox as it
-    ///    arrives, so intermediate deltas are observed as they occur.
-    /// 2. A **driver** task that awaits `backend.execute(..)` to
-    ///    completion, then — crucially — awaits the forwarding task's
-    ///    `JoinHandle` before injecting the final `Result` only when the
-    ///    backend did not already stream a terminal event.
-    ///
-    /// The await on the forwarding task's handle is what guarantees
-    /// ordering: `backend.execute` drops its `sink` sender when it
-    /// returns, which closes the broadcast channel, which is exactly the
-    /// signal the forwarding task uses to stop. Without waiting for it,
-    /// a backend whose `execute` future never yields (e.g. `FakeBackend`
-    /// or a purely synchronous scripted backend) can have its driver task
-    /// enqueue the synthesized terminal event in the mailbox *before* the
-    /// forwarding task — spawned but not yet polled — has forwarded the
-    /// already-buffered intermediate events, causing them to be silently
-    /// dropped once the agent's `active_run` guard clears on the terminal
-    /// event. Waiting for the forwarding task to finish first eliminates
-    /// that race regardless of scheduler ordering.
+    /// The transcript is validated first; an invalid transcript is rejected
+    /// with a normal backend error. Otherwise a forwarding task relays
+    /// streamed events to the mailbox while a driver task holds the scheduler
+    /// permits and runs the request. The driver waits for the forwarding task
+    /// to drain before synthesizing a terminal event, so streamed events are
+    /// never overtaken.
     async fn execute_backend(&mut self, request: ExecutionRequest) {
-        // Validate the transcript before constructing/dispatching the
-        // ExecutionRequest: never send an invalid transcript to the backend.
         if let Err(error) = validate_transcript(&self.agent.state.messages) {
-            tracing::error!(
-                ?error,
-                "refusing to dispatch backend request with invalid transcript"
-            );
+            tracing::error!(?error, "refusing to dispatch backend request with invalid transcript");
             let event = ExecutionEvent::Error {
                 request_id: request.request_id,
                 error: ExecutionError::InvalidRequest {
@@ -573,12 +477,7 @@ impl AgentRunner {
             return;
         }
 
-        // Acquire the global backend semaphore permit.
         let global_permit = self.scheduler.acquire_backend_permit().await;
-
-        // Acquire the backend-specific permit (concurrency slot + rate-limit
-        // guard).  This is a no-op if no limits were configured for this
-        // backend via Scheduler::configure_backend_limits.
         let backend_id = self.backend.descriptor().id;
         let backend_guard = self
             .scheduler
@@ -622,15 +521,9 @@ impl AgentRunner {
         let result_commands = self.task.commands_tx.clone();
         let result_token = token.clone();
         tokio::spawn(async move {
-            // Hold both permits for the complete backend request lifecycle.
-            // The forwarding task must not lock these permits: it needs to
-            // receive events while the driver is executing the backend.
             let _global_permit = global_permit;
             let _backend_guard = backend_guard;
             let outcome = backend.execute(request, event_tx, result_token).await;
-            // Ensure every already-streamed event has been forwarded to the
-            // mailbox before injecting the synthesized terminal event (see
-            // the doc comment above for why this ordering matters).
             let terminal_forwarded = forward_handle.await.unwrap_or(false);
             if !terminal_forwarded {
                 let event = match outcome {
@@ -644,14 +537,8 @@ impl AgentRunner {
         });
     }
 
-    /// Dispatches a tool execution effect.
-    ///
-    /// Acquires a tool permit from the [`Scheduler`] before spawning the
-    /// execution task. The permit is moved into the spawned task and held
-    /// for the entire tool execution, throttling concurrent tool calls
-    /// across all agents.
+    /// Executes a tool call and reports the result to the agent's mailbox.
     async fn execute_tool(&mut self, request: ToolRequest) {
-        // Throttle tool executions — block if at capacity.
         let permit = self.scheduler.acquire_tool_permit().await;
 
         let call_id = request.call.id;
@@ -660,62 +547,40 @@ impl AgentRunner {
         let token = self.cancel.child_token();
         self.tool_tokens.insert(call_id, token.clone());
         let commands = self.task.commands_tx.clone();
+        let executor = self.tool_registry.get_executor(&name);
 
-        match self.tool_registry.get_executor(&name) {
-            Some(executor) => {
-                tokio::spawn(async move {
-                    // Hold the permit for the duration of tool execution.
-                    let _permit = permit;
-                    // Convert protocol ToolCall to harness-tools ToolInput
-                    let input = harness_tools::ToolInput { arguments };
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(executor) = executor else {
+                let _ = commands
+                    .send(AgentCommand::ToolFailed {
+                        call_id,
+                        error: harness_protocol::tools::ToolError::ExecutionFailed,
+                    })
+                    .await;
+                return;
+            };
 
-                    match executor.execute(input, token).await {
-                        Ok(tool_result) => {
-                            // Convert harness-tools ToolResult to protocol ToolResult
-                            let result = harness_protocol::tools::ToolResult {
-                                call_id,
-                                output: tool_result.output,
-                                is_error: tool_result.is_error,
-                            };
-                            let _ = commands
-                                .send(AgentCommand::ToolCompleted { call_id, result })
-                                .await;
-                        }
-                        Err(tool_error) => {
-                            // Convert harness-tools ToolError to protocol ToolError
-                            let error = match tool_error {
-                                harness_tools::ToolError::ExecutionFailed => {
-                                    harness_protocol::tools::ToolError::ExecutionFailed
-                                }
-                                harness_tools::ToolError::PermissionDenied => {
-                                    harness_protocol::tools::ToolError::PermissionDenied
-                                }
-                                harness_tools::ToolError::Timeout => {
-                                    harness_protocol::tools::ToolError::Timeout
-                                }
-                                harness_tools::ToolError::Internal => {
-                                    harness_protocol::tools::ToolError::Internal
-                                }
-                            };
-                            let _ = commands
-                                .send(AgentCommand::ToolFailed { call_id, error })
-                                .await;
-                        }
-                    }
-                });
-            }
-            None => {
-                tokio::spawn(async move {
-                    let _permit = permit;
+            let input = harness_tools::ToolInput { arguments };
+            match executor.execute(input, token).await {
+                Ok(tool_result) => {
+                    let result = harness_protocol::tools::ToolResult {
+                        call_id,
+                        output: tool_result.output,
+                        is_error: tool_result.is_error,
+                    };
                     let _ = commands
-                        .send(AgentCommand::ToolFailed {
-                            call_id,
-                            error: harness_protocol::tools::ToolError::ExecutionFailed,
-                        })
+                        .send(AgentCommand::ToolCompleted { call_id, result })
                         .await;
-                });
+                }
+                Err(tool_error) => {
+                    let error = to_protocol_tool_error(tool_error);
+                    let _ = commands
+                        .send(AgentCommand::ToolFailed { call_id, error })
+                        .await;
+                }
             }
-        }
+        });
     }
 
     fn cancel_backend(&mut self, run_id: RunId) {
@@ -735,6 +600,21 @@ impl AgentRunner {
             self.agent.state.status,
             AgentStatus::Cancelled | AgentStatus::Completed | AgentStatus::Failed
         )
+    }
+}
+
+fn to_protocol_tool_error(
+    error: harness_tools::ToolError,
+) -> harness_protocol::tools::ToolError {
+    match error {
+        harness_tools::ToolError::ExecutionFailed => {
+            harness_protocol::tools::ToolError::ExecutionFailed
+        }
+        harness_tools::ToolError::PermissionDenied => {
+            harness_protocol::tools::ToolError::PermissionDenied
+        }
+        harness_tools::ToolError::Timeout => harness_protocol::tools::ToolError::Timeout,
+        harness_tools::ToolError::Internal => harness_protocol::tools::ToolError::Internal,
     }
 }
 
