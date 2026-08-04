@@ -1,3 +1,4 @@
+
 //! OpenAI-compatible backend composition and registry factory.
 //!
 //! Reuses `harness_integration_openai::OpenAiClient` directly — see
@@ -19,7 +20,9 @@ pub struct OpenAiCompatibleBackend;
 
 impl OpenAiCompatibleBackend {
     pub fn new(config: OpenAiCompatibleConfig) -> GenericModelBackend {
-        GenericModelBackend::new(Arc::new(OpenAiClient::new(config.into_openai_config())))
+        let openai_config = config.into_openai_config();
+        let recovery = openai_config.recovery.clone();
+        GenericModelBackend::new_with_recovery(Arc::new(OpenAiClient::new(openai_config)), recovery)
     }
 }
 
@@ -77,6 +80,18 @@ mod tests {
         let capabilities = backend.capabilities();
         assert!(capabilities.streaming);
         assert!(capabilities.tool_calls);
+        assert_eq!(
+            backend.recovery_policy(),
+            &harness_generic_backend::RecoveryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn direct_constructor_uses_configured_recovery_policy() {
+        let mut config = OpenAiCompatibleConfig::new("http://localhost:11434/v1", "llama3");
+        config.recovery.max_attempts = 5;
+        let backend = OpenAiCompatibleBackend::new(config);
+        assert_eq!(backend.recovery_policy().max_attempts, 5);
     }
 
     #[tokio::test]

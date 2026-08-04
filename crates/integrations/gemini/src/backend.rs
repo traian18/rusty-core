@@ -1,3 +1,4 @@
+
 //! Gemini backend composition and registry factory.
 
 use std::sync::Arc;
@@ -16,7 +17,8 @@ pub struct GeminiBackend;
 
 impl GeminiBackend {
     pub fn new(config: GeminiConfig) -> GenericModelBackend {
-        GenericModelBackend::new(Arc::new(GeminiClient::new(config)))
+        let recovery = config.recovery.clone();
+        GenericModelBackend::new_with_recovery(Arc::new(GeminiClient::new(config)), recovery)
     }
 }
 
@@ -65,6 +67,18 @@ mod tests {
         assert!(capabilities.streaming);
         assert!(capabilities.tool_calls);
         assert!(capabilities.host_managed_tools);
+        assert_eq!(
+            backend.recovery_policy(),
+            &harness_generic_backend::RecoveryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn direct_constructor_uses_configured_recovery_policy() {
+        let mut config = GeminiConfig::new("test-key");
+        config.recovery.max_attempts = 5;
+        let backend = GeminiBackend::new(config);
+        assert_eq!(backend.recovery_policy().max_attempts, 5);
     }
 
     #[tokio::test]

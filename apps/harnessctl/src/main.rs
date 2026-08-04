@@ -105,6 +105,13 @@ enum SessionCommand {
         /// Print raw JSON instead of a compact human-readable line.
         #[arg(long)]
         json: bool,
+        /// Resume from a prior subscription: replay every durable event with
+        /// `session_sequence` greater than this value before live events
+        /// begin. Pass the highest `session_sequence` seen before a
+        /// disconnect to reconnect without gaps or duplicates. Omit for a
+        /// fresh, live-only subscription.
+        #[arg(long)]
+        since_seq: Option<u64>,
     },
     /// Print a session's current snapshot.
     Snapshot { session_id: String },
@@ -296,9 +303,9 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             print_ack_or_error(response)
         }
 
-        SessionCommand::Events { session_id, json } => {
+        SessionCommand::Events { session_id, json, since_seq } => {
             let session_id = parse_session_id(&session_id)?;
-            client.subscribe(session_id).await?;
+            client.subscribe(session_id, since_seq).await?;
             loop {
                 match client.next_event().await? {
                     Some(RpcResponseBody::Event(envelope)) => {

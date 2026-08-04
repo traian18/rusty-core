@@ -1,3 +1,4 @@
+
 //! [`RpcHandler`] implementation wrapping a [`Harness`].
 //!
 //! This is where "what a request means" is decided — the transport crates
@@ -14,7 +15,9 @@ use tokio::sync::broadcast;
 use harness_engine::{FsWorkspace, Harness, SessionHandle};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
-use harness_protocol::rpc::{RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire};
+use harness_protocol::rpc::{
+    RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire,
+};
 use harness_runtime::rpc::RpcHandler;
 use harness_runtime::session_runtime::SessionStatus;
 
@@ -46,9 +49,17 @@ impl HarnessRpcHandler {
         integration_config: serde_json::Value,
         toolset: harness_protocol::tools::AgentToolset,
     ) -> RpcResponseBody {
-        let builder = match self.harness.session().integration(integration, integration_config) {
+        let builder = match self
+            .harness
+            .session()
+            .integration(integration, integration_config)
+        {
             Ok(builder) => builder,
-            Err(error) => return RpcResponseBody::Error { message: error.to_string() },
+            Err(error) => {
+                return RpcResponseBody::Error {
+                    message: error.to_string(),
+                }
+            }
         };
         let workspace = Arc::new(FsWorkspace::new(workspace_root));
         match builder.toolset(toolset, workspace).start().await {
@@ -60,7 +71,9 @@ impl HarnessRpcHandler {
                     .insert(session_id, Arc::new(handle));
                 RpcResponseBody::SessionCreated { session_id }
             }
-            Err(error) => RpcResponseBody::Error { message: error.to_string() },
+            Err(error) => RpcResponseBody::Error {
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -91,6 +104,19 @@ fn wire_snapshot(
 #[async_trait]
 impl RpcHandler for HarnessRpcHandler {
     async fn handle(&self, session_id: Option<SessionId>, body: RpcRequestBody) -> RpcResponseBody {
+        // Hello is handled entirely at the transport layer (each transport's
+        // dispatch() intercepts it before this method is ever called, the
+        // same way Subscribe is intercepted) since it's a connection-level
+        // handshake with no session semantics. This arm only fires if a
+        // transport forwards it here anyway, which would be a bug in that
+        // transport.
+        if matches!(body, RpcRequestBody::Hello { .. }) {
+            return RpcResponseBody::Error {
+                message: "Hello must be handled by the transport, not dispatched to handle()"
+                    .to_string(),
+            };
+        }
+
         // CreateSession is the only request that doesn't target an existing
         // session, so it's handled before the session lookup below.
         if let RpcRequestBody::CreateSession {
@@ -117,6 +143,7 @@ impl RpcHandler for HarnessRpcHandler {
         };
 
         match body {
+            RpcRequestBody::Hello { .. } => unreachable!("handled above"),
             RpcRequestBody::CreateSession { .. } => unreachable!("handled above"),
 
             RpcRequestBody::Prompt(input) => {
@@ -125,13 +152,17 @@ impl RpcHandler for HarnessRpcHandler {
                 // engine API yet. Revisit once that's added.
                 match handle.send(&input.text).await {
                     Ok(()) => RpcResponseBody::Ack,
-                    Err(error) => RpcResponseBody::Error { message: error.to_string() },
+                    Err(error) => RpcResponseBody::Error {
+                        message: error.to_string(),
+                    },
                 }
             }
 
             RpcRequestBody::Cancel => match handle.cancel().await {
                 Ok(()) => RpcResponseBody::Ack,
-                Err(error) => RpcResponseBody::Error { message: error.to_string() },
+                Err(error) => RpcResponseBody::Error {
+                    message: error.to_string(),
+                },
             },
 
             // SessionHandle doesn't expose pause/resume yet — only
@@ -144,7 +175,9 @@ impl RpcHandler for HarnessRpcHandler {
             RpcRequestBody::ResolvePermission { id, decision } => {
                 match handle.resolve_permission(id, decision).await {
                     Ok(()) => RpcResponseBody::Ack,
-                    Err(error) => RpcResponseBody::Error { message: error.to_string() },
+                    Err(error) => RpcResponseBody::Error {
+                        message: error.to_string(),
+                    },
                 }
             }
 
@@ -155,13 +188,18 @@ impl RpcHandler for HarnessRpcHandler {
             // subscribing needs a long-lived receiver, not a single
             // request/response. This arm only fires if a transport forwards
             // it here anyway, which would be a bug in that transport.
-            RpcRequestBody::Subscribe => RpcResponseBody::Error {
+            RpcRequestBody::Subscribe { .. } => RpcResponseBody::Error {
                 message: "Subscribe must be handled by the transport, not dispatched to handle()"
                     .to_string(),
             },
 
             RpcRequestBody::CloseSession => {
-                match self.harness.session_manager().close_session(session_id).await {
+                match self
+                    .harness
+                    .session_manager()
+                    .close_session(session_id)
+                    .await
+                {
                     Ok(()) => {
                         self.sessions
                             .lock()
@@ -169,7 +207,9 @@ impl RpcHandler for HarnessRpcHandler {
                             .remove(&session_id);
                         RpcResponseBody::Ack
                     }
-                    Err(error) => RpcResponseBody::Error { message: error.to_string() },
+                    Err(error) => RpcResponseBody::Error {
+                        message: error.to_string(),
+                    },
                 }
             }
         }
@@ -178,6 +218,27 @@ impl RpcHandler for HarnessRpcHandler {
     fn subscribe(&self, session_id: SessionId) -> Option<broadcast::Receiver<AgentEventEnvelope>> {
         self.lookup(session_id).map(|handle| handle.subscribe())
     }
+
+    async fn events_since(&self, session_id: SessionId, since_seq: u64) -> Vec<AgentEventEnvelope> {
+        // Only known sessions can be resumed — an unknown session_id
+        // (already closed, or never created on this daemon instance) has no
+        // meaningful backlog to replay.
+        if self.lookup(session_id).is_none() {
+            return Vec::new();
+        }
+        match self
+            .harness
+            .session_store()
+            .events_since(session_id, since_seq)
+            .await
+        {
+            Ok(events) => events.into_iter().map(|event| event.envelope).collect(),
+            // No durable history (no store configured, or nothing persisted
+            // yet for this session) — resume degrades to "live events only",
+            // matching `Subscribe { since_seq: None }`'s behavior.
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,10 +246,31 @@ mod tests {
     use super::*;
 
     use harness_integration_anthropic::AnthropicConfig;
+    use harness_protocol::commands::AgentStatus;
+    use harness_protocol::events::{AgentEvent, EventVisibility};
+    use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp};
 
     fn empty_toolset() -> harness_protocol::tools::AgentToolset {
         harness_protocol::tools::AgentToolset {
             tools: HashMap::new(),
+        }
+    }
+
+    fn durable_envelope(session_id: SessionId, sequence: u64) -> AgentEventEnvelope {
+        AgentEventEnvelope {
+            event_id: EventId::new(),
+            session_id,
+            agent_id: AgentId::new(),
+            parent_agent_id: None,
+            run_id: Some(RunId::new()),
+            agent_sequence: sequence,
+            session_sequence: Some(sequence),
+            timestamp: Timestamp::now(),
+            visibility: EventVisibility::User,
+            event: AgentEvent::StateChanged {
+                from: AgentStatus::Idle,
+                to: AgentStatus::PreparingContext,
+            },
         }
     }
 
@@ -200,6 +282,20 @@ mod tests {
         let store_dir = tempfile::tempdir().expect("tempdir");
         let harness = Harness::builder()
             .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
+            .build()
+            .await
+            .expect("build harness");
+        (HarnessRpcHandler::new(Arc::new(harness)), store_dir)
+    }
+
+    async fn new_handler_with_store() -> (HarnessRpcHandler, tempfile::TempDir) {
+        let store_dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(harness_session_store::JsonlSessionStore::new(
+            store_dir.path().to_path_buf(),
+        ));
+        let harness = Harness::builder()
+            .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
+            .session_store(store)
             .build()
             .await
             .expect("build harness");
@@ -228,14 +324,20 @@ mod tests {
             other => panic!("expected SessionCreated, got {other:?}"),
         };
 
-        let snapshot = handler.handle(Some(session_id), RpcRequestBody::Snapshot).await;
+        let snapshot = handler
+            .handle(Some(session_id), RpcRequestBody::Snapshot)
+            .await;
         assert!(matches!(snapshot, RpcResponseBody::Snapshot(_)));
 
-        let closed = handler.handle(Some(session_id), RpcRequestBody::CloseSession).await;
+        let closed = handler
+            .handle(Some(session_id), RpcRequestBody::CloseSession)
+            .await;
         assert!(matches!(closed, RpcResponseBody::Ack));
 
         // The session is gone from the handler's map now.
-        let after_close = handler.handle(Some(session_id), RpcRequestBody::Snapshot).await;
+        let after_close = handler
+            .handle(Some(session_id), RpcRequestBody::Snapshot)
+            .await;
         assert!(matches!(after_close, RpcResponseBody::Error { .. }));
     }
 
@@ -253,5 +355,104 @@ mod tests {
         let (handler, _store_dir) = new_handler().await;
         let response = handler.handle(None, RpcRequestBody::Snapshot).await;
         assert!(matches!(response, RpcResponseBody::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn hello_dispatched_to_handle_returns_error() {
+        let (handler, _store_dir) = new_handler().await;
+        let response = handler
+            .handle(
+                None,
+                RpcRequestBody::Hello {
+                    protocol_version: 1,
+                },
+            )
+            .await;
+        assert!(matches!(response, RpcResponseBody::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn subscribe_dispatched_to_handle_returns_error() {
+        let (handler, _store_dir) = new_handler().await;
+        let response = handler
+            .handle(
+                Some(SessionId::new()),
+                RpcRequestBody::Subscribe { since_seq: None },
+            )
+            .await;
+        assert!(matches!(response, RpcResponseBody::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn events_since_on_unknown_session_returns_empty() {
+        let (handler, _store_dir) = new_handler().await;
+        let backlog = handler.events_since(SessionId::new(), 0).await;
+        assert!(backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_since_without_a_durable_store_returns_empty() {
+        let (handler, _store_dir) = new_handler().await;
+        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+        let create = handler
+            .handle(
+                None,
+                RpcRequestBody::CreateSession {
+                    workspace_root: workspace_dir.path().to_path_buf(),
+                    integration: "anthropic".to_string(),
+                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
+                        .unwrap(),
+                    toolset: empty_toolset(),
+                },
+            )
+            .await;
+        let session_id = match create {
+            RpcResponseBody::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+
+        // `new_handler()` builds a `Harness` without `.session_store(...)`,
+        // so it falls back to the in-memory no-op store — resume degrades to
+        // "no backlog" rather than erroring.
+        let backlog = handler.events_since(session_id, 0).await;
+        assert!(backlog.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_since_filters_by_session_sequence() {
+        let (handler, _store_dir) = new_handler_with_store().await;
+        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+        let create = handler
+            .handle(
+                None,
+                RpcRequestBody::CreateSession {
+                    workspace_root: workspace_dir.path().to_path_buf(),
+                    integration: "anthropic".to_string(),
+                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
+                        .unwrap(),
+                    toolset: empty_toolset(),
+                },
+            )
+            .await;
+        let session_id = match create {
+            RpcResponseBody::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+
+        for sequence in 1..=3 {
+            handler
+                .harness
+                .session_store()
+                .append(durable_envelope(session_id, sequence).into())
+                .await
+                .expect("append durable event");
+        }
+
+        let backlog = handler.events_since(session_id, 1).await;
+        let sequences: Vec<u64> = backlog
+            .iter()
+            .map(|event| event.session_sequence.expect("sequenced event"))
+            .collect();
+        assert_eq!(sequences, vec![2, 3]);
     }
 }

@@ -97,6 +97,14 @@ impl ModelClient for AnthropicClient {
     /// The `cancel` token is checked before forwarding each event. When
     /// cancellation is signalled the method returns [`ModelError::Cancelled`]
     /// immediately.
+    ///
+    /// # Timeouts
+    ///
+    /// Both connection-level timeouts (raised by `reqwest` while sending the
+    /// request) and stream-read timeouts (raised while awaiting the next SSE
+    /// chunk) are classified as [`ModelError::Timeout`] rather than a generic
+    /// [`ModelError::BackendError`], so the recovery policy can treat them as
+    /// retryable transient failures.
     #[instrument(skip(self, request, events, cancel))]
     async fn stream(
         &self,
@@ -259,7 +267,7 @@ impl AnthropicClient {
     fn handle_rate_limit(
         response: reqwest::Response,
     ) -> Result<ModelResult, ModelError> {
-        let retry_after = retry_after(response.headers());
+        let retry_after = retry_after_from_headers(response.headers());
 
         Err(ModelError::RateLimited { retry_after })
     }
@@ -277,38 +285,28 @@ impl AnthropicClient {
     }
 }
 
-/// Normalize standard `Retry-After` (seconds) and Anthropic's millisecond hint.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get("retry-after-ms")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .or_else(|| {
-            headers
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs)
-        })
+/// Normalize Anthropic's `retry-after-ms` and the standard `Retry-After`
+/// (seconds) headers using the shared, provider-neutral parser.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    harness_model::retry::parse_retry_after(|name| headers.get(name).and_then(|value| value.to_str().ok()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::retry_after;
+    use super::retry_after_from_headers;
     use std::time::Duration;
 
     #[test]
     fn retry_after_ms_is_normalized_to_duration() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "1250".parse().unwrap());
-        assert_eq!(retry_after(&headers), Some(Duration::from_millis(1250)));
+        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_millis(1250)));
     }
 
     #[test]
     fn standard_retry_after_uses_seconds() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
-        assert_eq!(retry_after(&headers), Some(Duration::from_secs(3)));
+        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_secs(3)));
     }
 }

@@ -1,3 +1,4 @@
+
 //! Anthropic backend composition and registry factory.
 
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use async_trait::async_trait;
 use harness_generic_backend::GenericModelBackend;
 use harness_protocol::backend::{BackendCapabilities, BackendDescriptor};
 use harness_protocol::ids::BackendId;
-use harness_runtime::{IntegrationFactory, traits::ExecutionBackend};
+use harness_runtime::{traits::ExecutionBackend, IntegrationFactory};
 
 use crate::client::AnthropicClient;
 use crate::config::AnthropicConfig;
@@ -17,7 +18,8 @@ pub struct AnthropicBackend;
 impl AnthropicBackend {
     /// Construct an Anthropic-backed execution backend for direct injection.
     pub fn new(config: AnthropicConfig) -> GenericModelBackend {
-        GenericModelBackend::new(Arc::new(AnthropicClient::new(config)))
+        let recovery = config.recovery.clone();
+        GenericModelBackend::new_with_recovery(Arc::new(AnthropicClient::new(config)), recovery)
     }
 }
 
@@ -66,6 +68,18 @@ mod tests {
         assert!(capabilities.streaming);
         assert!(capabilities.tool_calls);
         assert!(capabilities.host_managed_tools);
+        assert_eq!(
+            backend.recovery_policy(),
+            &harness_generic_backend::RecoveryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn direct_constructor_uses_configured_recovery_policy() {
+        let mut config = AnthropicConfig::new("test-key");
+        config.recovery.max_attempts = 5;
+        let backend = AnthropicBackend::new(config);
+        assert_eq!(backend.recovery_policy().max_attempts, 5);
     }
 
     #[tokio::test]

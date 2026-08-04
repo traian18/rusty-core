@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicConfig;
-use harness_protocol::rpc::{RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody};
+use harness_protocol::rpc::{
+    RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
+    PROTOCOL_VERSION,
+};
 use harness_protocol::tools::AgentToolset;
 use harness_runtime::rpc::RpcHandler;
 
@@ -72,6 +75,18 @@ async fn full_stack_create_session_snapshot_close() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let mut stream = stream.expect("connect to harnessd's socket");
+
+    // Every wire connection negotiates compatibility before session RPCs.
+    let hello = RpcRequest {
+        id: RequestCorrelationId(0),
+        session_id: None,
+        body: RpcRequestBody::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    };
+    write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()).await;
+    let response = read_frame(&mut stream).await;
+    assert!(matches!(response.body, RpcResponseBody::Hello { .. }));
 
     // CreateSession
     let create = RpcRequest {

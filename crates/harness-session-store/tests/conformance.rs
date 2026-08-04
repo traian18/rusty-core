@@ -1,3 +1,4 @@
+
 //! Shared `SessionStore` conformance suite (Tasks 7.3/7.4 acceptance criteria).
 //!
 //! The same battery of contract checks runs against **both** concrete store
@@ -33,7 +34,7 @@ use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, MessageId, RunId, SessionId, Timestamp};
 use harness_session_store::{
     DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, SessionStore,
-    SqliteSessionStore, StoredSession, StoreError,
+    SqliteSessionStore, StoreError, StoredSession,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,7 +49,10 @@ use harness_session_store::{
 fn envelope(session: SessionId, seq: u64) -> AgentEventEnvelope {
     let (from, to) = match seq % 3 {
         0 => (AgentStatus::Idle, AgentStatus::PreparingContext),
-        1 => (AgentStatus::PreparingContext, AgentStatus::WaitingForBackend),
+        1 => (
+            AgentStatus::PreparingContext,
+            AgentStatus::WaitingForBackend,
+        ),
         _ => (AgentStatus::WaitingForBackend, AgentStatus::Executing),
     };
     AgentEventEnvelope {
@@ -172,7 +176,10 @@ async fn round_trip_reconstructed_session_matches_exactly(store: Arc<dyn Session
 async fn load_returns_all_events_when_no_snapshot(store: Arc<dyn SessionStore>) {
     let session = SessionId::new();
     for seq in 1..=3 {
-        store.append(event(session, seq)).await.expect("append event");
+        store
+            .append(event(session, seq))
+            .await
+            .expect("append event");
     }
 
     let stored = store.load_session(session).await.expect("load session");
@@ -189,8 +196,37 @@ async fn load_returns_all_events_when_no_snapshot(store: Arc<dyn SessionStore>) 
     );
     for event in &stored.events {
         assert_eq!(event.envelope.session_id, session);
-        assert!(matches!(event.envelope.event, AgentEvent::StateChanged { .. }));
+        assert!(matches!(
+            event.envelope.event,
+            AgentEvent::StateChanged { .. }
+        ));
     }
+}
+
+/// Resume history is independent of restore snapshots: a client cursor from
+/// before the latest snapshot still receives every durable event after it.
+async fn events_since_reads_full_history_across_snapshot(store: Arc<dyn SessionStore>) {
+    let session = SessionId::new();
+    for seq in 1..=5 {
+        store
+            .append(event(session, seq))
+            .await
+            .expect("append event");
+    }
+    store
+        .save_snapshot(snapshot(session, 4))
+        .await
+        .expect("save snapshot");
+
+    let resumed = store
+        .events_since(session, 2)
+        .await
+        .expect("resume history");
+    let sequences: Vec<u64> = resumed
+        .iter()
+        .map(|event| event.session_sequence.expect("sequenced event"))
+        .collect();
+    assert_eq!(sequences, vec![3, 4, 5]);
 }
 
 /// An unknown session loads as `StoreError::NotFound`.
@@ -299,6 +335,7 @@ async fn concurrent_appends_are_serialized_and_intact(store: Arc<dyn SessionStor
 async fn conformance_suite(store: Arc<dyn SessionStore>) {
     round_trip_reconstructed_session_matches_exactly(store.clone()).await;
     load_returns_all_events_when_no_snapshot(store.clone()).await;
+    events_since_reads_full_history_across_snapshot(store.clone()).await;
     load_missing_session_is_not_found(store.clone()).await;
     ephemeral_events_are_rejected(store.clone()).await;
     later_snapshot_replaces_earlier(store.clone()).await;

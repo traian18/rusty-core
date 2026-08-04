@@ -1,3 +1,4 @@
+
 //! Session store contract and durable session types.
 //!
 //! This module defines the abstract persistence contract from spec §59 —
@@ -29,9 +30,7 @@ use serde::{Deserialize, Serialize};
 use harness_protocol::backend::BackendBinding;
 use harness_protocol::commands::{AgentError, AgentOperation, AgentStatus};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope};
-use harness_protocol::ids::{
-    AgentId, PermissionId, RunId, SessionId, Timestamp, ToolCallId,
-};
+use harness_protocol::ids::{AgentId, PermissionId, RunId, SessionId, Timestamp, ToolCallId};
 use harness_protocol::messages::AgentMessage;
 use harness_protocol::tools::ToolCall;
 use harness_protocol::usage::AgentBudget;
@@ -261,6 +260,25 @@ pub trait SessionStore: Send + Sync {
     /// Returns [`StoreError::NotFound`] if no stored data exists for `id`.
     async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError>;
 
+    /// Loads durable events whose session sequence is strictly greater than
+    /// `since_seq`, ordered oldest first.
+    ///
+    /// Unlike `load_session`, this is a history API: snapshots must not hide
+    /// older events that a reconnecting client has not observed yet. Stores
+    /// with an indexed/full-log implementation should override this method.
+    async fn events_since(
+        &self,
+        id: SessionId,
+        since_seq: u64,
+    ) -> Result<Vec<DurableSessionEvent>, StoreError> {
+        let stored = self.load_session(id).await?;
+        Ok(stored
+            .events
+            .into_iter()
+            .filter(|event| event.session_sequence.is_some_and(|seq| seq > since_seq))
+            .collect())
+    }
+
     /// Appends a single durable event to the session's history.
     ///
     /// Callers must only pass events for which [`is_durable`] returns `true`;
@@ -308,18 +326,19 @@ pub trait SessionStore: Send + Sync {
 /// | `Failed`                    | yes      | error                                              |
 /// | `Completed`                 | yes      | final outcome                                      |
 pub fn is_durable(event: &AgentEvent) -> bool {
-    matches!(event,
+    matches!(
+        event,
         AgentEvent::AssistantMessageCompleted { .. }
-        | AgentEvent::ToolCallStarted { .. }
-        | AgentEvent::ToolCallCompleted { .. }
-        | AgentEvent::ChildAgentSpawned { .. }
-        | AgentEvent::ChildAgentCompleted { .. }
-        | AgentEvent::PermissionRequested { .. }
-        | AgentEvent::UsageUpdated { .. }
-        | AgentEvent::Failed { .. }
-        | AgentEvent::Completed { .. }
-        | AgentEvent::StateChanged { .. }
-        | AgentEvent::RunStarted { .. }
+            | AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ToolCallCompleted { .. }
+            | AgentEvent::ChildAgentSpawned { .. }
+            | AgentEvent::ChildAgentCompleted { .. }
+            | AgentEvent::PermissionRequested { .. }
+            | AgentEvent::UsageUpdated { .. }
+            | AgentEvent::Failed { .. }
+            | AgentEvent::Completed { .. }
+            | AgentEvent::StateChanged { .. }
+            | AgentEvent::RunStarted { .. }
     )
     // explicitly ephemeral: AssistantTextDelta, ReasoningDelta,
     // AssistantMessageStarted, BackendRequestStarted, ToolCallRequested,
@@ -333,11 +352,9 @@ pub fn is_durable(event: &AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_protocol::backend::{
-        BackendCapabilities, BackendDescriptor, BackendReference,
-    };
-    use harness_protocol::events::{AgentOutcome, EventVisibility};
+    use harness_protocol::backend::{BackendCapabilities, BackendDescriptor, BackendReference};
     use harness_protocol::effects::PermissionRequest;
+    use harness_protocol::events::{AgentOutcome, EventVisibility};
     use harness_protocol::ids::{
         BackendId, ConfigurationId, EventId, IntegrationId, MessageId, RequestId, RunId,
     };
@@ -677,10 +694,7 @@ mod tests {
         assert_eq!(agent.budget.max_total_tokens, Some(1000));
         // The resolved backend config survives the round-trip.
         assert_eq!(agent.backend_config["model"], "claude-3-5-sonnet");
-        assert_eq!(
-            agent.backend_config["endpoint"],
-            "https://api.example.com"
-        );
+        assert_eq!(agent.backend_config["endpoint"], "https://api.example.com");
         assert_eq!(agent.capabilities["can_spawn_agents"], false);
         assert!(agent.usage.is_object());
     }

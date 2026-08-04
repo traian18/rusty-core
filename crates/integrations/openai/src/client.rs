@@ -100,9 +100,15 @@ impl ModelClient for OpenAiClient {
             .json(&openai_request)
             .send()
             .await
-            .map_err(|e| ModelError::BackendError {
-                message: format!("HTTP request failed: {e}"),
-                code: "request_failed".to_string(),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ModelError::Timeout
+                } else {
+                    ModelError::BackendError {
+                        message: format!("HTTP request failed: {e}"),
+                        code: "request_failed".to_string(),
+                    }
+                }
             })?;
 
         let status = response.status();
@@ -128,8 +134,14 @@ impl OpenAiClient {
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                chunk = response.chunk() => chunk.map_err(|error| ModelError::Protocol {
-                    message: format!("failed to read OpenAI SSE stream: {error}"),
+                chunk = response.chunk() => chunk.map_err(|error| {
+                    if error.is_timeout() {
+                        ModelError::Timeout
+                    } else {
+                        ModelError::Protocol {
+                            message: format!("failed to read OpenAI SSE stream: {error}"),
+                        }
+                    }
                 })?,
             };
             let Some(chunk) = chunk else { break };
@@ -153,11 +165,7 @@ impl OpenAiClient {
     }
 
     fn handle_rate_limit(response: reqwest::Response) -> Result<ModelResult, ModelError> {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+        let retry_after = retry_after_from_headers(response.headers());
         Err(ModelError::RateLimited { retry_after })
     }
 
@@ -170,5 +178,30 @@ impl OpenAiClient {
             message: format!("HTTP {status}: {body}"),
             code: status.as_u16().to_string(),
         })
+    }
+}
+
+/// Normalize OpenAI's standard `Retry-After` header (whole seconds) using the
+/// shared, provider-neutral parser.
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    harness_model::retry::parse_retry_after(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_after_from_headers;
+    use std::time::Duration;
+
+    #[test]
+    fn standard_retry_after_is_normalized_to_duration() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn missing_header_normalizes_to_none() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_from_headers(&headers), None);
     }
 }

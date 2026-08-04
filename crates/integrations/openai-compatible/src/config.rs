@@ -1,8 +1,10 @@
+
 use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use harness_generic_backend::RecoveryPolicy;
 use harness_integration_openai::OpenAiConfig;
 
 /// Configuration for an OpenAI-Chat-Completions-compatible endpoint
@@ -28,6 +30,9 @@ pub struct OpenAiCompatibleConfig {
         deserialize_with = "deserialize_duration_secs"
     )]
     pub request_timeout: Duration,
+    /// Retry, deadline, and circuit-breaker settings for provider calls.
+    #[serde(default)]
+    pub recovery: RecoveryPolicy,
     /// Some providers require a custom header beyond `Authorization`.
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
@@ -63,6 +68,7 @@ impl OpenAiCompatibleConfig {
             model: model.into(),
             default_max_tokens: default_max_tokens(),
             request_timeout: default_timeout(),
+            recovery: RecoveryPolicy::default(),
             extra_headers: HashMap::new(),
         }
     }
@@ -77,6 +83,7 @@ impl OpenAiCompatibleConfig {
             default_model: self.model,
             default_max_tokens: self.default_max_tokens,
             request_timeout: self.request_timeout,
+            recovery: self.recovery,
             extra_headers: self.extra_headers,
         }
     }
@@ -88,9 +95,12 @@ mod tests {
 
     #[test]
     fn maps_fields_into_openai_config() {
-        let mut config = OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
+        let mut config =
+            OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
         config.api_key = Some("or-key".to_string());
-        config.extra_headers.insert("HTTP-Referer".to_string(), "my-app".to_string());
+        config
+            .extra_headers
+            .insert("HTTP-Referer".to_string(), "my-app".to_string());
 
         let openai_config = config.into_openai_config();
         assert_eq!(openai_config.base_url, "https://openrouter.ai/api/v1");
@@ -110,6 +120,14 @@ mod tests {
     }
 
     #[test]
+    fn maps_custom_recovery_into_openai_config() {
+        let mut config = OpenAiCompatibleConfig::new("http://localhost:11434/v1", "llama3");
+        config.recovery.max_attempts = 6;
+        let openai_config = config.into_openai_config();
+        assert_eq!(openai_config.recovery.max_attempts, 6);
+    }
+
+    #[test]
     fn deserializes_from_minimal_json() {
         let config: OpenAiCompatibleConfig = serde_json::from_value(serde_json::json!({
             "base_url": "http://localhost:11434/v1",
@@ -118,5 +136,6 @@ mod tests {
         .expect("valid minimal config");
         assert_eq!(config.default_max_tokens, 4096);
         assert!(config.api_key.is_none());
+        assert_eq!(config.recovery, RecoveryPolicy::default());
     }
 }

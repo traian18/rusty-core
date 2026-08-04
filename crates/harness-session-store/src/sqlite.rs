@@ -1,3 +1,4 @@
+
 //! WAL-mode SQLite [`SessionStore`] backed by a single-writer actor (Tasks 7.2/7.3).
 //!
 //! # Architecture
@@ -70,8 +71,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
-    is_durable, DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoredAgentState,
-    StoredSession, StoreError,
+    is_durable, DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoreError,
+    StoredAgentState, StoredSession,
 };
 
 /// Number of write requests that may be queued to the writer actor before
@@ -149,7 +150,10 @@ impl SqliteSessionStore {
             .build(manager)
             .map_err(|error| StoreError::Backend(format!("build read pool: {error}")))?;
 
-        Ok(Self { write_tx, read_pool })
+        Ok(Self {
+            write_tx,
+            read_pool,
+        })
     }
 }
 
@@ -278,7 +282,13 @@ fn handle_save_snapshot(
         .transaction()
         .map_err(|error| map_sqlite_error("begin snapshot transaction", error))?;
 
-    ensure_session(&tx, &snapshot.session_id, &snapshot.root_agent_id, now_ms(), true)?;
+    ensure_session(
+        &tx,
+        &snapshot.session_id,
+        &snapshot.root_agent_id,
+        now_ms(),
+        true,
+    )?;
 
     let agents_json = serde_json::to_string(&snapshot.agents)?;
     // The timestamp column holds the RFC3339-serialized `Timestamp` (via
@@ -335,10 +345,56 @@ fn ensure_session(
     };
     conn.execute(
         sql,
-        params![session_id.to_string(), root_agent_id.to_string(), updated_at],
+        params![
+            session_id.to_string(),
+            root_agent_id.to_string(),
+            updated_at
+        ],
     )
     .map_err(|error| map_sqlite_error("ensure session row", error))?;
     Ok(())
+}
+
+/// Reads the durable history after a reconnect cursor without applying the
+/// restore snapshot cutoff. The durable-events index makes this a bounded
+/// range query even when a session has a long history.
+fn events_since_sync(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+    id: SessionId,
+    since_seq: u64,
+) -> Result<Vec<DurableSessionEvent>, StoreError> {
+    let conn = pool
+        .get()
+        .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_sequence, envelope
+             FROM durable_events
+             WHERE session_id = ?1 AND session_sequence > ?2
+             ORDER BY session_sequence ASC, appended_at ASC",
+        )
+        .map_err(|error| map_sqlite_error("prepare resumed event query", error))?;
+    let rows = stmt
+        .query_map(params![id.to_string(), since_seq as i64], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| map_sqlite_error("query resumed events", error))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (session_sequence, envelope_json) =
+            row.map_err(|error| map_sqlite_error("read resumed event row", error))?;
+        let mut envelope: AgentEventEnvelope =
+            serde_json::from_str(&envelope_json).map_err(|error| {
+                StoreError::InvalidState(format!("corrupt durable event envelope: {error}"))
+            })?;
+        envelope.session_sequence = Some(session_sequence);
+        events.push(DurableSessionEvent {
+            envelope,
+            session_sequence: Some(session_sequence),
+        });
+    }
+    Ok(events)
 }
 
 /// Reconstructs a [`StoredSession`] for `id` from the latest snapshot plus the
@@ -408,11 +464,10 @@ fn load_session_sync(
     for row in rows {
         let (session_sequence, envelope_json) =
             row.map_err(|error| map_sqlite_error("read durable event row", error))?;
-        let mut envelope: AgentEventEnvelope = serde_json::from_str(&envelope_json).map_err(
-            |error| {
+        let mut envelope: AgentEventEnvelope =
+            serde_json::from_str(&envelope_json).map_err(|error| {
                 StoreError::InvalidState(format!("corrupt durable event envelope: {error}"))
-            },
-        )?;
+            })?;
         envelope.session_sequence = Some(session_sequence);
         events.push(DurableSessionEvent {
             envelope,
@@ -466,6 +521,17 @@ fn map_sqlite_error(context: &str, error: rusqlite::Error) -> StoreError {
 
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn events_since(
+        &self,
+        id: SessionId,
+        since_seq: u64,
+    ) -> Result<Vec<DurableSessionEvent>, StoreError> {
+        let pool = self.read_pool.clone();
+        tokio::task::spawn_blocking(move || events_since_sync(&pool, id, since_seq))
+            .await
+            .map_err(|error| StoreError::Backend(format!("events_since task failed: {error}")))?
+    }
+
     async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError> {
         // Reads go through the pooled connection — never the writer channel.
         let pool = self.read_pool.clone();
@@ -488,10 +554,9 @@ impl SessionStore for SqliteSessionStore {
             .send(WriteCommand::Append { event, reply })
             .await
             .map_err(|_| StoreError::Backend("sqlite writer task is not running".into()))?;
-        ack.await
-            .map_err(|_| {
-                StoreError::Backend("sqlite writer task terminated before acknowledging".into())
-            })?
+        ack.await.map_err(|_| {
+            StoreError::Backend("sqlite writer task terminated before acknowledging".into())
+        })?
     }
 
     async fn save_snapshot(&self, snapshot: DurableSessionSnapshot) -> Result<(), StoreError> {
@@ -500,10 +565,9 @@ impl SessionStore for SqliteSessionStore {
             .send(WriteCommand::SaveSnapshot { snapshot, reply })
             .await
             .map_err(|_| StoreError::Backend("sqlite writer task is not running".into()))?;
-        ack.await
-            .map_err(|_| {
-                StoreError::Backend("sqlite writer task terminated before acknowledging".into())
-            })?
+        ack.await.map_err(|_| {
+            StoreError::Backend("sqlite writer task terminated before acknowledging".into())
+        })?
     }
 }
 
@@ -593,11 +657,8 @@ mod tests {
         assert_eq!(loaded_snapshot.session_sequence, 3);
 
         // Only the events appended after the snapshot's sequence remain.
-        let sequences: Vec<Option<u64>> = stored
-            .events
-            .iter()
-            .map(|e| e.session_sequence)
-            .collect();
+        let sequences: Vec<Option<u64>> =
+            stored.events.iter().map(|e| e.session_sequence).collect();
         assert_eq!(sequences, vec![Some(4), Some(5)]);
 
         // The envelopes round-tripped intact (payload + event ids).
@@ -605,7 +666,10 @@ mod tests {
         assert_eq!(stored.events[1].envelope.event_id, appended_ids[4]);
         for event in &stored.events {
             assert_eq!(event.envelope.session_id, session);
-            assert!(matches!(event.envelope.event, AgentEvent::StateChanged { .. }));
+            assert!(matches!(
+                event.envelope.event,
+                AgentEvent::StateChanged { .. }
+            ));
         }
     }
 
@@ -620,11 +684,8 @@ mod tests {
 
         let stored = store.load_session(session).await.expect("load session");
         assert!(stored.snapshot.is_none());
-        let sequences: Vec<Option<u64>> = stored
-            .events
-            .iter()
-            .map(|e| e.session_sequence)
-            .collect();
+        let sequences: Vec<Option<u64>> =
+            stored.events.iter().map(|e| e.session_sequence).collect();
         assert_eq!(sequences, vec![Some(1), Some(2)]);
     }
 
@@ -656,12 +717,19 @@ mod tests {
         } // store dropped -> channel closed -> writer checkpoints and exits
 
         let reopened = SqliteSessionStore::open(&db_path).expect("reopen store");
-        let stored = reopened.load_session(session).await.expect("reload session");
+        let stored = reopened
+            .load_session(session)
+            .await
+            .expect("reload session");
         assert_eq!(
             stored.snapshot.as_ref().map(|s| s.session_sequence),
             Some(2)
         );
-        assert_eq!(stored.events.len(), 0, "both events captured by the snapshot");
+        assert_eq!(
+            stored.events.len(),
+            0,
+            "both events captured by the snapshot"
+        );
     }
 
     #[tokio::test]
@@ -694,17 +762,26 @@ mod tests {
         for seq in 0..16 {
             let store_a = store.clone();
             handles.push(tokio::spawn(async move {
-                store_a.append(event(session_a, seq)).await.expect("append to A");
+                store_a
+                    .append(event(session_a, seq))
+                    .await
+                    .expect("append to A");
             }));
             let store_b = store.clone();
             handles.push(tokio::spawn(async move {
-                store_b.append(event(session_b, seq)).await.expect("append to B");
+                store_b
+                    .append(event(session_b, seq))
+                    .await
+                    .expect("append to B");
             }));
         }
         for seq in 16..48 {
             let store = store.clone();
             handles.push(tokio::spawn(async move {
-                store.append(event(session_a, seq)).await.expect("burst append to A");
+                store
+                    .append(event(session_a, seq))
+                    .await
+                    .expect("burst append to A");
             }));
         }
         for handle in handles {
@@ -715,12 +792,26 @@ mod tests {
         let b = store.load_session(session_b).await.expect("load session B");
 
         // Every append landed exactly once, as a complete, intact row.
-        let seqs_a: Vec<u64> = a.events.iter().map(|e| e.session_sequence.unwrap()).collect();
-        let seqs_b: Vec<u64> = b.events.iter().map(|e| e.session_sequence.unwrap()).collect();
+        let seqs_a: Vec<u64> = a
+            .events
+            .iter()
+            .map(|e| e.session_sequence.unwrap())
+            .collect();
+        let seqs_b: Vec<u64> = b
+            .events
+            .iter()
+            .map(|e| e.session_sequence.unwrap())
+            .collect();
         assert_eq!(seqs_a, (0..48).collect::<Vec<u64>>());
         assert_eq!(seqs_b, (0..16).collect::<Vec<u64>>());
-        assert!(a.events.iter().all(|e| e.envelope.event_id.to_string().len() == 36));
-        assert!(b.events.iter().all(|e| e.envelope.event_id.to_string().len() == 36));
+        assert!(a
+            .events
+            .iter()
+            .all(|e| e.envelope.event_id.to_string().len() == 36));
+        assert!(b
+            .events
+            .iter()
+            .all(|e| e.envelope.event_id.to_string().len() == 36));
     }
 
     #[tokio::test]
@@ -900,8 +991,14 @@ mod tests {
         assert!(matches!(error, StoreError::NotFound(_)));
 
         // The store remains fully writable after recovery.
-        store.append(event(session, 1)).await.expect("append after recovery");
-        let stored = store.load_session(session).await.expect("load after recovery");
+        store
+            .append(event(session, 1))
+            .await
+            .expect("append after recovery");
+        let stored = store
+            .load_session(session)
+            .await
+            .expect("load after recovery");
         assert_eq!(stored.events.len(), 1);
     }
 }

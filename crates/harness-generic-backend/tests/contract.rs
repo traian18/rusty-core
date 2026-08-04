@@ -354,8 +354,9 @@ async fn test_error_normalization_backend_error() {
 
 #[tokio::test]
 async fn test_error_normalization_rate_limited() {
-    let client =
-        FakeModelClient::new().with_error(ModelError::RateLimited { retry_after: Some(42) });
+    let client = FakeModelClient::new().with_error(ModelError::RateLimited {
+        retry_after: Some(Duration::from_secs(42)),
+    });
 
     let backend = GenericModelBackend::new(Arc::new(client));
     let (result, _events) = run_execution(backend).await;

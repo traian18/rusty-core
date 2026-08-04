@@ -60,6 +60,9 @@ pub async fn run(
     integration_config: serde_json::Value,
     toolset: AgentToolset,
 ) -> Result<()> {
+    // `HarnessClient::connect` performs the `Hello` protocol-version
+    // handshake before returning, so a version-mismatched daemon fails here
+    // with a clear error rather than later during session interaction.
     let mut client = HarnessClient::connect(socket).await?;
 
     let session_id = match client
@@ -77,7 +80,11 @@ pub async fn run(
         RpcResponseBody::SessionCreated { session_id } => session_id,
         other => anyhow::bail!("create session failed: {other:?}"),
     };
-    client.subscribe(session_id).await?;
+    // A freshly created session has no history to resume, so `since_seq` is
+    // `None` — this is a live-only subscription, matching pre-resume
+    // behavior. A future reconnect flow for this same session would pass
+    // the highest `session_sequence` observed before the disconnect.
+    client.subscribe(session_id, None).await?;
 
     // From here on, reads and writes happen concurrently: a background task
     // owns the read half and forwards every frame (pushed events as well as

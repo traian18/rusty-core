@@ -1,3 +1,4 @@
+
 //! OpenAI backend composition and registry factory.
 
 use std::sync::Arc;
@@ -16,7 +17,8 @@ pub struct OpenAiBackend;
 
 impl OpenAiBackend {
     pub fn new(config: OpenAiConfig) -> GenericModelBackend {
-        GenericModelBackend::new(Arc::new(OpenAiClient::new(config)))
+        let recovery = config.recovery.clone();
+        GenericModelBackend::new_with_recovery(Arc::new(OpenAiClient::new(config)), recovery)
     }
 }
 
@@ -65,6 +67,18 @@ mod tests {
         assert!(capabilities.streaming);
         assert!(capabilities.tool_calls);
         assert!(capabilities.host_managed_tools);
+        assert_eq!(
+            backend.recovery_policy(),
+            &harness_generic_backend::RecoveryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn direct_constructor_uses_configured_recovery_policy() {
+        let mut config = OpenAiConfig::new("test-key");
+        config.recovery.max_attempts = 5;
+        let backend = OpenAiBackend::new(config);
+        assert_eq!(backend.recovery_policy().max_attempts, 5);
     }
 
     #[tokio::test]

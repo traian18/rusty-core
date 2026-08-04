@@ -5,7 +5,9 @@
 pub mod client;
 pub mod events;
 pub mod request;
+pub mod retry;
 
 pub use client::ModelClient;
 pub use events::{ModelError, ModelEvent, ModelResult};
 pub use request::{ModelCapabilities, ModelRequest};
+pub use retry::parse_retry_after;

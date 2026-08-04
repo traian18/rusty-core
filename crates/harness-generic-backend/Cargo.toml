@@ -15,6 +15,7 @@ harness-runtime = { path = "../harness-runtime" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
