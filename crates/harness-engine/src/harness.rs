@@ -1,27 +1,132 @@
 //! Top-level public harness entry point.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
+use harness_protocol::tools::AgentToolset;
 use harness_runtime::scheduler::Scheduler;
 use harness_runtime::session_manager::SessionManager;
-use harness_runtime::traits::{EventSink, SimpleToolRegistry};
+use harness_runtime::traits::{EventSink, SimpleToolRegistry, ToolRegistry, Workspace};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationFactory, IntegrationRegistry};
-use harness_session_store::SessionStore;
+use harness_session_store::{SessionStore, SessionSummary};
 
 use crate::builder::NoopSessionStore;
 use crate::session_builder::{HarnessError, SessionBuilder, SessionHandle};
+use crate::providers::{self, AuthFlowHandle, AuthFlowState, AuthMethod, BackendSelection, CredentialProfileId, CredentialProfileSummary, CredentialState, ModelDescriptor, ProviderDescriptor, ProviderHealth, ProviderKey};
 
 /// Public entry point for registering integrations and creating sessions.
 pub struct Harness {
     pub(crate) integrations: Arc<IntegrationRegistry>,
     pub(crate) sessions: Arc<SessionManager>,
     pub(crate) session_store: Arc<dyn SessionStore>,
+    pub(crate) model_cache: Arc<RwLock<HashMap<ProviderKey, Vec<ModelDescriptor>>>>,
 }
 
 impl Harness {
+    /// List every registered provider through a storage-neutral engine model.
+    pub fn list_providers(&self) -> Result<Vec<ProviderDescriptor>, HarnessError> {
+        Ok(self.integrations.list()?.into_iter().map(|(id, descriptor)| providers::descriptor_for(&id, descriptor.capabilities)).collect())
+    }
+
+    pub fn list_credential_profiles(&self, provider: &ProviderKey) -> Result<Vec<CredentialProfileSummary>, HarnessError> {
+        let descriptor = self.list_providers()?.into_iter().find(|item| &item.id == provider)
+            .ok_or_else(|| HarnessError::UnknownProvider(provider.to_string()))?;
+        let auth_method = descriptor.auth_methods[0];
+        let state = match provider.as_str() {
+            "anthropic-api" => if std::env::var_os("ANTHROPIC_API_KEY").is_some() { CredentialState::Available } else { CredentialState::Missing },
+            "openai-api" => if std::env::var_os("OPENAI_API_KEY").is_some() { CredentialState::Available } else { CredentialState::Missing },
+            _ => CredentialState::ManagedExternally,
+        };
+        Ok(vec![CredentialProfileSummary { id: CredentialProfileId::new(format!("{}:default", provider.as_str())), provider: provider.clone(), label: descriptor.credential_hint, state, auth_method }])
+    }
+
+    pub fn begin_auth(&self, provider: &ProviderKey, method: AuthMethod) -> Result<AuthFlowHandle, HarnessError> {
+        let profile = self.list_credential_profiles(provider)?.into_iter().next().ok_or_else(|| HarnessError::UnknownProvider(provider.to_string()))?;
+        let next = match method {
+            AuthMethod::Environment if profile.state == CredentialState::Available => AuthFlowState::Connected { profile },
+            AuthMethod::Environment => AuthFlowState::Failed { safe_message: "Set the provider API-key environment variable and refresh".into() },
+            AuthMethod::CliManaged => {
+                let (program, args) = match provider.as_str() {
+                    "github-copilot" => ("copilot", vec!["login"]),
+                    "codex" => ("codex", vec!["login"]),
+                    "claude-code" => ("claude", vec![]),
+                    _ => return Err(HarnessError::UnknownProvider(provider.to_string())),
+                };
+                AuthFlowState::WaitingForExternalCommand { program: program.into(), args: args.into_iter().map(str::to_owned).collect() }
+            }
+        };
+        Ok(AuthFlowHandle { provider: provider.clone(), states: vec![AuthFlowState::Starting, next] })
+    }
+
+    pub async fn list_models(&self, provider: &ProviderKey, _credential: &CredentialProfileId, refresh: bool) -> Result<Vec<ModelDescriptor>, HarnessError> {
+        if !self.list_providers()?.iter().any(|item| &item.id == provider) {
+            return Err(HarnessError::UnknownProvider(provider.to_string()));
+        }
+        if !refresh {
+            if let Some(models) = self.model_cache.read().map_err(|_| HarnessError::ProviderCatalog("model cache lock poisoned".into()))?.get(provider).cloned() {
+                return Ok(models);
+            }
+            return Ok(providers::default_models(provider));
+        }
+        match providers::discover_api_models(provider).await {
+            Ok(models) if !models.is_empty() => {
+                self.model_cache.write().map_err(|_| HarnessError::ProviderCatalog("model cache lock poisoned".into()))?
+                    .insert(provider.clone(), models.clone());
+                Ok(models)
+            }
+            Ok(_) => Ok(providers::default_models(provider)),
+            Err(_) => {
+                let mut fallback = self.model_cache.read().map_err(|_| HarnessError::ProviderCatalog("model cache lock poisoned".into()))?
+                    .get(provider).cloned().unwrap_or_else(|| providers::default_models(provider));
+                for model in &mut fallback { model.stale = true; }
+                Ok(fallback)
+            }
+        }
+    }
+
+    pub fn provider_health(&self, provider: &ProviderKey) -> Result<ProviderHealth, HarnessError> {
+        let profile = self.list_credential_profiles(provider)?.remove(0);
+        let program = match provider.as_str() {
+            "claude-code" => Some("claude"),
+            "codex" => Some("codex"),
+            "github-copilot" => Some("copilot"),
+            _ => None,
+        };
+        let executable = program.and_then(providers::find_executable);
+        let ready = profile.state != CredentialState::Missing && (program.is_none() || executable.is_some());
+        let message = if profile.state == CredentialState::Missing {
+            "Credential unavailable".into()
+        } else if program.is_some() && executable.is_none() {
+            format!("{} executable was not found on PATH", program.unwrap_or("provider"))
+        } else {
+            "Ready".into()
+        };
+        Ok(ProviderHealth { provider: provider.clone(), credential: profile.state, executable, ready, message })
+    }
+
+    pub fn session_from_selection(&self, selection: &BackendSelection) -> Result<SessionBuilder, HarnessError> {
+        let descriptor = self.list_providers()?.into_iter().find(|item| item.id == selection.provider)
+            .ok_or_else(|| HarnessError::UnknownProvider(selection.provider.to_string()))?;
+        let mut config = match descriptor.integration.as_str() {
+            "anthropic" | "openai" => serde_json::json!({"default_model": selection.provider_model_id.clone()}),
+            "claude-code" | "codex" | "github-copilot" if selection.provider_model_id == "default" => serde_json::json!({}),
+            "claude-code" | "codex" => serde_json::json!({"extra_args": ["--model", selection.provider_model_id.clone()]}),
+            "github-copilot" => serde_json::json!({"model": selection.provider_model_id.clone()}),
+            _ => serde_json::json!({}),
+        };
+        if let Some(object) = config.as_object_mut() {
+            object.insert("_backend_selection".into(), serde_json::to_value(
+                harness_protocol::backend::PersistedBackendSelection::v1(
+                    selection.provider.to_string(),
+                    selection.credential_profile.0.clone(),
+                    selection.provider_model_id.clone(),
+                )
+            )?);
+        }
+        self.session().integration(descriptor.integration, config)
+    }
     /// Create a harness with an empty integration registry, a fresh
     /// [`SessionManager`], and the in-memory no-op [`SessionStore`].
     ///
@@ -41,6 +146,7 @@ impl Harness {
                 Some(store.clone()),
             )),
             session_store: store,
+            model_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -78,6 +184,37 @@ impl Harness {
             self.integrations.clone(),
             self.sessions.clone(),
         )
+    }
+
+    /// Lists durable sessions newest-first for frontend discovery.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, HarnessError> {
+        Ok(self.session_store.list_sessions().await?)
+    }
+
+    /// Restores a session with the host's real workspace and tool policy.
+    pub async fn restore_session_with_toolset(
+        &self,
+        id: SessionId,
+        toolset: AgentToolset,
+        workspace: Arc<dyn Workspace>,
+    ) -> Result<SessionHandle, HarnessError> {
+        let registry = SimpleToolRegistry::new();
+        for descriptor in toolset.enabled_descriptors() {
+            let executor = SessionBuilder::build_executor_for(descriptor, workspace.clone());
+            let _ = registry.register(executor);
+        }
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(registry);
+        let runtime = self
+            .sessions
+            .restore_session(
+                id,
+                self.integrations.clone(),
+                tool_registry,
+                workspace,
+                Arc::new(NoopEventSink),
+            )
+            .await?;
+        Ok(SessionHandle::from_runtime(runtime))
     }
 
     /// Restore a previously persisted session, returning a live

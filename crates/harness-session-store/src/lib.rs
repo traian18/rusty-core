@@ -6,7 +6,7 @@ mod store;
 mod sqlite;
 mod jsonl;
 pub use store::{
-    is_durable, DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoredAgentState,
+    is_durable, DurableSessionEvent, DurableSessionSnapshot, summarize_session, SessionStore, SessionSummary, StoredAgentState,
     StoredPendingToolCall, StoredSession, StoreError,
 };
 pub use sqlite::SqliteSessionStore;

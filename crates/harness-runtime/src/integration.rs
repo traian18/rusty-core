@@ -92,6 +92,32 @@ impl IntegrationRegistry {
         Ok(factories.get(integration).cloned())
     }
 
+    /// List registered integration factories in stable identifier order.
+    pub fn list(&self) -> Result<Vec<(String, BackendDescriptor)>, IntegrationError> {
+        let factories = self.factories.read().map_err(|_| IntegrationError::RegistryPoisoned)?;
+        let mut entries = factories.iter().map(|(id, factory)| (id.clone(), factory.descriptor())).collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+
+    /// Resolves a stable integration key from a persisted backend display name.
+    pub fn id_for_descriptor_name(
+        &self,
+        descriptor_name: &str,
+    ) -> Result<Option<String>, IntegrationError> {
+        let factories = self
+            .factories
+            .read()
+            .map_err(|_| IntegrationError::RegistryPoisoned)?;
+        Ok(factories.iter().find_map(|(id, factory)| {
+            factory
+                .descriptor()
+                .name
+                .eq_ignore_ascii_case(descriptor_name.split(" [").next().unwrap_or(descriptor_name))
+                .then(|| id.clone())
+        }))
+    }
+
     /// Resolve a factory and construct a fresh backend from the given config.
     pub async fn create(
         &self,

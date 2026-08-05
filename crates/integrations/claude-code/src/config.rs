@@ -9,12 +9,15 @@ pub struct ClaudeCodeConfig {
     pub binary_path: PathBuf,
 
     /// Additional command-line arguments to pass to the CLI.
-    /// Common examples: --model claude-3-5-sonnet-20241022
+    /// Common examples: --model sonnet
     #[serde(default)]
     pub extra_args: Vec<String>,
 
-    /// Permission mode for the CLI (e.g., "autonomous" to bypass CLI prompts).
-    /// The harness becomes the single permission layer.
+    /// Permission mode for the CLI. The harness is the single permission
+    /// layer, so non-interactive runs default to `bypassPermissions` — one of
+    /// the Claude CLI's valid modes (`default`, `acceptEdits`, `plan`,
+    /// `bypassPermissions`). The sentinel `"interactive"` omits the flag
+    /// entirely and lets the CLI prompt.
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
 
@@ -28,7 +31,7 @@ fn default_binary_path() -> PathBuf {
 }
 
 fn default_permission_mode() -> String {
-    "autonomous".to_string()
+    "bypassPermissions".to_string()
 }
 
 impl Default for ClaudeCodeConfig {

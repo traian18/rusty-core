@@ -1,6 +1,6 @@
 [package]
 name = "harness-engine"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,6 +23,7 @@ harness-tool-web = { path = "../tools/web" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "fs"] }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }

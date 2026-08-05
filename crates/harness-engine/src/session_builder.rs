@@ -39,12 +39,17 @@ struct BroadcastEventSink {
 struct ToolAdvertisingBackend {
     inner: Arc<dyn ExecutionBackend>,
     tools: Vec<harness_protocol::tools::ToolDescriptor>,
+    selection: Option<harness_protocol::backend::PersistedBackendSelection>,
 }
 
 #[async_trait]
 impl ExecutionBackend for ToolAdvertisingBackend {
     fn descriptor(&self) -> harness_protocol::backend::BackendDescriptor {
-        self.inner.descriptor()
+        let mut descriptor = self.inner.descriptor();
+        if let Some(selection) = &self.selection {
+            descriptor.name = format!("{} [{}:{}]", descriptor.name, selection.provider, selection.provider_model_id);
+        }
+        descriptor
     }
 
     fn capabilities(&self) -> harness_protocol::backend::BackendCapabilities {
@@ -73,6 +78,10 @@ impl EventSink for BroadcastEventSink {
 /// Errors raised while configuring or operating a session.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
+    #[error("unknown provider: {0}")]
+    UnknownProvider(String),
+    #[error("provider catalog error: {0}")]
+    ProviderCatalog(String),
     #[error("missing required field: backend")]
     MissingBackend,
     #[error("missing required field: tool_registry")]
@@ -231,7 +240,7 @@ impl SessionBuilder {
         // 1. Register all tool executors into the registry.
         let registry = harness_runtime::traits::SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor = self.build_executor_for(descriptor, workspace.clone());
+            let executor = Self::build_executor_for(descriptor, workspace.clone());
             let _ = registry.register(executor);
         }
 
@@ -245,8 +254,7 @@ impl SessionBuilder {
     /// Build the appropriate executor for a given tool descriptor.
     ///
     /// Maps known descriptor name strings to concrete tool implementations.
-    fn build_executor_for(
-        &self,
+    pub(crate) fn build_executor_for(
         descriptor: &harness_protocol::tools::ToolDescriptor,
         workspace: Arc<dyn harness_runtime::traits::Workspace>,
     ) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
@@ -286,12 +294,13 @@ impl SessionBuilder {
     /// spawning. The resulting `Arc<SessionRuntime>` is registered with
     /// the manager for centralized lifecycle control.
     pub async fn start(self) -> Result<SessionHandle, HarnessError> {
-        let backend = match (self.backend, self.integration) {
-            (Some(backend), _) => backend,
+        let (backend, persisted_selection) = match (self.backend, self.integration) {
+            (Some(backend), _) => (backend, None),
             (None, Some(integration)) => {
-                self.integrations
-                    .create(&integration.id, integration.config)
-                    .await?
+                let persisted_selection = integration.config.get("_backend_selection")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+                let backend = self.integrations.create(&integration.id, integration.config).await?;
+                (backend, persisted_selection)
             }
             (None, None) => return Err(HarnessError::MissingBackend),
         };
@@ -337,6 +346,7 @@ impl SessionBuilder {
         let backend: Arc<dyn ExecutionBackend> = Arc::new(ToolAdvertisingBackend {
             inner: backend,
             tools: protocol_descriptors,
+            selection: persisted_selection,
         });
         let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
@@ -381,6 +391,16 @@ impl Default for SessionBuilder {
 }
 
 /// Handle to a live session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextInspection {
+    pub generation: u64,
+    pub estimated_tokens: Option<u64>,
+    pub checkpoint: Option<String>,
+    pub covered_through: Option<String>,
+    pub pinned_items: usize,
+    pub last_compacted_at: Option<String>,
+}
+
 pub struct SessionHandle {
     client: SessionClient,
     session_id: SessionId,
@@ -438,6 +458,18 @@ impl SessionHandle {
 
     pub fn snapshot(&self) -> SessionSnapshot {
         self.client.snapshot()
+    }
+
+    pub fn context_inspection(&self) -> ContextInspection {
+        let context = self.client.snapshot().context;
+        ContextInspection {
+            generation: context.generation,
+            estimated_tokens: context.estimated_tokens,
+            checkpoint: context.checkpoint,
+            covered_through: context.covered_through,
+            pinned_items: context.pinned_items,
+            last_compacted_at: context.last_compacted_at,
+        }
     }
 
     pub fn session_id(&self) -> SessionId {

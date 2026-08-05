@@ -25,6 +25,16 @@ use crate::session_runtime::{
 /// This is a pure function of live state — no stored copy — giving callers
 /// the current snapshot of the session status, root agent status, and usage.
 #[derive(Debug, Clone)]
+pub struct ContextSnapshot {
+    pub generation: u64,
+    pub estimated_tokens: Option<u64>,
+    pub checkpoint: Option<String>,
+    pub covered_through: Option<String>,
+    pub pinned_items: usize,
+    pub last_compacted_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     /// The session's unique identifier.
     pub session_id: SessionId,
@@ -39,6 +49,8 @@ pub struct SessionSnapshot {
     pub root_agent_status: AgentUsageSnapshot,
     /// Aggregated usage information across the session.
     pub usage: SessionUsageSnapshot,
+    /// Prepared-context lifecycle for the root agent.
+    pub context: ContextSnapshot,
     /// When this snapshot was taken.
     pub timestamp: Timestamp,
 }
@@ -141,12 +153,29 @@ impl SessionClient {
             timestamp: now.to_string(),
         };
 
+        let context = {
+            let state = self.runtime.state.lock().expect("session state mutex poisoned");
+            let agent = state.agents.get(&runtime_snapshot.root_agent_id);
+            match agent {
+                Some(agent) => ContextSnapshot {
+                    generation: agent.state.context.generation,
+                    estimated_tokens: agent.state.context.last_estimated_tokens,
+                    checkpoint: agent.state.context.active_checkpoint.map(|id| id.to_string()),
+                    covered_through: agent.state.context.covered_through.map(|id| id.to_string()),
+                    pinned_items: agent.state.context.pinned_items.len(),
+                    last_compacted_at: agent.state.context.last_compacted_at.map(|timestamp| timestamp.to_string()),
+                },
+                None => ContextSnapshot { generation: 0, estimated_tokens: None, checkpoint: None, covered_through: None, pinned_items: 0, last_compacted_at: None },
+            }
+        };
+
         SessionSnapshot {
             session_id: runtime_snapshot.session_id,
             status,
             root_agent_id: runtime_snapshot.root_agent_id,
             root_agent_status,
             usage,
+            context,
             timestamp: now,
         }
     }

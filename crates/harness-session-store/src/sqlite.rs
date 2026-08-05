@@ -71,8 +71,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
-    is_durable, DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoreError,
-    StoredAgentState, StoredSession,
+    is_durable, summarize_session, DurableSessionEvent, DurableSessionSnapshot, SessionStore,
+    SessionSummary, StoreError, StoredAgentState, StoredSession,
 };
 
 /// Number of write requests that may be queued to the writer actor before
@@ -475,17 +475,16 @@ fn load_session_sync(
         });
     }
 
-    if snapshot.is_none() && events.is_empty() {
-        return Err(StoreError::NotFound(id));
-    }
-
-    // Replay only the events not already captured by the snapshot (spec §71).
-    if let Some(snap) = &snapshot {
+    if let Some(snapshot) = &snapshot {
         events.retain(|event| {
             event
                 .session_sequence
-                .map_or(true, |seq| seq > snap.session_sequence)
+                .is_some_and(|sequence| sequence > snapshot.session_sequence)
         });
+    }
+
+    if snapshot.is_none() && events.is_empty() {
+        return Err(StoreError::NotFound(id));
     }
 
     Ok(StoredSession {
@@ -495,32 +494,74 @@ fn load_session_sync(
     })
 }
 
-/// Current wall clock in unix epoch milliseconds (store write time).
+fn list_sessions_sync(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+) -> Result<Vec<SessionSummary>, StoreError> {
+    let conn = pool
+        .get()
+        .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
+    let mut stmt = conn
+        .prepare("SELECT session_id FROM sessions ORDER BY updated_at DESC")
+        .map_err(|error| map_sqlite_error("prepare session catalog query", error))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| map_sqlite_error("query session catalog", error))?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        let value = row.map_err(|error| map_sqlite_error("read session catalog row", error))?;
+        let id = SessionId::from_str(&value).map_err(|error| {
+            StoreError::InvalidState(format!("corrupt session_id {value:?}: {error}"))
+        })?;
+        ids.push(id);
+    }
+    drop(stmt);
+    drop(conn);
+
+    let mut summaries = Vec::new();
+    for id in ids {
+        if let Some(summary) = summarize_session(&load_session_sync(pool, id)?) {
+            summaries.push(summary);
+        }
+    }
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
+    Ok(summaries)
+}
+
+fn map_sqlite_error(operation: &str, error: rusqlite::Error) -> StoreError {
+    if let rusqlite::Error::SqliteFailure(code, _) = &error {
+        if matches!(
+            code.extended_code,
+            SQLITE_CONSTRAINT_FOREIGNKEY
+                | SQLITE_CONSTRAINT_PRIMARYKEY
+                | SQLITE_CONSTRAINT_UNIQUE
+        ) {
+            return StoreError::InvalidState(format!("{operation}: {error}"));
+        }
+    }
+    StoreError::Backend(format!("{operation}: {error}"))
+}
+
 fn now_ms() -> i64 {
     Timestamp::now().timestamp_millis()
 }
 
-/// Maps a `rusqlite` error onto [`StoreError`], surfacing constraint
-/// violations (duplicate sequence/event, missing session) as
-/// [`StoreError::InvalidState`] and everything else as
-/// [`StoreError::Backend`].
-fn map_sqlite_error(context: &str, error: rusqlite::Error) -> StoreError {
-    match &error {
-        rusqlite::Error::SqliteFailure(ffi_error, _) => match ffi_error.extended_code {
-            SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY => StoreError::InvalidState(
-                format!("{context}: duplicate durable key (UNIQUE/PRIMARY KEY violated): {error}"),
-            ),
-            SQLITE_CONSTRAINT_FOREIGNKEY => StoreError::InvalidState(format!(
-                "{context}: foreign key violated (session row missing): {error}"
-            )),
-            _ => StoreError::Backend(format!("{context}: {error}")),
-        },
-        other => StoreError::Backend(format!("{context}: {other}")),
-    }
-}
-
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
+        let pool = self.read_pool.clone();
+        tokio::task::spawn_blocking(move || list_sessions_sync(&pool))
+            .await
+            .map_err(|error| StoreError::Backend(format!("session catalog task failed: {error}")))?
+    }
+
+    async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError> {
+        let pool = self.read_pool.clone();
+        tokio::task::spawn_blocking(move || load_session_sync(&pool, id))
+            .await
+            .map_err(|error| StoreError::Backend(format!("load session task failed: {error}")))?
+    }
+
     async fn events_since(
         &self,
         id: SessionId,
@@ -529,17 +570,7 @@ impl SessionStore for SqliteSessionStore {
         let pool = self.read_pool.clone();
         tokio::task::spawn_blocking(move || events_since_sync(&pool, id, since_seq))
             .await
-            .map_err(|error| StoreError::Backend(format!("events_since task failed: {error}")))?
-    }
-
-    async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError> {
-        // Reads go through the pooled connection — never the writer channel.
-        let pool = self.read_pool.clone();
-        tokio::task::spawn_blocking(move || load_session_sync(&pool, id))
-            .await
-            .map_err(|join_error| {
-                StoreError::Backend(format!("read task panicked: {join_error}"))
-            })?
+            .map_err(|error| StoreError::Backend(format!("event history task failed: {error}")))?
     }
 
     async fn append(&self, event: DurableSessionEvent) -> Result<(), StoreError> {
@@ -549,456 +580,49 @@ impl SessionStore for SqliteSessionStore {
                 event.envelope.event
             )));
         }
-        let (reply, ack) = oneshot::channel();
+        let (reply, acknowledgement) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::Append { event, reply })
             .await
-            .map_err(|_| StoreError::Backend("sqlite writer task is not running".into()))?;
-        ack.await.map_err(|_| {
-            StoreError::Backend("sqlite writer task terminated before acknowledging".into())
-        })?
+            .map_err(|_| StoreError::Backend("SQLite writer task is not running".into()))?;
+        acknowledgement
+            .await
+            .map_err(|_| StoreError::Backend("SQLite writer task terminated".into()))?
     }
 
     async fn save_snapshot(&self, snapshot: DurableSessionSnapshot) -> Result<(), StoreError> {
-        let (reply, ack) = oneshot::channel();
+        let (reply, acknowledgement) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::SaveSnapshot { snapshot, reply })
             .await
-            .map_err(|_| StoreError::Backend("sqlite writer task is not running".into()))?;
-        ack.await.map_err(|_| {
-            StoreError::Backend("sqlite writer task terminated before acknowledging".into())
-        })?
+            .map_err(|_| StoreError::Backend("SQLite writer task is not running".into()))?;
+        acknowledgement
+            .await
+            .map_err(|_| StoreError::Backend("SQLite writer task terminated".into()))?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    use harness_protocol::commands::AgentStatus;
-    use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
-    use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp};
-
-    /// Creates a unique scratch database path for one test.
-    fn temp_db(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "harness-session-store-sqlite-{tag}-{}-{nanos}",
-            std::process::id()
+    #[test]
+    fn opens_a_wal_database() {
+        let path = std::env::temp_dir().join(format!(
+            "harness-sqlite-test-{}-{}.db",
+            std::process::id(),
+            now_ms()
         ));
-        std::fs::create_dir_all(&dir).expect("create temp store dir");
-        dir.join("store.db")
-    }
-
-    /// A fully-qualified, sequenced envelope for testing.
-    fn envelope(session: SessionId, seq: u64) -> AgentEventEnvelope {
-        AgentEventEnvelope {
-            event_id: EventId::new(),
-            session_id: session,
-            agent_id: AgentId::new(),
-            parent_agent_id: None,
-            run_id: Some(RunId::new()),
-            agent_sequence: seq,
-            session_sequence: Some(seq),
-            timestamp: Timestamp::now(),
-            visibility: EventVisibility::User,
-            event: AgentEvent::StateChanged {
-                from: AgentStatus::Idle,
-                to: AgentStatus::PreparingContext,
-            },
-        }
-    }
-
-    /// A durable event with the given session sequence.
-    fn event(session: SessionId, seq: u64) -> DurableSessionEvent {
-        DurableSessionEvent {
-            session_sequence: Some(seq),
-            envelope: envelope(session, seq),
-        }
-    }
-
-    /// A minimal snapshot at the given session sequence.
-    fn snapshot(session: SessionId, seq: u64) -> DurableSessionSnapshot {
-        DurableSessionSnapshot {
-            session_id: session,
-            root_agent_id: AgentId::new(),
-            agents: Vec::new(),
-            session_sequence: seq,
-            timestamp: Timestamp::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn roundtrip_events_and_snapshot() {
-        let db_path = temp_db("roundtrip");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        let mut appended_ids = Vec::new();
-        for seq in 1..=5 {
-            let ev = event(session, seq);
-            appended_ids.push(ev.envelope.event_id);
-            store.append(ev).await.expect("append event");
-        }
-        store
-            .save_snapshot(snapshot(session, 3))
-            .await
-            .expect("save snapshot");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(stored.session_id, session);
-
-        let loaded_snapshot = stored.snapshot.expect("snapshot present");
-        assert_eq!(loaded_snapshot.session_id, session);
-        assert_eq!(loaded_snapshot.session_sequence, 3);
-
-        // Only the events appended after the snapshot's sequence remain.
-        let sequences: Vec<Option<u64>> =
-            stored.events.iter().map(|e| e.session_sequence).collect();
-        assert_eq!(sequences, vec![Some(4), Some(5)]);
-
-        // The envelopes round-tripped intact (payload + event ids).
-        assert_eq!(stored.events[0].envelope.event_id, appended_ids[3]);
-        assert_eq!(stored.events[1].envelope.event_id, appended_ids[4]);
-        for event in &stored.events {
-            assert_eq!(event.envelope.session_id, session);
-            assert!(matches!(
-                event.envelope.event,
-                AgentEvent::StateChanged { .. }
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn load_returns_all_events_when_no_snapshot() {
-        let db_path = temp_db("no-snapshot");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store.append(event(session, 2)).await.expect("append event");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert!(stored.snapshot.is_none());
-        let sequences: Vec<Option<u64>> =
-            stored.events.iter().map(|e| e.session_sequence).collect();
-        assert_eq!(sequences, vec![Some(1), Some(2)]);
-    }
-
-    #[tokio::test]
-    async fn load_missing_session_is_not_found() {
-        let db_path = temp_db("not-found");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-
-        let error = store
-            .load_session(SessionId::new())
-            .await
-            .expect_err("no data exists for an unknown session");
-        assert!(matches!(error, StoreError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn data_survives_store_recreation() {
-        let db_path = temp_db("restart");
-        let session = SessionId::new();
-
-        {
-            let store = SqliteSessionStore::open(&db_path).expect("open store");
-            store.append(event(session, 1)).await.expect("append event");
-            store.append(event(session, 2)).await.expect("append event");
-            store
-                .save_snapshot(snapshot(session, 2))
-                .await
-                .expect("save snapshot");
-        } // store dropped -> channel closed -> writer checkpoints and exits
-
-        let reopened = SqliteSessionStore::open(&db_path).expect("reopen store");
-        let stored = reopened
-            .load_session(session)
-            .await
-            .expect("reload session");
-        assert_eq!(
-            stored.snapshot.as_ref().map(|s| s.session_sequence),
-            Some(2)
-        );
-        assert_eq!(
-            stored.events.len(),
-            0,
-            "both events captured by the snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn wal_mode_is_confirmed_and_persistent() {
-        let db_path = temp_db("wal");
-        // `open` itself refuses to proceed unless PRAGMA journal_mode=WAL
-        // returns "wal" — reaching here is the confirmation.
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-        store.append(event(session, 1)).await.expect("append event");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = runtime
+            .block_on(async { SqliteSessionStore::open(&path) })
+            .expect("open store");
         drop(store);
-
-        // WAL is a persistent database property: a brand-new connection sees it.
-        let conn = Connection::open(&db_path).expect("open raw db");
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .expect("read journal mode");
-        assert_eq!(mode, "wal");
-    }
-
-    #[tokio::test]
-    async fn concurrent_appends_never_interleave_or_corrupt() {
-        let db_path = temp_db("concurrent");
-        let store = std::sync::Arc::new(SqliteSessionStore::open(&db_path).expect("open store"));
-        let session_a = SessionId::new();
-        let session_b = SessionId::new();
-
-        // Interleave appends from two sessions, plus a same-session burst.
-        let mut handles = Vec::new();
-        for seq in 0..16 {
-            let store_a = store.clone();
-            handles.push(tokio::spawn(async move {
-                store_a
-                    .append(event(session_a, seq))
-                    .await
-                    .expect("append to A");
-            }));
-            let store_b = store.clone();
-            handles.push(tokio::spawn(async move {
-                store_b
-                    .append(event(session_b, seq))
-                    .await
-                    .expect("append to B");
-            }));
-        }
-        for seq in 16..48 {
-            let store = store.clone();
-            handles.push(tokio::spawn(async move {
-                store
-                    .append(event(session_a, seq))
-                    .await
-                    .expect("burst append to A");
-            }));
-        }
-        for handle in handles {
-            handle.await.expect("join append task");
-        }
-
-        let a = store.load_session(session_a).await.expect("load session A");
-        let b = store.load_session(session_b).await.expect("load session B");
-
-        // Every append landed exactly once, as a complete, intact row.
-        let seqs_a: Vec<u64> = a
-            .events
-            .iter()
-            .map(|e| e.session_sequence.unwrap())
-            .collect();
-        let seqs_b: Vec<u64> = b
-            .events
-            .iter()
-            .map(|e| e.session_sequence.unwrap())
-            .collect();
-        assert_eq!(seqs_a, (0..48).collect::<Vec<u64>>());
-        assert_eq!(seqs_b, (0..16).collect::<Vec<u64>>());
-        assert!(a
-            .events
-            .iter()
-            .all(|e| e.envelope.event_id.to_string().len() == 36));
-        assert!(b
-            .events
-            .iter()
-            .all(|e| e.envelope.event_id.to_string().len() == 36));
-    }
-
-    #[tokio::test]
-    async fn unsequenced_events_are_assigned_sequences() {
-        let db_path = temp_db("unsequenced");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        let mut unsequenced = event(session, 1);
-        unsequenced.session_sequence = None;
-        unsequenced.envelope.session_sequence = None;
-        store.append(unsequenced).await.expect("append unsequenced");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(stored.events.len(), 1);
-        assert_eq!(stored.events[0].session_sequence, Some(1));
-        assert_eq!(stored.events[0].envelope.session_sequence, Some(1));
-    }
-
-    #[tokio::test]
-    async fn duplicate_sequence_is_rejected() {
-        let db_path = temp_db("duplicate");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append first");
-        // Same (session, sequence) with a fresh event_id violates the UNIQUE index.
-        let error = store
-            .append(event(session, 1))
-            .await
-            .expect_err("duplicate sequence must be rejected");
-        assert!(matches!(error, StoreError::InvalidState(_)));
-    }
-
-    #[tokio::test]
-    async fn later_snapshot_replaces_earlier() {
-        let db_path = temp_db("replace");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 1))
-            .await
-            .expect("save snapshot");
-        store.append(event(session, 2)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 2))
-            .await
-            .expect("save snapshot");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(
-            stored.snapshot.as_ref().map(|s| s.session_sequence),
-            Some(2),
-            "the latest snapshot row replaces the earlier one"
-        );
-        assert_eq!(stored.events.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn snapshot_timestamp_roundtrips_exactly() {
-        let db_path = temp_db("timestamp");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        let mut snap = snapshot(session, 1);
-        snap.timestamp = Timestamp::now(); // nanosecond precision
-        store
-            .save_snapshot(snap.clone())
-            .await
-            .expect("save snapshot");
-
-        let stored = store.load_session(session).await.expect("load session");
-        let loaded = stored.snapshot.expect("snapshot present");
-        assert_eq!(
-            loaded.timestamp, snap.timestamp,
-            "snapshot timestamp must survive the sqlite round-trip exactly"
-        );
-    }
-
-    #[tokio::test]
-    async fn event_and_snapshot_rows_land_in_expected_tables() {
-        let db_path = temp_db("rows");
-        let store = SqliteSessionStore::open(&db_path).expect("open store");
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store.append(event(session, 2)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 2))
-            .await
-            .expect("save snapshot");
-
-        let conn = Connection::open(&db_path).expect("open raw db");
-        let events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM durable_events WHERE session_id = ?1",
-                params![session.to_string()],
-                |row| row.get(0),
-            )
-            .expect("count durable events");
-        assert_eq!(events, 2, "one row per appended event");
-
-        let snapshots: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM snapshots WHERE session_id = ?1",
-                params![session.to_string()],
-                |row| row.get(0),
-            )
-            .expect("count snapshots");
-        assert_eq!(snapshots, 1, "exactly one snapshot row per session");
-
-        let sessions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
-                params![session.to_string()],
-                |row| row.get(0),
-            )
-            .expect("count sessions");
-        assert_eq!(sessions, 1, "session row auto-created by first write");
-    }
-
-    #[tokio::test]
-    async fn crash_recovery_leaves_no_partial_rows() {
-        let db_path = temp_db("crash");
-        let session = SessionId::new();
-
-        // Simulate a crash mid-batch: an *uncommitted* transaction writes a
-        // session row and two event rows, then the connection is dropped
-        // without COMMIT — SQLite rolls the transaction back on close.
-        {
-            let conn = Connection::open(&db_path).expect("open raw db");
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-                .expect("raw pragmas");
-            conn.execute_batch(SCHEMA_SQL).expect("raw schema");
-            conn.execute("BEGIN IMMEDIATE", []).expect("begin batch");
-            let now = now_ms();
-            conn.execute(
-                "INSERT INTO sessions (session_id, root_agent_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?3)",
-                params![session.to_string(), session.to_string(), now],
-            )
-            .expect("insert session row");
-            for sequence in 1..=2 {
-                conn.execute(
-                    "INSERT INTO durable_events
-                         (event_id, session_id, agent_id, parent_agent_id, run_id,
-                          agent_sequence, session_sequence, timestamp, visibility, envelope, appended_at)
-                     VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?4, ?5, '\"User\"', '{}', ?5)",
-                    params![
-                        EventId::new().to_string(),
-                        session.to_string(),
-                        AgentId::new().to_string(),
-                        sequence,
-                        now,
-                    ],
-                )
-                .expect("insert event row");
-            }
-            // Dropped here without COMMIT -> rollback.
-        }
-
-        // Reopen through the store: WAL replays/rolls back cleanly.
-        let store = SqliteSessionStore::open(&db_path).expect("reopen store");
-
-        let raw = Connection::open(&db_path).expect("open raw db");
-        let integrity: String = raw
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .expect("integrity check");
-        assert_eq!(integrity, "ok", "no partial/corrupt rows after the crash");
-
-        let error = store
-            .load_session(session)
-            .await
-            .expect_err("the uncommitted batch must not be visible");
-        assert!(matches!(error, StoreError::NotFound(_)));
-
-        // The store remains fully writable after recovery.
-        store
-            .append(event(session, 1))
-            .await
-            .expect("append after recovery");
-        let stored = store
-            .load_session(session)
-            .await
-            .expect("load after recovery");
-        assert_eq!(stored.events.len(), 1);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
     }
 }

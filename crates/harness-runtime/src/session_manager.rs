@@ -269,11 +269,34 @@ impl SessionManager {
             if backends.contains_key(&key) {
                 continue;
             }
+            let persisted_id = reference.integration.to_string();
+            let integration_id = match integrations.get(&persisted_id) {
+                Ok(Some(_)) => persisted_id,
+                Ok(None) => integrations
+                    .id_for_descriptor_name(&agent.backend.descriptor.name)
+                    .map_err(|error| SessionManagerError::BackendCreation {
+                        integration: persisted_id.clone(),
+                        message: error.to_string(),
+                    })?
+                    .ok_or_else(|| SessionManagerError::BackendCreation {
+                        integration: persisted_id.clone(),
+                        message: format!(
+                            "no registered integration matches backend {}",
+                            agent.backend.descriptor.name
+                        ),
+                    })?,
+                Err(error) => {
+                    return Err(SessionManagerError::BackendCreation {
+                        integration: persisted_id,
+                        message: error.to_string(),
+                    });
+                }
+            };
             let backend = integrations
-                .create(&reference.integration.to_string(), agent.backend_config.clone())
+                .create(&integration_id, agent.backend_config.clone())
                 .await
                 .map_err(|error| SessionManagerError::BackendCreation {
-                    integration: reference.integration.to_string(),
+                    integration: integration_id.clone(),
                     message: error.to_string(),
                 })?;
             backends.insert(key, backend);

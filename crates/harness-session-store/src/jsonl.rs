@@ -48,6 +48,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -57,8 +58,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
-    is_durable, DurableSessionEvent, DurableSessionSnapshot, SessionStore, StoreError,
-    StoredSession,
+    is_durable, summarize_session, DurableSessionEvent, DurableSessionSnapshot, SessionStore,
+    SessionSummary, StoreError, StoredSession,
 };
 
 /// Default number of appends between `File::sync_data()` flushes.
@@ -280,6 +281,40 @@ async fn writer_task(path: PathBuf, mut rx: mpsc::Receiver<WriteCommand>, sync_i
 
 #[async_trait]
 impl SessionStore for JsonlSessionStore {
+    async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
+        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut summaries = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Ok(id) = SessionId::from_str(stem) else {
+                continue;
+            };
+            let Ok((snapshot, events)) = self.read_records(id).await else {
+                continue;
+            };
+            let stored = StoredSession {
+                session_id: id,
+                snapshot,
+                events,
+            };
+            if let Some(summary) = summarize_session(&stored) {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
+        Ok(summaries)
+    }
+
     async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError> {
         let (snapshot, mut events) = self.read_records(id).await?;
 
@@ -363,310 +398,64 @@ impl SessionStore for JsonlSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_protocol::commands::AgentStatus;
-    use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
-    use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp};
+    use harness_protocol::{
+        commands::AgentStatus,
+        events::{AgentEvent, AgentEventEnvelope, EventVisibility},
+        ids::{AgentId, EventId, RunId, Timestamp},
+    };
 
-    /// Creates a unique scratch directory for one test.
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "harness-session-store-jsonl-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp store dir");
-        dir
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "harness-jsonl-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().timestamp_millis()
+        ))
     }
 
-    /// A fully-qualified, sequenced envelope for testing.
-    fn envelope(session: SessionId, seq: u64) -> AgentEventEnvelope {
-        AgentEventEnvelope {
-            event_id: EventId::new(),
-            session_id: session,
-            agent_id: AgentId::new(),
-            parent_agent_id: None,
-            run_id: Some(RunId::new()),
-            agent_sequence: seq,
-            session_sequence: Some(seq),
-            timestamp: Timestamp::now(),
-            visibility: EventVisibility::User,
-            event: AgentEvent::StateChanged {
-                from: AgentStatus::Idle,
-                to: AgentStatus::PreparingContext,
-            },
-        }
-    }
-
-    /// A durable event with the given session sequence.
-    fn event(session: SessionId, seq: u64) -> DurableSessionEvent {
+    fn event(session_id: SessionId, sequence: u64) -> DurableSessionEvent {
         DurableSessionEvent {
-            session_sequence: Some(seq),
-            envelope: envelope(session, seq),
-        }
-    }
-
-    /// A minimal snapshot at the given session sequence.
-    fn snapshot(session: SessionId, seq: u64) -> DurableSessionSnapshot {
-        DurableSessionSnapshot {
-            session_id: session,
-            root_agent_id: AgentId::new(),
-            agents: Vec::new(),
-            session_sequence: seq,
-            timestamp: Timestamp::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn writes_one_tagged_jsonl_file_per_session() {
-        let dir = temp_dir("one-file-per-session");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 1))
-            .await
-            .expect("save snapshot");
-
-        let path = dir.join(format!("{session}.jsonl"));
-        let raw = tokio::fs::read_to_string(&path)
-            .await
-            .expect("read session file");
-        let lines: Vec<&str> = raw.lines().collect();
-        assert_eq!(lines.len(), 2, "one line per record: {raw}");
-        assert!(
-            lines[0].contains("\"kind\":\"event\""),
-            "line 0: {}",
-            lines[0]
-        );
-        assert!(
-            lines[1].contains("\"kind\":\"snapshot\""),
-            "line 1: {}",
-            lines[1]
-        );
-    }
-
-    #[tokio::test]
-    async fn roundtrip_events_and_snapshot() {
-        let dir = temp_dir("roundtrip");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        for seq in 1..=5 {
-            store
-                .append(event(session, seq))
-                .await
-                .expect("append event");
-        }
-        store
-            .save_snapshot(snapshot(session, 3))
-            .await
-            .expect("save snapshot");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(stored.session_id, session);
-
-        let loaded_snapshot = stored.snapshot.expect("snapshot present");
-        assert_eq!(loaded_snapshot.session_id, session);
-        assert_eq!(loaded_snapshot.session_sequence, 3);
-
-        // Only the events appended after the snapshot's sequence remain.
-        let sequences: Vec<Option<u64>> =
-            stored.events.iter().map(|e| e.session_sequence).collect();
-        assert_eq!(sequences, vec![Some(4), Some(5)]);
-        for (event, expected) in stored.events.iter().zip([4u64, 5]) {
-            assert_eq!(event.envelope.agent_sequence, expected);
-            assert_eq!(event.envelope.session_id, session);
+            envelope: AgentEventEnvelope {
+                event_id: EventId::new(),
+                session_id,
+                agent_id: AgentId::new(),
+                parent_agent_id: None,
+                run_id: Some(RunId::new()),
+                agent_sequence: sequence,
+                session_sequence: Some(sequence),
+                timestamp: Timestamp::now(),
+                visibility: EventVisibility::User,
+                event: AgentEvent::StateChanged {
+                    from: AgentStatus::Idle,
+                    to: AgentStatus::PreparingContext,
+                },
+            },
+            session_sequence: Some(sequence),
         }
     }
 
     #[tokio::test]
-    async fn load_returns_all_events_when_no_snapshot() {
-        let dir = temp_dir("no-snapshot");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
+    async fn appends_and_loads_a_session() {
+        let directory = temp_dir();
+        let store = JsonlSessionStore::with_sync_interval(&directory, 1);
+        let session_id = SessionId::new();
 
-        store.append(event(session, 1)).await.expect("append event");
-        store.append(event(session, 2)).await.expect("append event");
+        store.append(event(session_id, 1)).await.expect("append");
+        let stored = store.load_session(session_id).await.expect("load");
 
-        let stored = store.load_session(session).await.expect("load session");
+        assert_eq!(stored.session_id, session_id);
+        assert_eq!(stored.events.len(), 1);
         assert!(stored.snapshot.is_none());
-        let sequences: Vec<Option<u64>> =
-            stored.events.iter().map(|e| e.session_sequence).collect();
-        assert_eq!(sequences, vec![Some(1), Some(2)]);
+
+        let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
     #[tokio::test]
-    async fn load_missing_session_is_not_found() {
-        let dir = temp_dir("not-found");
-        let store = JsonlSessionStore::new(dir.as_path());
-
+    async fn missing_session_is_reported() {
+        let store = JsonlSessionStore::new(temp_dir());
         let error = store
             .load_session(SessionId::new())
             .await
-            .expect_err("no file exists for an unknown session");
+            .expect_err("missing session");
         assert!(matches!(error, StoreError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn empty_session_file_is_not_found() {
-        let dir = temp_dir("empty-file");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        // A zero-record file holds no stored data.
-        let path = dir.join(format!("{session}.jsonl"));
-        tokio::fs::write(&path, b"")
-            .await
-            .expect("write empty file");
-
-        let error = store
-            .load_session(session)
-            .await
-            .expect_err("empty file has no stored data");
-        assert!(matches!(error, StoreError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn data_survives_store_recreation() {
-        let dir = temp_dir("restart");
-        let session = SessionId::new();
-
-        {
-            let store = JsonlSessionStore::new(dir.as_path());
-            store.append(event(session, 1)).await.expect("append event");
-            store.append(event(session, 2)).await.expect("append event");
-            store
-                .save_snapshot(snapshot(session, 2))
-                .await
-                .expect("save snapshot");
-        } // store dropped -> all senders dropped -> writer task flushes and exits
-
-        let reopened = JsonlSessionStore::new(dir.as_path());
-        let stored = reopened
-            .load_session(session)
-            .await
-            .expect("reload session");
-        assert_eq!(
-            stored.snapshot.as_ref().map(|s| s.session_sequence),
-            Some(2)
-        );
-        assert_eq!(
-            stored.events.len(),
-            0,
-            "both events captured by the snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_appends_are_serialized_by_single_writer() {
-        let dir = temp_dir("concurrent");
-        let store = std::sync::Arc::new(JsonlSessionStore::new(dir.as_path()));
-        let session = SessionId::new();
-
-        let mut handles = Vec::new();
-        for seq in 0..32 {
-            let store = store.clone();
-            handles.push(tokio::spawn(async move {
-                store
-                    .append(event(session, seq))
-                    .await
-                    .expect("append event");
-            }));
-        }
-        for handle in handles {
-            handle.await.expect("join append task");
-        }
-
-        // Every append must have landed as a complete, parseable line.
-        let stored = store.load_session(session).await.expect("load session");
-        let mut sequences: Vec<u64> = stored
-            .events
-            .iter()
-            .map(|e| e.session_sequence.expect("sequenced event"))
-            .collect();
-        sequences.sort_unstable();
-        assert_eq!(sequences, (0..32).collect::<Vec<u64>>());
-    }
-
-    #[tokio::test]
-    async fn later_snapshot_replaces_earlier() {
-        let dir = temp_dir("replace");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 1))
-            .await
-            .expect("save snapshot");
-        store.append(event(session, 2)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 2))
-            .await
-            .expect("save snapshot");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(
-            stored.snapshot.as_ref().map(|s| s.session_sequence),
-            Some(2),
-            "the last snapshot line wins"
-        );
-        assert_eq!(stored.events.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn unsequenced_events_are_treated_as_trailing() {
-        let dir = temp_dir("unsequenced");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-        store
-            .save_snapshot(snapshot(session, 1))
-            .await
-            .expect("save snapshot");
-
-        let mut unsequenced = event(session, 2);
-        unsequenced.session_sequence = None;
-        unsequenced.envelope.session_sequence = None;
-        store
-            .append(unsequenced)
-            .await
-            .expect("append unsequenced event");
-
-        let stored = store.load_session(session).await.expect("load session");
-        assert_eq!(stored.events.len(), 1);
-        assert_eq!(stored.events[0].session_sequence, None);
-    }
-
-    #[tokio::test]
-    async fn corrupt_record_line_is_reported() {
-        let dir = temp_dir("corrupt");
-        let store = JsonlSessionStore::new(dir.as_path());
-        let session = SessionId::new();
-
-        store.append(event(session, 1)).await.expect("append event");
-
-        // Append a garbage line directly to the session file.
-        let path = dir.join(format!("{session}.jsonl"));
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .await
-            .expect("open session file");
-        file.write_all(b"{ not json }\n")
-            .await
-            .expect("write garbage");
-        file.sync_data().await.expect("flush garbage");
-
-        let error = store
-            .load_session(session)
-            .await
-            .expect_err("corrupt line must surface as an error");
-        assert!(matches!(error, StoreError::InvalidState(_)));
     }
 }

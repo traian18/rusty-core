@@ -1,5 +1,5 @@
 [package]
-name = "harness-tool-web"
+name = "harness-integration-github-copilot"
 version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +9,14 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+harness-protocol = { path = "../../harness-protocol" }
+harness-runtime = { path = "../../harness-runtime" }
 async-trait = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
-html2text = { workspace = true }
-futures = { workspace = true }
-harness-tools = { path = "../../harness-tools" }
-tracing = { workspace = true }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "macros"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

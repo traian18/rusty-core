@@ -1,6 +1,6 @@
 [package]
 name = "harness-integration-claude-code"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,9 +12,14 @@ publish = false
 harness-protocol = { path = "../../harness-protocol" }
 harness-runtime = { path = "../../harness-runtime" }
 async-trait.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+rust_decimal.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util"] }
+tempfile = "3"

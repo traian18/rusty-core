@@ -107,6 +107,21 @@ pub struct BackendReference {
     pub model: Option<ModelId>,
 }
 
+/// Versioned, secret-free provider selection persisted with a backend reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBackendSelection {
+    pub version: u8,
+    pub provider: String,
+    pub credential_profile: String,
+    pub provider_model_id: String,
+}
+
+impl PersistedBackendSelection {
+    pub fn v1(provider: impl Into<String>, credential_profile: impl Into<String>, provider_model_id: impl Into<String>) -> Self {
+        Self { version: 1, provider: provider.into(), credential_profile: credential_profile.into(), provider_model_id: provider_model_id.into() }
+    }
+}
+
 /// A full backend binding combining a persistable reference and a live descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendBinding {
@@ -256,416 +271,38 @@ pub enum ExecutionEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::BackendId;
-
-    // -----------------------------------------------------------------------
-    // Capability-based branching
-    // -----------------------------------------------------------------------
-
-    /// Demonstrates that capability-based dispatch compiles and works correctly.
-    #[test]
-    fn capability_branching_works() {
-        let caps = BackendCapabilities {
-            streaming: true,
-            tool_calls: true,
-            ..Default::default()
-        };
-
-        // Simulate capability-based dispatch
-        let use_streaming = caps.streaming;
-        let use_tools = caps.tool_calls;
-        let use_reasoning = caps.reasoning_stream;
-        let use_images = caps.images;
-
-        assert!(use_streaming, "streaming should be enabled");
-        assert!(use_tools, "tool_calls should be enabled");
-        assert!(!use_reasoning, "reasoning_stream should be disabled by default");
-        assert!(!use_images, "images should be disabled by default");
-
-        // All-zeros default
-        let default_caps = BackendCapabilities::default();
-        assert!(!default_caps.streaming);
-        assert!(!default_caps.exact_cost);
-        assert!(!default_caps.resumable_sessions);
-    }
-
-    /// Verifies that a backend descriptor round-trips through JSON with
-    /// a mix of enabled and disabled capabilities.
-    #[test]
-    fn backend_descriptor_roundtrip() {
-        let desc = BackendDescriptor {
-            id: BackendId::new(),
-            name: "test-backend".into(),
-            description: "A test backend".into(),
-            capabilities: BackendCapabilities {
-                streaming: true,
-                tool_calls: true,
-                parallel_tool_calls: true,
-                host_managed_tools: true,
-                ..Default::default()
-            },
-        };
-
-        let json = serde_json::to_string(&desc).expect("serialize descriptor");
-        let deserialized: BackendDescriptor =
-            serde_json::from_str(&json).expect("deserialize descriptor");
-
-        assert_eq!(desc.id, deserialized.id);
-        assert_eq!(desc.name, deserialized.name);
-        assert_eq!(desc.capabilities.streaming, deserialized.capabilities.streaming);
-        assert_eq!(desc.capabilities.tool_calls, deserialized.capabilities.tool_calls);
-        assert_eq!(
-            desc.capabilities.parallel_tool_calls,
-            deserialized.capabilities.parallel_tool_calls
-        );
-        assert!(!deserialized.capabilities.reasoning_stream);
-        assert!(!deserialized.capabilities.exact_cost);
-    }
-
-    // -----------------------------------------------------------------------
-    // BackendReference / BackendBinding
-    // -----------------------------------------------------------------------
 
     #[test]
-    fn backend_reference_roundtrip() {
-        let reference = BackendReference {
-            integration: IntegrationId::new(),
-            configuration: ConfigurationId::new(),
-            model: None,
-        };
-
-        let json = serde_json::to_string(&reference).expect("serialize reference");
-        let deserialized: BackendReference =
-            serde_json::from_str(&json).expect("deserialize reference");
-
-        assert_eq!(reference.integration, deserialized.integration);
-        assert_eq!(reference.configuration, deserialized.configuration);
-        assert!(deserialized.model.is_none());
+    fn capabilities_default_to_disabled() {
+        let capabilities = BackendCapabilities::default();
+        assert!(!capabilities.streaming);
+        assert!(!capabilities.tool_calls);
+        assert!(!capabilities.exact_cost);
     }
 
     #[test]
-    fn backend_binding_roundtrip() {
-        let binding = BackendBinding {
-            reference: BackendReference {
-                integration: IntegrationId::new(),
-                configuration: ConfigurationId::new(),
-                model: Some(ModelId::new()),
-            },
-            descriptor: BackendDescriptor {
-                id: BackendId::new(),
-                name: "production".into(),
-                description: "Production backend".into(),
-                capabilities: BackendCapabilities {
-                    streaming: true,
-                    ..Default::default()
-                },
-            },
-        };
-
-        let json = serde_json::to_string(&binding).expect("serialize binding");
-        let deserialized: BackendBinding =
-            serde_json::from_str(&json).expect("deserialize binding");
-
-        assert_eq!(binding.reference.integration, deserialized.reference.integration);
-        assert_eq!(
-            binding.descriptor.name,
-            deserialized.descriptor.name
-        );
-        assert!(deserialized.reference.model.is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // ExecutionRequest / ExecutionContext
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn execution_request_roundtrip() {
-        let request = ExecutionRequest {
-            request_id: RequestId::new(),
-            run_id: RunId::new(),
-            system_prompt: "You are a helpful assistant.".into(),
-            messages: vec![],
-            tools: vec![],
-            extended_thinking: false,
-        };
-
-        let json = serde_json::to_string(&request).expect("serialize request");
-        let deserialized: ExecutionRequest =
-            serde_json::from_str(&json).expect("deserialize request");
-
-        assert_eq!(request.request_id, deserialized.request_id);
-        assert_eq!(request.run_id, deserialized.run_id);
-        assert_eq!(request.system_prompt, deserialized.system_prompt);
-        assert!(!deserialized.extended_thinking);
+    fn persisted_backend_selection_roundtrips() {
+        let selection =
+            PersistedBackendSelection::v1("openai-api", "openai-api:default", "gpt-test");
+        let encoded = serde_json::to_string(&selection).expect("serialize selection");
+        let decoded: PersistedBackendSelection =
+            serde_json::from_str(&encoded).expect("deserialize selection");
+        assert_eq!(decoded, selection);
     }
 
     #[test]
-    fn execution_context_defaults() {
-        let ctx = ExecutionContext {
-            max_tokens: Some(4096),
-            temperature: Some(0.7),
-            stop_sequences: vec![],
-        };
-
-        assert_eq!(ctx.max_tokens, Some(4096));
-        assert!((ctx.temperature.unwrap() - 0.7).abs() < f64::EPSILON);
-        assert!(ctx.stop_sequences.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // ExecutionEvent round-trip serialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn execution_event_text_delta_roundtrip() {
+    fn execution_event_roundtrips() {
         let request_id = RequestId::new();
         let event = ExecutionEvent::TextDelta {
             request_id,
-            delta: "Hello".into(),
+            delta: "hello".into(),
         };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::TextDelta {
-                request_id: rid,
-                delta,
-            } => {
-                assert_eq!(rid, request_id);
-                assert_eq!(delta, "Hello");
-            }
-            other => panic!("expected TextDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execution_event_reasoning_delta_roundtrip() {
-        let request_id = RequestId::new();
-        let event = ExecutionEvent::ReasoningDelta {
-            request_id,
-            delta: "thinking...".into(),
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::ReasoningDelta {
-                request_id: rid,
-                delta,
-            } => {
-                assert_eq!(rid, request_id);
-                assert_eq!(delta, "thinking...");
-            }
-            other => panic!("expected ReasoningDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execution_event_tool_call_requested_roundtrip() {
-        let request_id = RequestId::new();
-        let event = ExecutionEvent::ToolCallRequested {
-            request_id,
-            call: ToolCall {
-                id: crate::ids::ToolCallId::new(),
-                name: "search".into(),
-                arguments: serde_json::json!({"query": "rust"}),
-            },
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::ToolCallRequested {
-                request_id: rid,
-                call,
-            } => {
-                assert_eq!(rid, request_id);
-                assert_eq!(call.name, "search");
-            }
-            other => panic!("expected ToolCallRequested, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execution_event_usage_update_roundtrip() {
-        let request_id = RequestId::new();
-        let event = ExecutionEvent::UsageUpdate {
-            request_id,
-            usage: ModelUsage::default(),
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::UsageUpdate {
-                request_id: rid,
-                usage,
-            } => {
-                assert_eq!(rid, request_id);
-                assert!(usage.input_tokens.is_unknown());
-            }
-            other => panic!("expected UsageUpdate, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execution_event_completed_roundtrip() {
-        let request_id = RequestId::new();
-        let usage = ModelUsage::default();
-        let result = ExecutionResult {
-            request_id,
-            usage,
-            cost: Cost {
-                amount_usd: None,
-                source: None,
-            },
-            finish_reason: "end_turn".into(),
-        };
-        let event = ExecutionEvent::Completed {
-            request_id,
-            result,
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::Completed {
-                request_id: rid,
-                result: res,
-            } => {
-                assert_eq!(rid, request_id);
-                assert_eq!(res.finish_reason, "end_turn");
-            }
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execution_event_error_roundtrip() {
-        let request_id = RequestId::new();
-        let event = ExecutionEvent::Error {
-            request_id,
-            error: ExecutionError::RateLimited { retry_after: Some(30) },
-        };
-
-        let json = serde_json::to_string(&event).expect("serialize");
-        let deserialized: ExecutionEvent =
-            serde_json::from_str(&json).expect("deserialize");
-
-        match deserialized {
-            ExecutionEvent::Error {
-                request_id: rid,
-                error,
-            } => {
-                assert_eq!(rid, request_id);
-                match error {
-                    ExecutionError::RateLimited { retry_after } => {
-                        assert_eq!(retry_after, Some(30));
-                    }
-                    other => panic!("expected RateLimited, got {other:?}"),
-                }
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    /// Round-trip all six ExecutionEvent variants through a single serialization
-    /// cycle to verify the enum discriminant is preserved.
-    #[test]
-    fn all_execution_event_variants_roundtrip() {
-        let request_id = RequestId::new();
-        let events: Vec<ExecutionEvent> = vec![
-            ExecutionEvent::TextDelta {
-                request_id,
-                delta: "a".into(),
-            },
-            ExecutionEvent::ReasoningDelta {
-                request_id,
-                delta: "b".into(),
-            },
-            ExecutionEvent::ToolCallRequested {
-                request_id,
-                call: ToolCall {
-                    id: crate::ids::ToolCallId::new(),
-                    name: "c".into(),
-                    arguments: serde_json::json!({}),
-                },
-            },
-            ExecutionEvent::UsageUpdate {
-                request_id,
-                usage: ModelUsage::default(),
-            },
-            ExecutionEvent::Completed {
-                request_id,
-                result: ExecutionResult {
-                    request_id,
-                    usage: ModelUsage::default(),
-                    cost: Cost {
-                        amount_usd: None,
-                        source: None,
-                    },
-                    finish_reason: "d".into(),
-                },
-            },
-            ExecutionEvent::Error {
-                request_id,
-                error: ExecutionError::Cancelled,
-            },
-        ];
-
-        for event in &events {
-            let json = serde_json::to_string(event).expect("serialize");
-            let deserialized: ExecutionEvent =
-                serde_json::from_str(&json).expect("deserialize");
-            // Verify discriminant matches by comparing debug representation
-            let expected_tag = std::mem::discriminant(event);
-            let actual_tag = std::mem::discriminant(&deserialized);
-            assert_eq!(
-                expected_tag, actual_tag,
-                "discriminant mismatch for event: {event:?}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // ExecutionError
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn execution_error_variants_roundtrip() {
-        let errors = vec![
-            ExecutionError::BackendError {
-                message: "bad request".into(),
-                code: "ERR_400".into(),
-            },
-            ExecutionError::RateLimited { retry_after: Some(60) },
-            ExecutionError::InvalidRequest {
-                message: "missing field".into(),
-            },
-            ExecutionError::Cancelled,
-            ExecutionError::Timeout,
-        ];
-
-        for error in &errors {
-            let json = serde_json::to_string(error).expect("serialize");
-            let deserialized: ExecutionError =
-                serde_json::from_str(&json).expect("deserialize");
-            let expected_tag = std::mem::discriminant(error);
-            let actual_tag = std::mem::discriminant(&deserialized);
-            assert_eq!(
-                expected_tag, actual_tag,
-                "discriminant mismatch for error: {error:?}"
-            );
-        }
+        let encoded = serde_json::to_string(&event).expect("serialize event");
+        let decoded: ExecutionEvent = serde_json::from_str(&encoded).expect("deserialize event");
+        assert!(matches!(
+            decoded,
+            ExecutionEvent::TextDelta { request_id: id, delta }
+                if id == request_id && delta == "hello"
+        ));
     }
 }

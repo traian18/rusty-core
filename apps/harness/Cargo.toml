@@ -1,6 +1,6 @@
 [package]
 name = "harness"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,8 +15,13 @@ crossterm = "0.28"
 harness-engine = { path = "../../crates/harness-engine" }
 harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
 harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
+harness-integration-codex = { path = "../../crates/integrations/codex" }
+harness-integration-github-copilot = { path = "../../crates/integrations/github-copilot" }
+harness-integration-openai = { path = "../../crates/integrations/openai" }
 harness-protocol = { path = "../../crates/harness-protocol" }
 harness-session-store = { path = "../../crates/harness-session-store" }
+pulldown-cmark = "0.13"
 ratatui = "0.29"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+unicode-width = "0.2"

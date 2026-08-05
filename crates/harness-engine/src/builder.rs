@@ -114,6 +114,7 @@ impl HarnessBuilder {
             integrations,
             sessions,
             session_store: store,
+            model_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         })
     }
 }

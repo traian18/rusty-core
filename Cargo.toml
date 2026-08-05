@@ -18,6 +18,7 @@ members = [
     "crates/integrations/openai-compatible",
     "crates/integrations/claude-code",
     "crates/integrations/codex",
+    "crates/integrations/github-copilot",
     "crates/tools/filesystem",
     "crates/tools/shell",
     "crates/tools/git",
