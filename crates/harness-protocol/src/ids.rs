@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 macro_rules! newtype_id {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         #[repr(transparent)]
         pub struct $name(Uuid);
 
@@ -29,9 +31,7 @@ macro_rules! newtype_id {
 
             /// Derives a reproducible ID for deterministic core transitions.
             pub fn derived(seed: Uuid, sequence: u64, namespace: u64) -> Self {
-                let value = seed.as_u128()
-                    ^ ((sequence as u128) << 64)
-                    ^ namespace as u128;
+                let value = seed.as_u128() ^ ((sequence as u128) << 64) ^ namespace as u128;
                 Self(Uuid::from_u128(value))
             }
         }
@@ -72,6 +72,8 @@ newtype_id!(ConfigurationId);
 newtype_id!(ModelId);
 newtype_id!(BackendId);
 newtype_id!(ContextProviderId);
+newtype_id!(ContextCheckpointId);
+newtype_id!(ContextItemId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(DateTime<Utc>);
@@ -136,6 +138,8 @@ mod tests {
             ModelId,
             BackendId,
             ContextProviderId,
+            ContextCheckpointId,
+            ContextItemId,
         );
     }
 

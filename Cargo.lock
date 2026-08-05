@@ -703,9 +703,11 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "crossterm",
  "harness-engine",
  "harness-integration-anthropic",
+ "harness-integration-claude-code",
  "harness-protocol",
  "harness-session-store",
  "ratatui",
@@ -815,9 +817,9 @@ dependencies = [
  "async-trait",
  "harness-protocol",
  "harness-runtime",
- "rust_decimal",
+ "serde",
  "serde_json",
- "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",

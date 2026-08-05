@@ -1,15 +1,20 @@
 #![warn(clippy::all)]
 
-//! Context-provider abstractions and context assembly.
+//! Context-provider abstractions, model-aware budgeting, and context assembly.
 //!
-//! See [`provider`] for why this lives as a backend decorator rather than
-//! inside `harness-core`'s pure state machine.
+//! Canonical conversation history remains owned by the core. This crate
+//! prepares bounded inference views and decides when compaction is required.
 
 pub mod backend;
+pub mod policy;
 pub mod provider;
 pub mod providers;
 
 pub use backend::ContextAssemblingBackend;
+pub use policy::{
+    ContextBudget, ContextBudgetUnavailable, ContextDecision, ContextOwnership, ContextPolicy,
+    ContextPolicyError, TokenEstimate,
+};
 pub use provider::ContextProvider;
 pub use providers::{
     ChainedContextProvider, StaticSystemPromptProvider, TruncatingCompactionProvider,

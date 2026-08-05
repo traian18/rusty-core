@@ -1,4 +1,4 @@
-//! Agent domain entity. All external work is represented as effects from `Agent::apply`.
+//! Agent domain entity. All external work is represented as effects from Agent::apply.
 
 use std::collections::HashMap;
 
@@ -9,6 +9,7 @@ use harness_protocol::usage::AgentBudget;
 
 use crate::agent_state::AgentState;
 use crate::capabilities::AgentCapabilities;
+use crate::context_state::AgentContextState;
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageLedger {
@@ -59,6 +60,7 @@ impl Agent {
                 current_operation: None,
                 system_prompt,
                 messages: Vec::new(),
+                context: AgentContextState::default(),
                 active_run: None,
                 pending_tools: Default::default(),
                 pending_permissions: Default::default(),
@@ -86,9 +88,7 @@ mod tests {
     use harness_protocol::backend::{
         BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
     };
-    use harness_protocol::ids::{
-        AgentId, BackendId, ConfigurationId, IntegrationId, SessionId,
-    };
+    use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
     use harness_protocol::tools::AgentToolset;
 
     use crate::capabilities::WorkspaceCapabilities;
@@ -138,10 +138,12 @@ mod tests {
         assert!(root.is_root());
         assert_eq!(root.state.status, AgentStatus::Idle);
         assert!(root.state.pending_permissions.is_empty());
+        assert_eq!(root.state.context, AgentContextState::default());
 
         let child = agent(Some(root.id));
         assert!(!child.is_root());
         assert_eq!(child.parent_id, Some(root.id));
+        assert_eq!(child.state.context.generation, 0);
     }
 
     #[test]

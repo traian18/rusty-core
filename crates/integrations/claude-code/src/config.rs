@@ -1,45 +1,74 @@
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Configuration for driving the Claude Code CLI as a subprocess backend.
-///
-/// # `permission_mode` and trust
-///
-/// Defaults to `"bypassPermissions"` — the harness process has no TTY to
-/// relay the CLI's own interactive permission prompts to, so the delegated
-/// Claude Code instance must run autonomously using its own tools
-/// (Read/Write/Edit/Bash/...) within `working_dir`. This is a deliberate,
-/// documented trust decision (see `crates/integrations/claude-code/PLAN.md`,
-/// question 1): the harness's own tool registry and permission system are
-/// bypassed entirely for this backend — the CLI manages its own tools
-/// end-to-end. Only use this integration where that's the intended
-/// delegation model, and scope `working_dir` accordingly.
-#[derive(Clone, Debug)]
+/// Configuration for the Claude Code CLI integration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClaudeCodeConfig {
-    /// Resolved via `$PATH` by default.
+    /// Path to the Claude Code CLI binary (default: resolve "claude" via $PATH).
+    #[serde(default = "default_binary_path")]
     pub binary_path: PathBuf,
-    /// Extra CLI arguments passed through verbatim (e.g. `["--model", "opus"]`).
+
+    /// Additional command-line arguments to pass to the CLI.
+    /// Common examples: --model claude-3-5-sonnet-20241022
+    #[serde(default)]
     pub extra_args: Vec<String>,
-    /// One of `"bypassPermissions"`, `"acceptEdits"`, `"plan"`, etc. — see
-    /// `claude --help`'s `--permission-mode` for the current set.
+
+    /// Permission mode for the CLI (e.g., "autonomous" to bypass CLI prompts).
+    /// The harness becomes the single permission layer.
+    #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
-    /// Working directory for the spawned process. `None` inherits the
-    /// harness process's own current directory.
-    pub working_dir: Option<PathBuf>,
+
+    /// Optional timeout in seconds for the CLI subprocess.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+fn default_binary_path() -> PathBuf {
+    "claude".into()
+}
+
+fn default_permission_mode() -> String {
+    "autonomous".to_string()
 }
 
 impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
-            binary_path: PathBuf::from("claude"),
+            binary_path: default_binary_path(),
             extra_args: Vec::new(),
-            permission_mode: "bypassPermissions".to_string(),
-            working_dir: None,
+            permission_mode: default_permission_mode(),
+            timeout_secs: None,
         }
     }
 }
 
 impl ClaudeCodeConfig {
+    /// Create a new config with the default binary path ("claude").
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set a custom binary path.
+    pub fn with_binary_path(mut self, path: PathBuf) -> Self {
+        self.binary_path = path;
+        self
+    }
+
+    /// Add an extra CLI argument.
+    pub fn with_arg(mut self, arg: String) -> Self {
+        self.extra_args.push(arg);
+        self
+    }
+
+    /// Set the permission mode.
+    pub fn with_permission_mode(mut self, mode: String) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+
+    /// Set a timeout in seconds.
+    pub fn with_timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = Some(secs);
+        self
     }
 }

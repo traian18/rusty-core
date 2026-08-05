@@ -717,6 +717,7 @@ impl SessionRuntime {
                     current_operation: stored.current_operation,
                     system_prompt: stored.system_prompt,
                     messages: stored.messages,
+                    context: Default::default(),
                     active_run: stored.active_run,
                     pending_tools: stored
                         .pending_tools

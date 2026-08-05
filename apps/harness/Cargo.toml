@@ -10,9 +10,11 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 crossterm = "0.28"
 harness-engine = { path = "../../crates/harness-engine" }
 harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
+harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
 harness-protocol = { path = "../../crates/harness-protocol" }
 harness-session-store = { path = "../../crates/harness-session-store" }
 ratatui = "0.29"
