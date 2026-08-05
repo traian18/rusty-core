@@ -29,6 +29,7 @@ members = [
     "apps/harness",
     "apps/harnessd",
     "apps/harnessctl",
+    "sdk/rust",
 ]
 exclude = ["xtask"]
 

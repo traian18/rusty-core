@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use harness_protocol::commands::{AgentStatus, PermissionDecision};
+use harness_protocol::commands::{AgentStatus, PermissionDecision, UserInput};
 use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
 use harness_protocol::ids::{AgentId, PermissionId, SessionId, Timestamp};
 use harness_protocol::usage::{
@@ -57,18 +57,26 @@ pub struct SessionSnapshot {
 
 /// Maps an agent's live runtime status onto the coarser session-level status.
 ///
-/// `AgentStatus` returns to `Idle` after a successful run completes, so a
-/// recorded [`AgentOutcome`] (from [`AgentLiveState::last_outcome`]) is what
-/// distinguishes "never run" from "completed"/"cancelled" while idle.
+/// `AgentStatus` returns to `Idle` after a run completes (successfully,
+/// unsuccessfully, or cancelled), so a recorded [`AgentOutcome`] (from
+/// [`AgentLiveState::last_outcome`]) is what distinguishes "never run" from
+/// "completed"/"failed"/"cancelled" while idle.
+///
+/// A backend or agent failure must never be reported as a successful
+/// completion: `AgentStatus::Failed` and `AgentOutcome::Failed` both map to
+/// `SessionStatus::Failed`, distinct from `SessionStatus::Completed`. See
+/// `upgrade_rusty.md` RST-004.
 fn session_status_from_live(live: &AgentLiveState, fallback: SessionStatus) -> SessionStatus {
     use AgentStatus::*;
     match live.status {
         PreparingContext | WaitingForBackend | Streaming | Executing | WaitingForPermission
         | WaitingForChildren | Paused => SessionStatus::Running,
         Cancelled => SessionStatus::Cancelled,
-        Failed | Completed => SessionStatus::Completed,
+        Failed => SessionStatus::Failed,
+        Completed => SessionStatus::Completed,
         Idle => match live.last_outcome {
-            Some(AgentOutcome::Success) | Some(AgentOutcome::Failed) => SessionStatus::Completed,
+            Some(AgentOutcome::Success) => SessionStatus::Completed,
+            Some(AgentOutcome::Failed) => SessionStatus::Failed,
             Some(AgentOutcome::Cancelled) => SessionStatus::Cancelled,
             None => fallback,
         },
@@ -111,6 +119,16 @@ impl SessionClient {
         self.runtime.send_command(command).await
     }
 
+    /// Inject additional user input into the session.
+    pub async fn steer(&self, input: UserInput) -> Result<(), SessionError> {
+        self.runtime.steer(input).await
+    }
+
+    /// Queue a follow-up prompt for the session.
+    pub async fn follow_up(&self, input: UserInput) -> Result<(), SessionError> {
+        self.runtime.follow_up(input).await
+    }
+
     /// Resolve a permission request originating from the root agent.
     pub async fn resolve_permission(
         &self,
@@ -127,7 +145,7 @@ impl SessionClient {
     /// table that every `AgentRunner` publishes to after each transition —
     /// on every call. Immediately after `send(Prompt)` this reflects an
     /// in-flight status (e.g. `Running`); once the run completes it reflects
-    /// `Completed` with populated usage.
+    /// `Completed` (or `Failed`) with populated usage.
     pub fn snapshot(&self) -> SessionSnapshot {
         let runtime_snapshot = self.runtime.state_snapshot();
         let live = self
@@ -198,7 +216,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
+    use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionResult};
     use harness_protocol::commands::UserInput;
     use harness_protocol::ids::RequestId;
     use harness_protocol::tools::AgentToolset;
@@ -315,5 +333,73 @@ mod tests {
             "usage should be populated from the scripted ExecutionResult after completion"
         );
         assert_eq!(after.usage.cumulative.total_requests, 1);
+    }
+
+    /// RST-004: a backend/agent failure must never be reported through
+    /// `snapshot().status` as a successful completion. `AgentStatus::Failed`
+    /// (in-flight) and `AgentOutcome::Failed` (post-hoc, once the agent has
+    /// returned to `Idle`) must both project to `SessionStatus::Failed`,
+    /// distinct from `SessionStatus::Completed`.
+    #[tokio::test]
+    async fn snapshot_reports_failed_status_truthfully() {
+        let session_id = SessionId::new();
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let backend = Arc::new(FakeBackend::new().with_error(ExecutionError::BackendError {
+            message: "scripted failure".into(),
+            code: "TEST_FAILURE".into(),
+        }));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let workspace = Arc::new(FakeWorkspace::new());
+
+        let runtime = Arc::new(SessionRuntime::new_with_scheduler(
+            session_id,
+            backend,
+            tool_registry,
+            workspace,
+            Arc::new(NoopSink),
+            AgentToolset {
+                tools: std::collections::HashMap::new(),
+            },
+            scheduler,
+            None,
+        ));
+        let client = SessionClient::new(runtime);
+
+        let mut subscriber = client.subscribe();
+
+        client
+            .send(SessionCommand::Prompt(UserInput {
+                text: "hello".into(),
+                attachments: vec![],
+            }))
+            .await
+            .expect("send should succeed");
+
+        let mut failed_event_seen = false;
+        for _ in 0..50 {
+            while let Ok(envelope) = subscriber.try_recv() {
+                if matches!(
+                    envelope.event,
+                    harness_protocol::events::AgentEvent::Failed { .. }
+                ) {
+                    failed_event_seen = true;
+                }
+            }
+            if failed_event_seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(failed_event_seen, "run should fail within the polling window");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let after = client.snapshot();
+        assert_eq!(
+            after.status,
+            SessionStatus::Failed,
+            "a failed run must never be reported as SessionStatus::Completed"
+        );
     }
 }

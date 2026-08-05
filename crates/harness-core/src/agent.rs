@@ -62,6 +62,7 @@ impl Agent {
                 messages: Vec::new(),
                 context: AgentContextState::default(),
                 active_run: None,
+                queued_inputs: Default::default(),
                 pending_tools: Default::default(),
                 pending_permissions: Default::default(),
                 children: Vec::new(),

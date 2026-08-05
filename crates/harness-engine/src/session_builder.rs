@@ -380,6 +380,7 @@ impl SessionBuilder {
         Ok(SessionHandle {
             client: SessionClient::new(runtime),
             session_id,
+            session_manager,
         })
     }
 }
@@ -404,6 +405,7 @@ pub struct ContextInspection {
 pub struct SessionHandle {
     client: SessionClient,
     session_id: SessionId,
+    session_manager: Arc<SessionManager>,
 }
 
 impl SessionHandle {
@@ -415,11 +417,15 @@ impl SessionHandle {
     /// persisted snapshot (see
     /// [`Harness::restore_session`](crate::Harness::restore_session)) through
     /// the same handle API.
-    pub(crate) fn from_runtime(runtime: Arc<SessionRuntime>) -> Self {
+    pub(crate) fn from_runtime(
+        runtime: Arc<SessionRuntime>,
+        session_manager: Arc<SessionManager>,
+    ) -> Self {
         let session_id = runtime.session_id;
         Self {
             client: SessionClient::new(runtime),
             session_id,
+            session_manager,
         }
     }
 
@@ -433,12 +439,41 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Inject additional user input into this session.
+    pub async fn steer(&self, prompt: &str) -> Result<(), HarnessError> {
+        self.client
+            .steer(UserInput {
+                text: prompt.to_string(),
+                attachments: vec![],
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Queue a prompt to run after the current command boundary.
+    pub async fn follow_up(&self, prompt: &str) -> Result<(), HarnessError> {
+        self.client
+            .follow_up(UserInput {
+                text: prompt.to_string(),
+                attachments: vec![],
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Cancel the active session run.
     ///
     /// This keeps frontends on the public engine API instead of requiring
     /// access to runtime command types.
     pub async fn cancel(&self) -> Result<(), HarnessError> {
         self.client.send(SessionCommand::Cancel).await?;
+        Ok(())
+    }
+
+    /// Close this session permanently, cancelling active work, stopping event
+    /// forwarding, and releasing its scheduler slot.
+    pub async fn close(&self) -> Result<(), HarnessError> {
+        self.session_manager.close_session(self.session_id).await?;
         Ok(())
     }
 

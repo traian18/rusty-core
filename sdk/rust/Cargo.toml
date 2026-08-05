@@ -1,0 +1,30 @@
+[package]
+name = "rusty-harness-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Stable, application-agnostic Rust SDK facade over the Rusty agent harness engine."
+publish = false
+
+[dependencies]
+harness-engine = { path = "../../crates/harness-engine" }
+harness-protocol = { path = "../../crates/harness-protocol" }
+harness-runtime = { path = "../../crates/harness-runtime", features = ["testing"] }
+harness-session-store = { path = "../../crates/harness-session-store" }
+harness-workspace = { path = "../../crates/harness-workspace" }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true }
+harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }

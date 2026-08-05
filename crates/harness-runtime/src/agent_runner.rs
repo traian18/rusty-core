@@ -72,11 +72,31 @@ pub struct AgentRunner {
     live_state: LiveStateTable,
     backend_tokens: HashMap<RunId, CancellationToken>,
     tool_tokens: HashMap<ToolCallId, CancellationToken>,
-    /// Terminal `FinishRun` outcome, retrieved via [`Self::take_final_result`].
+    /// Outcome of the most recently completed `FinishRun` effect, retrieved
+    /// via [`Self::take_final_result`].
+    ///
+    /// This is overwritten on every completed run rather than queued: it
+    /// reflects the *latest* run's outcome. Callers that need durable
+    /// per-run history should read it from the transcript/event stream
+    /// instead of relying on this field surviving multiple runs.
     final_result: Option<Result<AgentResult, AgentError>>,
     supervision: Option<AgentSupervision>,
     /// Optional durable store used by `Persist` effects.
     session_store: Option<Arc<dyn harness_session_store::SessionStore>>,
+    /// When `true`, the mailbox loop in [`Self::run`] survives the
+    /// completion of an individual run (`AgentEffect::FinishRun`, whether
+    /// the outcome was success, failure, or the run-scoped cancel path) and
+    /// keeps accepting further `AgentCommand`s until the mailbox itself is
+    /// closed or the runner's own [`CancellationToken`] fires.
+    ///
+    /// Defaults to `false`, which preserves the historical one-shot
+    /// behavior (the loop exits as soon as any run finishes). Root session
+    /// agents should opt in via [`Self::long_lived`] so a session supports
+    /// multiple sequential prompts without recreating the root agent
+    /// (`upgrade_rusty.md` RST-002). Child agents should generally leave
+    /// this `false` so an awaited child still terminates promptly after its
+    /// single assigned task completes.
+    long_lived: bool,
 }
 
 /// Session-scoped services required to interpret child-agent effects.
@@ -174,6 +194,7 @@ impl AgentRunner {
             final_result: None,
             supervision: None,
             session_store: None,
+            long_lived: false,
         }
     }
 
@@ -199,12 +220,39 @@ impl AgentRunner {
         self
     }
 
-    /// Takes the captured outcome of the terminal `FinishRun` effect, if any.
+    /// Opts this runner into surviving individual run completion.
+    ///
+    /// Call this for a session's root agent so [`Self::run`] keeps
+    /// processing commands (accepting further prompts, steering, and
+    /// follow-ups) after a run finishes, instead of exiting its mailbox
+    /// loop. Leave this unset (the default) for child agents so an awaited
+    /// child still terminates promptly once its single assigned task
+    /// completes. See `upgrade_rusty.md` RST-002.
+    pub fn long_lived(mut self, long_lived: bool) -> Self {
+        self.long_lived = long_lived;
+        self
+    }
+
+    /// Takes the captured outcome of the most recently completed run's
+    /// `FinishRun` effect, if any.
+    ///
+    /// For a [`Self::long_lived`] runner this may be called after each run
+    /// completes; it always reflects the latest run only.
     pub fn take_final_result(&mut self) -> Option<Result<AgentResult, AgentError>> {
         self.final_result.take()
     }
 
     /// Processes commands until completion, cancellation, or mailbox closure.
+    ///
+    /// A non-[`Self::long_lived`] runner (the default; used for child
+    /// agents and any caller that has not opted in) exits as soon as the
+    /// active run finishes, preserving the original one-shot behavior. A
+    /// [`Self::long_lived`] runner (opt in for a session's root agent) keeps
+    /// looping after a run finishes, so the same mailbox can accept
+    /// additional prompts, steering, and follow-up commands without
+    /// recreating the agent. In both cases session/runner-level
+    /// cancellation (this runner's own [`CancellationToken`]) and mailbox
+    /// closure still terminate the loop.
     pub async fn run(&mut self) {
         self.publish_status();
         loop {
@@ -230,8 +278,13 @@ impl AgentRunner {
             }
 
             let effects = self.apply_and_publish(command);
-            if self.dispatch_effects(effects).await {
+            let finished_run = self.dispatch_effects(effects).await;
+            if finished_run && !self.long_lived {
                 break;
+            }
+            if finished_run && self.long_lived {
+                let effects = self.apply_and_publish(AgentCommand::StartNextQueuedRun);
+                self.dispatch_effects(effects).await;
             }
         }
     }
@@ -772,5 +825,111 @@ mod tests {
             events_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    /// RST-002: a runner opted into `.long_lived(true)` must keep processing
+    /// its mailbox after a run finishes, so the same agent/session can
+    /// accept a second `StartRun` without being recreated.
+    #[tokio::test]
+    async fn long_lived_runner_accepts_a_second_start_run_after_completion() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+
+        let (task, sender) = AgentTask::new(agent_id);
+        let request_id = harness_protocol::ids::RequestId::new();
+        let backend = Arc::new(FakeBackend::new().with_result(
+            harness_protocol::backend::ExecutionResult {
+                request_id,
+                usage: harness_protocol::usage::ModelUsage::default(),
+                cost: harness_protocol::usage::Cost::default(),
+                finish_reason: "end_turn".into(),
+            },
+        ));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            backend,
+            tool_registry,
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel.clone(),
+            live_state.clone(),
+            scheduler,
+        )
+        .long_lived(true);
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "first".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send first StartRun");
+
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        // Wait for the first run to complete (status returns to Idle with a
+        // recorded Success outcome) while the mailbox loop is still alive.
+        let mut first_completed = false;
+        for _ in 0..100 {
+            let live = live_state.lock().expect("live_state mutex poisoned").get(&agent_id).cloned();
+            if let Some(live) = live {
+                if live.status == AgentStatus::Idle
+                    && matches!(live.last_outcome, Some(AgentOutcome::Success))
+                {
+                    first_completed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(first_completed, "first run should complete");
+
+        // A second StartRun on the same mailbox must still be accepted and
+        // processed — proving the runner task did not exit after the first
+        // run's FinishRun effect.
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "second".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send second StartRun on the still-alive mailbox");
+
+        let mut second_completed = false;
+        for _ in 0..100 {
+            let live = live_state.lock().expect("live_state mutex poisoned").get(&agent_id).cloned();
+            if let Some(live) = live {
+                if live.status == AgentStatus::Idle && live.total_requests >= 2 {
+                    second_completed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            second_completed,
+            "a long-lived runner must process a second StartRun on the same mailbox"
+        );
+
+        drop(sender);
+        let runner = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("runner should exit once the mailbox is closed")
+            .expect("runner task should not panic");
+        assert_eq!(runner.agent.state.status, AgentStatus::Idle);
     }
 }

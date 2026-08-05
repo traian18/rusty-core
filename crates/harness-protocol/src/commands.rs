@@ -152,6 +152,22 @@ pub enum AgentCommand {
     /// Start a new run with the given user input.
     StartRun { input: UserInput },
 
+    /// Inject additional user input into the conversation.
+    ///
+    /// Runtimes that are unable to interrupt an in-flight backend request
+    /// must preserve ordering and deliver this command after that request has
+    /// reached a command boundary.
+    Steer { input: UserInput },
+
+    /// Queue user input to begin the next run after the current run reaches
+    /// a command boundary.
+    FollowUp { input: UserInput },
+
+    /// Start the next already-admitted FIFO input after the preceding run's
+    /// terminal effects have been published. This is runtime-internal; public
+    /// clients should use [`Self::FollowUp`] instead.
+    StartNextQueuedRun,
+
     /// An event arrived from the execution backend for the active run.
     BackendEvent {
         /// Which run this event belongs to.
@@ -396,6 +412,7 @@ mod tests {
             AgentCommand::Cancel,
             AgentCommand::Pause,
             AgentCommand::Resume,
+            AgentCommand::StartNextQueuedRun,
         ] {
             let json = serde_json::to_string(&cmd).expect("serialize");
             let deserialized: AgentCommand = serde_json::from_str(&json).expect("deserialize");

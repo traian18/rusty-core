@@ -252,6 +252,55 @@ fn cancel_stops_further_effects() {
 }
 
 #[test]
+fn follow_ups_are_admitted_fifo_and_start_after_completion() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let first_run = start(&mut agent);
+
+    assert!(agent.apply(AgentCommand::FollowUp {
+        input: UserInput { text: "second".into(), attachments: vec![] },
+    }).is_empty());
+    assert!(agent.apply(AgentCommand::FollowUp {
+        input: UserInput { text: "third".into(), attachments: vec![] },
+    }).is_empty());
+    assert_eq!(agent.state.queued_inputs.len(), 2);
+    assert_eq!(agent.state.messages.len(), 1);
+
+    let first_completion = agent.apply(AgentCommand::BackendEvent {
+        run_id: first_run,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
+    });
+    assert!(matches!(first_completion.as_slice(), [
+        AgentEffect::Emit { event: AgentEvent::StateChanged { .. } },
+        AgentEffect::Emit { event: AgentEvent::Completed { outcome: AgentOutcome::Success } },
+        AgentEffect::FinishRun { .. }
+    ]));
+    let second_start = agent.apply(AgentCommand::StartNextQueuedRun);
+    assert!(second_start.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::ExecuteBackend { request } if request.messages.last().is_some_and(|message| matches!(&message.content[0], ContentBlock::Text { text } if text == "second"))
+    )));
+    let second_run = agent.state.active_run.expect("second run starts");
+    assert_ne!(first_run, second_run);
+    assert_eq!(agent.state.queued_inputs.len(), 1);
+
+    agent.apply(AgentCommand::BackendEvent {
+        run_id: second_run,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
+    });
+    let third_start = agent.apply(AgentCommand::StartNextQueuedRun);
+    assert!(third_start.iter().any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
+    assert!(agent.state.active_run.is_some());
+    assert_eq!(agent.state.queued_inputs.len(), 0);
+    assert!(matches!(&agent.state.messages.last().unwrap().content[0], ContentBlock::Text { text } if text == "third"));
+}
+
+#[test]
 fn tool_failure_records_result_and_continues() {
     let mut agent = create_agent(PermissionMode::Allow);
     let run_id = start(&mut agent);

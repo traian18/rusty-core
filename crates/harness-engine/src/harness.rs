@@ -214,7 +214,7 @@ impl Harness {
                 Arc::new(NoopEventSink),
             )
             .await?;
-        Ok(SessionHandle::from_runtime(runtime))
+        Ok(SessionHandle::from_runtime(runtime, self.sessions.clone()))
     }
 
     /// Restore a previously persisted session, returning a live
@@ -244,7 +244,7 @@ impl Harness {
                 Arc::new(NoopEventSink),
             )
             .await?;
-        Ok(SessionHandle::from_runtime(runtime))
+        Ok(SessionHandle::from_runtime(runtime, self.sessions.clone()))
     }
 }
 

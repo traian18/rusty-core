@@ -444,6 +444,25 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// Send steering input to the root agent.
+    ///
+    /// Delivery is serialized through the root agent mailbox, preserving
+    /// transcript ordering with backend and tool events.
+    pub async fn steer(&self, input: UserInput) -> Result<(), SessionError> {
+        self.root_agent_tx
+            .send(AgentCommand::Steer { input })
+            .await
+            .map_err(|_| SessionError::ChannelClosed)
+    }
+
+    /// Queue a follow-up prompt for the root agent.
+    pub async fn follow_up(&self, input: UserInput) -> Result<(), SessionError> {
+        self.root_agent_tx
+            .send(AgentCommand::FollowUp { input })
+            .await
+            .map_err(|_| SessionError::ChannelClosed)
+    }
+
     /// Resolve a pending root-agent permission request.
     pub async fn resolve_permission(
         &self,
@@ -919,7 +938,10 @@ impl SessionRuntime {
             self.live_state.clone(),
             self.scheduler.clone(),
         )
-        .with_supervision(self.agent_supervisor.clone(), self.integrations.clone());
+            .with_supervision(self.agent_supervisor.clone(), self.integrations.clone())
+            // A root session survives individual run completion. Child
+            // runners remain one-shot under the supervisor.
+            .long_lived(true);
 
         self.event_bus
             .register_agent(runner.task.id, runner.task.events.clone());

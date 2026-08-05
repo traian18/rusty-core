@@ -20,7 +20,11 @@ use crate::transcript::validate_transcript;
 impl Agent {
     pub fn apply(&mut self, command: AgentCommand) -> Vec<AgentEffect> {
         match command {
-            AgentCommand::StartRun { input } => self.start_run(input),
+            AgentCommand::StartRun { input } => self.start_or_queue(input),
+            AgentCommand::Steer { input } | AgentCommand::FollowUp { input } => {
+                self.start_or_queue(input)
+            }
+            AgentCommand::StartNextQueuedRun => self.start_next_queued_run(),
             AgentCommand::BackendEvent { run_id, event } => self.backend_event(run_id, event),
             AgentCommand::ToolCompleted { call_id, result } => self.tool_completed(call_id, result),
             AgentCommand::ToolFailed { call_id, error } => self.tool_failed(call_id, error),
@@ -117,6 +121,17 @@ impl Agent {
         ]
     }
 
+    /// Starts an input immediately only when the agent is idle. Otherwise the
+    /// input is admitted into the session-local FIFO and will begin after the
+    /// active run reaches a terminal command boundary.
+    fn start_or_queue(&mut self, input: UserInput) -> Vec<AgentEffect> {
+        if self.state.active_run.is_some() {
+            self.state.queued_inputs.push_back(input);
+            return Vec::new();
+        }
+        self.start_run(input)
+    }
+
     fn start_run(&mut self, input: UserInput) -> Vec<AgentEffect> {
         if let Err(error) = validate_transcript(&self.state.messages) {
             return self.fail("INVALID_TRANSCRIPT", error.to_string());
@@ -187,7 +202,7 @@ impl Agent {
                 let from = self.state.status;
                 self.state.status = AgentStatus::Idle;
                 self.state.active_run = None;
-                vec![
+                let mut effects = vec![
                     Self::state_changed(from, AgentStatus::Idle),
                     AgentEffect::Emit {
                         event: AgentEvent::Completed {
@@ -200,10 +215,19 @@ impl Agent {
                             usage: self.terminal_usage_summary(),
                         },
                     },
-                ]
+                ];
+                effects
             }
             ExecutionEvent::Error { error, .. } => self.fail("BACKEND_ERROR", format!("{error:?}")),
         }
+    }
+
+    fn start_next_queued_run(&mut self) -> Vec<AgentEffect> {
+        self.state
+            .queued_inputs
+            .pop_front()
+            .map(|input| self.start_run(input))
+            .unwrap_or_default()
     }
 
     fn tool_requested(&mut self, call: ToolCall) -> Vec<AgentEffect> {

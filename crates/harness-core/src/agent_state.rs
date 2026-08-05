@@ -1,8 +1,8 @@
 //! Durable mutable state owned by an agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use harness_protocol::commands::{AgentError, AgentOperation, AgentStatus};
+use harness_protocol::commands::{AgentError, AgentOperation, AgentStatus, UserInput};
 use harness_protocol::ids::{AgentId, PermissionId, RunId, Timestamp, ToolCallId};
 use harness_protocol::messages::AgentMessage;
 use harness_protocol::tools::ToolCall;
@@ -25,6 +25,9 @@ pub struct AgentState {
     /// Per-agent inference-context checkpoint and pressure bookkeeping.
     pub context: AgentContextState,
     pub active_run: Option<RunId>,
+    /// User inputs admitted while a run is active. Inputs are consumed in FIFO
+    /// order once the active run reaches a terminal command boundary.
+    pub queued_inputs: VecDeque<UserInput>,
     pub pending_tools: HashMap<ToolCallId, PendingToolCall>,
     /// Exact correlation from a permission request to its pending tool call.
     pub pending_permissions: HashMap<PermissionId, ToolCallId>,
