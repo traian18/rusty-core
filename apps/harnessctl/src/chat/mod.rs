@@ -24,10 +24,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
 
+use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::ids::SessionId;
 use harness_protocol::rpc::{
-    RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
+    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
 };
 use harness_protocol::tools::AgentToolset;
 use harness_transport_ipc::framing::{read_frame, write_frame};
@@ -114,7 +115,10 @@ pub async fn run(
         while let Ok(response) = rx.try_recv() {
             match response.body {
                 RpcResponseBody::Event(envelope) => state.fold_event(envelope),
-                RpcResponseBody::Error { message } => state.push_log(format!("● error: {message}")),
+
+                RpcResponseBody::Failure(error) => {
+                    state.push_log(format!("● error: {}", error.message))
+                }
                 _ => {}
             }
         }
@@ -135,15 +139,15 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            RpcRequestBody::Prompt(UserInput {
+                            mutation(session_id, MutationCommand::Prompt(UserInput {
                                 text: prompt,
                                 attachments: vec![],
-                            }),
+                            })),
                         )
                         .await?;
                     }
                     InputAction::Cancel => {
-                        send(&mut write_half, &mut next_id, session_id, RpcRequestBody::Cancel).await?;
+                        send(&mut write_half, &mut next_id, session_id, mutation(session_id, MutationCommand::Cancel)).await?;
                         state.push_log("● cancellation requested".to_string());
                     }
                     InputAction::Approve if state.pending_permission.is_some() => {
@@ -152,7 +156,7 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            RpcRequestBody::ResolvePermission { id, decision: PermissionDecision::Approved },
+                            mutation(session_id, MutationCommand::ResolvePermission { id, decision: PermissionDecision::Approved }),
                         )
                         .await?;
                         state.push_log("● permission approved".to_string());
@@ -163,7 +167,7 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            RpcRequestBody::ResolvePermission { id, decision: PermissionDecision::Denied },
+                            mutation(session_id, MutationCommand::ResolvePermission { id, decision: PermissionDecision::Denied }),
                         )
                         .await?;
                         state.push_log("● permission rejected".to_string());
@@ -179,8 +183,22 @@ pub async fn run(
     }
 
     // Best-effort — the terminal is about to be restored either way.
-    let _ = send(&mut write_half, &mut next_id, session_id, RpcRequestBody::CloseSession).await;
+    let _ = send(&mut write_half, &mut next_id, session_id, mutation(session_id, MutationCommand::CloseSession)).await;
     Ok(())
+}
+
+
+fn mutation(session_id: SessionId, command: MutationCommand) -> RpcRequestBody {
+    RpcRequestBody::Mutate {
+        metadata: MutationMetadata {
+            command_id: CommandId::new(),
+            session_id,
+            run_id: None,
+            expected_session_revision: None,
+            trace_id: None,
+        },
+        command,
+    }
 }
 
 async fn send(

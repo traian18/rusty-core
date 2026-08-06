@@ -9,6 +9,7 @@
     "RunId": { "type": "string", "format": "uuid" },
     "RequestId": { "type": "string", "format": "uuid" },
     "ToolCallId": { "type": "string", "format": "uuid" },
+    "ToolId": { "type": "string", "format": "uuid" },
     "MessageId": { "type": "string", "format": "uuid" },
     "EventId": { "type": "string", "format": "uuid" },
     "PermissionId": { "type": "string", "format": "uuid" },
@@ -20,8 +21,9 @@
       "properties": {
         "mime_type": { "type": "string" },
         "data": {
-          "type": "string",
-          "description": "Base64-encoded bytes; the Rust type is Vec<u8>, which serde_json encodes as a JSON array of numbers by default, NOT base64. This schema documents the intended SDK-facing contract from sdk_plan.md SDK-503, not necessarily the exact byte-array shape emitted by the current Rust serde derive. Verify against a live CreateSession/Prompt round trip before relying on this field's exact wire shape."
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "description": "Exact serde_json representation of the Rust Vec<u8> field."
         }
       }
     },
@@ -47,6 +49,44 @@
         "message": { "type": "string" },
         "code": { "type": "string" },
         "details": {}
+      }
+    },
+    "ToolDescriptor": {
+      "type": "object",
+      "required": ["id", "name", "description", "input_schema"],
+      "properties": {
+        "id": { "$ref": "#/definitions/ToolId" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "input_schema": {}
+      }
+    },
+    "PermissionMode": { "enum": ["Allow", "Ask", "Deny"] },
+    "ToolPolicy": {
+      "type": "object",
+      "required": ["permission", "enabled"],
+      "properties": {
+        "permission": { "$ref": "#/definitions/PermissionMode" },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "ToolCapability": {
+      "type": "object",
+      "required": ["descriptor", "policy", "delegatable"],
+      "properties": {
+        "descriptor": { "$ref": "#/definitions/ToolDescriptor" },
+        "policy": { "$ref": "#/definitions/ToolPolicy" },
+        "delegatable": { "type": "boolean" }
+      }
+    },
+    "AgentToolset": {
+      "type": "object",
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/ToolCapability" }
+        }
       }
     },
     "ToolCall": {
@@ -204,7 +244,7 @@
               "workspace_root": { "type": "string" },
               "integration": { "type": "string" },
               "integration_config": {},
-              "toolset": { "type": "array", "items": { "type": "string" } }
+              "toolset": { "$ref": "#/definitions/AgentToolset" }
             }
         } } },
         { "type": "object", "required": ["Prompt"], "properties": { "Prompt": { "$ref": "#/definitions/UserInput" } } },

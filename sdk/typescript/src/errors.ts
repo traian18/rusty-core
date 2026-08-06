@@ -1,13 +1,7 @@
-/**
- * Typed errors for the TypeScript SDK.
- *
- * The current wire protocol only carries an untyped `{ message: string }`
- * on `RpcResponseBody::Error` (see `sdk_plan.md` SDK-200, "typed errors"
- * gap). `HarnessRpcError.message` is that raw server string until the
- * protocol grows a structured error code/category/details payload.
- */
+/** Typed errors for protocol-v2 clients. */
 
-/** Base class for every error this SDK throws. */
+import type { RpcErrorCategory, RpcErrorPayload } from "./types.js";
+
 export class HarnessSdkError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -15,31 +9,46 @@ export class HarnessSdkError extends Error {
   }
 }
 
-/** The daemon returned `RpcResponseBody::Error` for a request. */
 export class HarnessRpcError extends HarnessSdkError {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    public readonly code = "rpc.legacy_error",
+    public readonly category: RpcErrorCategory = "protocol",
+    public readonly retryable = false,
+    public readonly details?: unknown,
+    public readonly traceId?: string,
+    public readonly runId?: string,
+    public readonly providerRequestId?: string,
+  ) {
     super(message);
+  }
+
+  static fromPayload(payload: RpcErrorPayload): HarnessRpcError {
+    return new HarnessRpcError(
+      payload.message,
+      payload.code,
+      payload.category,
+      payload.retryable,
+      payload.details,
+      payload.trace_id,
+      payload.run_id,
+      payload.provider_request_id,
+    );
   }
 }
 
-/** The transport disconnected (process exit, socket close) before a reply. */
 export class HarnessTransportClosedError extends HarnessSdkError {
   constructor(message = "transport closed before a response was received") {
     super(message);
   }
 }
 
-/** A request did not receive a response within its timeout. */
 export class HarnessTimeoutError extends HarnessSdkError {
   constructor(message = "request timed out") {
     super(message);
   }
 }
 
-/**
- * The daemon's `Hello` response reported a `protocol_version` this SDK does
- * not support.
- */
 export class HarnessVersionMismatchError extends HarnessSdkError {
   constructor(
     public readonly expected: number,
@@ -51,7 +60,6 @@ export class HarnessVersionMismatchError extends HarnessSdkError {
   }
 }
 
-/** A frame from the daemon could not be parsed as JSON or did not match the expected envelope shape. */
 export class HarnessProtocolError extends HarnessSdkError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);

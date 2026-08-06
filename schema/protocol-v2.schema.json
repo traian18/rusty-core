@@ -1,0 +1,507 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rusty-core/schema/protocol-v2.schema.json",
+  "title": "Rusty harnessd wire protocol v2",
+  "description": "Protocol v2 stable tagged envelopes. Rust crates/harness-protocol/src/rpc.rs is authoritative.",
+  "definitions": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "AgentToolset": {
+      "type": "object",
+      "required": [
+        "tools"
+      ],
+      "properties": {
+        "tools": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "UserInput": {
+      "type": "object",
+      "required": [
+        "text",
+        "attachments"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "attachments": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MutationMetadata": {
+      "type": "object",
+      "required": [
+        "command_id",
+        "session_id",
+        "run_id",
+        "expected_session_revision",
+        "trace_id"
+      ],
+      "properties": {
+        "command_id": {
+          "$ref": "#/definitions/Uuid"
+        },
+        "session_id": {
+          "$ref": "#/definitions/Uuid"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_session_revision": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trace_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "MutationCommand": {
+      "oneOf": [
+        {
+          "$ref": "#/definitions/PromptCommand"
+        },
+        {
+          "$ref": "#/definitions/SteerCommand"
+        },
+        {
+          "$ref": "#/definitions/FollowUpCommand"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "cancel"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "resolve_permission"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "id",
+                "decision"
+              ],
+              "properties": {
+                "id": {
+                  "$ref": "#/definitions/Uuid"
+                },
+                "decision": {
+                  "enum": [
+                    "Approved",
+                    "Denied"
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "close_session"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PromptCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "prompt"
+        },
+        "payload": {
+          "$ref": "#/definitions/UserInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SteerCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "steer"
+        },
+        "payload": {
+          "$ref": "#/definitions/UserInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FollowUpCommand": {
+      "type": "object",
+      "required": [
+        "type",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "follow_up"
+        },
+        "payload": {
+          "$ref": "#/definitions/UserInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RpcError": {
+      "type": "object",
+      "required": [
+        "code",
+        "category",
+        "retryable",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "category": {
+          "enum": [
+            "protocol",
+            "validation",
+            "not_found",
+            "conflict",
+            "capacity",
+            "lifecycle",
+            "persistence",
+            "integration",
+            "internal"
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "trace_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "$ref": "#/definitions/Uuid"
+        },
+        "provider_request_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RpcRequestBody": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "hello"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "protocol_version"
+              ],
+              "properties": {
+                "protocol_version": {
+                  "const": 2
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "create_session"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "workspace_root",
+                "integration",
+                "integration_config",
+                "toolset"
+              ],
+              "properties": {
+                "workspace_root": {
+                  "type": "string"
+                },
+                "integration": {
+                  "type": "string"
+                },
+                "integration_config": {},
+                "toolset": {
+                  "$ref": "#/definitions/AgentToolset"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "mutate"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "metadata",
+                "command"
+              ],
+              "properties": {
+                "metadata": {
+                  "$ref": "#/definitions/MutationMetadata"
+                },
+                "command": {
+                  "$ref": "#/definitions/MutationCommand"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "list_sessions"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "restore_session"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "session_id",
+                "workspace_root",
+                "toolset"
+              ],
+              "properties": {
+                "session_id": {
+                  "$ref": "#/definitions/Uuid"
+                },
+                "workspace_root": {
+                  "type": "string"
+                },
+                "toolset": {
+                  "$ref": "#/definitions/AgentToolset"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "snapshot"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "payload"
+          ],
+          "properties": {
+            "type": {
+              "const": "subscribe"
+            },
+            "payload": {
+              "type": "object",
+              "required": [
+                "since_seq"
+              ],
+              "properties": {
+                "since_seq": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RpcRequest": {
+      "type": "object",
+      "required": [
+        "id",
+        "session_id",
+        "body"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body": {
+          "$ref": "#/definitions/RpcRequestBody"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RpcResponse": {
+      "type": "object",
+      "required": [
+        "id",
+        "body"
+      ],
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body": {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "hello",
+                "session_created",
+                "session_restored",
+                "sessions_listed",
+                "admission",
+                "snapshot",
+                "event",
+                "event_gap",
+                "ack",
+      
+                "failure"
+              ]
+            },
+            "payload": {}
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/definitions/RpcRequest"
+    },
+    {
+      "$ref": "#/definitions/RpcResponse"
+    }
+  ]
+}

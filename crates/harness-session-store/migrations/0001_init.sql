@@ -8,13 +8,18 @@
 -- Conventions:
 --   * All identifiers are UUIDs persisted as TEXT.
 --   * All timestamps are unix epoch *milliseconds* (INTEGER), matching the
---     monotonic ordering requirements of the session stream.
+--     monotonic ordering requirements of the session stream. The single
+--     exception is `snapshots.timestamp`, which stores the RFC3339-serialized
+--     `Timestamp` so the snapshot timestamp round-trips losslessly.
 --   * Structured payloads (event envelopes, agent state projections, usage
 --     records) are stored as JSON TEXT blobs; the store serializes/deserializes
 --     them via `serde_json` (see `store.rs` `StoredAgentState`, etc.).
 --
 -- The migration is deliberately idempotent-friendly: tables are created with
--- IF NOT EXISTS so a re-apply never corrupts an existing database.
+-- IF NOT EXISTS so a re-apply never corrupts an existing database. RC-300
+-- snapshot-versioning columns (`snapshots.schema_version`, `snapshots.metadata`)
+-- are added for pre-existing databases by `ensure_snapshot_columns` in
+-- `sqlite.rs` (guarded by `PRAGMA table_info`).
 
 -- ---------------------------------------------------------------------------
 -- sessions
@@ -144,12 +149,22 @@ CREATE INDEX IF NOT EXISTS idx_usage_records_run
 -- unique key. `agents` is the JSON-serialized `Vec<StoredAgentState>` captured
 -- in `DurableSessionSnapshot`; `session_sequence` is the point in the durable
 -- stream this snapshot was taken at (events after it are replayed on restore).
+--
+-- RC-300 additions:
+--   * `schema_version` — the snapshot schema version (see
+--     `crate::version::SCHEMA_VERSION`); legacy checkpoints default to 0 and
+--     are migrated by `crate::version::migrate_snapshot`.
+--   * `metadata` — the JSON-serialized `DurableSessionMetadata` block
+--     (workspace identity, integration/credential/tool references, compaction
+--     lineage). References only — secrets never enter it.
 CREATE TABLE IF NOT EXISTS snapshots (
     session_id        TEXT    NOT NULL PRIMARY KEY,         -- SessionId
     root_agent_id     TEXT    NOT NULL,                     -- AgentId of the root agent
     agents            TEXT    NOT NULL,                     -- JSON: Vec<StoredAgentState>
     session_sequence  INTEGER NOT NULL,                     -- u64 snapshot point in the event stream
     timestamp         INTEGER NOT NULL,                     -- unix ms (when the snapshot was taken)
+    schema_version    INTEGER NOT NULL DEFAULT 0,           -- RC-305 snapshot schema version
+    metadata          TEXT    NOT NULL DEFAULT '{}',        -- RC-304 DurableSessionMetadata (JSON)
 
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );

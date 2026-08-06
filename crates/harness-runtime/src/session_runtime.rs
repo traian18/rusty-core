@@ -5,6 +5,19 @@
 //! for subscribers — and [`SessionRuntime`], the top-level orchestrator that
 //! owns a session's root agent, cancellation scope, backend bindings, workspace
 //! binding, and event bus.
+//!
+//! # RC-300 additions
+//!
+//! - The event bus **preserves** a `session_sequence` already assigned by the
+//!   session's authoritative [`SessionCommitter`] (RC-301); it only assigns
+//!   sequences when no committer is configured, so stored and observed order
+//!   always agree when persistence is enabled.
+//! - [`SessionRuntime`] retains the durable store and owns the session's
+//!   shared committer and per-agent **projection table**
+//!   ([`AgentProjectionTable`]) — every runner publishes its
+//!   [`StoredAgentState`] after each transition, and [`SessionRuntime::checkpoint`]
+//!   (plus the automatic snapshot hooks) build versioned,
+//!   dependency-recorded [`DurableSessionSnapshot`]s from those projections.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -27,11 +40,15 @@ use harness_protocol::commands::{
 use harness_protocol::effects::SpawnAgentSpec;
 use harness_protocol::events::{AgentEventEnvelope, AgentOutcome};
 use harness_protocol::ids::{
-    AgentId, BackendId, ConfigurationId, IntegrationId, PermissionId, SessionId,
+    AgentId, BackendId, ConfigurationId, IntegrationId, PermissionId, SessionId, Timestamp,
 };
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::{AgentBudget, UsageRecord};
-use harness_session_store::{SessionStore, StoredAgentState};
+use harness_session_store::{
+    CheckpointReason, CheckpointRequester, DurableSessionMetadata, DurableSessionSnapshot,
+    SCHEMA_VERSION, SessionCommitter, SessionStore, StoredAgentState, StoredPendingToolCall,
+    StoreError,
+};
 use rust_decimal::Decimal;
 
 use crate::agent_runner::{AgentRunner, AgentTask};
@@ -69,6 +86,7 @@ pub enum SessionStatus {
 /// These are the user-facing commands that the session translates into
 /// [`AgentCommand`]s for the appropriate agent runner.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionCommand {
     /// Start a new run with the given user input.
     Prompt(UserInput),
@@ -210,6 +228,106 @@ impl Default for AgentLiveState {
 /// and read by [`SessionRuntime::agent_live_state`] / `SessionClient::snapshot`.
 pub type LiveStateTable = Arc<Mutex<HashMap<AgentId, AgentLiveState>>>;
 
+/// Shared table of per-agent durable projections (RC-302).
+///
+/// Every [`AgentRunner`] publishes its [`StoredAgentState`] here after each
+/// transition (the same data a snapshot serializes), so
+/// [`SessionRuntime::checkpoint`] and the automatic snapshot hooks always
+/// build snapshots from live, truthful agent state — never from a stale
+/// construction-time copy.
+pub type AgentProjectionTable = Arc<Mutex<HashMap<AgentId, StoredAgentState>>>;
+
+/// Projects a live [`Agent`] into its durable [`StoredAgentState`] form.
+///
+/// `backend_config` is not carried on the core agent today, so it is stored
+/// as `Null`; restore resolves backends through the integration registry
+/// with the persisted (non-secret) config when one is available.
+pub(crate) fn stored_agent_state(agent: &Agent) -> StoredAgentState {
+    StoredAgentState {
+        agent_id: agent.id,
+        parent_id: agent.parent_id,
+        status: agent.state.status,
+        current_operation: agent.state.current_operation.clone(),
+        system_prompt: agent.state.system_prompt.clone(),
+        messages: agent.state.messages.clone(),
+        active_run: agent.state.active_run,
+        pending_tools: agent
+            .state
+            .pending_tools
+            .iter()
+            .map(|(call_id, pending)| {
+                (
+                    *call_id,
+                    StoredPendingToolCall {
+                        call: pending.call.clone(),
+                        started_at: pending.started_at,
+                    },
+                )
+            })
+            .collect(),
+        pending_permissions: agent.state.pending_permissions.clone(),
+        children: agent.state.children.clone(),
+        last_error: agent.state.last_error.clone(),
+        transition_sequence: agent.state.transition_sequence,
+        depth: agent.state.depth,
+        backend: agent.backend.clone(),
+        backend_config: serde_json::Value::Null,
+        budget: agent.budget.clone(),
+        capabilities: serde_json::to_value(&agent.capabilities).unwrap_or(serde_json::Value::Null),
+        usage: serde_json::to_value(&agent.usage).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+/// Builds a versioned snapshot from the live projection table (RC-302/RC-305).
+///
+/// The snapshot records the workspace identity it was taken under and the
+/// integration references of every projected agent (RC-304) — references
+/// only, never secrets. The workspace identity uses the same canonical form
+/// the restore-time resolver compares against (see
+/// [`crate::restore::canonical_workspace_identity`]), so a restore of this
+/// snapshot against the same workspace resolves cleanly.
+fn build_snapshot(
+    session_id: SessionId,
+    root_agent_id: AgentId,
+    projection: &AgentProjectionTable,
+    workspace: &dyn Workspace,
+    at_sequence: u64,
+    compacted: bool,
+    compaction_generation: u64,
+) -> DurableSessionSnapshot {
+    let agents = projection
+        .lock()
+        .expect("projection mutex poisoned")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut integration_references: Vec<String> = agents
+        .iter()
+        .map(|agent| agent.backend.reference.integration.to_string())
+        .collect();
+    integration_references.sort_unstable();
+    integration_references.dedup();
+
+    DurableSessionSnapshot {
+        session_id,
+        root_agent_id,
+        agents,
+        session_sequence: at_sequence,
+        timestamp: Timestamp::now(),
+        schema_version: SCHEMA_VERSION,
+        metadata: DurableSessionMetadata {
+            workspace_identity: Some(crate::restore::canonical_workspace_identity(
+                workspace.root(),
+            )),
+            integration_references,
+            credential_profiles: Vec::new(),
+            tool_policy_ids: Vec::new(),
+            compacted,
+            compaction_generation,
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BridgeEventSink — connects EventSink trait to external persistence/logging
 // ---------------------------------------------------------------------------
@@ -244,11 +362,12 @@ impl EventSink for BridgeEventSink {
 ///
 /// # Ordering
 ///
-/// Every event that flows through the bus receives a monotonically increasing
-/// [`session_sequence`](AgentEventEnvelope::session_sequence) number.  This,
-/// combined with the agent-local [`agent_sequence`](AgentEventEnvelope::agent_sequence),
-/// allows consumers to reconstruct a total order across all agents in the
-/// session.
+/// When a session has an authoritative [`SessionCommitter`] (RC-301), every
+/// event already carries its final `session_sequence` and the bus **preserves
+/// it** — stored and observed order agree. Without a committer, the bus
+/// assigns a monotonically increasing sequence itself. Combined with the
+/// agent-local [`agent_sequence`](AgentEventEnvelope::agent_sequence), this
+/// gives consumers a total order across all agents in the session.
 ///
 /// # Lifecycle
 ///
@@ -269,9 +388,8 @@ pub struct SessionEventBus {
     /// channel created in [`new`](SessionEventBus::new).
     subscriber_sender: broadcast::Sender<AgentEventEnvelope>,
 
-    /// Monotonically increasing session-level sequence counter. Every event
-    /// that flows through the bus receives the next value before being fanned
-    /// out.
+    /// Monotonically increasing session-level sequence counter. Used only
+    /// when events arrive without a committer-assigned sequence.
     session_sequence: AtomicU64,
 }
 
@@ -311,9 +429,9 @@ impl SessionEventBus {
     /// Run the event bus's forwarding loop.
     ///
     /// Polls every registered agent receiver via [`try_recv`],
-    /// assigns a monotonically increasing `session_sequence` to each event,
-    /// and forwards to all subscribers.  Exits when `bus_cancel` is
-    /// triggered.
+    /// assigns a monotonically increasing `session_sequence` to each event
+    /// that does not already carry one, and forwards to all subscribers.
+    /// Exits when `bus_cancel` is triggered.
     pub async fn run(&self, bus_cancel: CancellationToken) {
         loop {
             if bus_cancel.is_cancelled() {
@@ -354,8 +472,13 @@ impl SessionEventBus {
         receivers.retain_mut(|rx| loop {
             match rx.try_recv() {
                 Ok(mut envelope) => {
-                    let seq = self.session_sequence.fetch_add(1, Ordering::Relaxed);
-                    envelope.session_sequence = Some(seq);
+                    // RC-301: preserve a committer-assigned sequence so the
+                    // observed stream matches the stored durable order.
+                    // Without one, assign the next bus sequence.
+                    if envelope.session_sequence.is_none() {
+                        let seq = self.session_sequence.fetch_add(1, Ordering::Relaxed);
+                        envelope.session_sequence = Some(seq);
+                    }
                     let _ = self.subscriber_sender.send(envelope);
                     had_data = true;
                     // Continue draining this receiver.
@@ -380,6 +503,50 @@ impl SessionEventBus {
 }
 
 // ---------------------------------------------------------------------------
+// RuntimeCheckpointRequester — RC-302 automatic snapshot hook
+// ---------------------------------------------------------------------------
+
+/// Bridges the committer's checkpoint hooks to an actual snapshot save.
+///
+/// Captures the fields a snapshot needs (live projections, store, workspace)
+/// so the committer can fire terminal-run and count-based checkpoint
+/// requests without holding a reference to the not-yet-constructed
+/// [`SessionRuntime`]. The snapshot is built synchronously (all in-memory);
+/// only the durable write is spawned.
+struct RuntimeCheckpointRequester {
+    session_id: SessionId,
+    root_agent_id: AgentId,
+    projection: AgentProjectionTable,
+    store: Arc<dyn SessionStore>,
+    workspace: Arc<dyn Workspace>,
+}
+
+impl CheckpointRequester for RuntimeCheckpointRequester {
+    fn request_checkpoint(
+        &self,
+        _session_id: SessionId,
+        at_sequence: u64,
+        reason: CheckpointReason,
+    ) {
+        let snapshot = build_snapshot(
+            self.session_id,
+            self.root_agent_id,
+            &self.projection,
+            self.workspace.as_ref(),
+            at_sequence,
+            false,
+            0,
+        );
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            if let Err(error) = store.save_snapshot(snapshot).await {
+                tracing::error!(%error, ?reason, "automatic session checkpoint failed");
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SessionRuntime
 // ---------------------------------------------------------------------------
 
@@ -395,6 +562,15 @@ impl SessionEventBus {
 ///   the event bus alive so subscribers can receive terminal events.
 /// * [`shutdown()`](SessionRuntime::shutdown) stops everything including the
 ///   event bus — called by `close_session` and `Drop`.
+///
+/// # RC-300
+///
+/// When a durable store is configured, the runtime owns the session's
+/// authoritative [`SessionCommitter`] (shared with every runner), the
+/// per-agent [`AgentProjectionTable`], and the store handle itself — so
+/// [`checkpoint()`](SessionRuntime::checkpoint) can write a truthful
+/// snapshot at any point (explicit requests, terminal runs, count-based
+/// cadence, and clean close).
 pub struct SessionRuntime {
     /// The session's unique identifier.
     pub session_id: SessionId,
@@ -427,6 +603,14 @@ pub struct SessionRuntime {
     pub integrations: Arc<IntegrationRegistry>,
     /// Live per-agent status/usage projection, updated by every `AgentRunner`.
     live_state: LiveStateTable,
+    /// Live per-agent durable projection (RC-302), updated by every runner
+    /// and consumed by `checkpoint()`.
+    projection: AgentProjectionTable,
+    /// The session's authoritative commit boundary (RC-301), when a store is
+    /// configured.
+    committer: Option<Arc<SessionCommitter>>,
+    /// The durable store, retained for checkpoints (RC-302).
+    session_store: Option<Arc<dyn SessionStore>>,
     /// Sender to the root agent's task command channel.
     root_agent_tx: mpsc::Sender<AgentCommand>,
     /// Handle to the root agent's spawned task, captured so that a supervisor
@@ -488,6 +672,7 @@ impl SessionRuntime {
             .await
             .map_err(|_| SessionError::ChannelClosed)
     }
+
     /// Create a new session runtime with a default scheduler.
     ///
     /// This constructor:
@@ -615,6 +800,25 @@ impl SessionRuntime {
         let agent_supervisor = AgentSupervisor::new(session_id, cancellation.clone());
         let integrations = Arc::new(IntegrationRegistry::new());
 
+        // ── 3b. RC-300: projection table + authoritative committer ────────
+        let projection: AgentProjectionTable = Arc::new(Mutex::new(HashMap::new()));
+        projection
+            .lock()
+            .expect("projection mutex poisoned")
+            .insert(root_agent_id, stored_agent_state(&root_agent));
+
+        let committer = session_store.clone().map(|store| {
+            let mut committer = SessionCommitter::new(store.clone(), session_id);
+            committer = committer.with_checkpoint_requester(Arc::new(RuntimeCheckpointRequester {
+                session_id,
+                root_agent_id,
+                projection: projection.clone(),
+                store,
+                workspace: workspace.clone(),
+            }));
+            Arc::new(committer)
+        });
+
         // ── 4. Event bus ───────────────────────────────────
         // NOTE: The event bus uses its own independent CancellationToken,
         // NOT a child of the session cancellation.  This way, calling
@@ -659,9 +863,13 @@ impl SessionRuntime {
             live_state.clone(),
             scheduler.clone(),
         )
-        .with_supervision(agent_supervisor.clone(), integrations.clone());
-        if let Some(store) = session_store {
+        .with_supervision(agent_supervisor.clone(), integrations.clone())
+        .with_projection(projection.clone());
+        if let Some(store) = session_store.clone() {
             runner = runner.with_session_store(store);
+        }
+        if let Some(committer) = &committer {
+            runner = runner.with_committer(committer.clone());
         }
 
         // Register the agent's broadcast sender with the event bus
@@ -689,6 +897,9 @@ impl SessionRuntime {
             agent_supervisor,
             integrations,
             live_state,
+            projection,
+            committer,
+            session_store,
             root_agent_tx,
             root_task_handle: Mutex::new(None),
             bus_cancel,
@@ -724,7 +935,9 @@ impl SessionRuntime {
     /// When `session_store` is `Some`, the handle is threaded into every
     /// restored runner via
     /// [`AgentRunner::with_session_store`](crate::agent_runner::AgentRunner::with_session_store)
-    /// so `Persist` effects keep flowing through the store after a restore.
+    /// so `Persist` effects keep flowing through the store after a restore,
+    /// and the session's authoritative committer resumes after the last
+    /// durable event (RC-301).
     #[allow(clippy::too_many_arguments)]
     pub fn from_stored(
         session_id: SessionId,
@@ -751,8 +964,9 @@ impl SessionRuntime {
                     system_prompt: stored.system_prompt,
                     messages: stored.messages,
                     context: Default::default(),
-                    active_run: stored.active_run,
-                    pending_tools: stored
+                active_run: stored.active_run,
+                queued_inputs: Default::default(),
+                pending_tools: stored
                         .pending_tools
                         .into_iter()
                         .map(|(call_id, pending)| {
@@ -786,6 +1000,15 @@ impl SessionRuntime {
             .expect("a stored snapshot must contain exactly one root agent (parent_id = None)");
         let root_agent_id = root_agent.id;
 
+        // ── 1b. RC-300: seed the projection table from the stored agents ──
+        let projection: AgentProjectionTable = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut table = projection.lock().expect("projection mutex poisoned");
+            for agent in agents.values() {
+                table.insert(agent.id, stored_agent_state(agent));
+            }
+        }
+
         // ── 2. Cancellation ──────────────────────────────────
         let cancellation = SessionCancellation::new();
         let agent_supervisor = AgentSupervisor::new(session_id, cancellation.clone());
@@ -805,11 +1028,25 @@ impl SessionRuntime {
         // ── 4. Live state table ─────────────────────────────
         let live_state: LiveStateTable = Arc::new(Mutex::new(HashMap::new()));
 
+        // ── 4b. RC-300: the session's authoritative committer resumes after
+        // the last durable event.
+        let committer = session_store.clone().map(|store| {
+            let mut committer = SessionCommitter::new(store.clone(), session_id);
+            committer = committer.with_checkpoint_requester(Arc::new(RuntimeCheckpointRequester {
+                session_id,
+                root_agent_id,
+                projection: projection.clone(),
+                store,
+                workspace: workspace.clone(),
+            }));
+            Arc::new(committer)
+        });
+
         // ── 5. Spawn one runner per restored agent ──────────
         // Each runner registers its cancellation token with the supervisor,
         // publishes live status/usage to the shared table, and — when a store
-        // is configured — receives the store handle so `Persist` effects keep
-        // flowing after the restore.
+        // is configured — receives the store handle and the session's
+        // committer so `Persist` effects keep flowing after the restore.
         let spawn_restored =
             |agent: Agent| -> (mpsc::Sender<AgentCommand>, tokio::task::JoinHandle<()>) {
                 let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
@@ -837,9 +1074,13 @@ impl SessionRuntime {
                     live_state.clone(),
                     scheduler.clone(),
                 )
-                .with_supervision(agent_supervisor.clone(), integrations.clone());
+                .with_supervision(agent_supervisor.clone(), integrations.clone())
+                .with_projection(projection.clone());
                 if let Some(store) = session_store.clone() {
                     runner = runner.with_session_store(store);
+                }
+                if let Some(committer) = &committer {
+                    runner = runner.with_committer(committer.clone());
                 }
 
                 event_bus.register_agent(runner.task.id, runner.task.events.clone());
@@ -882,6 +1123,9 @@ impl SessionRuntime {
             agent_supervisor,
             integrations,
             live_state,
+            projection,
+            committer,
+            session_store,
             root_agent_tx,
             root_task_handle: Mutex::new(None),
             bus_cancel,
@@ -936,12 +1180,16 @@ impl SessionRuntime {
             .lock()
             .expect("live_state mutex poisoned")
             .insert(agent.id, AgentLiveState::default());
+        self.projection
+            .lock()
+            .expect("projection mutex poisoned")
+            .insert(agent.id, stored_agent_state(&agent));
 
         let bridge_sink = Arc::new(BridgeEventSink {
             external_sink: Some(self.event_sink.clone()),
         });
 
-        let runner = AgentRunner::new(
+        let mut runner = AgentRunner::new(
             agent,
             task,
             self.default_backend.clone(),
@@ -952,10 +1200,17 @@ impl SessionRuntime {
             self.live_state.clone(),
             self.scheduler.clone(),
         )
-            .with_supervision(self.agent_supervisor.clone(), self.integrations.clone())
-            // A root session survives individual run completion. Child
-            // runners remain one-shot under the supervisor.
-            .long_lived(true);
+        .with_supervision(self.agent_supervisor.clone(), self.integrations.clone())
+        .with_projection(self.projection.clone())
+        // A root session survives individual run completion. Child
+        // runners remain one-shot under the supervisor.
+        .long_lived(true);
+        if let Some(store) = &self.session_store {
+            runner = runner.with_session_store(store.clone());
+        }
+        if let Some(committer) = &self.committer {
+            runner = runner.with_committer(committer.clone());
+        }
 
         self.event_bus
             .register_agent(runner.task.id, runner.task.events.clone());
@@ -1063,6 +1318,38 @@ impl SessionRuntime {
             .get(&agent_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Writes a truthful snapshot of the session at its last committed
+    /// durable sequence (RC-302).
+    ///
+    /// The snapshot is built from the live per-agent projections (never a
+    /// stale construction-time copy), versioned with the current
+    /// [`SCHEMA_VERSION`], and recorded with the workspace identity and
+    /// integration references it was taken under (RC-304). Returns `Ok(())`
+    /// when no store is configured (nothing to checkpoint).
+    pub async fn checkpoint(&self) -> Result<(), StoreError> {
+        let Some(store) = &self.session_store else {
+            return Ok(());
+        };
+        // The snapshot point is the store's own last committed sequence —
+        // authoritative and gap-free from the committer's perspective.
+        let sequence = store.current_sequence(self.session_id).await?;
+        let root_agent_id = self
+            .state
+            .lock()
+            .expect("state mutex poisoned")
+            .root_agent_id;
+        let snapshot = build_snapshot(
+            self.session_id,
+            root_agent_id,
+            &self.projection,
+            self.workspace.as_ref(),
+            sequence,
+            false,
+            0,
+        );
+        store.save_snapshot(snapshot).await
     }
 }
 
@@ -1268,6 +1555,7 @@ mod tests {
     use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome};
     use harness_protocol::ids::{RequestId, SessionId};
     use harness_protocol::usage::{Cost, ModelUsage};
+    use harness_session_store::{JsonlSessionStore, SessionStore};
 
     use crate::testing::{FakeBackend, FakeToolRegistry};
     use crate::traits::EventSink;
@@ -1285,6 +1573,15 @@ mod tests {
             events.push(envelope.event);
         }
         events
+    }
+
+    /// Drains buffered envelopes from a broadcast receiver non-blockingly.
+    fn drain_envelopes(rx: &mut broadcast::Receiver<AgentEventEnvelope>) -> Vec<AgentEventEnvelope> {
+        let mut envelopes = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            envelopes.push(envelope);
+        }
+        envelopes
     }
 
     // -----------------------------------------------------------------------
@@ -1532,5 +1829,157 @@ mod tests {
             "usage should be populated from the scripted ExecutionResult"
         );
         assert_eq!(after.total_requests, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: RC-301 — stored and observed order agree through the committer
+    // -----------------------------------------------------------------------
+
+    /// With a durable store configured, events flow through the session's
+    /// authoritative committer: subscribers observe the exact sequences the
+    /// store persisted, ephemeral deltas are not persisted, and a terminal
+    /// run triggers a checkpoint (RC-302).
+    #[tokio::test]
+    async fn committed_events_match_stored_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-runtime-rc301-{}-{}",
+            std::process::id(),
+            Timestamp::now().timestamp_millis()
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(JsonlSessionStore::new(&dir));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+
+        let backend = Arc::new(
+            FakeBackend::new()
+                .with_events(vec![
+                    ExecutionEvent::TextDelta {
+                        request_id,
+                        delta: "hello".into(),
+                    },
+                    ExecutionEvent::Completed {
+                        request_id,
+                        result: ExecutionResult {
+                            request_id,
+                            usage: ModelUsage::default(),
+                            cost: Cost::default(),
+                            finish_reason: "end_turn".into(),
+                        },
+                    },
+                ])
+                .with_result(ExecutionResult {
+                    request_id,
+                    usage: ModelUsage::default(),
+                    cost: Cost::default(),
+                    finish_reason: "end_turn".into(),
+                }),
+        );
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let workspace = Arc::new(FakeWorkspace::new());
+
+        struct NoopSink;
+        impl EventSink for NoopSink {
+            fn send(&self, _envelope: AgentEventEnvelope) {}
+        }
+
+        let runtime = SessionRuntime::new_with_scheduler(
+            session_id,
+            backend,
+            tool_registry,
+            workspace,
+            Arc::new(NoopSink),
+            AgentToolset {
+                tools: HashMap::new(),
+            },
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+            Some(store.clone()),
+        );
+
+        let mut subscriber = runtime.event_bus.subscribe();
+        runtime
+            .send_command(SessionCommand::Prompt(UserInput {
+                text: "hello".to_string(),
+                attachments: vec![],
+            }))
+            .await
+            .expect("send_command should succeed");
+
+        // Collect observed sequences (committer-assigned) until the run
+        // completes.
+        let mut observed_sequences: Vec<u64> = Vec::new();
+        let mut completed = false;
+        for _ in 0..50 {
+            let batch = drain_envelopes(&mut subscriber);
+            for envelope in batch {
+                if let Some(sequence) = envelope.session_sequence {
+                    observed_sequences.push(sequence);
+                }
+                if matches!(envelope.event, AgentEvent::Completed { .. }) {
+                    completed = true;
+                }
+            }
+            if completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(completed, "run should complete");
+
+        // Wait for the terminal checkpoint to land in the store.
+        let mut snapshot_seen = false;
+        for _ in 0..50 {
+            if let Ok(stored) = store.load_session(session_id).await {
+                snapshot_seen = stored.snapshot.is_some();
+                if snapshot_seen {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            snapshot_seen,
+            "a terminal run must produce an automatic checkpoint"
+        );
+
+        // Every durable event the store persisted must carry a final sequence,
+        // and the observed stream is strictly increasing overall (stored and
+        // observed order agree on the durable events).
+        let stored_events = store
+            .events_since(session_id, 0)
+            .await
+            .expect("load committed event history");
+        let stored_sequences: Vec<u64> = stored_events
+            .iter()
+            .filter_map(|event| event.session_sequence)
+            .collect();
+        assert!(
+            !stored_sequences.is_empty(),
+            "durable events were persisted with final sequences"
+        );
+        for pair in observed_sequences.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "observed sequences are strictly increasing"
+            );
+        }
+        for stored_sequence in &stored_sequences {
+            assert!(
+                observed_sequences.contains(stored_sequence),
+                "stored sequence {stored_sequence} was observed with the same value"
+            );
+        }
+
+        // No streaming delta was persisted.
+        assert!(
+            stored_events
+                .iter()
+                .all(|event| !matches!(
+                    event.envelope.event,
+                    AgentEvent::AssistantTextDelta { .. }
+                )),
+            "ephemeral deltas are never stored"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

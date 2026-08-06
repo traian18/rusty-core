@@ -1,54 +1,30 @@
 /**
- * Wire-protocol types for harnessd protocol v1.
+ * Wire-protocol types for harnessd protocol v2.
  *
- * These types mirror the Rust types in `crates/harness-protocol/src/{rpc,events,commands,ids}.rs`
- * exactly, including serde's default "externally tagged" enum representation:
- *
- * - A unit variant (e.g. `Cancel`) serializes as the bare string `"Cancel"`.
- * - A struct/tuple variant (e.g. `Prompt(UserInput)`) serializes as
- *   `{ "Prompt": { ... } }` — exactly one key, named after the variant.
- *
- * This is a hand-authored mirror of the Rust source, not a generated
- * artifact. See `schema/protocol-v1.schema.json` for the language-neutral
- * JSON Schema description of the same shapes, and `sdk_plan.md` (SDK-201)
- * for the plan to replace both with generated code from one source of
- * truth.
- *
- * IMPORTANT: serde's default enum representation is "closed" — an
- * unrecognized variant fails to deserialize on the Rust side. Until the
- * protocol adopts an explicit `#[serde(tag = "type")]` + catch-all
- * representation (tracked in `sdk_plan.md` SDK-200), do not assume unknown
- * additive variants are safely ignorable by this client either; guard with
- * {@link isKnownRpcResponseBody} before matching.
+ * These types mirror the Rust types in `crates/harness-protocol/src/{rpc,events,commands,ids,tools}.rs`
+ * exactly, including serde's default externally tagged enum representation.
+ * This is a hand-authored mirror pending protocol code generation (SDK-201).
  */
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 
-// ---------------------------------------------------------------------------
-// IDs
-// ---------------------------------------------------------------------------
-
-/** All harness identifiers are plain UUID strings on the wire. */
+// IDs are UUID strings on the wire.
 export type SessionId = string;
 export type AgentId = string;
 export type RunId = string;
 export type RequestId = string;
 export type ToolCallId = string;
+export type ToolId = string;
 export type MessageId = string;
 export type EventId = string;
 export type PermissionId = string;
-
-/** RFC3339 UTC timestamp string, as produced by `chrono`'s serde impl. */
+export type CommandId = string;
 export type Timestamp = string;
-
-// ---------------------------------------------------------------------------
-// Commands / user input
-// ---------------------------------------------------------------------------
 
 export interface Attachment {
   mime_type: string;
-  /** Base64-encoded bytes (JSON has no native byte-array type). */
-  data: string;
+  /** Exact serde_json representation of Rust `Vec<u8>`. */
+  data: number[];
 }
 
 export interface UserInput {
@@ -77,9 +53,30 @@ export type AgentStatus =
   | "Cancelled"
   | "Failed";
 
-// ---------------------------------------------------------------------------
-// Tools
-// ---------------------------------------------------------------------------
+export interface ToolDescriptor {
+  id: ToolId;
+  name: string;
+  description: string;
+  input_schema: unknown;
+}
+
+export type PermissionMode = "Allow" | "Ask" | "Deny";
+
+export interface ToolPolicy {
+  permission: PermissionMode;
+  enabled: boolean;
+}
+
+export interface ToolCapability {
+  descriptor: ToolDescriptor;
+  policy: ToolPolicy;
+  delegatable: boolean;
+}
+
+/** Rust `HashMap<ToolId, ToolCapability>` serializes as a JSON object. */
+export interface AgentToolset {
+  tools: Record<ToolId, ToolCapability>;
+}
 
 export interface ToolCall {
   id: ToolCallId;
@@ -103,21 +100,12 @@ export interface PermissionRequest {
   agent_id: AgentId;
 }
 
-// ---------------------------------------------------------------------------
-// Usage
-// ---------------------------------------------------------------------------
-
 export interface AgentUsageSnapshot {
   timestamp: string;
   [key: string]: unknown;
 }
 
-// ---------------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------------
-
 export type EventVisibility = "User" | "Developer" | "Internal";
-
 export type AgentOutcome = "Success" | "Cancelled" | "Failed";
 
 export type AgentEvent =
@@ -152,82 +140,169 @@ export interface AgentEventEnvelope {
   event: AgentEvent;
 }
 
-// ---------------------------------------------------------------------------
-// RPC request/response envelopes
-// ---------------------------------------------------------------------------
-
 export interface ProtocolCapabilities {
   resumable_subscribe: boolean;
   lifecycle_commands: boolean;
+  typed_errors: boolean;
+  mutation_admission: boolean;
+  session_restore: boolean;
+  event_gap_signals: boolean;
+  durable_idempotency: boolean;
+  pause_resume: boolean;
+}
+
+export interface MutationMetadata {
+  command_id: CommandId;
+  session_id: SessionId;
+  run_id: RunId | null;
+  expected_session_revision: number | null;
+  trace_id: string | null;
+}
+
+export type MutationCommand =
+  | { type: "prompt"; payload: UserInput }
+  | { type: "steer"; payload: UserInput }
+  | { type: "follow_up"; payload: UserInput }
+  | { type: "cancel" }
+  | {
+      type: "resolve_permission";
+      payload: { id: PermissionId; decision: PermissionDecision };
+    }
+  | { type: "close_session" };
+
+export type AdmissionResult =
+  | { type: "accepted" }
+  | { type: "accepted_started"; payload: { run_id: RunId } }
+  | {
+      type: "accepted_queued";
+      payload: { run_id: RunId; position: number };
+    }
+  | { type: "accepted_applied" }
+  | { type: "duplicate"; payload: { original: AdmissionResult } }
+  | {
+      type: "rejected_conflict";
+      payload: { current_session_revision: number };
+    }
+  | { type: "rejected_closed" }
+  | { type: "rejected_invalid_state"; payload: { reason: string } }
+  | { type: "rejected_capacity"; payload: { limit: string } };
+
+export type RpcErrorCategory =
+  | "protocol"
+  | "validation"
+  | "not_found"
+  | "conflict"
+  | "capacity"
+  | "lifecycle"
+  | "persistence"
+  | "integration"
+  | "internal";
+
+export interface RpcErrorPayload {
+  code: string;
+  category: RpcErrorCategory;
+  retryable: boolean;
+  message: string;
+  details?: unknown;
+  trace_id?: string;
+  run_id?: RunId;
+  provider_request_id?: string;
+}
+
+export interface SessionSummaryWire {
+  session_id: SessionId;
+  title: string;
+  backend_name: string | null;
+  updated_at: Timestamp;
+  restorable: boolean;
 }
 
 export type RpcRequestBody =
-  | { Hello: { protocol_version: number } }
+  | { type: "hello"; payload: { protocol_version: number } }
   | {
-      CreateSession: {
+      type: "create_session";
+      payload: {
         workspace_root: string;
         integration: string;
         integration_config: unknown;
-        toolset: string[];
+        toolset: AgentToolset;
       };
     }
-  | { Prompt: UserInput }
-  | { Steer: UserInput }
-  | { FollowUp: UserInput }
-  | "Cancel"
-  | "Pause"
-  | "Resume"
-  | { ResolvePermission: { id: PermissionId; decision: PermissionDecision } }
-  | "Snapshot"
-  | { Subscribe: { since_seq: number | null } }
-  | "CloseSession";
+  | {
+      type: "mutate";
+      payload: { metadata: MutationMetadata; command: MutationCommand };
+    }
+  | { type: "list_sessions" }
+  | {
+      type: "restore_session";
+      payload: {
+        session_id: SessionId;
+        workspace_root: string;
+        toolset: AgentToolset;
+      };
+    }
+  | { type: "snapshot" }
+  | { type: "subscribe"; payload: { since_seq: number | null } };
 
 export interface RpcRequest {
-  /** Client-assigned correlation id, echoed back on the matching response. */
   id: number;
   session_id: SessionId | null;
   body: RpcRequestBody;
 }
 
-/**
- * Opaque wire representation of a point-in-time session snapshot. Treat as
- * unstructured pending a stable, documented shape (`sdk_plan.md` SDK-400).
- */
 export type SessionSnapshotWire = Record<string, unknown>;
 
 export type RpcResponseBody =
-  | { Hello: { protocol_version: number; capabilities: ProtocolCapabilities } }
-  | { SessionCreated: { session_id: SessionId } }
-  | "Ack"
-  | { Snapshot: SessionSnapshotWire }
-  | { Event: AgentEventEnvelope }
-  | { Error: { message: string } };
+  | {
+      type: "hello";
+      payload: {
+        protocol_version: number;
+        capabilities: ProtocolCapabilities;
+      };
+    }
+  | { type: "session_created"; payload: { session_id: SessionId } }
+  | { type: "session_restored"; payload: { session_id: SessionId; session_revision: number } }
+  | { type: "sessions_listed"; payload: { sessions: SessionSummaryWire[] } }
+  | {
+      type: "admission";
+      payload: {
+        metadata: MutationMetadata;
+        result: AdmissionResult;
+        session_revision: number;
+      };
+    }
+  | { type: "snapshot"; payload: SessionSnapshotWire }
+  | { type: "event"; payload: AgentEventEnvelope }
+  | {
+      type: "event_gap";
+      payload: {
+        session_id: SessionId;
+        last_delivered_sequence: number;
+        dropped: number;
+        cursor_expired: boolean;
+      };
+    }
+  | { type: "ack" }
+
+  | { type: "failure"; payload: RpcErrorPayload };
 
 export interface RpcResponse {
-  /** `null` marks a server-pushed event frame, not a reply to a request. */
   id: number | null;
   body: RpcResponseBody;
 }
 
-/**
- * Narrow a decoded {@link RpcResponseBody} to a known variant name.
- *
- * Defensive helper for the "closed enum" forward-compatibility gap noted at
- * the top of this file: prefer this over an unchecked `in` check so a
- * future additive variant fails loudly instead of silently mismatching.
- */
-export function isKnownRpcResponseBody(
-  body: RpcResponseBody,
-): body is RpcResponseBody {
-  if (typeof body === "string") {
-    return body === "Ack";
-  }
-  const key = Object.keys(body)[0];
-  return (
-    key === "Hello" ||
-    key === "SessionCreated" ||
-    key === "Snapshot" ||
-    key === "Event" ||
-    key === "Error"
-  );
+export function isKnownRpcResponseBody(body: RpcResponseBody): body is RpcResponseBody {
+  return [
+    "hello",
+    "session_created",
+    "session_restored",
+    "sessions_listed",
+    "admission",
+    "snapshot",
+    "event",
+    "event_gap",
+    "ack",
+
+    "failure",
+  ].includes(body.type);
 }

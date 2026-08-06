@@ -16,6 +16,7 @@ use crate::config::GeminiConfig;
 pub struct GeminiBackend;
 
 impl GeminiBackend {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(config: GeminiConfig) -> GenericModelBackend {
         let recovery = config.recovery.clone();
         GenericModelBackend::new_with_recovery(Arc::new(GeminiClient::new(config)), recovery)

@@ -1,56 +1,25 @@
-
-//! Wire-format RPC contract shared by every transport (`harness-transport-ipc`,
-//! `harness-transport-websocket`, `harness-transport-stdio`).
+//! Transport-neutral JSON RPC contract shared by harness transports and SDKs.
 //!
-//! These types are deliberately framing-agnostic: each request/response is one
-//! independently-serializable JSON value. How bytes are delimited on the wire
-//! (length-prefixing, WebSocket message boundaries, newline-delimiting) is a
-//! transport concern, defined in each transport crate — not a protocol
-//! concern, and not defined here. This module holds only serializable data,
-//! matching this crate's "no runtime or I/O policy" invariant; the behavioral
-//! counterpart (`RpcHandler`, which dispatches these types against a live
-//! session) lives in `harness-runtime` since it needs `async_trait` and
-//! `tokio::sync::broadcast`.
+//! Protocol v2 uses internally tagged command/response enums. Variant names and
+//! payload fields are therefore stable across languages and do not depend on
+//! serde's externally-tagged enum representation.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::admission::{AdmissionResult, MutationMetadata};
 use crate::commands::{PermissionDecision, UserInput};
 use crate::events::AgentEventEnvelope;
 use crate::ids::{AgentId, PermissionId, SessionId, Timestamp};
 use crate::tools::AgentToolset;
 use crate::usage::{AgentUsageSnapshot, SessionUsageSnapshot};
 
-/// The current wire protocol version.
-///
-/// A client sends this in [`RpcRequestBody::Hello`] as the version it
-/// speaks; the daemon compares it against its own [`PROTOCOL_VERSION`] and
-/// responds with [`RpcResponseBody::Hello`] on a match or
-/// [`RpcResponseBody::Error`] on a mismatch, so a client/daemon version skew
-/// fails fast and clearly at connection time instead of manifesting as a
-/// confusing mid-session deserialization error.
-///
-/// Bump this whenever a wire-incompatible change is made to [`RpcRequestBody`]
-/// or [`RpcResponseBody`] (removing/renaming a variant or field, changing a
-/// field's type/meaning). Purely additive changes (a new enum variant a
-/// well-behaved client should tolerate) do not require a bump, though today's
-/// `serde`-derived enums still fail closed on an unrecognized variant — see
-/// the module-level docs for the caveat this leaves open.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Client-assigned correlation id, echoed back on the matching [`RpcResponse`]
-/// so a caller can match responses to requests on a connection carrying
-/// multiple in-flight requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestCorrelationId(pub u64);
 
-/// A request sent to a running harness daemon over any transport.
-///
-/// Every request carries an explicit `session_id` (absent only for
-/// [`RpcRequestBody::Hello`] and [`RpcRequestBody::CreateSession`]) so a
-/// single connection can address any number of sessions rather than being
-/// pinned to one session for its lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub id: RequestCorrelationId,
@@ -58,109 +27,162 @@ pub struct RpcRequest {
     pub body: RpcRequestBody,
 }
 
-/// The set of operations a client can request.
-///
-/// Mirrors [`harness_runtime::session_runtime::SessionCommand`] plus the
-/// session-lifecycle and read operations ([`SessionClient`]-level concerns)
-/// that command alone doesn't cover.
+/// Mutations are explicitly separated from reads. Each mutation carries a
+/// client-generated command id and optional optimistic revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum MutationCommand {
+    Prompt(UserInput),
+    Steer(UserInput),
+    FollowUp(UserInput),
+    Cancel,
+    ResolvePermission {
+        id: PermissionId,
+        decision: PermissionDecision,
+    },
+    CloseSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcRequestBody {
-    /// Negotiate the wire protocol version before any other request.
-    ///
-    /// Every transport (`harness-transport-ipc`, `-websocket`, `-stdio`)
-    /// rejects non-`Hello` requests on a connection that hasn't completed
-    /// this handshake yet, so a version-mismatched client fails fast with a
-    /// clear error instead of silently misbehaving later.
     Hello { protocol_version: u32 },
-    /// Create a new session against `workspace_root`, resolving `integration`
-    /// (e.g. `"anthropic"`) with the given provider-specific JSON config.
     CreateSession {
         workspace_root: PathBuf,
         integration: String,
         integration_config: serde_json::Value,
         toolset: AgentToolset,
     },
-    /// Start a run with the given user input.
-    Prompt(UserInput),
-    /// Inject input at the next safe command boundary of the active run.
-    Steer(UserInput),
-    /// Queue input FIFO for a subsequent run.
-    FollowUp(UserInput),
-    /// Cancel the session's active run while preserving queued follow-ups.
-    Cancel,
-    /// Pause the session.
-    Pause,
-    /// Resume a paused session.
-    Resume,
-    /// Resolve a pending permission request.
-    ResolvePermission {
-        id: PermissionId,
-        decision: PermissionDecision,
+    /// Idempotent, revision-aware session mutation.
+    Mutate {
+        metadata: MutationMetadata,
+        command: MutationCommand,
     },
-    /// Take a point-in-time snapshot of the session's state.
+    ListSessions,
+    /// Restore/open a durable session using host-supplied non-secret bindings.
+    RestoreSession {
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        toolset: AgentToolset,
+    },
     Snapshot,
-    /// Start streaming this session's event feed on this connection.
-    ///
-    /// When `since_seq` is `Some(n)`, every durable event with
-    /// `session_sequence > n` is replayed (oldest first) before the live
-    /// stream attaches, letting a reconnecting client resume without gaps or
-    /// duplicates. `None` behaves exactly like the pre-resume protocol:
-    /// live events only, starting from whatever arrives after the
-    /// subscription is acknowledged.
-    ///
-    /// Only *durable* events are ever replayed this way — ephemeral events
-    /// (`AssistantTextDelta`, `ReasoningDelta`, progress ticks; see
-    /// `harness_session_store::is_durable`) are never persisted and so are
-    /// unrecoverable after a disconnect. A reconnecting client sees the
-    /// final assembled message/result, not the replayed keystrokes.
     Subscribe { since_seq: Option<u64> },
-    /// Tear down the session.
-    CloseSession,
 }
 
-/// A response to an [`RpcRequest`], or an unsolicited pushed event.
-///
-/// `id` is `Some` for a direct reply to a request and `None` for an event
-/// pushed asynchronously after a [`RpcRequestBody::Subscribe`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub id: Option<RequestCorrelationId>,
     pub body: RpcResponseBody,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcErrorCategory {
+    Protocol,
+    Validation,
+    NotFound,
+    Conflict,
+    Capacity,
+    Lifecycle,
+    Persistence,
+    Integration,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RpcError {
+    pub code: String,
+    pub category: RpcErrorCategory,
+    pub retryable: bool,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<crate::ids::RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_request_id: Option<String>,
+}
+
+impl RpcError {
+    pub fn new(
+        code: impl Into<String>,
+        category: RpcErrorCategory,
+        retryable: bool,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            category,
+            retryable,
+            message: message.into(),
+            details: None,
+            trace_id: None,
+            run_id: None,
+            provider_request_id: None,
+        }
+    }
+
+    pub fn protocol(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(code, RpcErrorCategory::Protocol, false, message)
+    }
+
+    pub fn not_found(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(code, RpcErrorCategory::NotFound, false, message)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryWire {
+    pub session_id: SessionId,
+    pub title: String,
+    pub backend_name: Option<String>,
+    pub updated_at: Timestamp,
+    pub restorable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcResponseBody {
-    /// Reply to [`RpcRequestBody::Hello`] on a successful version match.
     Hello {
         protocol_version: u32,
         capabilities: ProtocolCapabilities,
     },
-    SessionCreated {
-        session_id: SessionId,
+    SessionCreated { session_id: SessionId },
+    SessionRestored { session_id: SessionId, session_revision: u64 },
+    SessionsListed { sessions: Vec<SessionSummaryWire> },
+    Admission {
+        metadata: MutationMetadata,
+        result: AdmissionResult,
+        session_revision: u64,
     },
-    Ack,
     Snapshot(SessionSnapshotWire),
     Event(AgentEventEnvelope),
-    Error {
-        message: String,
+    /// A durable/live subscription gap. Clients must reconnect from
+    /// `last_delivered_sequence` or request a snapshot when the cursor has
+    /// expired.
+    EventGap {
+        session_id: SessionId,
+        last_delivered_sequence: u64,
+        dropped: u64,
+        cursor_expired: bool,
     },
+    Ack,
+    Failure(RpcError),
 }
 
-/// Capabilities the daemon advertises during the [`RpcRequestBody::Hello`]
-/// handshake.
-///
-/// Deliberately separate from [`crate::backend::BackendCapabilities`], which
-/// describes a *model provider's* features (streaming, tool calls, ...);
-/// this struct describes the *daemon/protocol's* own feature set so a client
-/// can adapt its behavior (e.g. only attempt a resumed `Subscribe` if
-/// `resumable_subscribe` is advertised) without a version bump for every new
-/// optional capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolCapabilities {
-    /// Whether `Subscribe { since_seq: Some(_) }` is supported.
     pub resumable_subscribe: bool,
-    /// Whether the daemon supports `Steer` and `FollowUp` lifecycle commands.
     pub lifecycle_commands: bool,
+    pub typed_errors: bool,
+    pub mutation_admission: bool,
+    pub session_restore: bool,
+    pub event_gap_signals: bool,
+    /// False until command admissions are stored durably across daemon restarts.
+    pub durable_idempotency: bool,
+    pub pause_resume: bool,
 }
 
 impl Default for ProtocolCapabilities {
@@ -168,17 +190,16 @@ impl Default for ProtocolCapabilities {
         Self {
             resumable_subscribe: true,
             lifecycle_commands: true,
+            typed_errors: true,
+            mutation_admission: true,
+            session_restore: true,
+            event_gap_signals: true,
+            durable_idempotency: false,
+            pause_resume: false,
         }
     }
 }
 
-/// Serializable projection of `harness_runtime::session_client::SessionSnapshot`.
-///
-/// Defined here rather than reused directly because `harness-runtime`'s
-/// `SessionSnapshot`/`SessionStatus` don't (and shouldn't need to) derive
-/// `Serialize`/`Deserialize` for their in-process use, and `harness-protocol`
-/// cannot depend on `harness-runtime` (the dependency runs the other way).
-/// `harnessd` maps the runtime type into this one at the RPC boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshotWire {
     pub session_id: SessionId,
@@ -189,8 +210,8 @@ pub struct SessionSnapshotWire {
     pub timestamp: Timestamp,
 }
 
-/// Wire counterpart of `harness_runtime::session_runtime::SessionStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatusWire {
     Idle,
     Running,
@@ -202,145 +223,84 @@ pub enum SessionStatusWire {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::CommandId;
 
     #[test]
-    fn rpc_request_round_trips_through_json() {
+    fn v2_mutation_uses_stable_tags_and_round_trips() {
+        let session_id = SessionId::new();
         let request = RpcRequest {
             id: RequestCorrelationId(1),
-            session_id: None,
-            body: RpcRequestBody::CreateSession {
-                workspace_root: PathBuf::from("/tmp/workspace"),
-                integration: "anthropic".to_string(),
-                integration_config: serde_json::json!({ "api_key": "test" }),
-                toolset: AgentToolset {
-                    tools: std::collections::HashMap::new(),
+            session_id: Some(session_id),
+            body: RpcRequestBody::Mutate {
+                metadata: MutationMetadata {
+                    command_id: CommandId::new(),
+                    session_id,
+                    run_id: None,
+                    expected_session_revision: Some(3),
+                    trace_id: Some("trace-1".into()),
                 },
+                command: MutationCommand::Cancel,
             },
         };
-        let json = serde_json::to_string(&request).expect("serializable");
-        let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
-        assert_eq!(parsed.id, request.id);
-        assert!(matches!(parsed.body, RpcRequestBody::CreateSession { .. }));
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["body"]["type"], "mutate");
+        assert_eq!(value["body"]["payload"]["command"]["type"], "cancel");
+        let parsed: RpcRequest = serde_json::from_value(value).expect("deserialize");
+        assert!(matches!(parsed.body, RpcRequestBody::Mutate { .. }));
     }
 
     #[test]
-    fn rpc_response_error_round_trips() {
+    fn typed_error_round_trips() {
         let response = RpcResponse {
-            id: Some(RequestCorrelationId(42)),
-            body: RpcResponseBody::Error {
-                message: "boom".to_string(),
-            },
+            id: Some(RequestCorrelationId(2)),
+            body: RpcResponseBody::Failure(RpcError::new(
+                "session.busy",
+                RpcErrorCategory::Conflict,
+                true,
+                "session already has an active run",
+            )),
         };
-        let json = serde_json::to_string(&response).expect("serializable");
-        let parsed: RpcResponse = serde_json::from_str(&json).expect("deserializable");
-        assert_eq!(parsed.id, Some(RequestCorrelationId(42)));
-        assert!(matches!(parsed.body, RpcResponseBody::Error { message } if message == "boom"));
+        let value = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(value["body"]["type"], "failure");
+        assert_eq!(value["body"]["payload"]["code"], "session.busy");
+        let parsed: RpcResponse = serde_json::from_value(value).expect("deserialize");
+        assert!(matches!(parsed.body, RpcResponseBody::Failure(error) if error.retryable));
     }
 
     #[test]
-    fn hello_request_round_trips_through_json() {
-        let request = RpcRequest {
-            id: RequestCorrelationId(0),
-            session_id: None,
-            body: RpcRequestBody::Hello {
-                protocol_version: PROTOCOL_VERSION,
-            },
-        };
-        let json = serde_json::to_string(&request).expect("serializable");
-        let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
-        assert!(matches!(
-            parsed.body,
-            RpcRequestBody::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION
-        ));
-    }
-
-    #[test]
-    fn hello_response_round_trips_through_json() {
+    fn event_gap_round_trips() {
+        let session_id = SessionId::new();
         let response = RpcResponse {
-            id: Some(RequestCorrelationId(0)),
-            body: RpcResponseBody::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                capabilities: ProtocolCapabilities::default(),
+            id: None,
+            body: RpcResponseBody::EventGap {
+                session_id,
+                last_delivered_sequence: 41,
+                dropped: 3,
+                cursor_expired: false,
             },
         };
-        let json = serde_json::to_string(&response).expect("serializable");
-        let parsed: RpcResponse = serde_json::from_str(&json).expect("deserializable");
-        match parsed.body {
-            RpcResponseBody::Hello {
-                protocol_version,
-                capabilities,
-            } => {
-                assert_eq!(protocol_version, PROTOCOL_VERSION);
-                assert!(capabilities.resumable_subscribe);
-            }
-            other => panic!("expected Hello, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn subscribe_since_seq_round_trips_through_json() {
-        let request = RpcRequest {
-            id: RequestCorrelationId(3),
-            session_id: Some(SessionId::new()),
-            body: RpcRequestBody::Subscribe {
-                since_seq: Some(42),
-            },
-        };
-        let json = serde_json::to_string(&request).expect("serializable");
-        let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
+        let value = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(value["body"]["type"], "event_gap");
+        let parsed: RpcResponse = serde_json::from_value(value).expect("deserialize");
         assert!(matches!(
             parsed.body,
-            RpcRequestBody::Subscribe {
-                since_seq: Some(42)
-            }
+            RpcResponseBody::EventGap {
+                session_id: parsed_id,
+                last_delivered_sequence: 41,
+                dropped: 3,
+                cursor_expired: false,
+            } if parsed_id == session_id
         ));
     }
 
     #[test]
-    fn subscribe_without_since_seq_round_trips_through_json() {
-        let request = RpcRequest {
-            id: RequestCorrelationId(4),
-            session_id: Some(SessionId::new()),
-            body: RpcRequestBody::Subscribe { since_seq: None },
-        };
-        let json = serde_json::to_string(&request).expect("serializable");
-        let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
-        assert!(matches!(
-            parsed.body,
-            RpcRequestBody::Subscribe { since_seq: None }
-        ));
-    }
-
-    #[test]
-    fn protocol_capabilities_default_advertises_resumable_subscribe() {
+    fn capabilities_are_truthful() {
         let capabilities = ProtocolCapabilities::default();
-        assert!(capabilities.resumable_subscribe);
-        assert!(capabilities.lifecycle_commands);
-    }
-
-    #[test]
-    fn lifecycle_requests_round_trip_through_json() {
-        for body in [
-            RpcRequestBody::Steer(UserInput {
-                text: "focus on tests".into(),
-                attachments: vec![],
-            }),
-            RpcRequestBody::FollowUp(UserInput {
-                text: "then summarize".into(),
-                attachments: vec![],
-            }),
-        ] {
-            let request = RpcRequest {
-                id: RequestCorrelationId(9),
-                session_id: Some(SessionId::new()),
-                body,
-            };
-            let json = serde_json::to_string(&request).expect("serializable");
-            let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
-            assert!(matches!(
-                parsed.body,
-                RpcRequestBody::Steer(_) | RpcRequestBody::FollowUp(_)
-            ));
-        }
+        assert!(capabilities.typed_errors);
+        assert!(capabilities.mutation_admission);
+        assert!(capabilities.session_restore);
+        assert!(capabilities.event_gap_signals);
+        assert!(!capabilities.durable_idempotency);
+        assert!(!capabilities.pause_resume);
     }
 }

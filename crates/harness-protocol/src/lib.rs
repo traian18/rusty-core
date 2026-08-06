@@ -2,6 +2,7 @@
 
 //! Shared IDs, commands, events, and serializable protocol types; no runtime or I/O policy.
 
+pub mod admission;
 pub mod backend;
 pub mod commands;
 pub mod effects;
@@ -11,3 +12,4 @@ pub mod messages;
 pub mod rpc;
 pub mod tools;
 pub mod usage;
+pub mod lifecycle;

@@ -146,8 +146,11 @@ pub trait CredentialStore: Send + Sync {
 
 /// Host bridge for an OS keychain or other secure credential service. The
 /// harness stores only the resolver and never serializes returned secrets.
+type CredentialResolver =
+    dyn Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync;
+
 pub struct SecureCredentialStore {
-    resolver: Box<dyn Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync>,
+    resolver: Box<CredentialResolver>,
 }
 
 impl SecureCredentialStore {

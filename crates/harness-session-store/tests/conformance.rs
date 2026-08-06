@@ -1,4 +1,3 @@
-
 //! Shared `SessionStore` conformance suite (Tasks 7.3/7.4 acceptance criteria).
 //!
 //! The same battery of contract checks runs against **both** concrete store
@@ -7,7 +6,8 @@
 //! loudly at the shared boundary instead of being papered over by
 //! implementation-specific tests.
 //!
-//! The suite covers the cross-implementation contract from spec §59/§71:
+//! The suite covers the cross-implementation contract from spec §59/§71 plus
+//! the RC-300 additions:
 //!
 //! - **round trip** — append N events + a snapshot, reload, and confirm the
 //!   reconstructed [`StoredSession`] matches **exactly** (the acceptance test
@@ -18,13 +18,20 @@
 //! - an unknown session loads as [`StoreError::NotFound`];
 //! - a later snapshot replaces an earlier one;
 //! - concurrent appends from many tasks land intact (both stores serialize
-//!   writes through a single-writer model).
+//!   writes through a single-writer model);
+//! - **`current_sequence`** (RC-301) — the durable sequencer resume point is
+//!   `0` for a fresh session and tracks committed events plus the snapshot;
+//! - **`raw_records`** (RC-305 diagnostics) — the unprocessed record stream
+//!   includes events and the snapshot without the restore cutoff;
+//! - **snapshot versioning** (RC-305) — snapshots written through
+//!   `save_snapshot` carry the current [`SCHEMA_VERSION`] and round-trip
+//!   through `load_session`.
 //!
 //! Implementation-specific guarantees (WAL mode confirmation, crash recovery,
 //! duplicate-sequence rejection, unsequenced-event assignment, cross-instance
-//! durability) are covered by each implementation's in-module tests and are
-//! deliberately **not** part of the shared suite, since the two backends
-//! legitimately differ there.
+//! durability, retention pruning) are covered by each implementation's
+//! in-module tests and are deliberately **not** part of the shared suite,
+//! since the two backends legitimately differ there.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,8 +40,8 @@ use harness_protocol::commands::AgentStatus;
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, MessageId, RunId, SessionId, Timestamp};
 use harness_session_store::{
-    DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, SessionStore,
-    SqliteSessionStore, StoreError, StoredSession,
+    DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, RawRecord, SCHEMA_VERSION,
+    SessionStore, SqliteSessionStore, StoreError, StoredSession,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +84,8 @@ fn event(session: SessionId, seq: u64) -> DurableSessionEvent {
     }
 }
 
-/// A minimal snapshot at the given session sequence.
+/// A minimal snapshot at the given session sequence, stamped with the current
+/// schema version.
 fn snapshot(session: SessionId, seq: u64) -> DurableSessionSnapshot {
     DurableSessionSnapshot {
         session_id: session,
@@ -85,6 +93,8 @@ fn snapshot(session: SessionId, seq: u64) -> DurableSessionSnapshot {
         agents: Vec::new(),
         session_sequence: seq,
         timestamp: Timestamp::now(),
+        schema_version: SCHEMA_VERSION,
+        metadata: Default::default(),
     }
 }
 
@@ -331,6 +341,68 @@ async fn concurrent_appends_are_serialized_and_intact(store: Arc<dyn SessionStor
     );
 }
 
+/// RC-301: `current_sequence` is `0` for a fresh session, then tracks the
+/// highest committed durable sequence (events and snapshot alike).
+async fn current_sequence_tracks_committed_history(store: Arc<dyn SessionStore>) {
+    let session = SessionId::new();
+    assert_eq!(
+        store.current_sequence(session).await.expect("fresh sequence"),
+        0,
+        "a session that never existed has no committed sequence"
+    );
+
+    store.append(event(session, 1)).await.expect("append event");
+    store.append(event(session, 2)).await.expect("append event");
+    store
+        .save_snapshot(snapshot(session, 2))
+        .await
+        .expect("save snapshot");
+    store.append(event(session, 3)).await.expect("append event");
+
+    assert_eq!(
+        store.current_sequence(session).await.expect("committed sequence"),
+        3
+    );
+}
+
+/// RC-305: `raw_records` exposes the unprocessed stream — events and the
+/// snapshot — without the restore cutoff.
+async fn raw_records_expose_events_and_snapshot(store: Arc<dyn SessionStore>) {
+    let session = SessionId::new();
+    store.append(event(session, 1)).await.expect("append event");
+    store.append(event(session, 2)).await.expect("append event");
+    store
+        .save_snapshot(snapshot(session, 2))
+        .await
+        .expect("save snapshot");
+    store.append(event(session, 3)).await.expect("append event");
+
+    let records = store.raw_records(session).await.expect("raw records");
+    let mut event_count = 0;
+    let mut snapshot_seen = false;
+    for record in &records {
+        match record {
+            RawRecord::Event(event) => {
+                event_count += 1;
+                assert!(
+                    event.session_sequence.is_some(),
+                    "durable events always carry their final sequence"
+                );
+            }
+            RawRecord::Snapshot(snapshot) => {
+                snapshot_seen = true;
+                assert_eq!(snapshot.session_sequence, 2);
+                assert_eq!(
+                    snapshot.schema_version, SCHEMA_VERSION,
+                    "snapshots written by this build are versioned"
+                );
+            }
+        }
+    }
+    assert_eq!(event_count, 3, "raw_records must not apply the snapshot cutoff");
+    assert!(snapshot_seen);
+}
+
 /// Runs every shared conformance check against a live store instance.
 async fn conformance_suite(store: Arc<dyn SessionStore>) {
     round_trip_reconstructed_session_matches_exactly(store.clone()).await;
@@ -339,7 +411,9 @@ async fn conformance_suite(store: Arc<dyn SessionStore>) {
     load_missing_session_is_not_found(store.clone()).await;
     ephemeral_events_are_rejected(store.clone()).await;
     later_snapshot_replaces_earlier(store.clone()).await;
-    concurrent_appends_are_serialized_and_intact(store).await;
+    concurrent_appends_are_serialized_and_intact(store.clone()).await;
+    current_sequence_tracks_committed_history(store.clone()).await;
+    raw_records_expose_events_and_snapshot(store).await;
 }
 
 // ---------------------------------------------------------------------------

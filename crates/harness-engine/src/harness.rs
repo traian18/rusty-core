@@ -192,6 +192,12 @@ impl Harness {
     }
 
     /// Restores a session with the host's real workspace and tool policy.
+    ///
+    /// RC-304: restore is **strict** — the snapshot's recorded workspace
+    /// identity and integration references are validated against the live
+    /// `workspace` and the harness's integration registry, and a mismatch or
+    /// missing provider rejects the restore instead of silently substituting
+    /// a fake.
     pub async fn restore_session_with_toolset(
         &self,
         id: SessionId,
@@ -222,16 +228,24 @@ impl Harness {
     ///
     /// The harness's integration registry re-creates the stored agents'
     /// execution backends, and the configured [`SessionStore`] supplies the
-    /// durable snapshot/event history. Session-scoped dependencies the
-    /// harness does not own (tool registry, workspace, external event sink)
-    /// are populated with empty/in-memory defaults — the restored session's
-    /// own state (agents, messages, capabilities, usage, backend bindings)
-    /// comes entirely from the store.
+    /// durable snapshot/event history.
+    ///
+    /// # RC-300 restore contract
+    ///
+    /// Restore is **strict** (RC-304): the snapshot's recorded workspace
+    /// identity and integration references are validated against the current
+    /// host before any backend is created, and a missing dependency rejects
+    /// the restore. This method binds an in-memory fake workspace, so it only
+    /// succeeds when the snapshot recorded no workspace binding or one that
+    /// matches the fake — for sessions created against a real workspace use
+    /// [`restore_session_with_toolset`](Self::restore_session_with_toolset),
+    /// which validates against the host's actual workspace.
     ///
     /// # Errors
     ///
     /// Returns [`HarnessError::SessionManager`] when no store is configured,
-    /// the session is not found, the stored session has no snapshot
+    /// the session is not found, replay validation fails, dependency
+    /// resolution rejects the restore, the stored session has no snapshot
     /// checkpoint, or a stored backend cannot be re-created.
     pub async fn restore_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
         let runtime = self

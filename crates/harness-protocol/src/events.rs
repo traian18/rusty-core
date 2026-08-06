@@ -261,7 +261,7 @@ mod tests {
         let e2 = make_env(2);
         let e3 = make_env(3);
 
-        let mut events = vec![e3.clone(), e1.clone(), e2.clone()];
+        let mut events = [e3.clone(), e1.clone(), e2.clone()];
         events.sort_by_key(|e| e.agent_sequence);
 
         assert_eq!(events[0].agent_sequence, 1);
@@ -298,7 +298,7 @@ mod tests {
         let b = make_env(Some(2));
         let c = make_env(Some(3));
 
-        let mut events = vec![c, a.clone(), b];
+        let mut events = [c, a.clone(), b];
         events.sort_by_key(|e| e.session_sequence.unwrap_or(0));
 
         assert_eq!(events[0].session_sequence, Some(1));

@@ -1,18 +1,23 @@
 /**
- * High-level client over one connected/managed `harnessd` transport.
- *
- * This mirrors the operations documented in the workspace README's "Talk to
- * a running harnessd" section, using the same `RpcRequestBody`/
- * `RpcResponseBody` contract. It does not invent operations the daemon
- * doesn't support (e.g. `Pause`/`Resume` are wired on the wire but the
- * daemon rejects them today — see `sdk_plan.md` SDK-101).
+ * High-level protocol-v2 client over one connected harnessd transport.
  */
 
-import { HarnessRpcError, HarnessTransportClosedError, HarnessVersionMismatchError } from "./errors.js";
+import { randomUUID } from "node:crypto";
+
+import {
+  HarnessRpcError,
+  HarnessTimeoutError,
+  HarnessTransportClosedError,
+  HarnessVersionMismatchError,
+} from "./errors.js";
 import { HarnessSession } from "./session.js";
 import type { Transport } from "./transport.js";
-import {
+import type {
+  AdmissionResult,
   AgentEventEnvelope,
+  AgentToolset,
+  MutationCommand,
+  MutationMetadata,
   PermissionDecision,
   PermissionId,
   ProtocolCapabilities,
@@ -21,11 +26,11 @@ import {
   RpcResponseBody,
   SessionId,
   SessionSnapshotWire,
-  PROTOCOL_VERSION,
+  SessionSummaryWire,
 } from "./types.js";
+import { PROTOCOL_VERSION } from "./types.js";
 
 export interface ConnectOptions {
-  /** Per-request timeout in milliseconds. Defaults to 30s. */
   requestTimeoutMs?: number;
 }
 
@@ -33,7 +38,33 @@ export interface CreateSessionOptions {
   workspaceRoot: string;
   integration: string;
   integrationConfig?: unknown;
-  toolset?: string[];
+  toolset?: AgentToolset;
+}
+
+export interface RestoreSessionOptions {
+  sessionId: SessionId;
+  workspaceRoot: string;
+  toolset?: AgentToolset;
+}
+
+export interface MutationOptions {
+  commandId?: string;
+  expectedSessionRevision?: number | null;
+  runId?: string | null;
+  traceId?: string | null;
+}
+
+export interface AdmissionReceipt {
+  metadata: MutationMetadata;
+  result: AdmissionResult;
+  sessionRevision: number;
+}
+
+export interface EventGap {
+  sessionId: SessionId;
+  lastDeliveredSequence: number;
+  dropped: number;
+  cursorExpired: boolean;
 }
 
 type PendingReply = {
@@ -42,13 +73,6 @@ type PendingReply = {
   timer: ReturnType<typeof setTimeout>;
 };
 
-/**
- * Connects to a `harnessd` instance over one {@link Transport} and exposes
- * session lifecycle operations.
- *
- * Construct via {@link HarnessClient.connect}, which performs the mandatory
- * `Hello` handshake before returning.
- */
 export class HarnessClient {
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingReply>();
@@ -56,6 +80,8 @@ export class HarnessClient {
     SessionId,
     Set<(event: AgentEventEnvelope) => void>
   >();
+  private readonly gapListeners = new Map<SessionId, Set<(gap: EventGap) => void>>();
+  private readonly sessionRevisions = new Map<SessionId, number>();
   private closed = false;
   private readonly requestTimeoutMs: number;
 
@@ -69,114 +95,154 @@ export class HarnessClient {
     this.transport.onClose((reason) => this.handleClose(reason));
   }
 
-  /**
-   * Perform the mandatory `Hello` handshake over `transport` and return a
-   * ready-to-use client. Rejects with {@link HarnessVersionMismatchError} if
-   * the daemon reports an incompatible protocol version.
-   */
   static async connect(
     transport: Transport,
     options: ConnectOptions = {},
   ): Promise<HarnessClient> {
-    const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     const bootstrap = new HarnessClient(
       transport,
-      { resumable_subscribe: false, lifecycle_commands: false },
-      requestTimeoutMs,
+      {
+        resumable_subscribe: false,
+        lifecycle_commands: false,
+        typed_errors: false,
+        mutation_admission: false,
+        session_restore: false,
+        event_gap_signals: false,
+        durable_idempotency: false,
+        pause_resume: false,
+      },
+      options.requestTimeoutMs ?? 30_000,
     );
     const body = await bootstrap.request({
-      Hello: { protocol_version: PROTOCOL_VERSION },
+      type: "hello",
+      payload: { protocol_version: PROTOCOL_VERSION },
     });
-    if (typeof body === "string" || !("Hello" in body)) {
-      throw new HarnessRpcError(
-        "expected a Hello response to the handshake request",
-      );
+    if (body.type !== "hello") {
+      throw new HarnessRpcError("expected a hello response");
     }
-    if (body.Hello.protocol_version !== PROTOCOL_VERSION) {
+    if (body.payload.protocol_version !== PROTOCOL_VERSION) {
       throw new HarnessVersionMismatchError(
         PROTOCOL_VERSION,
-        body.Hello.protocol_version,
+        body.payload.protocol_version,
       );
     }
     (bootstrap as { capabilities: ProtocolCapabilities }).capabilities =
-      body.Hello.capabilities;
+      body.payload.capabilities;
     return bootstrap;
   }
 
-  /** Create a new session and return a {@link HarnessSession} handle. */
   async createSession(options: CreateSessionOptions): Promise<HarnessSession> {
     const body = await this.request({
-      CreateSession: {
+      type: "create_session",
+      payload: {
         workspace_root: options.workspaceRoot,
         integration: options.integration,
         integration_config: options.integrationConfig ?? {},
-        toolset: options.toolset ?? [],
+        toolset: options.toolset ?? { tools: {} },
       },
     });
-    if (typeof body === "string" || !("SessionCreated" in body)) {
-      throw new HarnessRpcError("expected SessionCreated response");
+    if (body.type !== "session_created") {
+      throw new HarnessRpcError("expected session_created response");
     }
-    return new HarnessSession(this, body.SessionCreated.session_id);
+    this.sessionRevisions.set(body.payload.session_id, 0);
+    return new HarnessSession(this, body.payload.session_id);
   }
 
-  /** Send a prompt to start or continue a run on `sessionId`. */
-  async prompt(sessionId: SessionId, text: string): Promise<void> {
-    await this.requestForSession(sessionId, {
-      Prompt: { text, attachments: [] },
+  async listSessions(): Promise<SessionSummaryWire[]> {
+    const body = await this.request({ type: "list_sessions" });
+    if (body.type !== "sessions_listed") {
+      throw new HarnessRpcError("expected sessions_listed response");
+    }
+    return body.payload.sessions;
+  }
+
+  async restoreSession(options: RestoreSessionOptions): Promise<HarnessSession> {
+    if (!this.capabilities.session_restore) {
+      throw new HarnessRpcError("the connected daemon does not support session restore");
+    }
+    const body = await this.request({
+      type: "restore_session",
+      payload: {
+        session_id: options.sessionId,
+        workspace_root: options.workspaceRoot,
+        toolset: options.toolset ?? { tools: {} },
+      },
     });
+    if (body.type !== "session_restored") {
+      throw new HarnessRpcError("expected session_restored response");
+    }
+    this.sessionRevisions.set(body.payload.session_id, body.payload.session_revision);
+    return new HarnessSession(this, body.payload.session_id);
   }
 
-  /** Inject input at the active run's next safe command boundary. */
-  async steer(sessionId: SessionId, text: string): Promise<void> {
+  prompt(
+    sessionId: SessionId,
+    text: string,
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
+    return this.mutate(
+      sessionId,
+      { type: "prompt", payload: { text, attachments: [] } },
+      options,
+    );
+  }
+
+  steer(
+    sessionId: SessionId,
+    text: string,
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
     this.requireLifecycleCommands();
-    await this.requestForSession(sessionId, {
-      Steer: { text, attachments: [] },
-    });
+    return this.mutate(
+      sessionId,
+      { type: "steer", payload: { text, attachments: [] } },
+      options,
+    );
   }
 
-  /** Queue input FIFO to run after the active run completes. */
-  async followUp(sessionId: SessionId, text: string): Promise<void> {
+  followUp(
+    sessionId: SessionId,
+    text: string,
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
     this.requireLifecycleCommands();
-    await this.requestForSession(sessionId, {
-      FollowUp: { text, attachments: [] },
-    });
+    return this.mutate(
+      sessionId,
+      { type: "follow_up", payload: { text, attachments: [] } },
+      options,
+    );
   }
 
-  /** Cancel the active run on `sessionId`, if any. */
-  async cancel(sessionId: SessionId): Promise<void> {
-    await this.requestForSession(sessionId, "Cancel");
+  cancel(sessionId: SessionId, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.mutate(sessionId, { type: "cancel" }, options);
   }
 
-  /** Resolve a pending permission request on `sessionId`. */
-  async resolvePermission(
+  resolvePermission(
     sessionId: SessionId,
     id: PermissionId,
     decision: PermissionDecision,
-  ): Promise<void> {
-    await this.requestForSession(sessionId, {
-      ResolvePermission: { id, decision },
-    });
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
+    return this.mutate(
+      sessionId,
+      { type: "resolve_permission", payload: { id, decision } },
+      options,
+    );
   }
 
-  /** Read a point-in-time snapshot of `sessionId`. */
   async snapshot(sessionId: SessionId): Promise<SessionSnapshotWire> {
-    const body = await this.requestForSession(sessionId, "Snapshot");
-    if (typeof body === "string" || !("Snapshot" in body)) {
-      throw new HarnessRpcError("expected Snapshot response");
+    const body = await this.requestForSession(sessionId, { type: "snapshot" });
+    if (body.type !== "snapshot") {
+      throw new HarnessRpcError("expected snapshot response");
     }
-    return body.Snapshot;
+    return body.payload;
   }
 
-  /**
-   * Subscribe to `sessionId`'s event stream, optionally replaying durable
-   * events with `session_sequence > sinceSeq` first (see the workspace
-   * README's "Durability and resume" section for exactly which event
-   * variants are replayable).
-   */
   async subscribe(
     sessionId: SessionId,
     onEvent: (event: AgentEventEnvelope) => void,
     sinceSeq: number | null = null,
+    onGap?: (gap: EventGap) => void,
   ): Promise<() => void> {
     let listeners = this.eventListeners.get(sessionId);
     if (!listeners) {
@@ -184,28 +250,72 @@ export class HarnessClient {
       this.eventListeners.set(sessionId, listeners);
     }
     listeners.add(onEvent);
+    if (onGap) {
+      let gaps = this.gapListeners.get(sessionId);
+      if (!gaps) {
+        gaps = new Set();
+        this.gapListeners.set(sessionId, gaps);
+      }
+      gaps.add(onGap);
+    }
 
     await this.requestForSession(sessionId, {
-      Subscribe: { since_seq: sinceSeq },
+      type: "subscribe",
+      payload: { since_seq: sinceSeq },
     });
 
     return () => {
       listeners?.delete(onEvent);
+      if (onGap) this.gapListeners.get(sessionId)?.delete(onGap);
     };
   }
 
-  /** Tear the session down on the daemon. */
-  async closeSession(sessionId: SessionId): Promise<void> {
-    await this.requestForSession(sessionId, "CloseSession");
+  async closeSession(
+    sessionId: SessionId,
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
+    const receipt = await this.mutate(sessionId, { type: "close_session" }, options);
     this.eventListeners.delete(sessionId);
+    this.gapListeners.delete(sessionId);
+    this.sessionRevisions.delete(sessionId);
+    return receipt;
   }
 
-  /** Close the underlying transport. */
   async close(): Promise<void> {
     await this.transport.close();
   }
 
-  private async requestForSession(
+  private async mutate(
+    sessionId: SessionId,
+    command: MutationCommand,
+    options: MutationOptions = {},
+  ): Promise<AdmissionReceipt> {
+    const metadata: MutationMetadata = {
+      command_id: options.commandId ?? randomUUID(),
+      session_id: sessionId,
+      run_id: options.runId ?? null,
+      expected_session_revision:
+        options.expectedSessionRevision === undefined
+          ? (this.sessionRevisions.get(sessionId) ?? null)
+          : options.expectedSessionRevision,
+      trace_id: options.traceId ?? null,
+    };
+    const body = await this.requestForSession(sessionId, {
+      type: "mutate",
+      payload: { metadata, command },
+    });
+    if (body.type !== "admission") {
+      throw new HarnessRpcError("expected admission response");
+    }
+    this.sessionRevisions.set(sessionId, body.payload.session_revision);
+    return {
+      metadata: body.payload.metadata,
+      result: body.payload.result,
+      sessionRevision: body.payload.session_revision,
+    };
+  }
+
+  private requestForSession(
     sessionId: SessionId,
     body: RpcRequestBody,
   ): Promise<RpcResponseBody> {
@@ -231,17 +341,15 @@ export class HarnessClient {
     return new Promise<RpcResponseBody>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(
-          new HarnessRpcError(
-            `request ${id} timed out after ${this.requestTimeoutMs}ms`,
-          ),
-        );
+        reject(new HarnessTimeoutError(
+          `request ${id} timed out after ${this.requestTimeoutMs}ms`,
+        ));
       }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.transport.send({ id, session_id: sessionId, body });
     }).then((responseBody) => {
-      if (typeof responseBody !== "string" && "Error" in responseBody) {
-        throw new HarnessRpcError(responseBody.Error.message);
+      if (responseBody.type === "failure") {
+        throw HarnessRpcError.fromPayload(responseBody.payload);
       }
       return responseBody;
     });
@@ -249,7 +357,7 @@ export class HarnessClient {
 
   private handleResponse(response: RpcResponse): void {
     if (response.id === null) {
-      this.handlePushedEvent(response.body);
+      this.handlePush(response.body);
       return;
     }
     const pending = this.pending.get(response.id);
@@ -259,12 +367,26 @@ export class HarnessClient {
     pending.resolve(response.body);
   }
 
-  private handlePushedEvent(body: RpcResponseBody): void {
-    if (typeof body === "string" || !("Event" in body)) return;
-    const envelope = body.Event;
-    const listeners = this.eventListeners.get(envelope.session_id);
-    if (!listeners) return;
-    for (const listener of listeners) listener(envelope);
+  private handlePush(body: RpcResponseBody): void {
+    if (body.type === "event") {
+      const listeners = this.eventListeners.get(body.payload.session_id);
+      if (listeners) {
+        for (const listener of listeners) listener(body.payload);
+      }
+      return;
+    }
+    if (body.type === "event_gap") {
+      const gap: EventGap = {
+        sessionId: body.payload.session_id,
+        lastDeliveredSequence: body.payload.last_delivered_sequence,
+        dropped: body.payload.dropped,
+        cursorExpired: body.payload.cursor_expired,
+      };
+      const listeners = this.gapListeners.get(gap.sessionId);
+      if (listeners) {
+        for (const listener of listeners) listener(gap);
+      }
+    }
   }
 
   private handleClose(reason?: Error): void {

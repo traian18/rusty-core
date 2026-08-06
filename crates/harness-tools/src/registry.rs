@@ -27,9 +27,11 @@ pub trait ToolRegistry: Send + Sync {
     fn descriptors(&self) -> Vec<ToolDescriptor>;
 }
 
+type RegisteredTool = (ToolDescriptor, Arc<dyn ToolExecutor>);
+
 /// HashMap-backed concrete implementation.
 pub struct SimpleToolRegistry {
-    tools: Mutex<HashMap<String, (ToolDescriptor, Arc<dyn ToolExecutor>)>>,
+    tools: Mutex<HashMap<String, RegisteredTool>>,
 }
 
 impl SimpleToolRegistry {

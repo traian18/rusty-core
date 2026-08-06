@@ -44,7 +44,7 @@ under one crate name and adds small ergonomic wrappers:
 Applications that are not Rust, or that want the engine in a separate
 process/sandbox, should run `harnessd` and speak the wire protocol instead
 — see [`../typescript`](../typescript) and
-[`../../schema/protocol-v1.schema.json`](../../schema/protocol-v1.schema.json).
+[`../../schema/protocol-v2.schema.json`](../../schema/protocol-v2.schema.json).
 Both integration modes are meant to expose equivalent session/event/
 permission semantics (see `sdk_plan.md` §2, "One behavioral contract").
 

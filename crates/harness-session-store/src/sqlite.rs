@@ -1,4 +1,3 @@
-
 //! WAL-mode SQLite [`SessionStore`] backed by a single-writer actor (Tasks 7.2/7.3).
 //!
 //! # Architecture
@@ -8,13 +7,13 @@
 //! `rusqlite::Connection`:
 //!
 //! ```text
-//!              append / save_snapshot
+//!              append / save_snapshot / prune
 //!                        │
 //!              mpsc channel (WriteCommand)
 //!                        ▼
 //!            writer actor ── owns ──> WAL-mode Connection
 //!                        │
-//!              pooled reads (r2d2_sqlite)  ◄── load_session
+//!              pooled reads (r2d2_sqlite)  ◄── load_session / current_sequence / raw_records
 //! ```
 //!
 //! - **Writes**: [`SqliteSessionStore::append`] and
@@ -35,20 +34,42 @@
 //! single ACID transaction, so a crash mid-batch can only lose the *uncommitted*
 //! tail — never partially written rows: on the next open, SQLite replays the
 //! WAL, rolls back interrupted transactions, and the idempotent migration
-//! (`IF NOT EXISTS`, `migrations/0001_init.sql`) re-applies cleanly.
+//! (`IF NOT EXISTS`, `migrations/0001_init.sql`) re-applies cleanly. The
+//! snapshot-versioning columns (`schema_version`, `metadata`) are added to
+//! pre-existing databases by [`ensure_snapshot_columns`], guarded by
+//! `PRAGMA table_info`.
+//!
+//! # RC-300 additions
+//!
+//! - [`SessionStore::current_sequence`] resolves the highest committed
+//!   sequence with an indexed `MAX(session_sequence)` query, giving the
+//!   [`crate::commit::SessionCommitter`] a cheap resume point.
+//! - [`SessionStore::raw_records`] streams the unprocessed record stream
+//!   (durable events plus the latest snapshot) for
+//!   [`crate::diagnostics`].
+//! - [`SessionStore::prune_events_before`] implements RC-305 retention as an
+//!   explicit maintenance operation: it deletes durable events at or below a
+//!   sequence inside the writer actor's own transaction. The caller must have
+//!   written a snapshot at or above the prune point first (see
+//!   [`crate::retention::prune_plan`]); the store does not verify that
+//!   precondition, so the runtime must.
+//! - Snapshot rows persist `schema_version` (RC-305) and the
+//!   [`DurableSessionMetadata`](crate::store::DurableSessionMetadata) block
+//!   (RC-304) so versioning and dependency recording survive restarts.
 //!
 //! # Schema mapping
 //!
 //! `append` writes exactly one `durable_events` row (the full
 //! `AgentEventEnvelope` as JSON in `envelope`); `save_snapshot` upserts the
 //! session's single `snapshots` row (replacing any earlier one), carrying the
-//! `Vec<StoredAgentState>` as JSON; `load_session` returns the latest snapshot
-//! plus the durable events appended after it (`session_sequence >
-//! snapshot.session_sequence`, ordered by sequence). The per-agent projection
-//! (`agents`) and usage denormalization (`usage_records`) tables defined by
-//! the migration are intentionally not populated here — the snapshot's JSON
-//! `agents` column is the source of truth for restore, and usage is derivable
-//! from the event log (spec §71 "snapshot + event restoration").
+//! `Vec<StoredAgentState>` as JSON plus the snapshot version/metadata;
+//! `load_session` returns the latest snapshot plus the durable events appended
+//! after it (`session_sequence > snapshot.session_sequence`, ordered by
+//! sequence). The per-agent projection (`agents`) and usage denormalization
+//! (`usage_records`) tables defined by the migration are intentionally not
+//! populated here — the snapshot's JSON `agents` column is the source of truth
+//! for restore, and usage is derivable from the event log (spec §71 "snapshot
+//! + event restoration").
 //!
 //! Events appended without a `session_sequence` (the runtime has not yet
 //! assigned one) are assigned the next `MAX(session_sequence) + 1` for their
@@ -71,8 +92,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
-    is_durable, summarize_session, DurableSessionEvent, DurableSessionSnapshot, SessionStore,
-    SessionSummary, StoreError, StoredAgentState, StoredSession,
+    is_durable, summarize_session, DurableSessionEvent, DurableSessionMetadata,
+    DurableSessionSnapshot, RawRecord, SessionStore, SessionSummary, StoreError, StoredAgentState,
+    StoredSession,
 };
 
 /// Number of write requests that may be queued to the writer actor before
@@ -105,6 +127,15 @@ enum WriteCommand {
         snapshot: DurableSessionSnapshot,
         /// Acknowledges the outcome to the caller.
         reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    /// Prune durable events at or below a sequence (RC-305 retention).
+    Prune {
+        /// The session whose events are pruned.
+        session_id: SessionId,
+        /// Remove events with `session_sequence <= sequence`.
+        sequence: u64,
+        /// Acknowledges the number of removed rows.
+        reply: oneshot::Sender<Result<u64, StoreError>>,
     },
 }
 
@@ -182,6 +213,42 @@ fn init_writer_connection(conn: &mut Connection) -> Result<(), StoreError> {
     // Idempotent schema application; safe to re-run after a crash.
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|error| map_sqlite_error("apply schema migration", error))?;
+
+    // RC-305/RC-304: upgrade pre-existing databases with the snapshot
+    // versioning and dependency-metadata columns.
+    ensure_snapshot_columns(conn)?;
+
+    Ok(())
+}
+
+/// Adds the RC-300 `schema_version`/`metadata` columns to a pre-existing
+/// `snapshots` table (new databases get them from the schema SQL).
+///
+/// SQLite lacks `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so the columns are
+/// detected via `PRAGMA table_info` before applying the guarded `ALTER`.
+fn ensure_snapshot_columns(conn: &mut Connection) -> Result<(), StoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(snapshots)")
+        .map_err(|error| map_sqlite_error("inspect snapshots columns", error))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| map_sqlite_error("read snapshots columns", error))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|error| map_sqlite_error("collect snapshots columns", error))?;
+    drop(stmt);
+
+    if !columns.iter().any(|column| column == "schema_version") {
+        conn.execute_batch(
+            "ALTER TABLE snapshots ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|error| map_sqlite_error("add schema_version column", error))?;
+    }
+    if !columns.iter().any(|column| column == "metadata") {
+        conn.execute_batch(
+            "ALTER TABLE snapshots ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
+        )
+        .map_err(|error| map_sqlite_error("add metadata column", error))?;
+    }
     Ok(())
 }
 
@@ -201,6 +268,13 @@ fn writer_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCommand>) {
             }
             WriteCommand::SaveSnapshot { snapshot, reply } => {
                 let _ = reply.send(handle_save_snapshot(&mut conn, snapshot));
+            }
+            WriteCommand::Prune {
+                session_id,
+                sequence,
+                reply,
+            } => {
+                let _ = reply.send(handle_prune(&mut conn, session_id, sequence));
             }
         }
     }
@@ -273,7 +347,8 @@ fn handle_append(conn: &mut Connection, event: DurableSessionEvent) -> Result<()
 
 /// Writes/replaces the session's latest `snapshots` row inside its own
 /// transaction (upsert on `session_id`), correcting the `sessions` row's
-/// `root_agent_id` to the snapshot's root agent.
+/// `root_agent_id` to the snapshot's root agent. Persists the snapshot's
+/// schema version (RC-305) and dependency metadata (RC-304).
 fn handle_save_snapshot(
     conn: &mut Connection,
     snapshot: DurableSessionSnapshot,
@@ -291,6 +366,7 @@ fn handle_save_snapshot(
     )?;
 
     let agents_json = serde_json::to_string(&snapshot.agents)?;
+    let metadata_json = serde_json::to_string(&snapshot.metadata)?;
     // The timestamp column holds the RFC3339-serialized `Timestamp` (via
     // `to_rfc3339`) so the snapshot timestamp round-trips losslessly without
     // re-deriving it from a truncated millisecond value. SQLite stores the
@@ -298,19 +374,25 @@ fn handle_save_snapshot(
     // `to_rfc3339` output sorts lexicographically like timestamps.
     let timestamp_rfc3339 = snapshot.timestamp.to_rfc3339();
     tx.execute(
-        "INSERT INTO snapshots (session_id, root_agent_id, agents, session_sequence, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO snapshots
+             (session_id, root_agent_id, agents, session_sequence, timestamp,
+              schema_version, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(session_id) DO UPDATE SET
              root_agent_id    = excluded.root_agent_id,
              agents           = excluded.agents,
              session_sequence = excluded.session_sequence,
-             timestamp        = excluded.timestamp",
+             timestamp        = excluded.timestamp,
+             schema_version   = excluded.schema_version,
+             metadata         = excluded.metadata",
         params![
             snapshot.session_id.to_string(),
             snapshot.root_agent_id.to_string(),
             agents_json,
             snapshot.session_sequence as i64,
             timestamp_rfc3339,
+            snapshot.schema_version as i64,
+            metadata_json,
         ],
     )
     .map_err(|error| map_sqlite_error("save snapshot", error))?;
@@ -318,6 +400,32 @@ fn handle_save_snapshot(
     tx.commit()
         .map_err(|error| map_sqlite_error("commit snapshot transaction", error))?;
     Ok(())
+}
+
+/// Prunes durable events at or below `sequence` for `session_id` (RC-305).
+///
+/// The caller must have written a snapshot at or above `sequence` first (see
+/// [`crate::retention::prune_plan`]) so a restore can still reconstruct the
+/// session; this function does not verify that precondition by design — the
+/// retention policy lives with the caller.
+fn handle_prune(
+    conn: &mut Connection,
+    session_id: SessionId,
+    sequence: u64,
+) -> Result<u64, StoreError> {
+    let tx = conn
+        .transaction()
+        .map_err(|error| map_sqlite_error("begin prune transaction", error))?;
+    let removed = tx
+        .execute(
+            "DELETE FROM durable_events
+             WHERE session_id = ?1 AND session_sequence <= ?2",
+            params![session_id.to_string(), sequence as i64],
+        )
+        .map_err(|error| map_sqlite_error("prune durable events", error))?;
+    tx.commit()
+        .map_err(|error| map_sqlite_error("commit prune transaction", error))?;
+    Ok(removed as u64)
 }
 
 /// Ensures a `sessions` row exists for `session_id`, touching `updated_at`.
@@ -397,6 +505,44 @@ fn events_since_sync(
     Ok(events)
 }
 
+/// Decodes a stored `snapshots` row into a [`DurableSessionSnapshot`].
+///
+/// `schema_version` and `metadata` come from the RC-300 columns; pre-RC-300
+/// rows (columns defaulting to 0 / `{}`) are reported as version 0 with empty
+/// metadata so [`crate::version::migrate_snapshot`] can upgrade them.
+fn decode_snapshot_row(
+    id: SessionId,
+    row: (String, String, i64, String, i64, String),
+) -> Result<DurableSessionSnapshot, StoreError> {
+    let (root_agent_id, agents_json, session_sequence, timestamp_rfc3339, schema_version, metadata_json) = row;
+    let agents: Vec<StoredAgentState> = serde_json::from_str(&agents_json)?;
+    let root_agent_id = AgentId::from_str(&root_agent_id).map_err(|error| {
+        StoreError::InvalidState(format!(
+            "corrupt root_agent_id {root_agent_id:?} in snapshot: {error}"
+        ))
+    })?;
+    let timestamp = serde_json::from_str::<Timestamp>(&format!("\"{timestamp_rfc3339}\""))
+        .map_err(|error| {
+            StoreError::InvalidState(format!(
+                "corrupt snapshot timestamp {timestamp_rfc3339:?}: {error}"
+            ))
+        })?;
+    let metadata: DurableSessionMetadata = serde_json::from_str(&metadata_json).map_err(|error| {
+        StoreError::InvalidState(format!(
+            "corrupt snapshot metadata {metadata_json:?}: {error}"
+        ))
+    })?;
+    Ok(DurableSessionSnapshot {
+        session_id: id,
+        root_agent_id,
+        agents,
+        session_sequence: session_sequence as u64,
+        timestamp,
+        schema_version: schema_version as u64,
+        metadata,
+    })
+}
+
 /// Reconstructs a [`StoredSession`] for `id` from the latest snapshot plus the
 /// durable events appended after it. Runs on the read pool (blocking call).
 fn load_session_sync(
@@ -408,38 +554,27 @@ fn load_session_sync(
         .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
 
     // Latest restore checkpoint, if any.
-    let snapshot_row: Option<(String, String, i64, String)> = conn
+    let snapshot_row: Option<(String, String, i64, String, i64, String)> = conn
         .query_row(
-            "SELECT root_agent_id, agents, session_sequence, timestamp
+            "SELECT root_agent_id, agents, session_sequence, timestamp, schema_version, metadata
              FROM snapshots WHERE session_id = ?1",
             params![id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| map_sqlite_error("load snapshot", error))?;
 
     let snapshot = match snapshot_row {
-        Some((root_agent_id, agents_json, session_sequence, timestamp_rfc3339)) => {
-            let agents: Vec<StoredAgentState> = serde_json::from_str(&agents_json)?;
-            let root_agent_id = AgentId::from_str(&root_agent_id).map_err(|error| {
-                StoreError::InvalidState(format!(
-                    "corrupt root_agent_id {root_agent_id:?} in snapshot: {error}"
-                ))
-            })?;
-            let timestamp = serde_json::from_str::<Timestamp>(&format!("\"{timestamp_rfc3339}\""))
-                .map_err(|error| {
-                    StoreError::InvalidState(format!(
-                        "corrupt snapshot timestamp {timestamp_rfc3339:?}: {error}"
-                    ))
-                })?;
-            Some(DurableSessionSnapshot {
-                session_id: id,
-                root_agent_id,
-                agents,
-                session_sequence: session_sequence as u64,
-                timestamp,
-            })
-        }
+        Some(row) => Some(decode_snapshot_row(id, row)?),
         None => None,
     };
 
@@ -492,6 +627,100 @@ fn load_session_sync(
         snapshot,
         events,
     })
+}
+
+/// Resolves the highest committed sequence for `id` via indexed queries.
+fn current_sequence_sync(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+    id: SessionId,
+) -> Result<u64, StoreError> {
+    let conn = pool
+        .get()
+        .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
+    let event_max: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(session_sequence) FROM durable_events WHERE session_id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| map_sqlite_error("read max event sequence", error))?;
+    let snapshot_max: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(session_sequence) FROM snapshots WHERE session_id = ?1",
+            params![id.to_string()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| map_sqlite_error("read max snapshot sequence", error))?;
+    let event_max = event_max.map(|value| value as u64).unwrap_or(0);
+    let snapshot_max = snapshot_max.map(|value| value as u64).unwrap_or(0);
+    Ok(event_max.max(snapshot_max))
+}
+
+/// Streams the unprocessed record stream (events + latest snapshot), with the
+/// snapshot's real identity/version/metadata fields — never placeholders.
+fn raw_records_sync(
+    pool: &r2d2::Pool<SqliteConnectionManager>,
+    id: SessionId,
+) -> Result<Vec<RawRecord>, StoreError> {
+    let mut records = Vec::new();
+
+    {
+        let conn = pool
+            .get()
+            .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_sequence, envelope
+                 FROM durable_events
+                 WHERE session_id = ?1
+                 ORDER BY session_sequence ASC",
+            )
+            .map_err(|error| map_sqlite_error("prepare raw event query", error))?;
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| map_sqlite_error("query raw events", error))?;
+        for row in rows {
+            let (session_sequence, envelope_json) =
+                row.map_err(|error| map_sqlite_error("read raw event row", error))?;
+            let mut envelope: AgentEventEnvelope =
+                serde_json::from_str(&envelope_json).map_err(|error| {
+                    StoreError::InvalidState(format!("corrupt durable event envelope: {error}"))
+                })?;
+            envelope.session_sequence = Some(session_sequence);
+            records.push(RawRecord::Event(DurableSessionEvent {
+                envelope,
+                session_sequence: Some(session_sequence),
+            }));
+        }
+    }
+
+    let conn = pool
+        .get()
+        .map_err(|error| StoreError::Backend(format!("acquire read connection: {error}")))?;
+    let snapshot_row: Option<(String, String, i64, String, i64, String)> = conn
+        .query_row(
+            "SELECT root_agent_id, agents, session_sequence, timestamp, schema_version, metadata
+             FROM snapshots WHERE session_id = ?1",
+            params![id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| map_sqlite_error("load raw snapshot", error))?;
+    if let Some(row) = snapshot_row {
+        records.push(RawRecord::Snapshot(decode_snapshot_row(id, row)?));
+    }
+    Ok(records)
 }
 
 fn list_sessions_sync(
@@ -573,6 +802,20 @@ impl SessionStore for SqliteSessionStore {
             .map_err(|error| StoreError::Backend(format!("event history task failed: {error}")))?
     }
 
+    async fn current_sequence(&self, id: SessionId) -> Result<u64, StoreError> {
+        let pool = self.read_pool.clone();
+        tokio::task::spawn_blocking(move || current_sequence_sync(&pool, id))
+            .await
+            .map_err(|error| StoreError::Backend(format!("sequence task failed: {error}")))?
+    }
+
+    async fn raw_records(&self, id: SessionId) -> Result<Vec<RawRecord>, StoreError> {
+        let pool = self.read_pool.clone();
+        tokio::task::spawn_blocking(move || raw_records_sync(&pool, id))
+            .await
+            .map_err(|error| StoreError::Backend(format!("raw records task failed: {error}")))?
+    }
+
     async fn append(&self, event: DurableSessionEvent) -> Result<(), StoreError> {
         if !is_durable(&event.envelope.event) {
             return Err(StoreError::InvalidState(format!(
@@ -600,19 +843,68 @@ impl SessionStore for SqliteSessionStore {
             .await
             .map_err(|_| StoreError::Backend("SQLite writer task terminated".into()))?
     }
+
+    async fn prune_events_before(
+        &self,
+        id: SessionId,
+        sequence: u64,
+    ) -> Result<u64, StoreError> {
+        let (reply, acknowledgement) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::Prune {
+                session_id: id,
+                sequence,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::Backend("SQLite writer task is not running".into()))?;
+        acknowledgement
+            .await
+            .map_err(|_| StoreError::Backend("SQLite writer task terminated".into()))?
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_protocol::commands::AgentStatus;
+    use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
+    use harness_protocol::ids::{AgentId, EventId, RunId};
 
-    #[test]
-    fn opens_a_wal_database() {
-        let path = std::env::temp_dir().join(format!(
-            "harness-sqlite-test-{}-{}.db",
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-sqlite-{tag}-{}-{}",
             std::process::id(),
             now_ms()
         ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("store.db")
+    }
+
+    fn event(session_id: SessionId, sequence: u64) -> DurableSessionEvent {
+        DurableSessionEvent {
+            envelope: AgentEventEnvelope {
+                event_id: EventId::new(),
+                session_id,
+                agent_id: AgentId::new(),
+                parent_agent_id: None,
+                run_id: Some(RunId::new()),
+                agent_sequence: sequence,
+                session_sequence: Some(sequence),
+                timestamp: Timestamp::now(),
+                visibility: EventVisibility::User,
+                event: AgentEvent::StateChanged {
+                    from: AgentStatus::Idle,
+                    to: AgentStatus::PreparingContext,
+                },
+            },
+            session_sequence: Some(sequence),
+        }
+    }
+
+    #[test]
+    fn opens_a_wal_database() {
+        let path = temp_db("wal");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -621,8 +913,69 @@ mod tests {
             .block_on(async { SqliteSessionStore::open(&path) })
             .expect("open store");
         drop(store);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("db-shm"));
-        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[tokio::test]
+    async fn current_sequence_is_zero_for_fresh_session() {
+        let store = SqliteSessionStore::open(temp_db("seq-zero")).expect("open store");
+        assert_eq!(
+            store.current_sequence(SessionId::new()).await.expect("sequence"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn current_sequence_tracks_committed_events() {
+        let store = SqliteSessionStore::open(temp_db("seq")).expect("open store");
+        let session = SessionId::new();
+        store.append(event(session, 1)).await.expect("append 1");
+        store.append(event(session, 2)).await.expect("append 2");
+        assert_eq!(
+            store.current_sequence(session).await.expect("sequence"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_removes_only_events_at_or_below_sequence() {
+        let store = SqliteSessionStore::open(temp_db("prune")).expect("open store");
+        let session = SessionId::new();
+        store.append(event(session, 1)).await.expect("append 1");
+        store.append(event(session, 2)).await.expect("append 2");
+        store.append(event(session, 3)).await.expect("append 3");
+
+        let removed = store
+            .prune_events_before(session, 2)
+            .await
+            .expect("prune");
+        assert_eq!(removed, 2);
+
+        let stored = store.load_session(session).await.expect("load");
+        let sequences: Vec<u64> = stored
+            .events
+            .iter()
+            .filter_map(|event| event.session_sequence)
+            .collect();
+        assert_eq!(sequences, vec![3], "only events above the prune point survive");
+    }
+
+    #[tokio::test]
+    async fn snapshot_version_and_metadata_round_trip() {
+        let store = SqliteSessionStore::open(temp_db("snap-meta")).expect("open store");
+        let session = SessionId::new();
+        let mut snapshot = crate::testing::test_snapshot(session, 1);
+        snapshot.metadata.workspace_identity = Some("/srv/prod".into());
+        snapshot.metadata.integration_references = vec!["anthropic".into()];
+        store.save_snapshot(snapshot).await.expect("save snapshot");
+
+        let stored = store.load_session(session).await.expect("load");
+        let loaded = stored.snapshot.expect("snapshot");
+        assert_eq!(loaded.schema_version, crate::version::SCHEMA_VERSION);
+        assert_eq!(
+            loaded.metadata.workspace_identity.as_deref(),
+            Some("/srv/prod")
+        );
+        assert_eq!(loaded.metadata.integration_references, vec!["anthropic"]);
     }
 }

@@ -4,7 +4,7 @@ use harness_protocol::usage::{ModelUsage, UsageRecord};
 
 use crate::agent::UsageLedger;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AgentUsageSummary {
     pub self_usage: ModelUsage,
     pub descendant_usage: ModelUsage,

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -15,11 +16,12 @@ use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentSta
 use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, SpawnMode, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
+use harness_session_store::SessionCommitter;
 
 use crate::agent_supervisor::{AgentSupervisor, SupervisorError};
 use crate::integration::IntegrationRegistry;
 use crate::scheduler::Scheduler;
-use crate::session_runtime::LiveStateTable;
+use crate::session_runtime::{stored_agent_state, AgentProjectionTable, LiveStateTable};
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
 /// Mailbox and control handles for one agent.
@@ -70,6 +72,14 @@ pub struct AgentRunner {
     pub scheduler: Arc<Scheduler>,
     /// Shared per-agent live state published after every transition.
     live_state: LiveStateTable,
+    /// Shared per-agent durable projection (RC-302), published after every
+    /// transition so a checkpoint always reflects truthful agent state.
+    projection: Option<AgentProjectionTable>,
+    /// The session's authoritative commit boundary (RC-301). When set, every
+    /// emitted event is committed (sequenced + persisted when durable)
+    /// before publication; the session bus then preserves the assigned
+    /// sequence so stored and observed order agree.
+    committer: Option<Arc<SessionCommitter>>,
     backend_tokens: HashMap<RunId, CancellationToken>,
     tool_tokens: HashMap<ToolCallId, CancellationToken>,
     /// Outcome of the most recently completed `FinishRun` effect, retrieved
@@ -189,6 +199,8 @@ impl AgentRunner {
             cancel,
             scheduler,
             live_state,
+            projection: None,
+            committer: None,
             backend_tokens: HashMap::new(),
             tool_tokens: HashMap::new(),
             final_result: None,
@@ -217,6 +229,21 @@ impl AgentRunner {
         store: Arc<dyn harness_session_store::SessionStore>,
     ) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Routes emitted events through the session's authoritative committer
+    /// (RC-301): sequence allocation, durable persistence with the final
+    /// sequence, and truthful publish-on-success semantics.
+    pub fn with_committer(mut self, committer: Arc<SessionCommitter>) -> Self {
+        self.committer = Some(committer);
+        self
+    }
+
+    /// Publishes this runner's durable agent projection after every
+    /// transition (RC-302), so session checkpoints are always truthful.
+    pub fn with_projection(mut self, projection: AgentProjectionTable) -> Self {
+        self.projection = Some(projection);
         self
     }
 
@@ -256,6 +283,9 @@ impl AgentRunner {
     pub async fn run(&mut self) {
         self.publish_status();
         loop {
+            if self.task.commands_tx.strong_count() == 1 {
+                break;
+            }
             if self.cancel.is_cancelled() {
                 self.cancel_run().await;
                 break;
@@ -269,7 +299,8 @@ impl AgentRunner {
                 _ = self.cancel.cancelled() => {
                     self.cancel_run().await;
                     break;
-                }
+                },
+                _ = tokio::time::sleep(Duration::from_millis(250)) => continue,
             };
 
             if self.cancel.is_cancelled() {
@@ -327,14 +358,24 @@ impl AgentRunner {
                     }
                 });
 
-        let mut table = self.live_state.lock().expect("live_state mutex poisoned");
-        let entry = table.entry(self.agent.id).or_default();
-        entry.status = self.agent.state.status;
-        entry.current_operation = self.agent.state.current_operation.clone();
-        entry.last_error = self.agent.state.last_error.clone();
-        entry.usage = usage;
-        entry.total_requests = self.agent.usage.records.len() as u64;
-        entry.total_cost_usd = total_cost_usd;
+        {
+            let mut table = self.live_state.lock().expect("live_state mutex poisoned");
+            let entry = table.entry(self.agent.id).or_default();
+            entry.status = self.agent.state.status;
+            entry.current_operation = self.agent.state.current_operation.clone();
+            entry.last_error = self.agent.state.last_error.clone();
+            entry.usage = usage;
+            entry.total_requests = self.agent.usage.records.len() as u64;
+            entry.total_cost_usd = total_cost_usd;
+        }
+
+        // RC-302: publish the durable projection so checkpoints are truthful.
+        if let Some(projection) = &self.projection {
+            projection
+                .lock()
+                .expect("projection mutex poisoned")
+                .insert(self.agent.id, stored_agent_state(&self.agent));
+        }
     }
 
     fn publish_outcome(&self, outcome: AgentOutcome) {
@@ -458,6 +499,52 @@ impl AgentRunner {
         };
         self.agent_sequence = self.agent_sequence.wrapping_add(1);
 
+        // RC-301: when the session's authoritative committer is configured,
+        // every event flows through the one commit boundary — the sequencer
+        // assigns the final sequence, durable events are persisted with it,
+        // and the committed envelope is published only when persistence
+        // succeeded (strict policy) or explicitly degraded (best-effort).
+        if let Some(committer) = &self.committer {
+            match committer.commit(envelope).await {
+                Ok(Some(committed)) => {
+                    // RC-302: a terminal run triggers an automatic checkpoint
+                    // at the committed sequence.
+                    if matches!(
+                        &committed.envelope.event,
+                        AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+                    ) {
+                        if let Some(sequence) = committed.envelope.session_sequence {
+                            committer.checkpoint_for_terminal_run(sequence);
+                        }
+                    }
+                    let _ = self.task.events.send(committed.envelope.clone());
+                    self.event_sink.send(committed.envelope);
+                }
+                Ok(None) => {
+                    // Strict policy: persistence failed, so the event is
+                    // never published. The session state has already
+                    // advanced; the runtime must treat this as a
+                    // session-level failure.
+                    tracing::error!(
+                        session_id = %self.agent.session_id,
+                        agent_id = %self.agent.id,
+                        "commit boundary rejected an event; it was not published"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        session_id = %self.agent.session_id,
+                        agent_id = %self.agent.id,
+                        %error,
+                        "commit boundary failed; event was not published"
+                    );
+                }
+            }
+            return;
+        }
+
+        // Legacy path (no store configured): persist durable events directly
+        // and let the session bus assign sequences.
         if harness_session_store::is_durable(&envelope.event) {
             self.persist(SessionMutation::AppendEvent(envelope.clone()))
                 .await;

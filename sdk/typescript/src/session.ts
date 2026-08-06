@@ -1,8 +1,11 @@
-/**
- * Ergonomic per-session handle returned by {@link HarnessClient.createSession}.
- */
+/** Ergonomic per-session handle returned by HarnessClient. */
 
-import type { HarnessClient } from "./client.js";
+import type {
+  AdmissionReceipt,
+  EventGap,
+  HarnessClient,
+  MutationOptions,
+} from "./client.js";
 import type {
   AgentEventEnvelope,
   PermissionDecision,
@@ -17,68 +20,53 @@ export class HarnessSession {
     public readonly sessionId: SessionId,
   ) {}
 
-  /** Send a prompt, starting a new run if the session is idle. */
-  prompt(text: string): Promise<void> {
-    return this.client.prompt(this.sessionId, text);
+  prompt(text: string, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.prompt(this.sessionId, text, options);
   }
 
-  /** Inject input at the active run's next safe command boundary. */
-  steer(text: string): Promise<void> {
-    return this.client.steer(this.sessionId, text);
+  steer(text: string, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.steer(this.sessionId, text, options);
   }
 
-  /** Queue input FIFO to run after the active run completes. */
-  followUp(text: string): Promise<void> {
-    return this.client.followUp(this.sessionId, text);
+  followUp(text: string, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.followUp(this.sessionId, text, options);
   }
 
-  /** Cancel the active run, if any. */
-  cancel(): Promise<void> {
-    return this.client.cancel(this.sessionId);
+  cancel(options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.cancel(this.sessionId, options);
   }
 
-  /** Resolve a pending tool-call permission request. */
   resolvePermission(
     id: PermissionId,
     decision: PermissionDecision,
-  ): Promise<void> {
-    return this.client.resolvePermission(this.sessionId, id, decision);
+    options?: MutationOptions,
+  ): Promise<AdmissionReceipt> {
+    return this.client.resolvePermission(this.sessionId, id, decision, options);
   }
 
-  /** Read a point-in-time snapshot of this session. */
   snapshot(): Promise<SessionSnapshotWire> {
     return this.client.snapshot(this.sessionId);
   }
 
-  /**
-   * Subscribe to this session's event stream.
-   *
-   * Returns an unsubscribe function. Pass `sinceSeq` to replay durable
-   * events after reconnecting (see the workspace README's "Durability and
-   * resume" section).
-   */
   subscribe(
     onEvent: (event: AgentEventEnvelope) => void,
     sinceSeq: number | null = null,
+    onGap?: (gap: EventGap) => void,
   ): Promise<() => void> {
-    return this.client.subscribe(this.sessionId, onEvent, sinceSeq);
+    return this.client.subscribe(this.sessionId, onEvent, sinceSeq, onGap);
   }
 
-  /**
-   * Async-iterable event stream, for `for await (const event of session.events())`
-   * usage instead of a callback.
-   */
   async *events(
     sinceSeq: number | null = null,
+    onGap?: (gap: EventGap) => void,
   ): AsyncGenerator<AgentEventEnvelope, void, void> {
     const queue: AgentEventEnvelope[] = [];
     let wake: (() => void) | null = null;
     let done = false;
-
     const unsubscribe = await this.subscribe((event) => {
       queue.push(event);
       wake?.();
-    }, sinceSeq);
+    }, sinceSeq, onGap);
 
     try {
       while (!done) {
@@ -93,13 +81,12 @@ export class HarnessSession {
         }
       }
     } finally {
-      unsubscribe();
       done = true;
+      unsubscribe();
     }
   }
 
-  /** Tear this session down on the daemon. */
-  close(): Promise<void> {
-    return this.client.closeSession(this.sessionId);
+  close(options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.closeSession(this.sessionId, options);
   }
 }

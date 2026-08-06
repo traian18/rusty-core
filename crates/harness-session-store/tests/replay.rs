@@ -100,6 +100,10 @@
 //!   must be rejected by SQLite (UNIQUE index) as [`StoreError::InvalidState`]
 //!   at write time, while the unindexed JSONL store accepts it (documented
 //!   divergence).
+//! - **`migrate-v0-to-v1`** — a pre-RC-300 (schema version 0) checkpoint plus
+//!   one trailing durable event, proving both stores still read legacy
+//!   checkpoints and that the v0 → v1 migration (RC-305) is a committed,
+//!   pure transformation.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -107,8 +111,8 @@ use std::sync::Arc;
 
 use harness_protocol::ids::SessionId;
 use harness_session_store::{
-    DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, SessionStore,
-    SqliteSessionStore, StoredSession, StoreError,
+    migrate_snapshot, DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore,
+    SCHEMA_VERSION, SessionStore, SqliteSessionStore, StoredSession, StoreError,
 };
 use serde::Deserialize;
 
@@ -123,6 +127,7 @@ const STORE_JSONL: &str = "jsonl";
 const FIXTURE_NAMES: &[&str] = &[
     "roundtrip-nanosecond-timestamp",
     "duplicate-sequence-rejected",
+    "migrate-v0-to-v1",
 ];
 
 // ===========================================================================
@@ -238,7 +243,7 @@ fn committed_fixture_names() -> Vec<String> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 path.file_stem().map(|stem| stem.to_string_lossy().into_owned())
             } else {
                 None
@@ -411,6 +416,39 @@ async fn jsonl_store_replays_every_committed_fixture() {
         ))));
         replay_fixture(&store, STORE_JSONL, name).await;
     }
+}
+
+/// RC-305: the committed `migrate-v0-to-v1` fixture's legacy checkpoint
+/// (schema version 0, no metadata) upgrades to the current schema version
+/// through `migrate_snapshot` — the committed backward-migration proof.
+#[test]
+fn legacy_fixture_snapshot_migrates_to_current_version() {
+    let fixture = load_fixture("migrate-v0-to-v1");
+    let expected = fixture
+        .expected_session
+        .expect("fixture carries an expected session");
+    let snapshot = expected
+        .snapshot
+        .expect("fixture carries a snapshot");
+    assert_eq!(
+        snapshot.schema_version, 0,
+        "the legacy fixture's snapshot is version 0"
+    );
+
+    let migrated = migrate_snapshot(snapshot).expect("v0 migrates to the current version");
+    assert_eq!(
+        migrated.schema_version, SCHEMA_VERSION,
+        "migration stamps the current schema version"
+    );
+    assert_eq!(
+        migrated.session_sequence, 1,
+        "migration preserves the checkpoint point"
+    );
+    assert_eq!(
+        migrated.root_agent_id.to_string(),
+        "22222222-2222-2222-2222-222222222222",
+        "migration preserves identity fields"
+    );
 }
 
 // ===========================================================================

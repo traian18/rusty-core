@@ -36,7 +36,7 @@ pub struct BackendDescriptor {
 /// This is the primary mechanism for capability-based dispatch.
 /// Consumers must **never** branch on backend identity;
 /// they should inspect these boolean flags instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendCapabilities {
     /// Whether the backend can stream partial response deltas.
     pub streaming: bool,
@@ -64,26 +64,6 @@ pub struct BackendCapabilities {
     pub exact_usage: bool,
     /// Whether the backend reports exact cost information.
     pub exact_cost: bool,
-}
-
-impl Default for BackendCapabilities {
-    fn default() -> Self {
-        Self {
-            streaming: false,
-            reasoning_stream: false,
-            tool_calls: false,
-            parallel_tool_calls: false,
-            host_managed_tools: false,
-            backend_managed_tools: false,
-            permissions: false,
-            images: false,
-            resumable_sessions: false,
-            native_subagents: false,
-            model_switching: false,
-            exact_usage: false,
-            exact_cost: false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

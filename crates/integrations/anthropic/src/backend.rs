@@ -17,6 +17,7 @@ pub struct AnthropicBackend;
 
 impl AnthropicBackend {
     /// Construct an Anthropic-backed execution backend for direct injection.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(config: AnthropicConfig) -> GenericModelBackend {
         let recovery = config.recovery.clone();
         GenericModelBackend::new_with_recovery(Arc::new(AnthropicClient::new(config)), recovery)

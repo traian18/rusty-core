@@ -62,7 +62,7 @@ impl ClientBuilder {
 ///
 /// Applications that are not Rust, or that want the engine in a separate
 /// process, should instead run `harnessd` and speak the wire protocol
-/// described in `schema/protocol-v1.schema.json` (see the TypeScript SDK
+/// described in `schema/protocol-v2.schema.json` (see the TypeScript SDK
 /// under `sdk/typescript` for a reference client).
 pub struct Client {
     inner: Harness,

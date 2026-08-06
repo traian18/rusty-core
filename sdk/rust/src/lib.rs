@@ -54,10 +54,14 @@ pub use session::Session;
 ///
 /// Re-exported here so SDK consumers can reference IDs, events, and command
 /// payloads without depending on `harness-protocol` directly. See
-/// `schema/protocol-v1.schema.json` for the language-neutral description of
+/// `schema/protocol-v2.schema.json` for the language-neutral description of
 /// the same shapes.
 pub mod protocol {
+    pub use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
     pub use harness_protocol::commands::{Attachment, PermissionDecision, UserInput};
+    pub use harness_protocol::rpc::{
+        MutationCommand, ProtocolCapabilities, RpcError, RpcErrorCategory, SessionSummaryWire,
+    };
     pub use harness_protocol::events::{
         AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility,
     };

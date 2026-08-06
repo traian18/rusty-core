@@ -1,4 +1,36 @@
 //! Durable session-store contract and serializable restore state.
+//!
+//! This module defines the [`SessionStore`] trait — the single durability
+//! boundary every runtime mutation crosses — plus the serializable payloads
+//! that cross it: [`DurableSessionEvent`], [`DurableSessionSnapshot`], and
+//! the [`StoredSession`] reconstruction returned by
+//! [`SessionStore::load_session`].
+//!
+//! # RC-300 contract additions
+//!
+//! The trait gained three RC-300 primitives used by the authoritative commit
+//! boundary ([`crate::commit::SessionCommitter`]), trailing replay
+//! ([`crate::replay`]), and retention/diagnostics ([`crate::retention`],
+//! [`crate::diagnostics`]):
+//!
+//! - [`SessionStore::current_sequence`] — the highest committed session
+//!   sequence for a session (the durable sequencer resume point). Returns
+//!   `0` for an unknown session so a fresh `SessionCommitter` can resume
+//!   from `1` without a "not found" probe.
+//! - [`SessionStore::raw_records`] — the unprocessed record stream (events
+//!   *and* snapshots, in store order) used by read-only diagnostics and by
+//!   cursor/audit tooling that must not rely on the snapshot-cutoff view.
+//! - [`SessionStore::prune_events_before`] — an explicit, opt-in retention
+//!   operation that removes durable events at or below a sequence. The
+//!   default implementation rejects the call so a store that has not opted
+//!   in can never silently discard replay/audit history.
+//!
+//! [`DurableSessionSnapshot`] carries a [`DurableSessionMetadata`] block that
+//! records the non-secret host dependencies the snapshot was taken under
+//! (workspace identity, integration/credential/tool references) plus
+//! compaction lineage, so [`crate::resolver`] can verify a restore against
+//! the *current* host instead of silently substituting fakes, and so
+//! compaction history is never lost. Secrets never appear in this block.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -85,6 +117,45 @@ pub struct StoredAgentState {
     pub usage: serde_json::Value,
 }
 
+/// Non-secret durable metadata captured with a snapshot (RC-302/RC-304).
+///
+/// This block records what the session was **authorized against** at
+/// snapshot time so a later restore can verify the same host dependencies
+/// still exist. It deliberately contains only *references* (identities and
+/// policy IDs) — never credentials, secret configuration, or bearer tokens.
+/// A missing dependency discovered during restore produces a typed
+/// [`crate::resolver::MissingDependency`] instead of a silent substitution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableSessionMetadata {
+    /// Canonical identity of the workspace the session was bound to, if any
+    /// (e.g. the canonicalized root path). `None` means the session had no
+    /// workspace binding and restore must not invent one.
+    #[serde(default)]
+    pub workspace_identity: Option<String>,
+    /// Integration family IDs referenced by the snapshot's agents.
+    #[serde(default)]
+    pub integration_references: Vec<String>,
+    /// Credential-profile references the session was authorized under.
+    #[serde(default)]
+    pub credential_profiles: Vec<String>,
+    /// Tool-policy IDs the session's tool capabilities were governed by.
+    #[serde(default)]
+    pub tool_policy_ids: Vec<String>,
+    /// Whether this snapshot was produced by a compaction step.
+    #[serde(default)]
+    pub compacted: bool,
+    /// Monotonic compaction generation; `0` for a plain checkpoint.
+    #[serde(default)]
+    pub compaction_generation: u64,
+}
+
+/// A durable restore checkpoint (RC-302).
+///
+/// Snapshots are versioned ([`schema_version`](Self::schema_version), see
+/// [`crate::version::SCHEMA_VERSION`]) so a newer snapshot is rejected
+/// up-front by an older build and older snapshots can be migrated forward.
+/// `metadata` records the non-secret host dependencies the checkpoint was
+/// taken under (see [`DurableSessionMetadata`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableSessionSnapshot {
     pub session_id: SessionId,
@@ -92,6 +163,14 @@ pub struct DurableSessionSnapshot {
     pub agents: Vec<StoredAgentState>,
     pub session_sequence: u64,
     pub timestamp: Timestamp,
+    /// Snapshot schema version (RC-305). Absent in pre-RC-300 checkpoints,
+    /// which deserialize as `0` and are migrated by
+    /// [`crate::version::migrate_snapshot`].
+    #[serde(default)]
+    pub schema_version: u64,
+    /// Non-secret durable metadata captured with this checkpoint (RC-304).
+    #[serde(default)]
+    pub metadata: DurableSessionMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +188,21 @@ pub struct StoredSession {
     pub session_id: SessionId,
     pub snapshot: Option<DurableSessionSnapshot>,
     pub events: Vec<DurableSessionEvent>,
+}
+
+/// A single raw record in a session's durable stream, in store order.
+///
+/// Unlike [`StoredSession`] (which applies the snapshot cutoff),
+/// [`SessionStore::raw_records`] returns the unprocessed append stream — the
+/// input that read-only diagnostics and repair tooling operate on. Snapshot
+/// records appear in the position they were appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RawRecord {
+    /// A durable event appended to the history.
+    Event(DurableSessionEvent),
+    /// A restore checkpoint (replaces any earlier one for the session).
+    Snapshot(DurableSessionSnapshot),
 }
 
 pub fn summarize_session(stored: &StoredSession) -> Option<SessionSummary> {
@@ -189,6 +283,68 @@ pub trait SessionStore: Send + Sync {
 
     async fn append(&self, event: DurableSessionEvent) -> Result<(), StoreError>;
     async fn save_snapshot(&self, snapshot: DurableSessionSnapshot) -> Result<(), StoreError>;
+
+    /// Returns the highest committed session sequence for `id`.
+    ///
+    /// This is the durable sequencer resume point used by
+    /// [`crate::commit::SessionCommitter`] after a restart. An unknown
+    /// session reports `0` (not an error), so a fresh committer can resume
+    /// from sequence `1` without probing for existence first.
+    ///
+    /// The default implementation derives the value from
+    /// [`load_session`](Self::load_session): the snapshot's sequence plus the
+    /// trailing events' maximum. Stores with an index override this with a
+    /// bounded query.
+    async fn current_sequence(&self, id: SessionId) -> Result<u64, StoreError> {
+        match self.load_session(id).await {
+            Ok(stored) => {
+                let snapshot_max = stored
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.session_sequence)
+                    .unwrap_or(0);
+                let event_max = stored
+                    .events
+                    .iter()
+                    .filter_map(|event| event.session_sequence)
+                    .max()
+                    .unwrap_or(0);
+                Ok(snapshot_max.max(event_max))
+            }
+            Err(StoreError::NotFound(_)) => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the unprocessed record stream for `id` (events and snapshots
+    /// in store order), without applying the snapshot cutoff.
+    ///
+    /// Read-only diagnostics and audit tooling use this; it never mutates
+    /// anything. The default implementation is not available for every store
+    /// and reports [`StoreError::InvalidState`].
+    async fn raw_records(&self, _id: SessionId) -> Result<Vec<RawRecord>, StoreError> {
+        Err(StoreError::InvalidState(
+            "this store does not expose raw records".into(),
+        ))
+    }
+
+    /// Explicitly removes durable events with `session_sequence <= sequence`.
+    ///
+    /// Retention is an opt-in maintenance operation (RC-305): the default
+    /// implementation rejects it so a store that has not consciously opted
+    /// in can never silently destroy replay/audit history. Stores that
+    /// implement pruning must document what replay/audit prerequisites they
+    /// preserve (typically: a snapshot at or above `sequence` must exist
+    /// first). Returns the number of removed events.
+    async fn prune_events_before(
+        &self,
+        _id: SessionId,
+        _sequence: u64,
+    ) -> Result<u64, StoreError> {
+        Err(StoreError::InvalidState(
+            "event pruning is not supported by this store".into(),
+        ))
+    }
 }
 
 pub fn is_durable(event: &AgentEvent) -> bool {
@@ -218,5 +374,40 @@ mod tests {
             message_id: harness_protocol::ids::MessageId::new(),
             delta: "partial".into(),
         }));
+    }
+
+    #[test]
+    fn snapshot_metadata_round_trips() {
+        let metadata = DurableSessionMetadata {
+            workspace_identity: Some("/srv/app".into()),
+            integration_references: vec!["anthropic".into()],
+            credential_profiles: vec!["anthropic:default".into()],
+            tool_policy_ids: vec!["policy-host".into()],
+            compacted: true,
+            compaction_generation: 3,
+        };
+        let json = serde_json::to_string(&metadata).expect("serialize metadata");
+        let decoded: DurableSessionMetadata =
+            serde_json::from_str(&json).expect("deserialize metadata");
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn legacy_snapshot_deserializes_with_version_zero_and_empty_metadata() {
+        let json = serde_json::json!({
+            "session_id": SessionId::new(),
+            "root_agent_id": AgentId::new(),
+            "agents": [],
+            "session_sequence": 4,
+            "timestamp": Timestamp::now(),
+        });
+        let snapshot: DurableSessionSnapshot =
+            serde_json::from_value(json).expect("legacy snapshot without version fields");
+        assert_eq!(snapshot.schema_version, 0, "pre-RC-300 checkpoints are version 0");
+        assert_eq!(
+            snapshot.metadata,
+            DurableSessionMetadata::default(),
+            "legacy checkpoints carry no dependency metadata"
+        );
     }
 }

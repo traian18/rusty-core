@@ -30,15 +30,14 @@ pub async fn run_backend_contract_suite(backend: Arc<dyn ExecutionBackend>) {
     let _ = backend.capabilities();
 
     let (events, _receiver) = broadcast::channel(256);
-    match backend
+    if let Ok(result) = backend
         .execute(request(), events, CancellationToken::new())
         .await
     {
-        Ok(result) => assert!(
+        assert!(
             !result.finish_reason.is_empty(),
             "successful execution must have a finish reason"
-        ),
-        Err(_) => {}
+        );
     }
 
     let (events, _receiver) = broadcast::channel(256);

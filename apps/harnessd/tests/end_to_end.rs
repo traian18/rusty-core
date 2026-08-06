@@ -15,8 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicConfig;
+use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::rpc::{
-    RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
+    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
     PROTOCOL_VERSION,
 };
 use harness_protocol::tools::AgentToolset;
@@ -122,11 +123,20 @@ async fn full_stack_create_session_snapshot_close() {
     let close_req = RpcRequest {
         id: RequestCorrelationId(3),
         session_id: Some(session_id),
-        body: RpcRequestBody::CloseSession,
+        body: RpcRequestBody::Mutate {
+            metadata: MutationMetadata {
+                command_id: CommandId::new(),
+                session_id,
+                run_id: None,
+                expected_session_revision: None,
+                trace_id: None,
+            },
+            command: MutationCommand::CloseSession,
+        },
     };
     write_frame(&mut stream, &serde_json::to_vec(&close_req).unwrap()).await;
     let response = read_frame(&mut stream).await;
-    assert!(matches!(response.body, RpcResponseBody::Ack));
+    assert!(matches!(response.body, RpcResponseBody::Admission { .. }));
 
     shutdown.cancel();
 }

@@ -16,6 +16,7 @@ use crate::config::OpenAiConfig;
 pub struct OpenAiBackend;
 
 impl OpenAiBackend {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(config: OpenAiConfig) -> GenericModelBackend {
         let recovery = config.recovery.clone();
         GenericModelBackend::new_with_recovery(Arc::new(OpenAiClient::new(config)), recovery)

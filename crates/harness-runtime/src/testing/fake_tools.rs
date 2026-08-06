@@ -74,9 +74,7 @@ impl ToolRegistry for FakeToolRegistry {
     }
 
     fn get_executor(&self, tool_id: &str) -> Option<Arc<dyn ToolExecutor>> {
-        self.executors
-            .get(tool_id)
-            .map(|executor| executor.clone())
+        self.executors.get(tool_id).cloned()
     }
 
     fn descriptors(&self) -> Vec<ToolDescriptor> {

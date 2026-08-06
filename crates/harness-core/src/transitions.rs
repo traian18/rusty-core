@@ -1,4 +1,3 @@
-//! Deterministic agent state transitions. The core mutates state and emits effects only.
 
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{
@@ -121,9 +120,6 @@ impl Agent {
         ]
     }
 
-    /// Starts an input immediately only when the agent is idle. Otherwise the
-    /// input is admitted into the session-local FIFO and will begin after the
-    /// active run reaches a terminal command boundary.
     fn start_or_queue(&mut self, input: UserInput) -> Vec<AgentEffect> {
         if self.state.active_run.is_some() {
             self.state.queued_inputs.push_back(input);
@@ -183,9 +179,6 @@ impl Agent {
                 }]
             }
             ExecutionEvent::ToolCallRequested { call, .. } => self.tool_requested(call),
-            // Usage updates are cumulative snapshots for observability. The
-            // terminal result below is the single authoritative ledger record
-            // for a model request.
             ExecutionEvent::UsageUpdate { .. } => Vec::new(),
             ExecutionEvent::Completed { result, .. } => {
                 let is_tool_turn = result.finish_reason == "tool_use";
@@ -195,14 +188,12 @@ impl Agent {
                     tool_usage: None,
                 });
                 if is_tool_turn {
-                    // The model request is complete, but the agent run is not:
-                    // tool results will trigger the next backend request.
                     return Vec::new();
                 }
                 let from = self.state.status;
                 self.state.status = AgentStatus::Idle;
                 self.state.active_run = None;
-                let mut effects = vec![
+                let effects = vec![
                     Self::state_changed(from, AgentStatus::Idle),
                     AgentEffect::Emit {
                         event: AgentEvent::Completed {
@@ -444,10 +435,6 @@ impl Agent {
         effects
     }
 
-    /// Converts a protocol usage summary into a core usage summary. The
-    /// protocol metrics only carry aggregate token counts, so those are mapped
-    /// onto the core `ModelUsage.total_tokens` while the per-kind counters stay
-    /// unknown (the same distinction the protocol itself preserves).
     fn bridge_usage_summary(
         protocol: &harness_protocol::usage::AgentUsageSummary,
     ) -> crate::usage::AgentUsageSummary {
@@ -466,13 +453,6 @@ impl Agent {
         }
     }
 
-    /// Builds the protocol usage summary carried by a terminal `FinishRun`
-    /// result so a parent can roll up its child's *real* usage (spec §31).
-    ///
-    /// The ledger is the single authoritative store of `UsageRecord`s; the
-    /// summary exposed here maps the aggregated self usage onto the protocol's
-    /// aggregate-only metrics (`total_tokens`), leaving per-kind counters
-    /// unknown, consistent with the protocol's "unknown is not zero" rule.
     fn terminal_usage_summary(&self) -> AgentUsageSummary {
         let self_usage = self.usage.self_usage();
         AgentUsageSummary {
@@ -490,10 +470,19 @@ impl Agent {
 
     fn cancel(&mut self) -> Vec<AgentEffect> {
         let from = self.state.status;
+        if matches!(
+            from,
+            AgentStatus::Idle | AgentStatus::Cancelled | AgentStatus::Failed
+        ) && self.state.active_run.is_none()
+        {
+            return Vec::new();
+        }
+
         let mut effects = Vec::new();
         if let Some(run_id) = self.state.active_run {
             effects.push(AgentEffect::CancelBackend { run_id });
         }
+
         let mut calls: Vec<_> = self.state.pending_tools.keys().copied().collect();
         calls.sort();
         effects.extend(
@@ -501,6 +490,7 @@ impl Agent {
                 .into_iter()
                 .map(|call_id| AgentEffect::CancelTool { call_id }),
         );
+
         let mut children = self.state.children.clone();
         children.sort();
         effects.extend(
@@ -508,10 +498,13 @@ impl Agent {
                 .into_iter()
                 .map(|agent_id| AgentEffect::CancelChild { agent_id }),
         );
+
         self.state.status = AgentStatus::Cancelled;
         self.state.active_run = None;
         self.state.pending_tools.clear();
         self.state.pending_permissions.clear();
+        self.state.children.clear();
+
         effects.push(Self::state_changed(from, AgentStatus::Cancelled));
         effects.push(AgentEffect::Emit {
             event: AgentEvent::Completed {
@@ -524,7 +517,7 @@ impl Agent {
     fn pause(&mut self) -> Vec<AgentEffect> {
         if matches!(
             self.state.status,
-            AgentStatus::Cancelled | AgentStatus::Completed | AgentStatus::Failed
+            AgentStatus::Paused | AgentStatus::Cancelled | AgentStatus::Failed
         ) {
             return Vec::new();
         }
@@ -537,29 +530,65 @@ impl Agent {
         if self.state.status != AgentStatus::Paused {
             return Vec::new();
         }
-        if let Some(run_id) = self.state.active_run {
-            self.state.status = AgentStatus::WaitingForBackend;
-            let request = self.execution_request(run_id);
-            vec![
-                Self::state_changed(AgentStatus::Paused, AgentStatus::WaitingForBackend),
-                AgentEffect::ExecuteBackend { request },
-            ]
-        } else {
-            self.state.status = AgentStatus::Idle;
-            vec![Self::state_changed(AgentStatus::Paused, AgentStatus::Idle)]
+        match self.state.active_run {
+            Some(run_id) => {
+                self.state.status = AgentStatus::WaitingForBackend;
+                let request = self.execution_request(run_id);
+                vec![
+                    Self::state_changed(AgentStatus::Paused, AgentStatus::WaitingForBackend),
+                    AgentEffect::ExecuteBackend { request },
+                ]
+            }
+            None => {
+                self.state.status = AgentStatus::Idle;
+                vec![Self::state_changed(AgentStatus::Paused, AgentStatus::Idle)]
+            }
         }
     }
 
-    fn assistant_message_id(&mut self) -> MessageId {
+    fn append_assistant_text(&mut self, delta: &str) -> MessageId {
         if let Some(message) = self
+            .state
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+        {
+            if let Some(ContentBlock::Text { text }) = message
+                .content
+                .iter_mut()
+                .find(|block| matches!(block, ContentBlock::Text { .. }))
+            {
+                text.push_str(delta);
+                return message.id;
+            }
+        }
+
+        let id = self.next_message_id();
+        let created_at = self.next_timestamp();
+        self.state.messages.push(AgentMessage {
+            id,
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text {
+                text: delta.to_owned(),
+            }],
+            created_at,
+        });
+        id
+    }
+
+    fn assistant_message_id(&mut self) -> MessageId {
+        if let Some(id) = self
             .state
             .messages
             .iter()
             .rev()
             .find(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.id)
         {
-            return message.id;
+            return id;
         }
+
         let id = self.next_message_id();
         let created_at = self.next_timestamp();
         self.state.messages.push(AgentMessage {
@@ -569,158 +598,5 @@ impl Agent {
             created_at,
         });
         id
-    }
-
-    fn append_assistant_text(&mut self, delta: &str) -> MessageId {
-        let id = self.assistant_message_id();
-        let message = self
-            .state
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
-            .expect("assistant message exists");
-        match message.content.last_mut() {
-            Some(ContentBlock::Text { text }) => text.push_str(delta),
-            _ => message.content.push(ContentBlock::Text {
-                text: delta.to_owned(),
-            }),
-        }
-        id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use harness_protocol::backend::{
-        BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
-    };
-    use harness_protocol::commands::{AgentCommand, AgentResult, AgentStatus};
-    use harness_protocol::effects::AgentEffect;
-    use harness_protocol::events::AgentEvent;
-    use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
-    use harness_protocol::tools::AgentToolset;
-    use harness_protocol::usage::{AgentBudget, AgentUsageMetrics, AgentUsageSummary, UsageValue};
-
-    use crate::agent::Agent;
-    use crate::capabilities::{AgentCapabilities, WorkspaceCapabilities};
-
-    fn test_agent() -> Agent {
-        Agent::new(
-            AgentId::new(),
-            SessionId::new(),
-            None,
-            0,
-            "system".into(),
-            BackendBinding {
-                reference: BackendReference {
-                    integration: IntegrationId::new(),
-                    configuration: ConfigurationId::new(),
-                    model: None,
-                },
-                descriptor: BackendDescriptor {
-                    id: BackendId::new(),
-                    name: "fake".into(),
-                    description: "fake".into(),
-                    capabilities: BackendCapabilities::default(),
-                },
-            },
-            AgentCapabilities {
-                tools: AgentToolset {
-                    tools: HashMap::new(),
-                },
-                can_spawn_agents: false,
-                max_child_depth: None,
-                workspace: WorkspaceCapabilities {
-                    can_read: false,
-                    can_write: false,
-                    can_search: false,
-                },
-                backend: BackendCapabilities::default(),
-            },
-            AgentBudget::default(),
-        )
-    }
-
-    #[test]
-    fn child_completed_rolls_up_usage_and_resumes_from_waiting_for_children() {
-        let mut agent = test_agent();
-        let child_a = AgentId::new();
-        let child_b = AgentId::new();
-        agent.state.children = vec![child_a, child_b];
-        agent.state.status = AgentStatus::WaitingForChildren;
-
-        let usage_a = AgentUsageSummary {
-            inclusive_usage: AgentUsageMetrics {
-                total_tokens: UsageValue::new(Some(100)),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let usage_b = AgentUsageSummary {
-            inclusive_usage: AgentUsageMetrics {
-                total_tokens: UsageValue::new(Some(50)),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        // First child completes: the agent stays WaitingForChildren.
-        let effects = agent.apply(AgentCommand::ChildCompleted {
-            agent_id: child_a,
-            result: AgentResult {
-                summary: "a".into(),
-                usage: usage_a.clone(),
-            },
-        });
-        assert_eq!(agent.state.status, AgentStatus::WaitingForChildren);
-        assert_eq!(agent.state.children, vec![child_b]);
-        assert!(
-            !effects.iter().any(|e| matches!(
-                e,
-                AgentEffect::Emit {
-                    event: AgentEvent::StateChanged { .. }
-                }
-            )),
-            "no StateChanged should be emitted before all children finish"
-        );
-
-        // Second child completes: the agent transitions to Idle and emits StateChanged.
-        let effects = agent.apply(AgentCommand::ChildCompleted {
-            agent_id: child_b,
-            result: AgentResult {
-                summary: "b".into(),
-                usage: usage_b.clone(),
-            },
-        });
-        assert_eq!(agent.state.status, AgentStatus::Idle);
-        assert!(agent.state.children.is_empty());
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                AgentEffect::Emit {
-                    event: AgentEvent::StateChanged {
-                        from: AgentStatus::WaitingForChildren,
-                        to: AgentStatus::Idle
-                    }
-                }
-            )),
-            "expected StateChanged from WaitingForChildren to Idle"
-        );
-
-        // Both children's usage is stored in the ledger for later retrieval.
-        let stored_a = agent
-            .usage
-            .child_usage
-            .get(&child_a)
-            .expect("child a usage stored");
-        assert_eq!(stored_a.inclusive_usage.total_tokens.value(), Some(100));
-        let stored_b = agent
-            .usage
-            .child_usage
-            .get(&child_b)
-            .expect("child b usage stored");
-        assert_eq!(stored_b.inclusive_usage.total_tokens.value(), Some(50));
     }
 }

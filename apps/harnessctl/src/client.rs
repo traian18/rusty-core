@@ -54,7 +54,8 @@ impl HarnessClient {
             RpcResponseBody::Hello { protocol_version, .. } => bail!(
                 "protocol version mismatch: client speaks {PROTOCOL_VERSION}, daemon speaks {protocol_version}"
             ),
-            RpcResponseBody::Error { message } => bail!("handshake failed: {message}"),
+
+            RpcResponseBody::Failure(error) => bail!("handshake failed: {}", error.message),
             other => bail!("unexpected response to Hello: {other:?}"),
         }
     }

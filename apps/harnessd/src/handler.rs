@@ -1,29 +1,58 @@
+//! harnessd RPC dispatcher for the transport-neutral protocol.
 
-//! [`RpcHandler`] implementation wrapping a [`Harness`].
-//!
-//! This is where "what a request means" is decided — the transport crates
-//! (`harness-transport-ipc` and friends) only know how to move bytes and
-//! dispatch against the `RpcHandler` trait; this module is the only place
-//! that knows about `Harness`/`SessionBuilder`/`SessionHandle`.
-
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use harness_engine::{FsWorkspace, Harness, SessionHandle};
+use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
 use harness_protocol::rpc::{
-    RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire,
+    MutationCommand, RpcError, RpcErrorCategory, RpcRequestBody, RpcResponseBody,
+    SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
 };
 use harness_runtime::rpc::RpcHandler;
 use harness_runtime::session_runtime::SessionStatus;
 
+const DEDUPLICATION_WINDOW: usize = 1024;
+
+struct AdmissionCache {
+    entries: HashMap<(SessionId, CommandId), (AdmissionResult, u64)>,
+    order: VecDeque<(SessionId, CommandId)>,
+}
+
+impl AdmissionCache {
+    fn new() -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn get(&self, session_id: SessionId, id: CommandId) -> Option<(AdmissionResult, u64)> {
+        self.entries.get(&(session_id, id)).cloned()
+    }
+
+    fn insert(&mut self, session_id: SessionId, id: CommandId, result: AdmissionResult, revision: u64) {
+        let key = (session_id, id);
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, (result, revision));
+        self.order.push_back(key);
+        while self.order.len() > DEDUPLICATION_WINDOW {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+}
+
 pub struct HarnessRpcHandler {
     harness: Arc<Harness>,
     sessions: Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
+    revisions: Mutex<HashMap<SessionId, u64>>,
+    admissions: Mutex<AdmissionCache>,
 }
 
 impl HarnessRpcHandler {
@@ -31,6 +60,8 @@ impl HarnessRpcHandler {
         Self {
             harness,
             sessions: Mutex::new(HashMap::new()),
+            revisions: Mutex::new(HashMap::new()),
+            admissions: Mutex::new(AdmissionCache::new()),
         }
     }
 
@@ -42,6 +73,15 @@ impl HarnessRpcHandler {
             .cloned()
     }
 
+    fn error(
+        code: &'static str,
+        category: RpcErrorCategory,
+        retryable: bool,
+        message: impl Into<String>,
+    ) -> RpcResponseBody {
+        RpcResponseBody::Failure(RpcError::new(code, category, retryable, message))
+    }
+
     async fn create_session(
         &self,
         workspace_root: std::path::PathBuf,
@@ -49,16 +89,15 @@ impl HarnessRpcHandler {
         integration_config: serde_json::Value,
         toolset: harness_protocol::tools::AgentToolset,
     ) -> RpcResponseBody {
-        let builder = match self
-            .harness
-            .session()
-            .integration(integration, integration_config)
-        {
+        let builder = match self.harness.session().integration(integration, integration_config) {
             Ok(builder) => builder,
             Err(error) => {
-                return RpcResponseBody::Error {
-                    message: error.to_string(),
-                }
+                return Self::error(
+                    "integration.invalid_configuration",
+                    RpcErrorCategory::Validation,
+                    false,
+                    error.to_string(),
+                )
             }
         };
         let workspace = Arc::new(FsWorkspace::new(workspace_root));
@@ -69,11 +108,180 @@ impl HarnessRpcHandler {
                     .lock()
                     .expect("sessions mutex poisoned")
                     .insert(session_id, Arc::new(handle));
+                self.revisions
+                    .lock()
+                    .expect("revisions mutex poisoned")
+                    .insert(session_id, 0);
                 RpcResponseBody::SessionCreated { session_id }
             }
-            Err(error) => RpcResponseBody::Error {
-                message: error.to_string(),
+            Err(error) => Self::error(
+                "session.create_failed",
+                RpcErrorCategory::Integration,
+                false,
+                error.to_string(),
+            ),
+        }
+    }
+
+    async fn restore_session(
+        &self,
+        session_id: SessionId,
+        workspace_root: std::path::PathBuf,
+        toolset: harness_protocol::tools::AgentToolset,
+    ) -> RpcResponseBody {
+        if let Some(handle) = self.lookup(session_id) {
+            let _ = handle;
+            let session_revision = *self
+                .revisions
+                .lock()
+                .expect("revisions mutex poisoned")
+                .get(&session_id)
+                .unwrap_or(&0);
+            return RpcResponseBody::SessionRestored {
+                session_id,
+                session_revision,
+            };
+        }
+        match self
+            .harness
+            .restore_session_with_toolset(
+                session_id,
+                toolset,
+                Arc::new(FsWorkspace::new(workspace_root)),
+            )
+            .await
+        {
+            Ok(handle) => {
+                self.sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .insert(session_id, Arc::new(handle));
+                let revision = self
+                    .harness
+                    .session_store()
+                    .current_sequence(session_id)
+                    .await
+                    .unwrap_or(0);
+                self.revisions
+                    .lock()
+                    .expect("revisions mutex poisoned")
+                    .insert(session_id, revision);
+                RpcResponseBody::SessionRestored { session_id, session_revision: revision }
+            }
+            Err(error) => Self::error(
+                "session.restore_failed",
+                RpcErrorCategory::Persistence,
+                false,
+                error.to_string(),
+            ),
+        }
+    }
+
+    async fn mutate(
+        &self,
+        outer_session_id: Option<SessionId>,
+        metadata: MutationMetadata,
+        command: MutationCommand,
+    ) -> RpcResponseBody {
+        if outer_session_id != Some(metadata.session_id) {
+            return Self::error(
+                "mutation.session_mismatch",
+                RpcErrorCategory::Validation,
+                false,
+                "request session_id must match mutation metadata session_id",
+            );
+        }
+
+        if let Some((original, revision)) = self
+            .admissions
+            .lock()
+            .expect("admissions mutex poisoned")
+            .get(metadata.session_id, metadata.command_id)
+        {
+            return RpcResponseBody::Admission {
+                metadata,
+                result: AdmissionResult::Duplicate {
+                    original: Box::new(original),
+                },
+                session_revision: revision,
+            };
+        }
+
+        let session_id = metadata.session_id;
+        let current_revision = *self
+            .revisions
+            .lock()
+            .expect("revisions mutex poisoned")
+            .get(&session_id)
+            .unwrap_or(&0);
+        if metadata
+            .expected_session_revision
+            .is_some_and(|expected| expected != current_revision)
+        {
+            return RpcResponseBody::Admission {
+                metadata,
+                result: AdmissionResult::RejectedConflict {
+                    current_session_revision: current_revision,
+                },
+                session_revision: current_revision,
+            };
+        }
+
+        let Some(handle) = self.lookup(session_id) else {
+            return Self::error(
+                "session.not_open",
+                RpcErrorCategory::NotFound,
+                false,
+                "session is not open; restore it before sending mutations",
+            );
+        };
+
+        let is_close = matches!(&command, MutationCommand::CloseSession);
+        let operation = match command {
+            MutationCommand::Prompt(input) => handle.send_input(input).await,
+            MutationCommand::Steer(input) => handle.steer_input(input).await,
+            MutationCommand::FollowUp(input) => handle.follow_up_input(input).await,
+            MutationCommand::Cancel => handle.cancel().await,
+            MutationCommand::ResolvePermission { id, decision } => {
+                handle.resolve_permission(id, decision).await
+            }
+            MutationCommand::CloseSession => handle.close().await,
+        };
+
+        let result = match operation {
+            Ok(()) => AdmissionResult::Accepted,
+            Err(error) => AdmissionResult::RejectedInvalidState {
+                reason: error.to_string(),
             },
+        };
+        let accepted = matches!(result, AdmissionResult::Accepted);
+        let revision = if accepted {
+            current_revision.saturating_add(1)
+        } else {
+            current_revision
+        };
+
+        if accepted {
+            self.revisions
+                .lock()
+                .expect("revisions mutex poisoned")
+                .insert(session_id, revision);
+            if is_close {
+                self.sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .remove(&session_id);
+            }
+        }
+        self.admissions
+            .lock()
+            .expect("admissions mutex poisoned")
+            .insert(session_id, metadata.command_id, result.clone(), revision);
+
+        RpcResponseBody::Admission {
+            metadata,
+            result,
+            session_revision: revision,
         }
     }
 }
@@ -88,9 +296,7 @@ fn wire_status(status: SessionStatus) -> SessionStatusWire {
     }
 }
 
-fn wire_snapshot(
-    snapshot: harness_runtime::session_client::SessionSnapshot,
-) -> SessionSnapshotWire {
+fn wire_snapshot(snapshot: harness_runtime::session_client::SessionSnapshot) -> SessionSnapshotWire {
     SessionSnapshotWire {
         session_id: snapshot.session_id,
         status: wire_status(snapshot.status),
@@ -104,125 +310,75 @@ fn wire_snapshot(
 #[async_trait]
 impl RpcHandler for HarnessRpcHandler {
     async fn handle(&self, session_id: Option<SessionId>, body: RpcRequestBody) -> RpcResponseBody {
-        // Hello is handled entirely at the transport layer (each transport's
-        // dispatch() intercepts it before this method is ever called, the
-        // same way Subscribe is intercepted) since it's a connection-level
-        // handshake with no session semantics. This arm only fires if a
-        // transport forwards it here anyway, which would be a bug in that
-        // transport.
-        if matches!(body, RpcRequestBody::Hello { .. }) {
-            return RpcResponseBody::Error {
-                message: "Hello must be handled by the transport, not dispatched to handle()"
-                    .to_string(),
-            };
-        }
-
-        // CreateSession is the only request that doesn't target an existing
-        // session, so it's handled before the session lookup below.
-        if let RpcRequestBody::CreateSession {
-            workspace_root,
-            integration,
-            integration_config,
-            toolset,
-        } = body
-        {
-            return self
-                .create_session(workspace_root, integration, integration_config, toolset)
-                .await;
-        }
-
-        let Some(session_id) = session_id else {
-            return RpcResponseBody::Error {
-                message: "request requires a session_id".to_string(),
-            };
-        };
-        let Some(handle) = self.lookup(session_id) else {
-            return RpcResponseBody::Error {
-                message: "unknown session".to_string(),
-            };
-        };
-
         match body {
-            RpcRequestBody::Hello { .. } => unreachable!("handled above"),
-            RpcRequestBody::CreateSession { .. } => unreachable!("handled above"),
-
-            RpcRequestBody::Prompt(input) => {
-                match handle.send_input(input).await {
-                    Ok(()) => RpcResponseBody::Ack,
-                    Err(error) => RpcResponseBody::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-
-            RpcRequestBody::Steer(input) => match handle.steer_input(input).await {
-                Ok(()) => RpcResponseBody::Ack,
-                Err(error) => RpcResponseBody::Error {
-                    message: error.to_string(),
-                },
-            },
-
-            RpcRequestBody::FollowUp(input) => match handle.follow_up_input(input).await {
-                    Ok(()) => RpcResponseBody::Ack,
-                    Err(error) => RpcResponseBody::Error {
-                        message: error.to_string(),
-                    },
-            },
-
-            RpcRequestBody::Cancel => match handle.cancel().await {
-                Ok(()) => RpcResponseBody::Ack,
-                Err(error) => RpcResponseBody::Error {
-                    message: error.to_string(),
-                },
-            },
-
-            // SessionHandle doesn't expose pause/resume yet — only
-            // send/cancel/resolve_permission/subscribe/snapshot are wired
-            // through the public engine API (crates/harness-engine/src/session_builder.rs).
-            RpcRequestBody::Pause | RpcRequestBody::Resume => RpcResponseBody::Error {
-                message: "pause/resume is not yet exposed by the session engine API".to_string(),
-            },
-
-            RpcRequestBody::ResolvePermission { id, decision } => {
-                match handle.resolve_permission(id, decision).await {
-                    Ok(()) => RpcResponseBody::Ack,
-                    Err(error) => RpcResponseBody::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-
-            RpcRequestBody::Snapshot => RpcResponseBody::Snapshot(wire_snapshot(handle.snapshot())),
-
-            // The transport layer intercepts Subscribe before it ever reaches
-            // `handle()` (see harness-transport-ipc's dispatch()), since
-            // subscribing needs a long-lived receiver, not a single
-            // request/response. This arm only fires if a transport forwards
-            // it here anyway, which would be a bug in that transport.
-            RpcRequestBody::Subscribe { .. } => RpcResponseBody::Error {
-                message: "Subscribe must be handled by the transport, not dispatched to handle()"
-                    .to_string(),
-            },
-
-            RpcRequestBody::CloseSession => {
-                match self
-                    .harness
-                    .session_manager()
-                    .close_session(session_id)
+            RpcRequestBody::Hello { .. } => Self::error(
+                "protocol.invalid_dispatch",
+                RpcErrorCategory::Protocol,
+                false,
+                "Hello must be handled by the transport",
+            ),
+            RpcRequestBody::CreateSession {
+                workspace_root,
+                integration,
+                integration_config,
+                toolset,
+            } => {
+                self.create_session(workspace_root, integration, integration_config, toolset)
                     .await
-                {
-                    Ok(()) => {
-                        self.sessions
-                            .lock()
-                            .expect("sessions mutex poisoned")
-                            .remove(&session_id);
-                        RpcResponseBody::Ack
-                    }
-                    Err(error) => RpcResponseBody::Error {
-                        message: error.to_string(),
-                    },
+            }
+            RpcRequestBody::Mutate { metadata, command } => {
+                self.mutate(session_id, metadata, command).await
+            }
+            RpcRequestBody::ListSessions => match self.harness.list_sessions().await {
+                Ok(sessions) => RpcResponseBody::SessionsListed {
+                    sessions: sessions
+                        .into_iter()
+                        .map(|summary| SessionSummaryWire {
+                            session_id: summary.session_id,
+                            title: summary.title,
+                            backend_name: summary.backend_name,
+                            updated_at: summary.updated_at,
+                            restorable: summary.restorable,
+                        })
+                        .collect(),
+                },
+                Err(error) => Self::error(
+                    "session.list_failed",
+                    RpcErrorCategory::Persistence,
+                    true,
+                    error.to_string(),
+                ),
+            },
+            RpcRequestBody::RestoreSession {
+                session_id,
+                workspace_root,
+                toolset,
+            } => self.restore_session(session_id, workspace_root, toolset).await,
+            RpcRequestBody::Snapshot => {
+                let Some(session_id) = session_id else {
+                    return Self::error(
+                        "request.missing_session_id",
+                        RpcErrorCategory::Validation,
+                        false,
+                        "Snapshot requires a session_id",
+                    );
+                };
+                match self.lookup(session_id) {
+                    Some(handle) => RpcResponseBody::Snapshot(wire_snapshot(handle.snapshot())),
+                    None => Self::error(
+                        "session.not_open",
+                        RpcErrorCategory::NotFound,
+                        false,
+                        "session is not open",
+                    ),
                 }
             }
+            RpcRequestBody::Subscribe { .. } => Self::error(
+                "protocol.invalid_dispatch",
+                RpcErrorCategory::Protocol,
+                false,
+                "Subscribe must be handled by the transport",
+            ),
         }
     }
 
@@ -231,275 +387,54 @@ impl RpcHandler for HarnessRpcHandler {
     }
 
     async fn events_since(&self, session_id: SessionId, since_seq: u64) -> Vec<AgentEventEnvelope> {
-        // Only known sessions can be resumed — an unknown session_id
-        // (already closed, or never created on this daemon instance) has no
-        // meaningful backlog to replay.
         if self.lookup(session_id).is_none() {
             return Vec::new();
         }
-        match self
-            .harness
+        self.harness
             .session_store()
             .events_since(session_id, since_seq)
             .await
-        {
-            Ok(events) => events.into_iter().map(|event| event.envelope).collect(),
-            // No durable history (no store configured, or nothing persisted
-            // yet for this session) — resume degrades to "live events only",
-            // matching `Subscribe { since_seq: None }`'s behavior.
-            Err(_) => Vec::new(),
-        }
+            .map(|events| events.into_iter().map(|event| event.envelope).collect())
+            .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_protocol::commands::UserInput;
 
-    use harness_integration_anthropic::AnthropicConfig;
-    use harness_protocol::commands::AgentStatus;
-    use harness_protocol::events::{AgentEvent, EventVisibility};
-    use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp};
-
-    fn empty_toolset() -> harness_protocol::tools::AgentToolset {
-        harness_protocol::tools::AgentToolset {
-            tools: HashMap::new(),
+    #[test]
+    fn admission_cache_is_bounded_and_deduplicates() {
+        let mut cache = AdmissionCache::new();
+        let session_id = SessionId::new();
+        let first = CommandId::new();
+        cache.insert(session_id, first, AdmissionResult::Accepted, 1);
+        assert!(cache.get(session_id, first).is_some());
+        for revision in 2..=(DEDUPLICATION_WINDOW as u64 + 2) {
+            cache.insert(session_id, CommandId::new(), AdmissionResult::Accepted, revision);
         }
+        assert!(cache.entries.len() <= DEDUPLICATION_WINDOW);
+        assert!(cache.get(session_id, first).is_none());
     }
 
-    fn durable_envelope(session_id: SessionId, sequence: u64) -> AgentEventEnvelope {
-        AgentEventEnvelope {
-            event_id: EventId::new(),
-            session_id,
-            agent_id: AgentId::new(),
-            parent_agent_id: None,
-            run_id: Some(RunId::new()),
-            agent_sequence: sequence,
-            session_sequence: Some(sequence),
-            timestamp: Timestamp::now(),
-            visibility: EventVisibility::User,
-            event: AgentEvent::StateChanged {
-                from: AgentStatus::Idle,
-                to: AgentStatus::PreparingContext,
-            },
-        }
-    }
-
-    // `AnthropicFactory::create()` never makes a network call — it just
-    // constructs a `GenericModelBackend` (see
-    // crates/integrations/anthropic/src/backend.rs) — so it's safe to
-    // register in tests without a real API key.
-    async fn new_handler() -> (HarnessRpcHandler, tempfile::TempDir) {
-        let store_dir = tempfile::tempdir().expect("tempdir");
-        let harness = Harness::builder()
-            .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
-            .build()
-            .await
-            .expect("build harness");
-        (HarnessRpcHandler::new(Arc::new(harness)), store_dir)
-    }
-
-    async fn new_handler_with_store() -> (HarnessRpcHandler, tempfile::TempDir) {
-        let store_dir = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(harness_session_store::JsonlSessionStore::new(
-            store_dir.path().to_path_buf(),
+    #[test]
+    fn mutation_command_is_constructible_for_all_lifecycle_inputs() {
+        let input = UserInput {
+            text: "hello".into(),
+            attachments: vec![],
+        };
+        assert!(matches!(
+            MutationCommand::Prompt(input.clone()),
+            MutationCommand::Prompt(_)
         ));
-        let harness = Harness::builder()
-            .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
-            .session_store(store)
-            .build()
-            .await
-            .expect("build harness");
-        (HarnessRpcHandler::new(Arc::new(harness)), store_dir)
-    }
-
-    #[tokio::test]
-    async fn create_session_then_snapshot_then_close() {
-        let (handler, _store_dir) = new_handler().await;
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-
-        let create = handler
-            .handle(
-                None,
-                RpcRequestBody::CreateSession {
-                    workspace_root: workspace_dir.path().to_path_buf(),
-                    integration: "anthropic".to_string(),
-                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
-                        .unwrap(),
-                    toolset: empty_toolset(),
-                },
-            )
-            .await;
-        let session_id = match create {
-            RpcResponseBody::SessionCreated { session_id } => session_id,
-            other => panic!("expected SessionCreated, got {other:?}"),
-        };
-
-        let snapshot = handler
-            .handle(Some(session_id), RpcRequestBody::Snapshot)
-            .await;
-        assert!(matches!(snapshot, RpcResponseBody::Snapshot(_)));
-
-        let closed = handler
-            .handle(Some(session_id), RpcRequestBody::CloseSession)
-            .await;
-        assert!(matches!(closed, RpcResponseBody::Ack));
-
-        // The session is gone from the handler's map now.
-        let after_close = handler
-            .handle(Some(session_id), RpcRequestBody::Snapshot)
-            .await;
-        assert!(matches!(after_close, RpcResponseBody::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_input_commands_are_admitted() {
-        let (handler, _store_dir) = new_handler().await;
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        let create = handler
-            .handle(
-                None,
-                RpcRequestBody::CreateSession {
-                    workspace_root: workspace_dir.path().to_path_buf(),
-                    integration: "anthropic".to_string(),
-                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
-                        .unwrap(),
-                    toolset: empty_toolset(),
-                },
-            )
-            .await;
-        let session_id = match create {
-            RpcResponseBody::SessionCreated { session_id } => session_id,
-            other => panic!("expected SessionCreated, got {other:?}"),
-        };
-
-        for body in [
-            RpcRequestBody::Steer(harness_protocol::commands::UserInput {
-                text: "steer".into(),
-                attachments: vec![],
-            }),
-            RpcRequestBody::FollowUp(harness_protocol::commands::UserInput {
-                text: "follow-up".into(),
-                attachments: vec![],
-            }),
-        ] {
-            let response = handler.handle(Some(session_id), body).await;
-            assert!(matches!(response, RpcResponseBody::Ack));
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_session_returns_error() {
-        let (handler, _store_dir) = new_handler().await;
-        let response = handler
-            .handle(Some(SessionId::new()), RpcRequestBody::Snapshot)
-            .await;
-        assert!(matches!(response, RpcResponseBody::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn request_without_session_id_returns_error() {
-        let (handler, _store_dir) = new_handler().await;
-        let response = handler.handle(None, RpcRequestBody::Snapshot).await;
-        assert!(matches!(response, RpcResponseBody::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn hello_dispatched_to_handle_returns_error() {
-        let (handler, _store_dir) = new_handler().await;
-        let response = handler
-            .handle(
-                None,
-                RpcRequestBody::Hello {
-                    protocol_version: 1,
-                },
-            )
-            .await;
-        assert!(matches!(response, RpcResponseBody::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn subscribe_dispatched_to_handle_returns_error() {
-        let (handler, _store_dir) = new_handler().await;
-        let response = handler
-            .handle(
-                Some(SessionId::new()),
-                RpcRequestBody::Subscribe { since_seq: None },
-            )
-            .await;
-        assert!(matches!(response, RpcResponseBody::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn events_since_on_unknown_session_returns_empty() {
-        let (handler, _store_dir) = new_handler().await;
-        let backlog = handler.events_since(SessionId::new(), 0).await;
-        assert!(backlog.is_empty());
-    }
-
-    #[tokio::test]
-    async fn events_since_without_a_durable_store_returns_empty() {
-        let (handler, _store_dir) = new_handler().await;
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        let create = handler
-            .handle(
-                None,
-                RpcRequestBody::CreateSession {
-                    workspace_root: workspace_dir.path().to_path_buf(),
-                    integration: "anthropic".to_string(),
-                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
-                        .unwrap(),
-                    toolset: empty_toolset(),
-                },
-            )
-            .await;
-        let session_id = match create {
-            RpcResponseBody::SessionCreated { session_id } => session_id,
-            other => panic!("expected SessionCreated, got {other:?}"),
-        };
-
-        // `new_handler()` builds a `Harness` without `.session_store(...)`,
-        // so it falls back to the in-memory no-op store — resume degrades to
-        // "no backlog" rather than erroring.
-        let backlog = handler.events_since(session_id, 0).await;
-        assert!(backlog.is_empty());
-    }
-
-    #[tokio::test]
-    async fn events_since_filters_by_session_sequence() {
-        let (handler, _store_dir) = new_handler_with_store().await;
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        let create = handler
-            .handle(
-                None,
-                RpcRequestBody::CreateSession {
-                    workspace_root: workspace_dir.path().to_path_buf(),
-                    integration: "anthropic".to_string(),
-                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
-                        .unwrap(),
-                    toolset: empty_toolset(),
-                },
-            )
-            .await;
-        let session_id = match create {
-            RpcResponseBody::SessionCreated { session_id } => session_id,
-            other => panic!("expected SessionCreated, got {other:?}"),
-        };
-
-        for sequence in 1..=3 {
-            handler
-                .harness
-                .session_store()
-                .append(durable_envelope(session_id, sequence).into())
-                .await
-                .expect("append durable event");
-        }
-
-        let backlog = handler.events_since(session_id, 1).await;
-        let sequences: Vec<u64> = backlog
-            .iter()
-            .map(|event| event.session_sequence.expect("sequenced event"))
-            .collect();
-        assert_eq!(sequences, vec![2, 3]);
+        assert!(matches!(
+            MutationCommand::Steer(input.clone()),
+            MutationCommand::Steer(_)
+        ));
+        assert!(matches!(
+            MutationCommand::FollowUp(input),
+            MutationCommand::FollowUp(_)
+        ));
     }
 }

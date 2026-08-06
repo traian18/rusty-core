@@ -11,7 +11,7 @@ use crate::agent_state::AgentState;
 use crate::capabilities::AgentCapabilities;
 use crate::context_state::AgentContextState;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageLedger {
     pub records: Vec<harness_protocol::usage::UsageRecord>,
     pub child_usage: HashMap<AgentId, crate::usage::AgentUsageSummary>,

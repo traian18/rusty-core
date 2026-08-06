@@ -15,9 +15,10 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::ids::{PermissionId, SessionId, ToolId};
-use harness_protocol::rpc::{RpcRequestBody, RpcResponseBody};
+use harness_protocol::rpc::{MutationCommand, RpcRequestBody, RpcResponseBody};
 use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy};
 
 use client::HarnessClient;
@@ -294,10 +295,10 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             let response = client
                 .request(
                     Some(session_id),
-                    RpcRequestBody::Prompt(UserInput {
+                    mutation(session_id, MutationCommand::Prompt(UserInput {
                         text: prompt,
                         attachments: vec![],
-                    }),
+                    })),
                 )
                 .await?;
             print_ack_or_error(response)
@@ -345,7 +346,7 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
         SessionCommand::Cancel { session_id } => {
             let session_id = parse_session_id(&session_id)?;
             let response = client
-                .request(Some(session_id), RpcRequestBody::Cancel)
+                .request(Some(session_id), mutation(session_id, MutationCommand::Cancel))
                 .await?;
             print_ack_or_error(response)
         }
@@ -353,7 +354,7 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
         SessionCommand::Close { session_id } => {
             let session_id = parse_session_id(&session_id)?;
             let response = client
-                .request(Some(session_id), RpcRequestBody::CloseSession)
+                .request(Some(session_id), mutation(session_id, MutationCommand::CloseSession))
                 .await?;
             print_ack_or_error(response)
         }
@@ -376,10 +377,10 @@ async fn run_permission_command(
             let response = client
                 .request(
                     Some(session_id),
-                    RpcRequestBody::ResolvePermission {
+                    mutation(session_id, MutationCommand::ResolvePermission {
                         id,
                         decision: decision.into(),
-                    },
+                    }),
                 )
                 .await?;
             print_ack_or_error(response)
@@ -387,9 +388,22 @@ async fn run_permission_command(
     }
 }
 
+fn mutation(session_id: SessionId, command: MutationCommand) -> RpcRequestBody {
+    RpcRequestBody::Mutate {
+        metadata: MutationMetadata {
+            command_id: CommandId::new(),
+            session_id,
+            run_id: None,
+            expected_session_revision: None,
+            trace_id: None,
+        },
+        command,
+    }
+}
+
 fn print_ack_or_error(response: RpcResponseBody) -> Result<()> {
     match response {
-        RpcResponseBody::Ack => {
+        RpcResponseBody::Ack | RpcResponseBody::Admission { .. } => {
             println!("ok");
             Ok(())
         }

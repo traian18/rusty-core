@@ -17,7 +17,7 @@ All SDKs are clients of the same behavioral contract: sessions, runs,
 agents, events, and permissions behave the same whether an application
 embeds the Rust engine directly or talks to `harnessd` over the wire. The
 wire shape of that contract is described in
-[`../schema/protocol-v1.schema.json`](../schema/protocol-v1.schema.json)
+[`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json)
 and [`../schema/compatibility-policy.md`](../schema/compatibility-policy.md).
 
 The Rust SDK and the TypeScript SDK are hand-written against that contract
@@ -42,7 +42,7 @@ closed.
 - Embedding directly in a Rust process: [`rust/README.md`](rust/README.md).
 - Everything else (IDEs, CLIs, servers, other languages via the daemon):
   [`typescript/README.md`](typescript/README.md), and the raw protocol
-  reference in [`../schema/protocol-v1.schema.json`](../schema/protocol-v1.schema.json).
+  reference in [`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json).
 - The full production roadmap, phases, and release gates:
   [`../sdk_plan.md`](../sdk_plan.md).
 - Current v1 feature scope decisions: [`../docs/product-scope-v1.md`](../docs/product-scope-v1.md).

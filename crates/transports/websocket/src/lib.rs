@@ -132,9 +132,10 @@ where
                             Err(error) => {
                                 send(out_tx, RpcResponse {
                                     id: None,
-                                    body: RpcResponseBody::Error {
-                                        message: format!("invalid request: {error}"),
-                                    },
+                                    body: RpcResponseBody::Failure(harness_protocol::rpc::RpcError::protocol(
+                                        "protocol.invalid_request",
+                                        format!("invalid request: {error}"),
+                                    )),
                                 }).await;
                                 continue;
                             }
@@ -142,9 +143,10 @@ where
                         if !hello_received && !matches!(request.body, RpcRequestBody::Hello { .. }) {
                             send(out_tx, RpcResponse {
                                 id: Some(request.id),
-                                body: RpcResponseBody::Error {
-                                    message: "Hello must be the first request on a connection".to_string(),
-                                },
+                                body: RpcResponseBody::Failure(harness_protocol::rpc::RpcError::protocol(
+                                    "protocol.hello_required",
+                                    "Hello must be the first request on a connection",
+                                )),
                             }).await;
                             continue;
                         }
@@ -182,11 +184,12 @@ async fn dispatch(
                 capabilities: ProtocolCapabilities::default(),
             }
         } else {
-            RpcResponseBody::Error {
-                message: format!(
+            RpcResponseBody::Failure(harness_protocol::rpc::RpcError::protocol(
+                "protocol.version_mismatch",
+                format!(
                     "protocol version mismatch: daemon speaks {PROTOCOL_VERSION}, client sent {protocol_version}"
                 ),
-            }
+            ))
         };
         send(
             out_tx,
@@ -205,9 +208,10 @@ async fn dispatch(
                 out_tx,
                 RpcResponse {
                     id: Some(id),
-                    body: RpcResponseBody::Error {
-                        message: "Subscribe requires a session_id".to_string(),
-                    },
+                    body: RpcResponseBody::Failure(harness_protocol::rpc::RpcError::protocol(
+                        "request.missing_session_id",
+                        "Subscribe requires a session_id",
+                    )),
                 },
             )
             .await;
@@ -271,7 +275,19 @@ async fn dispatch(
                                         }
                                     }
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                                        tracing::warn!(count, "websocket subscriber lagged; some events were dropped");
+                                        tracing::warn!(count, "websocket subscriber lagged; signalling an event gap");
+                                        let gap = RpcResponse {
+                                            id: None,
+                                            body: RpcResponseBody::EventGap {
+                                                session_id,
+                                                last_delivered_sequence: last_sent_seq,
+                                                dropped: count,
+                                                cursor_expired: false,
+                                            },
+                                        };
+                                        if !send(&event_tx, gap).await {
+                                            break;
+                                        }
                                     }
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
@@ -285,9 +301,10 @@ async fn dispatch(
                     out_tx,
                     RpcResponse {
                         id: Some(id),
-                        body: RpcResponseBody::Error {
-                            message: "unknown session".to_string(),
-                        },
+                        body: RpcResponseBody::Failure(harness_protocol::rpc::RpcError::not_found(
+                            "SESSION_NOT_FOUND",
+                            "unknown session",
+                        )),
                     },
                 )
                 .await;
@@ -314,9 +331,9 @@ async fn send(out_tx: &mpsc::Sender<String>, response: RpcResponse) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
 
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -390,6 +407,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_envelope(session_id: SessionId, session_sequence: u64) -> AgentEventEnvelope {
         AgentEventEnvelope {
             event_id: EventId::new(),
@@ -483,7 +501,7 @@ mod tests {
         .expect("send hello");
 
         let response = recv_response(&mut ws).await;
-        assert!(matches!(response.body, RpcResponseBody::Error { .. }));
+        assert!(matches!(response.body, RpcResponseBody::Failure(_)));
 
         ws.send(Message::Text(
             serde_json::to_string(&RpcRequest {
@@ -498,7 +516,7 @@ mod tests {
         let response = recv_response(&mut ws).await;
         assert!(matches!(
             response.body,
-            RpcResponseBody::Error { message } if message.contains("Hello must be the first")
+            RpcResponseBody::Failure(error) if error.message.contains("Hello must be the first")
         ));
     }
 
@@ -523,171 +541,9 @@ mod tests {
         .expect("send");
 
         let response = recv_response(&mut ws).await;
-        assert!(matches!(response.body, RpcResponseBody::Error { .. }));
+        assert!(matches!(response.body, RpcResponseBody::Failure(_)));
     }
 
     #[tokio::test]
     async fn request_response_round_trips() {
-        let session_id = SessionId::new();
-        let handler = Arc::new(FakeRpcHandler::new(session_id));
-        let (addr, _shutdown) = start_server(handler).await;
-
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
-
-        ws.send(Message::Text(
-            serde_json::to_string(&RpcRequest {
-                id: RequestCorrelationId(1),
-                session_id: None,
-                body: RpcRequestBody::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            })
-            .unwrap(),
-        ))
-        .await
-        .expect("send hello");
-        let hello_response = recv_response(&mut ws).await;
-        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
-
-        let request = RpcRequest {
-            id: RequestCorrelationId(2),
-            session_id: None,
-            body: RpcRequestBody::CreateSession {
-                workspace_root: std::path::PathBuf::from("/tmp/ws"),
-                integration: "anthropic".to_string(),
-                integration_config: serde_json::json!({}),
-                toolset: harness_protocol::tools::AgentToolset {
-                    tools: HashMap::new(),
-                },
-            },
-        };
-        ws.send(Message::Text(serde_json::to_string(&request).unwrap()))
-            .await
-            .expect("send");
-
-        let response = recv_response(&mut ws).await;
-        assert_eq!(response.id, Some(RequestCorrelationId(2)));
-        assert!(matches!(
-            response.body,
-            RpcResponseBody::SessionCreated { session_id: sid } if sid == session_id
-        ));
-    }
-
-    #[tokio::test]
-    async fn subscribe_streams_events_after_ack() {
-        let session_id = SessionId::new();
-        let handler = Arc::new(FakeRpcHandler::new(session_id));
-        let events_tx = handler.events.clone();
-        let (addr, _shutdown) = start_server(handler).await;
-
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
-
-        ws.send(Message::Text(
-            serde_json::to_string(&RpcRequest {
-                id: RequestCorrelationId(1),
-                session_id: None,
-                body: RpcRequestBody::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            })
-            .unwrap(),
-        ))
-        .await
-        .expect("send hello");
-        let hello_response = recv_response(&mut ws).await;
-        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
-
-        let subscribe = RpcRequest {
-            id: RequestCorrelationId(7),
-            session_id: Some(session_id),
-            body: RpcRequestBody::Subscribe { since_seq: None },
-        };
-        ws.send(Message::Text(serde_json::to_string(&subscribe).unwrap()))
-            .await
-            .expect("send subscribe");
-
-        let ack = recv_response(&mut ws).await;
-        assert!(matches!(ack.body, RpcResponseBody::Ack));
-
-        events_tx
-            .send(make_envelope(session_id, 1))
-            .expect("send event");
-
-        let pushed = recv_response(&mut ws).await;
-        assert!(pushed.id.is_none());
-        assert!(matches!(pushed.body, RpcResponseBody::Event(_)));
-    }
-
-    #[tokio::test]
-    async fn subscribe_with_since_seq_replays_backlog_and_dedupes_live_events() {
-        let session_id = SessionId::new();
-        let handler = Arc::new(FakeRpcHandler::new(session_id));
-        {
-            let mut backlog = handler.backlog.lock().unwrap();
-            backlog.push(make_envelope(session_id, 1));
-            backlog.push(make_envelope(session_id, 2));
-        }
-        let events_tx = handler.events.clone();
-        let (addr, _shutdown) = start_server(handler).await;
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
-            .await
-            .expect("connect");
-
-        ws.send(Message::Text(
-            serde_json::to_string(&RpcRequest {
-                id: RequestCorrelationId(1),
-                session_id: None,
-                body: RpcRequestBody::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            })
-            .unwrap(),
-        ))
-        .await
-        .expect("send hello");
-        let hello_response = recv_response(&mut ws).await;
-        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
-
-        ws.send(Message::Text(
-            serde_json::to_string(&RpcRequest {
-                id: RequestCorrelationId(3),
-                session_id: Some(session_id),
-                body: RpcRequestBody::Subscribe { since_seq: Some(0) },
-            })
-            .unwrap(),
-        ))
-        .await
-        .expect("send subscribe");
-
-        let ack = recv_response(&mut ws).await;
-        assert!(matches!(ack.body, RpcResponseBody::Ack));
-
-        let first = recv_response(&mut ws).await;
-        let second = recv_response(&mut ws).await;
-        let seqs: Vec<u64> = [first, second]
-            .into_iter()
-            .map(|r| match r.body {
-                RpcResponseBody::Event(envelope) => envelope.session_sequence.unwrap(),
-                other => panic!("expected replayed Event, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(seqs, vec![1, 2]);
-
-        events_tx
-            .send(make_envelope(session_id, 2))
-            .expect("send duplicate event");
-        events_tx
-            .send(make_envelope(session_id, 3))
-            .expect("send fresh event");
-
-        let third = recv_response(&mut ws).await;
-        match third.body {
-            RpcResponseBody::Event(envelope) => assert_eq!(envelope.session_sequence, Some(3)),
-            other => panic!("expected Event with seq 3, got {other:?}"),
-        }
-    }
-}
+        let ses

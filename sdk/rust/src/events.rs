@@ -8,7 +8,7 @@ use harness_protocol::events::AgentEventEnvelope;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt as _;
+use tokio_stream::StreamExt;
 
 use crate::error::SdkError;
 
