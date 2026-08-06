@@ -176,6 +176,7 @@ fn scripted_vertical_slice() {
     });
     assert!(matches!(requested.as_slice(), [
         AgentEffect::Emit { event: AgentEvent::ToolCallRequested { .. } },
+        AgentEffect::Emit { event: AgentEvent::StateChanged { to: AgentStatus::Executing, .. } },
         AgentEffect::ExecuteTool { .. }
     ]));
 
@@ -189,6 +190,7 @@ fn scripted_vertical_slice() {
     });
     assert!(matches!(completed.as_slice(), [
         AgentEffect::Emit { event: AgentEvent::ToolCallCompleted { .. } },
+        AgentEffect::Emit { event: AgentEvent::StateChanged { from: AgentStatus::Executing, to: AgentStatus::WaitingForBackend } },
         AgentEffect::ExecuteBackend { .. }
     ]));
     assert!(agent.state.pending_tools.is_empty());
@@ -349,8 +351,87 @@ fn tool_failure_records_result_and_continues() {
     });
     assert!(matches!(effects.as_slice(), [
         AgentEffect::Emit { event: AgentEvent::ToolCallCompleted { .. } },
+        AgentEffect::Emit { event: AgentEvent::StateChanged { from: AgentStatus::Executing, to: AgentStatus::WaitingForBackend } },
         AgentEffect::ExecuteBackend { .. }
     ]));
+}
+
+#[test]
+fn cancellation_wins_over_a_late_permission_approval() {
+    let mut agent = create_agent(PermissionMode::Ask);
+    let run_id = start(&mut agent);
+    let call_id = ToolCallId::new();
+    let requested = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+    let permission_id = requested
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::RequestPermission { request } => Some(request.id),
+            _ => None,
+        })
+        .expect("permission request");
+
+    let cancelled = agent.apply(AgentCommand::Cancel);
+    assert!(cancelled.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::CancelTool { call_id: id } if *id == call_id
+    )));
+    assert_eq!(agent.state.status, AgentStatus::Cancelled);
+    assert!(agent.state.pending_permissions.is_empty());
+    assert!(agent.state.pending_tools.is_empty());
+
+    let late = agent.apply(AgentCommand::PermissionResolved {
+        id: permission_id,
+        decision: PermissionDecision::Approved,
+    });
+    assert!(late.is_empty(), "late approval must not execute the cancelled tool");
+    assert_eq!(agent.state.status, AgentStatus::Cancelled);
+}
+
+#[test]
+fn a_permission_decision_is_applied_at_most_once() {
+    let mut agent = create_agent(PermissionMode::Ask);
+    let run_id = start(&mut agent);
+    let call_id = ToolCallId::new();
+    let requested = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+    let permission_id = requested
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::RequestPermission { request } => Some(request.id),
+            _ => None,
+        })
+        .expect("permission request");
+
+    let first = agent.apply(AgentCommand::PermissionResolved {
+        id: permission_id,
+        decision: PermissionDecision::Approved,
+    });
+    assert_eq!(
+        first
+            .iter()
+            .filter(|effect| matches!(effect, AgentEffect::ExecuteTool { .. }))
+            .count(),
+        1
+    );
+
+    let duplicate = agent.apply(AgentCommand::PermissionResolved {
+        id: permission_id,
+        decision: PermissionDecision::Denied,
+    });
+    assert!(duplicate.is_empty(), "resolved permission IDs are consumed");
+    assert_eq!(agent.state.status, AgentStatus::Executing);
+    assert!(agent.state.pending_tools.contains_key(&call_id));
 }
 
 #[test]

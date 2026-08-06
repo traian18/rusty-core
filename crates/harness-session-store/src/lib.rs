@@ -12,6 +12,10 @@
 //! - [`projection`] — side-effect-free trailing state reduction (RC-303).
 //! - [`resolver`] — strict host dependency resolution (RC-304).
 //! - [`retention`] and [`diagnostics`] — lifecycle tooling (RC-305).
+//! - [`testing`] — [`MemoryStore`](testing::MemoryStore) and
+//!   [`FaultInjectingStore`](testing::FaultInjectingStore), used by this
+//!   crate's and embedding crates' M2 crash/restart and durability-policy
+//!   fixtures.
 
 pub mod commit;
 pub mod diagnostics;
@@ -49,6 +53,7 @@ pub use store::{
     DurableSessionSnapshot, RawRecord, SessionStore, SessionSummary, StoredAgentState,
     StoredPendingToolCall, StoredSession, StoreError,
 };
+pub use testing::{FaultInjectingStore, MemoryStore};
 pub use version::{
     check_snapshot_version, migrate_snapshot, SnapshotVersionError,
     MIN_SUPPORTED_SNAPSHOT_VERSION, SCHEMA_VERSION,

@@ -222,6 +222,7 @@ impl Agent {
     }
 
     fn tool_requested(&mut self, call: ToolCall) -> Vec<AgentEffect> {
+        let from = self.state.status;
         let call_id = call.id;
         let message_id = self.next_message_id();
         let created_at = self.next_timestamp();
@@ -252,6 +253,7 @@ impl Agent {
         match permission {
             Some(PermissionMode::Allow) => {
                 self.state.status = AgentStatus::Executing;
+                effects.push(Self::state_changed(from, AgentStatus::Executing));
                 effects.push(AgentEffect::ExecuteTool {
                     request: ToolRequest {
                         call,
@@ -261,6 +263,10 @@ impl Agent {
             }
             Some(PermissionMode::Ask) => {
                 self.state.status = AgentStatus::WaitingForPermission;
+                effects.push(Self::state_changed(
+                    from,
+                    AgentStatus::WaitingForPermission,
+                ));
                 let permission_id = self.next_permission_id();
                 self.state
                     .pending_permissions
@@ -339,8 +345,12 @@ impl Agent {
         }];
         if self.state.pending_tools.is_empty() {
             if let Some(run_id) = self.state.active_run {
+                let from = self.state.status;
                 self.state.status = AgentStatus::WaitingForBackend;
                 let request = self.execution_request(run_id);
+                if from != AgentStatus::WaitingForBackend {
+                    effects.push(Self::state_changed(from, AgentStatus::WaitingForBackend));
+                }
                 effects.push(AgentEffect::ExecuteBackend { request });
             }
         }
@@ -504,6 +514,16 @@ impl Agent {
         self.state.pending_tools.clear();
         self.state.pending_permissions.clear();
         self.state.children.clear();
+        // `Cancel` is documented and certified (RC-203,
+        // `multiple_follow_ups_are_fifo_and_survive_cancellation`) as
+        // cancelling only the *current run*: already-queued follow-up/steer
+        // input is a separate, already-committed piece of user intent and
+        // must remain available for an explicit `StartNextQueuedRun` after
+        // the cancel — including across a restore, so a queued follow-up
+        // typed just before a crash is not silently lost. Do not clear
+        // `queued_inputs` here; a caller that truly wants to abandon queued
+        // work (e.g. a full session teardown) should do so explicitly at
+        // its own layer instead of narrowing this shared transition.
 
         effects.push(Self::state_changed(from, AgentStatus::Cancelled));
         effects.push(AgentEffect::Emit {

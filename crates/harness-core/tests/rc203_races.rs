@@ -261,3 +261,45 @@ fn failed_run_can_be_followed_by_a_new_prompt() {
     assert!(agent.state.active_run.is_some());
     assert_eq!(agent.state.status, AgentStatus::PreparingContext);
 }
+
+/// M2: `AgentCommand::Steer`'s doc comment specifies that a runtime unable to
+/// interrupt an in-flight backend request must preserve ordering and deliver
+/// it after the current run reaches a command boundary — i.e. it is
+/// permitted (and is what this runtime does) to fall back to the same
+/// queue-then-drain behavior as `FollowUp`. This locks that fallback down
+/// and proves it races cancellation identically: a `Steer` sent while a run
+/// is active is queued, survives a `Cancel` of that run, and is available to
+/// an explicit `StartNextQueuedRun` afterward.
+#[test]
+fn steer_while_run_active_falls_back_to_queue_and_survives_cancellation() {
+    let mut agent = agent();
+    let first = start(&mut agent, "first");
+
+    assert!(agent
+        .apply(AgentCommand::Steer {
+            input: input("mid-flight steer")
+        })
+        .is_empty());
+    assert_eq!(agent.state.queued_inputs.len(), 1);
+
+    agent.apply(AgentCommand::Cancel);
+    assert_eq!(agent.state.status, AgentStatus::Cancelled);
+    assert_eq!(
+        agent.state.queued_inputs.len(),
+        1,
+        "a queued steer must survive cancellation of the run it was sent during"
+    );
+
+    let effects = agent.apply(AgentCommand::StartNextQueuedRun);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::ExecuteBackend { request }
+            if matches!(
+                request.messages.last().map(|message| &message.content[0]),
+                Some(ContentBlock::Text { text }) if text == "mid-flight steer"
+            )
+    )));
+    let run_id = agent.state.active_run.expect("queued steer should start");
+    assert_ne!(run_id, first);
+    assert!(agent.state.queued_inputs.is_empty());
+}

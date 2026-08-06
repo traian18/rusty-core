@@ -556,4 +556,174 @@ mod tests {
         send_request(
             &mut stream,
             &RpcRequest {
-                id: harness_protocol::rpc::Reques
+                id: harness_protocol::rpc::RequestCorrelationId(1),
+                session_id: Some(session_id),
+                body: RpcRequestBody::Snapshot,
+            },
+        )
+        .await;
+
+        let response = read_response(&mut stream).await;
+        assert!(matches!(response.body, RpcResponseBody::Failure(_)));
+
+        // Hello still succeeds afterward on the same connection.
+        do_hello(&mut stream, 2).await;
+    }
+
+    #[tokio::test]
+    async fn request_response_round_trips() {
+        let session_id = SessionId::new();
+        let handler = Arc::new(FakeRpcHandler::new(session_id));
+        let (mut stream, _dir, _shutdown) = connect_and_serve(handler).await;
+        do_hello(&mut stream, 1).await;
+
+        let request = RpcRequest {
+            id: harness_protocol::rpc::RequestCorrelationId(2),
+            session_id: None,
+            body: RpcRequestBody::CreateSession {
+                workspace_root: std::path::PathBuf::from("/tmp/ws"),
+                integration: "anthropic".to_string(),
+                integration_config: serde_json::json!({}),
+                toolset: harness_protocol::tools::AgentToolset {
+                    tools: HashMap::new(),
+                },
+            },
+        };
+        send_request(&mut stream, &request).await;
+
+        let response = read_response(&mut stream).await;
+        assert_eq!(
+            response.id,
+            Some(harness_protocol::rpc::RequestCorrelationId(2))
+        );
+        assert!(matches!(
+            response.body,
+            RpcResponseBody::SessionCreated { session_id: sid } if sid == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_events_after_ack() {
+        let session_id = SessionId::new();
+        let handler = Arc::new(FakeRpcHandler::new(session_id));
+        let events_tx = handler.events.clone();
+        let (mut stream, _dir, _shutdown) = connect_and_serve(handler).await;
+        do_hello(&mut stream, 1).await;
+
+        let subscribe = RpcRequest {
+            id: harness_protocol::rpc::RequestCorrelationId(7),
+            session_id: Some(session_id),
+            body: RpcRequestBody::Subscribe { since_seq: None },
+        };
+        send_request(&mut stream, &subscribe).await;
+
+        let ack = read_response(&mut stream).await;
+        assert!(matches!(ack.body, RpcResponseBody::Ack));
+
+        let envelope = make_envelope(session_id, 1);
+        events_tx.send(envelope).expect("send event");
+
+        let pushed = read_response(&mut stream).await;
+        assert!(pushed.id.is_none());
+        assert!(matches!(pushed.body, RpcResponseBody::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_to_unknown_session_errors() {
+        let handler = Arc::new(FakeRpcHandler::new(SessionId::new()));
+        let (mut stream, _dir, _shutdown) = connect_and_serve(handler).await;
+        do_hello(&mut stream, 1).await;
+
+        let subscribe = RpcRequest {
+            id: harness_protocol::rpc::RequestCorrelationId(9),
+            session_id: Some(SessionId::new()),
+            body: RpcRequestBody::Subscribe { since_seq: None },
+        };
+        send_request(&mut stream, &subscribe).await;
+
+        let response = read_response(&mut stream).await;
+        assert!(matches!(response.body, RpcResponseBody::Failure(_)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_since_seq_replays_backlog_before_live_events() {
+        let session_id = SessionId::new();
+        let handler = Arc::new(FakeRpcHandler::new(session_id));
+        {
+            let mut backlog = handler.backlog.lock().unwrap();
+            backlog.push(make_envelope(session_id, 1));
+            backlog.push(make_envelope(session_id, 2));
+        }
+        let events_tx = handler.events.clone();
+        let (mut stream, _dir, _shutdown) = connect_and_serve(handler).await;
+        do_hello(&mut stream, 1).await;
+
+        let subscribe = RpcRequest {
+            id: harness_protocol::rpc::RequestCorrelationId(3),
+            session_id: Some(session_id),
+            body: RpcRequestBody::Subscribe { since_seq: Some(0) },
+        };
+        send_request(&mut stream, &subscribe).await;
+
+        let ack = read_response(&mut stream).await;
+        assert!(matches!(ack.body, RpcResponseBody::Ack));
+
+        let first = read_response(&mut stream).await;
+        let second = read_response(&mut stream).await;
+        let seqs: Vec<u64> = [first, second]
+            .into_iter()
+            .map(|r| match r.body {
+                RpcResponseBody::Event(envelope) => envelope.session_sequence.unwrap(),
+                other => panic!("expected replayed Event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+
+        // A live event with a sequence already covered by the backlog is
+        // deduplicated (never forwarded); one past the backlog is forwarded.
+        events_tx
+            .send(make_envelope(session_id, 2))
+            .expect("send duplicate event");
+        events_tx
+            .send(make_envelope(session_id, 3))
+            .expect("send fresh event");
+
+        let third = read_response(&mut stream).await;
+        match third.body {
+            RpcResponseBody::Event(envelope) => assert_eq!(envelope.session_sequence, Some(3)),
+            other => panic!("expected Event with seq 3, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_without_since_seq_skips_backlog() {
+        let session_id = SessionId::new();
+        let handler = Arc::new(FakeRpcHandler::new(session_id));
+        {
+            let mut backlog = handler.backlog.lock().unwrap();
+            backlog.push(make_envelope(session_id, 1));
+        }
+        let events_tx = handler.events.clone();
+        let (mut stream, _dir, _shutdown) = connect_and_serve(handler).await;
+        do_hello(&mut stream, 1).await;
+
+        let subscribe = RpcRequest {
+            id: harness_protocol::rpc::RequestCorrelationId(4),
+            session_id: Some(session_id),
+            body: RpcRequestBody::Subscribe { since_seq: None },
+        };
+        send_request(&mut stream, &subscribe).await;
+
+        let ack = read_response(&mut stream).await;
+        assert!(matches!(ack.body, RpcResponseBody::Ack));
+
+        events_tx
+            .send(make_envelope(session_id, 5))
+            .expect("send live event");
+        let pushed = read_response(&mut stream).await;
+        match pushed.body {
+            RpcResponseBody::Event(envelope) => assert_eq!(envelope.session_sequence, Some(5)),
+            other => panic!("expected Event with seq 5, got {other:?}"),
+        }
+    }
+}

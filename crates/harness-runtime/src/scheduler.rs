@@ -18,6 +18,16 @@
 //! is automatically released, so callers never need to remember to release it
 //! manually.
 //!
+//! # Cancellation
+//!
+//! The plain `acquire_*_permit` methods wait unconditionally for a slot.
+//! Callers that must remain cancellable while queued for a permit (an M2
+//! correctness requirement: "cancel during scheduler wait") should use the
+//! `*_cancellable` variants instead. These race the acquire against a
+//! [`CancellationToken`] and return `None` if cancellation wins before a
+//! permit was obtained, without ever holding a permit that is then
+//! immediately dropped.
+//!
 //! # Construction
 //!
 //! ```ignore
@@ -34,6 +44,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use harness_protocol::ids::BackendId;
 
@@ -313,6 +324,21 @@ impl Scheduler {
             .expect("Scheduler semaphore should never be closed")
     }
 
+    /// Cancellable variant of [`Self::acquire_backend_permit`].
+    ///
+    /// Returns `None` if `cancel` fires before a permit becomes available.
+    pub async fn acquire_backend_permit_cancellable(
+        self: &Arc<Self>,
+        cancel: &CancellationToken,
+    ) -> Option<OwnedSemaphorePermit> {
+        let sem = self.backend_requests.clone();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            permit = sem.acquire_owned() => Some(permit.expect("Scheduler semaphore should never be closed")),
+        }
+    }
+
     /// Acquires a permit for executing a tool.
     ///
     /// Blocks until the number of in-flight tool executions is below
@@ -323,6 +349,21 @@ impl Scheduler {
             .acquire_owned()
             .await
             .expect("Scheduler semaphore should never be closed")
+    }
+
+    /// Cancellable variant of [`Self::acquire_tool_permit`].
+    ///
+    /// Returns `None` if `cancel` fires before a permit becomes available.
+    pub async fn acquire_tool_permit_cancellable(
+        self: &Arc<Self>,
+        cancel: &CancellationToken,
+    ) -> Option<OwnedSemaphorePermit> {
+        let sem = self.tool_executions.clone();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            permit = sem.acquire_owned() => Some(permit.expect("Scheduler semaphore should never be closed")),
+        }
     }
 
     /// Acquires a permit for spawning a child process.
@@ -384,6 +425,29 @@ impl Scheduler {
         self: &Arc<Self>,
         backend: BackendId,
     ) -> BackendPermitGuard {
+        self.acquire_backend_specific_permit_inner(backend, None)
+            .await
+            .expect("uncancellable acquire never returns None")
+    }
+
+    /// Cancellable variant of [`Self::acquire_backend_specific_permit`].
+    ///
+    /// Returns `None` if `cancel` fires while waiting on either the
+    /// sliding-window rate limit or the per-backend concurrency semaphore.
+    pub async fn acquire_backend_specific_permit_cancellable(
+        self: &Arc<Self>,
+        backend: BackendId,
+        cancel: &CancellationToken,
+    ) -> Option<BackendPermitGuard> {
+        self.acquire_backend_specific_permit_inner(backend, Some(cancel))
+            .await
+    }
+
+    async fn acquire_backend_specific_permit_inner(
+        self: &Arc<Self>,
+        backend: BackendId,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<BackendPermitGuard> {
         // Look up the per-backend state.  If none is configured we return
         // a no-op guard immediately.
         let state = {
@@ -397,7 +461,7 @@ impl Scheduler {
 
         let state = match state {
             Some(s) => s,
-            None => return BackendPermitGuard::noop(),
+            None => return Some(BackendPermitGuard::noop()),
         };
 
         // Wait until the sliding-window rate limit allows a new request.
@@ -405,6 +469,12 @@ impl Scheduler {
         // We do NOT hold the concurrency semaphore permit while waiting
         // for the rate window so that waiting does not consume a slot.
         loop {
+            if let Some(cancel) = cancel {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+            }
+
             let can_proceed = {
                 let mut window = state
                     .window
@@ -422,17 +492,121 @@ impl Scheduler {
                 break;
             }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some(cancel) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
 
         // Acquire a concurrency slot for this backend.
-        let permit = state
-            .concurrency
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Backend concurrency semaphore should never be closed");
+        let concurrency = state.concurrency.clone();
+        let permit = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                permit = concurrency.acquire_owned() => permit,
+            }
+        } else {
+            concurrency.acquire_owned().await
+        }
+        .expect("Backend concurrency semaphore should never be closed");
 
-        BackendPermitGuard::new(permit)
+        Some(BackendPermitGuard::new(permit))
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    /// M2 race: a caller queued behind an exhausted global tool-execution
+    /// semaphore must be able to abandon the wait via cancellation instead
+    /// of blocking forever.
+    #[tokio::test]
+    async fn cancel_wins_race_against_exhausted_tool_permit() {
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+            max_concurrent_tool_executions: 1,
+            ..SchedulerConfig::default()
+        }));
+
+        // Hold the only permit so a second acquire has to wait.
+        let _held = scheduler.acquire_tool_permit().await;
+
+        let cancel = CancellationToken::new();
+        let waiter_scheduler = scheduler.clone();
+        let waiter_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire_tool_permit_cancellable(&waiter_cancel)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellable acquire should return promptly after cancellation")
+            .expect("waiter task should not panic");
+        assert!(
+            result.is_none(),
+            "cancellable acquire must yield None once cancellation wins the race"
+        );
+    }
+
+    /// A cancellable acquire that wins its race for a permit before
+    /// cancellation must still return `Some`.
+    #[tokio::test]
+    async fn cancellable_acquire_succeeds_when_permit_is_available() {
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+        let cancel = CancellationToken::new();
+        let permit = scheduler.acquire_tool_permit_cancellable(&cancel).await;
+        assert!(permit.is_some());
+    }
+
+    /// A backend-specific rate-limit wait must also be cancellable.
+    #[tokio::test]
+    async fn cancel_wins_race_against_backend_rate_limit_wait() {
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+        let backend = BackendId::new();
+        scheduler.configure_backend_limits(
+            backend,
+            BackendRateLimits {
+                max_concurrent_requests: 4,
+                requests_per_minute: Some(1),
+                tokens_per_minute: None,
+            },
+        );
+
+        // Consume the one-per-minute allowance.
+        let _first = scheduler
+            .acquire_backend_specific_permit(backend)
+            .await;
+
+        let cancel = CancellationToken::new();
+        let waiter_scheduler = scheduler.clone();
+        let waiter_cancel = cancel.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire_backend_specific_permit_cancellable(backend, &waiter_cancel)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("cancellable backend-specific acquire should return promptly")
+            .expect("waiter task should not panic");
+        assert!(
+            result.is_none(),
+            "cancellable backend-specific acquire must yield None once cancellation wins"
+        );
     }
 }

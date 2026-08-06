@@ -12,12 +12,29 @@ use harness_tools::{ToolError, ToolResult};
 /// A test double for [`ToolExecutor`] that always returns a scripted result.
 pub struct FakeToolExecutor {
     descriptor: ToolDescriptor,
+    /// If `true`, `execute` blocks (awaiting cancellation) instead of
+    /// returning immediately, simulating an in-flight tool call. Used to
+    /// exercise mid-flight tool cancellation deterministically.
+    block_until_cancelled: bool,
 }
 
 impl FakeToolExecutor {
     /// Create a new fake executor with the given descriptor.
     pub fn new(descriptor: ToolDescriptor) -> Self {
-        Self { descriptor }
+        Self {
+            descriptor,
+            block_until_cancelled: false,
+        }
+    }
+
+    /// Builder method: block until the cancellation token fires instead of
+    /// returning a scripted result immediately.
+    ///
+    /// Used to simulate a tool call that is still in flight so that
+    /// mid-flight cancellation can be exercised deterministically.
+    pub fn blocking_until_cancelled(mut self) -> Self {
+        self.block_until_cancelled = true;
+        self
     }
 }
 
@@ -30,8 +47,13 @@ impl ToolExecutor for FakeToolExecutor {
     async fn execute(
         &self,
         _input: ToolInput,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ToolResult, ToolError> {
+        if self.block_until_cancelled {
+            cancel.cancelled().await;
+            return Err(ToolError::ExecutionFailed);
+        }
+
         Ok(ToolResult {
             call_id: "fake-call-id".to_string(),
             output: serde_json::json!({"message": "fake result"}),

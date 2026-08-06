@@ -552,4 +552,157 @@ mod tests {
                 session_id: None,
                 body: RpcRequestBody::Hello {
                     protocol_version: PROTOCOL_VERSION,
-           
+                },
+            },
+        )
+        .await;
+        let hello_response = read_response_line(&mut client_out_read).await;
+        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
+
+        let request = RpcRequest {
+            id: RequestCorrelationId(2),
+            session_id: None,
+            body: RpcRequestBody::CreateSession {
+                workspace_root: std::path::PathBuf::from("/tmp/ws"),
+                integration: "anthropic".to_string(),
+                integration_config: serde_json::json!({}),
+                toolset: harness_protocol::tools::AgentToolset {
+                    tools: HashMap::new(),
+                },
+            },
+        };
+        write_request(&mut client_in_write, &request).await;
+
+        let response = read_response_line(&mut client_out_read).await;
+        assert_eq!(response.id, Some(RequestCorrelationId(2)));
+        assert!(matches!(
+            response.body,
+            RpcResponseBody::SessionCreated { session_id: sid } if sid == session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_streams_events_after_ack() {
+        let session_id = SessionId::new();
+        let handler_impl = Arc::new(FakeRpcHandler::new(session_id));
+        let events_tx = handler_impl.events.clone();
+        let handler: Arc<dyn RpcHandler> = handler_impl;
+
+        let (mut client_in_write, server_in_read) = tokio::io::duplex(4096);
+        let (server_out_write, mut client_out_read) = tokio::io::duplex(4096);
+
+        let shutdown = CancellationToken::new();
+        let serve_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = serve_io(server_in_read, server_out_write, handler, serve_shutdown).await;
+        });
+
+        write_request(
+            &mut client_in_write,
+            &RpcRequest {
+                id: RequestCorrelationId(1),
+                session_id: None,
+                body: RpcRequestBody::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            },
+        )
+        .await;
+        let hello_response = read_response_line(&mut client_out_read).await;
+        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
+
+        write_request(
+            &mut client_in_write,
+            &RpcRequest {
+                id: RequestCorrelationId(7),
+                session_id: Some(session_id),
+                body: RpcRequestBody::Subscribe { since_seq: None },
+            },
+        )
+        .await;
+
+        let ack = read_response_line(&mut client_out_read).await;
+        assert!(matches!(ack.body, RpcResponseBody::Ack));
+
+        events_tx
+            .send(make_envelope(session_id, 1))
+            .expect("send event");
+
+        let pushed = read_response_line(&mut client_out_read).await;
+        assert!(pushed.id.is_none());
+        assert!(matches!(pushed.body, RpcResponseBody::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_since_seq_replays_backlog_and_dedupes_live_events() {
+        let session_id = SessionId::new();
+        let handler_impl = Arc::new(FakeRpcHandler::new(session_id));
+        {
+            let mut backlog = handler_impl.backlog.lock().unwrap();
+            backlog.push(make_envelope(session_id, 1));
+            backlog.push(make_envelope(session_id, 2));
+        }
+        let events_tx = handler_impl.events.clone();
+        let handler: Arc<dyn RpcHandler> = handler_impl;
+
+        let (mut client_in_write, server_in_read) = tokio::io::duplex(4096);
+        let (server_out_write, mut client_out_read) = tokio::io::duplex(4096);
+
+        let shutdown = CancellationToken::new();
+        let serve_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = serve_io(server_in_read, server_out_write, handler, serve_shutdown).await;
+        });
+
+        write_request(
+            &mut client_in_write,
+            &RpcRequest {
+                id: RequestCorrelationId(1),
+                session_id: None,
+                body: RpcRequestBody::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            },
+        )
+        .await;
+        let hello_response = read_response_line(&mut client_out_read).await;
+        assert!(matches!(hello_response.body, RpcResponseBody::Hello { .. }));
+
+        write_request(
+            &mut client_in_write,
+            &RpcRequest {
+                id: RequestCorrelationId(3),
+                session_id: Some(session_id),
+                body: RpcRequestBody::Subscribe { since_seq: Some(0) },
+            },
+        )
+        .await;
+
+        let ack = read_response_line(&mut client_out_read).await;
+        assert!(matches!(ack.body, RpcResponseBody::Ack));
+
+        let first = read_response_line(&mut client_out_read).await;
+        let second = read_response_line(&mut client_out_read).await;
+        let seqs: Vec<u64> = [first, second]
+            .into_iter()
+            .map(|r| match r.body {
+                RpcResponseBody::Event(envelope) => envelope.session_sequence.unwrap(),
+                other => panic!("expected replayed Event, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+
+        events_tx
+            .send(make_envelope(session_id, 2))
+            .expect("send duplicate event");
+        events_tx
+            .send(make_envelope(session_id, 3))
+            .expect("send fresh event");
+
+        let third = read_response_line(&mut client_out_read).await;
+        match third.body {
+            RpcResponseBody::Event(envelope) => assert_eq!(envelope.session_sequence, Some(3)),
+            other => panic!("expected Event with seq 3, got {other:?}"),
+        }
+    }
+}

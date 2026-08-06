@@ -864,7 +864,8 @@ impl SessionRuntime {
             scheduler.clone(),
         )
         .with_supervision(agent_supervisor.clone(), integrations.clone())
-        .with_projection(projection.clone());
+        .with_projection(projection.clone())
+        .long_lived(true);
         if let Some(store) = session_store.clone() {
             runner = runner.with_session_store(store);
         }
@@ -1049,6 +1050,7 @@ impl SessionRuntime {
         // committer so `Persist` effects keep flowing after the restore.
         let spawn_restored =
             |agent: Agent| -> (mpsc::Sender<AgentCommand>, tokio::task::JoinHandle<()>) {
+                let is_root = agent.parent_id.is_none();
                 let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
                 let command_tx = task.commands_tx.clone();
                 let agent_cancel = cancellation.child_token();
@@ -1075,7 +1077,8 @@ impl SessionRuntime {
                     scheduler.clone(),
                 )
                 .with_supervision(agent_supervisor.clone(), integrations.clone())
-                .with_projection(projection.clone());
+                .with_projection(projection.clone())
+                .long_lived(is_root);
                 if let Some(store) = session_store.clone() {
                     runner = runner.with_session_store(store);
                 }
@@ -1170,6 +1173,7 @@ impl SessionRuntime {
     /// runner is created inline during construction so its sender can be
     /// retained by the runtime; later agents use this method.
     pub fn spawn_agent_runner(&self, agent: Agent) -> mpsc::Sender<AgentCommand> {
+        let is_root = agent.parent_id.is_none();
         let (task, _commands_tx) = AgentTask::new_with_capacities(agent.id, 64, 256);
         let command_tx = task.commands_tx.clone();
         let agent_cancel = self.cancellation.child_token();
@@ -1202,9 +1206,9 @@ impl SessionRuntime {
         )
         .with_supervision(self.agent_supervisor.clone(), self.integrations.clone())
         .with_projection(self.projection.clone())
-        // A root session survives individual run completion. Child
-        // runners remain one-shot under the supervisor.
-        .long_lived(true);
+        // Root runners survive individual run completion. Child runners are
+        // one-shot so supervisors can observe a definitive result.
+        .long_lived(is_root);
         if let Some(store) = &self.session_store {
             runner = runner.with_session_store(store.clone());
         }
@@ -1235,11 +1239,18 @@ impl SessionRuntime {
     pub async fn send_command(&self, command: SessionCommand) -> Result<(), SessionError> {
         let agent_command = match command {
             SessionCommand::Prompt(input) => {
+                if self.cancellation.is_cancelled() {
+                    return Err(SessionError::Cancelled);
+                }
                 // Optimistically transition to Running so that state_snapshot
                 // reflects the session as active immediately.
                 let mut state = self.state.lock().expect("state mutex poisoned");
-                if state.status == SessionStatus::Idle {
+                if matches!(
+                    state.status,
+                    SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Cancelled
+                ) {
                     state.status = SessionStatus::Running;
+                    state.error = None;
                 }
                 drop(state);
                 AgentCommand::StartRun { input }
@@ -1298,12 +1309,38 @@ impl SessionRuntime {
     /// of live state.
     pub fn state_snapshot(&self) -> SessionSnapshot {
         let state = self.state.lock().expect("state mutex poisoned");
+        let live = self
+            .live_state
+            .lock()
+            .expect("live_state mutex poisoned")
+            .get(&state.root_agent_id)
+            .cloned()
+            .unwrap_or_default();
+        let status = if state.status == SessionStatus::Failed {
+            SessionStatus::Failed
+        } else if self.cancellation.is_cancelled() {
+            SessionStatus::Cancelled
+        } else {
+            match live.status {
+                AgentStatus::Failed => SessionStatus::Failed,
+                AgentStatus::Cancelled => SessionStatus::Cancelled,
+                AgentStatus::Idle if live.last_outcome == Some(AgentOutcome::Success) => {
+                    SessionStatus::Completed
+                }
+                AgentStatus::Idle => state.status,
+                _ => SessionStatus::Running,
+            }
+        };
+        let error = state
+            .error
+            .clone()
+            .or_else(|| live.last_error.map(|error| error.message));
         SessionSnapshot {
             session_id: self.session_id,
-            status: state.status,
+            status,
             root_agent_id: state.root_agent_id,
             agent_count: state.agents.len(),
-            error: state.error.clone(),
+            error,
         }
     }
 
@@ -1550,7 +1587,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
+    use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionResult};
     use harness_protocol::commands::UserInput;
     use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome};
     use harness_protocol::ids::{RequestId, SessionId};
@@ -1829,6 +1866,125 @@ mod tests {
             "usage should be populated from the scripted ExecutionResult"
         );
         assert_eq!(after.total_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn session_root_remains_available_across_completed_runs() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let backend = Arc::new(FakeBackend::new().with_result(ExecutionResult {
+            request_id,
+            usage: ModelUsage::default(),
+            cost: Cost::default(),
+            finish_reason: "end_turn".into(),
+        }));
+
+        struct NoopSink;
+        impl EventSink for NoopSink {
+            fn send(&self, _envelope: AgentEventEnvelope) {}
+        }
+
+        let runtime = SessionRuntime::new(
+            session_id,
+            backend,
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        );
+        let root_id = runtime.state_snapshot().root_agent_id;
+
+        for prompt in ["first", "second"] {
+            runtime
+                .send_command(SessionCommand::Prompt(UserInput {
+                    text: prompt.into(),
+                    attachments: vec![],
+                }))
+                .await
+                .expect("root mailbox remains available");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let live = runtime.agent_live_state(root_id);
+                    let expected_requests = if prompt == "first" { 1 } else { 2 };
+                    if live.status == AgentStatus::Idle
+                        && live.total_requests >= expected_requests
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("run should complete");
+            assert_eq!(
+                runtime.state_snapshot().status,
+                SessionStatus::Completed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_provider_stream_failure_has_a_truthful_terminal_state() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let backend = Arc::new(
+            FakeBackend::new()
+                .with_events(vec![ExecutionEvent::TextDelta {
+                    request_id,
+                    delta: "partial".into(),
+                }])
+                .with_error(ExecutionError::BackendError {
+                    message: "stream disconnected".into(),
+                    code: "SCRIPTED_DISCONNECT".into(),
+                }),
+        );
+
+        struct NoopSink;
+        impl EventSink for NoopSink {
+            fn send(&self, _envelope: AgentEventEnvelope) {}
+        }
+
+        let runtime = SessionRuntime::new(
+            session_id,
+            backend,
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        );
+        let root_id = runtime.state_snapshot().root_agent_id;
+        let mut subscriber = runtime.event_bus.subscribe();
+        runtime
+            .send_command(SessionCommand::Prompt(UserInput {
+                text: "stream".into(),
+                attachments: vec![],
+            }))
+            .await
+            .expect("start run");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.agent_live_state(root_id).status == AgentStatus::Failed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider failure should terminate the run");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let events = drain_events(&mut subscriber);
+        let partial_index = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::AssistantTextDelta { delta, .. } if delta == "partial"))
+            .expect("partial delta is published");
+        let failed_index = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Failed { .. }))
+            .expect("failure event is published");
+        assert!(partial_index < failed_index);
+        let snapshot = runtime.state_snapshot();
+        assert_eq!(snapshot.status, SessionStatus::Failed);
+        assert!(snapshot.error.is_some());
     }
 
     // -----------------------------------------------------------------------

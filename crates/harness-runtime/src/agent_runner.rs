@@ -76,7 +76,8 @@ pub struct AgentRunner {
     /// transition so a checkpoint always reflects truthful agent state.
     projection: Option<AgentProjectionTable>,
     /// The session's authoritative commit boundary (RC-301). When set, every
-    /// emitted event is committed (sequenced + persisted when durable)
+    /// emitted event is committed (sequence allocation + durable persistence
+    /// with the final sequence, and truthful publish-on-success semantics)
     /// before publication; the session bus then preserves the assigned
     /// sequence so stored and observed order agree.
     committer: Option<Arc<SessionCommitter>>,
@@ -93,6 +94,10 @@ pub struct AgentRunner {
     supervision: Option<AgentSupervision>,
     /// Optional durable store used by `Persist` effects.
     session_store: Option<Arc<dyn harness_session_store::SessionStore>>,
+    /// A session-integrity failure that must terminate even a long-lived
+    /// root runner. Run-level provider/tool failures remain recoverable, but
+    /// losing the strict durable commit boundary does not.
+    fatal_error: bool,
     /// When `true`, the mailbox loop in [`Self::run`] survives the
     /// completion of an individual run (`AgentEffect::FinishRun`, whether
     /// the outcome was success, failure, or the run-scoped cancel path) and
@@ -206,6 +211,7 @@ impl AgentRunner {
             final_result: None,
             supervision: None,
             session_store: None,
+            fatal_error: false,
             long_lived: false,
         }
     }
@@ -310,6 +316,9 @@ impl AgentRunner {
 
             let effects = self.apply_and_publish(command);
             let finished_run = self.dispatch_effects(effects).await;
+            if self.fatal_error {
+                break;
+            }
             if finished_run && !self.long_lived {
                 break;
             }
@@ -390,7 +399,12 @@ impl AgentRunner {
             match effect {
                 AgentEffect::ExecuteBackend { request } => self.execute_backend(request).await,
                 AgentEffect::ExecuteTool { request } => self.execute_tool(request).await,
-                AgentEffect::Emit { event } => self.emit(event).await,
+                AgentEffect::Emit { event } => {
+                    if !self.emit(event).await {
+                        finish = true;
+                        break;
+                    }
+                }
                 AgentEffect::FinishRun { result } => {
                     finish = true;
                     self.final_result = Some(match self.agent.state.status {
@@ -422,7 +436,12 @@ impl AgentRunner {
                     self.spawn_agent(spec).await;
                 }
                 AgentEffect::RequestPermission { request } => {
-                    tracing::warn!(?request, "RequestPermission is not wired in Phase 2");
+                    // The preceding PermissionRequested event is the single
+                    // host-facing delivery path. This effect deliberately
+                    // performs no second publication: the runner remains in
+                    // WaitingForPermission until the matching
+                    // PermissionResolved command arrives.
+                    debug_assert!(self.agent.state.pending_permissions.contains_key(&request.id));
                 }
                 AgentEffect::Persist { mutation } => {
                     self.persist(mutation).await;
@@ -478,7 +497,7 @@ impl AgentRunner {
         }
     }
 
-    async fn emit(&mut self, event: AgentEvent) {
+    async fn emit(&mut self, event: AgentEvent) -> bool {
         match &event {
             AgentEvent::Completed { outcome } => self.publish_outcome(*outcome),
             AgentEvent::Failed { .. } => self.publish_outcome(AgentOutcome::Failed),
@@ -530,6 +549,11 @@ impl AgentRunner {
                         agent_id = %self.agent.id,
                         "commit boundary rejected an event; it was not published"
                     );
+                    self.fail_fatally(
+                        "PERSISTENCE_COMMIT_REJECTED",
+                        "strict event commit rejected publication".into(),
+                    );
+                    return false;
                 }
                 Err(error) => {
                     tracing::error!(
@@ -538,9 +562,14 @@ impl AgentRunner {
                         %error,
                         "commit boundary failed; event was not published"
                     );
+                    self.fail_fatally(
+                        "PERSISTENCE_COMMIT_FAILED",
+                        format!("strict event commit failed: {error}"),
+                    );
+                    return false;
                 }
             }
-            return;
+            return true;
         }
 
         // Legacy path (no store configured): persist durable events directly
@@ -552,6 +581,29 @@ impl AgentRunner {
 
         let _ = self.task.events.send(envelope.clone());
         self.event_sink.send(envelope);
+        true
+    }
+
+    fn fail_fatally(&mut self, code: &str, message: String) {
+        self.fatal_error = true;
+        for (_, token) in self.backend_tokens.drain() {
+            token.cancel();
+        }
+        for (_, token) in self.tool_tokens.drain() {
+            token.cancel();
+        }
+        let error = AgentError {
+            message,
+            code: code.into(),
+            details: None,
+        };
+        self.agent.state.status = AgentStatus::Failed;
+        self.agent.state.active_run = None;
+        self.agent.state.pending_tools.clear();
+        self.agent.state.pending_permissions.clear();
+        self.agent.state.last_error = Some(error.clone());
+        self.final_result = Some(Err(error));
+        self.publish_status();
     }
 
     /// Persists a session mutation through the injected session store.
@@ -617,13 +669,7 @@ impl AgentRunner {
             return;
         }
 
-        let global_permit = self.scheduler.acquire_backend_permit().await;
         let backend_id = self.backend.descriptor().id;
-        let backend_guard = self
-            .scheduler
-            .acquire_backend_specific_permit(backend_id)
-            .await;
-
         let run_id = request.run_id;
         let request_id = request.request_id;
         let (event_tx, mut event_rx) = broadcast::channel(256);
@@ -658,11 +704,21 @@ impl AgentRunner {
         });
 
         let backend = self.backend.clone();
+        let scheduler = self.scheduler.clone();
         let result_commands = self.task.commands_tx.clone();
         let result_token = token.clone();
         tokio::spawn(async move {
-            let _global_permit = global_permit;
-            let _backend_guard = backend_guard;
+            // Capacity waits must never block the agent mailbox. Both waits
+            // are also run-cancellable, so a queued request cannot survive a
+            // cancellation and execute later.
+            let _global_permit = tokio::select! {
+                permit = scheduler.acquire_backend_permit() => permit,
+                _ = result_token.cancelled() => return,
+            };
+            let _backend_guard = tokio::select! {
+                guard = scheduler.acquire_backend_specific_permit(backend_id) => guard,
+                _ = result_token.cancelled() => return,
+            };
             let outcome = backend.execute(request, event_tx, result_token).await;
             let terminal_forwarded = forward_handle.await.unwrap_or(false);
             if !terminal_forwarded {
@@ -679,8 +735,6 @@ impl AgentRunner {
 
     /// Executes a tool call and reports the result to the agent's mailbox.
     async fn execute_tool(&mut self, request: ToolRequest) {
-        let permit = self.scheduler.acquire_tool_permit().await;
-
         let call_id = request.call.id;
         let name = request.call.name.clone();
         let arguments = request.call.arguments.clone();
@@ -688,9 +742,15 @@ impl AgentRunner {
         self.tool_tokens.insert(call_id, token.clone());
         let commands = self.task.commands_tx.clone();
         let executor = self.tool_registry.get_executor(&name);
+        let scheduler = self.scheduler.clone();
 
         tokio::spawn(async move {
-            let _permit = permit;
+            // Like provider capacity, tool capacity is a cancellable queue
+            // wait and must not stall the runner's command mailbox.
+            let _permit = tokio::select! {
+                permit = scheduler.acquire_tool_permit() => permit,
+                _ = token.cancelled() => return,
+            };
             let Some(executor) = executor else {
                 let _ = commands
                     .send(AgentCommand::ToolFailed {
@@ -821,6 +881,66 @@ mod tests {
                 tools: AgentToolset {
                     tools: StdHashMap::new(),
                 },
+                can_spawn_agents: false,
+                max_child_depth: None,
+                workspace: WorkspaceCapabilities {
+                    can_read: false,
+                    can_write: false,
+                    can_search: false,
+                },
+                backend: BackendCapabilities::default(),
+            },
+            AgentBudget::default(),
+        )
+    }
+
+    /// Builds a test agent with a single tool whose policy requires
+    /// permission (`PermissionMode::Ask`), used to exercise the
+    /// `WaitingForPermission` state.
+    fn test_agent_with_ask_permission_tool(
+        agent_id: AgentId,
+        session_id: SessionId,
+        tool_name: &str,
+    ) -> Agent {
+        let tool_id = harness_protocol::ids::ToolId::new();
+        let mut tools = StdHashMap::new();
+        tools.insert(
+            tool_id,
+            harness_protocol::tools::ToolCapability {
+                descriptor: harness_protocol::tools::ToolDescriptor {
+                    id: tool_id,
+                    name: tool_name.into(),
+                    description: "ask-permission test tool".into(),
+                    input_schema: serde_json::json!({}),
+                },
+                policy: harness_protocol::tools::ToolPolicy {
+                    permission: harness_protocol::tools::PermissionMode::Ask,
+                    enabled: true,
+                },
+                delegatable: false,
+            },
+        );
+        Agent::new(
+            agent_id,
+            session_id,
+            None,
+            0,
+            String::new(),
+            BackendBinding {
+                reference: BackendReference {
+                    integration: IntegrationId::new(),
+                    configuration: ConfigurationId::new(),
+                    model: None,
+                },
+                descriptor: BackendDescriptor {
+                    id: BackendId::new(),
+                    name: "fake".into(),
+                    description: "fake".into(),
+                    capabilities: BackendCapabilities::default(),
+                },
+            },
+            AgentCapabilities {
+                tools: AgentToolset { tools },
                 can_spawn_agents: false,
                 max_child_depth: None,
                 workspace: WorkspaceCapabilities {
@@ -1018,5 +1138,570 @@ mod tests {
             .expect("runner should exit once the mailbox is closed")
             .expect("runner task should not panic");
         assert_eq!(runner.agent.state.status, AgentStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_processed_while_backend_waits_for_scheduler_capacity() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, sender) = AgentTask::new(agent_id);
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+            max_concurrent_backend_requests: 0,
+            ..SchedulerConfig::default()
+        }));
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            Arc::new(FakeBackend::new().blocking_until_cancelled()),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel,
+            live_state.clone(),
+            scheduler,
+        );
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "wait for capacity".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("start run");
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|state| state.status == AgentStatus::PreparingContext)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should reach its scheduler-capacity wait");
+        sender.send(AgentCommand::Cancel).await.expect("cancel run");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|state| state.status == AgentStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity wait must not block cancellation");
+
+        drop(sender);
+        let runner = tokio::time::timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("cancelled capacity wait should release mailbox senders")
+            .expect("runner task should not panic");
+        assert_eq!(runner.agent.state.status, AgentStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn strict_commit_failure_terminates_with_truthful_failed_state() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, sender) = AgentTask::new(agent_id);
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let store = Arc::new(harness_session_store::testing::MemoryStore::new());
+        store.set_fail_appends(true);
+        let committer = Arc::new(SessionCommitter::new(store, session_id));
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            Arc::new(FakeBackend::new().blocking_until_cancelled()),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            CancellationToken::new(),
+            live_state.clone(),
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+        )
+        .with_committer(committer)
+        .long_lived(true);
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "must be durable".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("start run");
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        let mut runner = tokio::time::timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("strict persistence failure must terminate the runner")
+            .expect("runner task should not panic");
+        assert_eq!(runner.agent.state.status, AgentStatus::Failed);
+        assert!(runner.agent.state.active_run.is_none());
+        let error = runner
+            .take_final_result()
+            .expect("fatal result")
+            .expect_err("strict persistence failure must be an error");
+        assert_eq!(error.code, "PERSISTENCE_COMMIT_FAILED");
+        assert_eq!(
+            live_state
+                .lock()
+                .expect("live_state mutex poisoned")
+                .get(&agent_id)
+                .expect("live state")
+                .status,
+            AgentStatus::Failed
+        );
+    }
+
+    /// M2: a `FollowUp` sent while a run is active must queue FIFO
+    /// (`Agent::queued_inputs`) rather than starting immediately, and the
+    /// long-lived runner's automatic `StartNextQueuedRun` drain must start
+    /// it only after the first run genuinely finishes.
+    #[tokio::test]
+    async fn follow_up_queued_while_run_active_starts_after_first_completes() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, sender) = AgentTask::new(agent_id);
+        let request_id = harness_protocol::ids::RequestId::new();
+        let backend = Arc::new(
+            FakeBackend::new()
+                .with_events(vec![ExecutionEvent::TextDelta {
+                    request_id,
+                    delta: "partial".into(),
+                }])
+                .with_result(harness_protocol::backend::ExecutionResult {
+                    request_id,
+                    usage: harness_protocol::usage::ModelUsage::default(),
+                    cost: harness_protocol::usage::Cost::default(),
+                    finish_reason: "end_turn".into(),
+                }),
+        );
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            backend,
+            tool_registry,
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel.clone(),
+            live_state.clone(),
+            scheduler,
+        )
+        .long_lived(true);
+
+        let mut events_rx = runner.task.events.subscribe();
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "first".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send first StartRun");
+
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        // Wait until the first run is genuinely in flight (Streaming) before
+        // sending the follow-up, so it is guaranteed to be queued rather
+        // than started immediately.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|state| state.status == AgentStatus::Streaming)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first run should reach Streaming");
+
+        sender
+            .send(AgentCommand::FollowUp {
+                input: UserInput {
+                    text: "second".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send follow-up while first run is active");
+
+        // Collect events in order until we observe two RunStarted events,
+        // proving the follow-up was queued (not started immediately) and
+        // only began after the first run's Completed/FinishRun.
+        let mut run_started_count = 0;
+        let mut saw_first_completed_before_second_start = false;
+        let mut first_completed_seen = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(envelope) = events_rx.recv().await {
+                match envelope.event {
+                    AgentEvent::Completed { .. } => {
+                        first_completed_seen = true;
+                    }
+                    AgentEvent::RunStarted { .. } => {
+                        run_started_count += 1;
+                        if run_started_count == 2 {
+                            saw_first_completed_before_second_start = first_completed_seen;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("should observe a second RunStarted for the queued follow-up");
+
+        assert_eq!(run_started_count, 2, "the follow-up must eventually start its own run");
+        assert!(
+            saw_first_completed_before_second_start,
+            "the queued follow-up must not start until the first run completed"
+        );
+
+        drop(sender);
+        let runner = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("runner should exit once the mailbox is closed")
+            .expect("runner task should not panic");
+        assert!(
+            runner.agent.state.queued_inputs.is_empty(),
+            "the queue must be drained once the follow-up run has started"
+        );
+    }
+
+    /// M2: the runner's long-lived loop drains the next queued input
+    /// (`StartNextQueuedRun`) after *any* `FinishRun` effect, not just a
+    /// successful completion — `fail()` emits `FinishRun` exactly like a
+    /// success or a cancellation does. This locks that behavior down for the
+    /// failure case specifically: a follow-up queued while a run is active
+    /// must still start its own run after the first run fails, not be
+    /// stranded in `queued_inputs` forever.
+    #[tokio::test]
+    async fn follow_up_queued_while_run_active_starts_after_first_run_fails() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, sender) = AgentTask::new(agent_id);
+        let backend = Arc::new(FakeBackend::new().with_error(
+            harness_protocol::backend::ExecutionError::BackendError {
+                message: "simulated transient failure".into(),
+                code: "TEMPORARY".into(),
+            },
+        ));
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            backend,
+            tool_registry,
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel.clone(),
+            live_state.clone(),
+            scheduler,
+        )
+        .long_lived(true);
+
+        let mut events_rx = runner.task.events.subscribe();
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "first".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send first StartRun");
+
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|state| state.status == AgentStatus::PreparingContext)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first run should reach PreparingContext");
+
+        sender
+            .send(AgentCommand::FollowUp {
+                input: UserInput {
+                    text: "second".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("queue a follow-up while the first run is active");
+
+        let mut run_started_count = 0;
+        let mut saw_first_failed_before_second_start = false;
+        let mut first_failed_seen = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(envelope) = events_rx.recv().await {
+                match envelope.event {
+                    AgentEvent::Failed { .. } => {
+                        first_failed_seen = true;
+                    }
+                    AgentEvent::RunStarted { .. } => {
+                        run_started_count += 1;
+                        if run_started_count == 2 {
+                            saw_first_failed_before_second_start = first_failed_seen;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("should observe a second RunStarted for the queued follow-up after the failure");
+
+        assert_eq!(
+            run_started_count, 2,
+            "the follow-up must eventually start its own run after the first run fails"
+        );
+        assert!(
+            saw_first_failed_before_second_start,
+            "the queued follow-up must not start until the first run has failed"
+        );
+
+        drop(sender);
+        let runner = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("runner should exit once the mailbox is closed")
+            .expect("runner task should not panic");
+        assert!(
+            runner.agent.state.queued_inputs.is_empty(),
+            "the queue must be drained once the follow-up run has started"
+        );
+    }
+
+    /// M2: `AgentCommand::Cancel` is documented as cancelling only the
+    /// *current run* (see `AgentCommand::Cancel`'s doc comment and RC-203's
+    /// `multiple_follow_ups_are_fifo_and_survive_cancellation`). A follow-up
+    /// queued while a run was active is already-committed user intent and
+    /// must survive session/runner-level cancellation too, not just an
+    /// explicit `AgentCommand::Cancel` applied directly to the core state
+    /// machine — otherwise a queued follow-up typed just before a crash or a
+    /// host-initiated teardown would be silently lost, which the `Agent`
+    /// value itself must not misrepresent to a caller or restore path that
+    /// inspects it afterward.
+    #[tokio::test]
+    async fn queued_follow_up_survives_runner_cancellation() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, sender) = AgentTask::new(agent_id);
+        let backend = Arc::new(FakeBackend::new().blocking_until_cancelled());
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            backend,
+            tool_registry,
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel.clone(),
+            live_state.clone(),
+            scheduler,
+        )
+        .long_lived(true);
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "first".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("send first StartRun");
+        sender
+            .send(AgentCommand::FollowUp {
+                input: UserInput {
+                    text: "queued".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("queue a follow-up while the first run is active");
+
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let runner = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("runner should stop promptly after cancellation")
+            .expect("runner task should not panic");
+
+        assert_eq!(runner.agent.state.status, AgentStatus::Cancelled);
+        assert_eq!(
+            runner.agent.state.queued_inputs.len(),
+            1,
+            "cancellation must not discard already-queued follow-up/steer input"
+        );
+        assert_eq!(
+            runner.agent.state.queued_inputs[0].text, "queued",
+            "the surviving queued input must be the one sent before cancellation"
+        );
+    }
+
+    /// M2: cancellation must be processed while the agent is
+    /// `WaitingForPermission`, and must not leave stale `pending_permissions`
+    /// or `pending_tools` state behind.
+    #[tokio::test]
+    async fn cancel_while_waiting_for_permission_transitions_to_cancelled() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let tool_name = "ask.tool";
+        let agent = test_agent_with_ask_permission_tool(agent_id, session_id, tool_name);
+        let (task, sender) = AgentTask::new(agent_id);
+        let call_id = harness_protocol::ids::ToolCallId::new();
+        let request_id = harness_protocol::ids::RequestId::new();
+        let backend = Arc::new(
+            FakeBackend::new()
+                .with_events(vec![ExecutionEvent::ToolCallRequested {
+                    request_id,
+                    call: harness_protocol::tools::ToolCall {
+                        id: call_id,
+                        name: tool_name.into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }])
+                .blocking_until_cancelled(),
+        );
+        let tool_registry = Arc::new(FakeToolRegistry::new());
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            backend,
+            tool_registry,
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel.clone(),
+            live_state.clone(),
+            scheduler,
+        );
+
+        sender
+            .send(AgentCommand::StartRun {
+                input: UserInput {
+                    text: "please".into(),
+                    attachments: vec![],
+                },
+            })
+            .await
+            .expect("start run");
+
+        let run_handle = tokio::spawn(async move {
+            runner.run().await;
+            runner
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if live_state
+                    .lock()
+                    .expect("live_state mutex poisoned")
+                    .get(&agent_id)
+                    .is_some_and(|state| state.status == AgentStatus::WaitingForPermission)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should reach WaitingForPermission");
+
+        cancel.cancel();
+
+        let runner = tokio::time::timeout(Duration::from_secs(2), run_handle)
+            .await
+            .expect("runner should stop promptly after cancellation while waiting for permission")
+            .expect("runner task should not panic");
+
+        assert_eq!(runner.agent.state.status, AgentStatus::Cancelled);
+        assert!(runner.agent.state.pending_permissions.is_empty());
+        assert!(runner.agent.state.pending_tools.is_empty());
+        assert_eq!(
+            live_state
+                .lock()
+                .expect("live_state mutex poisoned")
+                .get(&agent_id)
+                .expect("live state")
+                .status,
+            AgentStatus::Cancelled
+        );
     }
 }

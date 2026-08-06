@@ -216,10 +216,20 @@ async fn real_tools_e2e_fs_read_real_execution() {
         if !batch.is_empty() {
             all_events.extend(batch);
         }
-        if all_events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Completed { .. }))
-        {
+        // Wait on `ToolCallCompleted`, not just the top-level `Completed`:
+        // `make_tool_call_backend` scripts its own `Completed` event with
+        // finish_reason "tool_use" as part of the *same* replayed sequence
+        // that also emits `ToolCallRequested`, so it is not causally ordered
+        // after the real tool execution's disk I/O the way `ToolCallCompleted`
+        // is (that event is only emitted once `execute_tool`'s spawned task
+        // has actually awaited the tool executor to completion). Breaking on
+        // `Completed` alone raced the real filesystem write.
+        if all_events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Completed { .. } | AgentEvent::ToolCallCompleted { .. }
+            )
+        }) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -302,10 +312,20 @@ async fn real_tools_e2e_fs_edit_real_execution() {
         if !batch.is_empty() {
             all_events.extend(batch);
         }
-        if all_events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Completed { .. }))
-        {
+        // Wait on `ToolCallCompleted`, not just the top-level `Completed`:
+        // `make_tool_call_backend` scripts its own `Completed` event with
+        // finish_reason "tool_use" as part of the *same* replayed sequence
+        // that also emits `ToolCallRequested`, so it is not causally ordered
+        // after the real tool execution's disk I/O the way `ToolCallCompleted`
+        // is (that event is only emitted once `execute_tool`'s spawned task
+        // has actually awaited the tool executor to completion). Breaking on
+        // `Completed` alone raced the real filesystem write.
+        if all_events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Completed { .. } | AgentEvent::ToolCallCompleted { .. }
+            )
+        }) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -367,10 +387,20 @@ async fn real_tools_e2e_workspace_search_real_execution() {
         if !batch.is_empty() {
             all_events.extend(batch);
         }
-        if all_events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Completed { .. }))
-        {
+        // Wait on `ToolCallCompleted`, not just the top-level `Completed`:
+        // `make_tool_call_backend` scripts its own `Completed` event with
+        // finish_reason "tool_use" as part of the *same* replayed sequence
+        // that also emits `ToolCallRequested`, so it is not causally ordered
+        // after the real tool execution's disk I/O the way `ToolCallCompleted`
+        // is (that event is only emitted once `execute_tool`'s spawned task
+        // has actually awaited the tool executor to completion). Breaking on
+        // `Completed` alone raced the real filesystem write.
+        if all_events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Completed { .. } | AgentEvent::ToolCallCompleted { .. }
+            )
+        }) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
