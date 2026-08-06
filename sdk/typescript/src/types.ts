@@ -158,6 +158,7 @@ export interface AgentEventEnvelope {
 
 export interface ProtocolCapabilities {
   resumable_subscribe: boolean;
+  lifecycle_commands: boolean;
 }
 
 export type RpcRequestBody =
@@ -171,6 +172,8 @@ export type RpcRequestBody =
       };
     }
   | { Prompt: UserInput }
+  | { Steer: UserInput }
+  | { FollowUp: UserInput }
   | "Cancel"
   | "Pause"
   | "Resume"

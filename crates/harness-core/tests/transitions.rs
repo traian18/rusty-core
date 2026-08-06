@@ -252,6 +252,37 @@ fn cancel_stops_further_effects() {
 }
 
 #[test]
+fn cancelling_active_run_preserves_admitted_follow_ups() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let cancelled_run = start(&mut agent);
+    agent.apply(AgentCommand::FollowUp {
+        input: UserInput {
+            text: "continue after cancellation".into(),
+            attachments: vec![],
+        },
+    });
+
+    let effects = agent.apply(AgentCommand::Cancel);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::CancelBackend { run_id } if *run_id == cancelled_run
+    )));
+    assert_eq!(agent.state.queued_inputs.len(), 1);
+
+    let next_effects = agent.apply(AgentCommand::StartNextQueuedRun);
+    assert!(next_effects.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::ExecuteBackend { request }
+            if matches!(
+                &request.messages.last().expect("queued message").content[0],
+                ContentBlock::Text { text } if text == "continue after cancellation"
+            )
+    )));
+    assert!(agent.state.active_run.is_some());
+    assert_eq!(agent.state.queued_inputs.len(), 0);
+}
+
+#[test]
 fn follow_ups_are_admitted_fifo_and_start_after_completion() {
     let mut agent = create_agent(PermissionMode::Allow);
     let first_run = start(&mut agent);

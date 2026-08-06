@@ -82,7 +82,11 @@ pub enum RpcRequestBody {
     },
     /// Start a run with the given user input.
     Prompt(UserInput),
-    /// Cancel the session's current run.
+    /// Inject input at the next safe command boundary of the active run.
+    Steer(UserInput),
+    /// Queue input FIFO for a subsequent run.
+    FollowUp(UserInput),
+    /// Cancel the session's active run while preserving queued follow-ups.
     Cancel,
     /// Pause the session.
     Pause,
@@ -155,12 +159,15 @@ pub enum RpcResponseBody {
 pub struct ProtocolCapabilities {
     /// Whether `Subscribe { since_seq: Some(_) }` is supported.
     pub resumable_subscribe: bool,
+    /// Whether the daemon supports `Steer` and `FollowUp` lifecycle commands.
+    pub lifecycle_commands: bool,
 }
 
 impl Default for ProtocolCapabilities {
     fn default() -> Self {
         Self {
             resumable_subscribe: true,
+            lifecycle_commands: true,
         }
     }
 }
@@ -308,5 +315,32 @@ mod tests {
     fn protocol_capabilities_default_advertises_resumable_subscribe() {
         let capabilities = ProtocolCapabilities::default();
         assert!(capabilities.resumable_subscribe);
+        assert!(capabilities.lifecycle_commands);
+    }
+
+    #[test]
+    fn lifecycle_requests_round_trip_through_json() {
+        for body in [
+            RpcRequestBody::Steer(UserInput {
+                text: "focus on tests".into(),
+                attachments: vec![],
+            }),
+            RpcRequestBody::FollowUp(UserInput {
+                text: "then summarize".into(),
+                attachments: vec![],
+            }),
+        ] {
+            let request = RpcRequest {
+                id: RequestCorrelationId(9),
+                session_id: Some(SessionId::new()),
+                body,
+            };
+            let json = serde_json::to_string(&request).expect("serializable");
+            let parsed: RpcRequest = serde_json::from_str(&json).expect("deserializable");
+            assert!(matches!(
+                parsed.body,
+                RpcRequestBody::Steer(_) | RpcRequestBody::FollowUp(_)
+            ));
+        }
     }
 }

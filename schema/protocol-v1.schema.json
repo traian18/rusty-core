@@ -1,0 +1,273 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rusty-core/schema/protocol-v1.schema.json",
+  "title": "Rusty harnessd wire protocol v1",
+  "description": "Hand-authored JSON Schema mirroring crates/harness-protocol/src/{rpc,events,commands,ids}.rs. This is the language-neutral description referenced by sdk_plan.md SDK-201; it is not yet generated from the Rust source and can drift until codegen exists. Treat the Rust source as authoritative if the two disagree.",
+  "definitions": {
+    "SessionId": { "type": "string", "format": "uuid" },
+    "AgentId": { "type": "string", "format": "uuid" },
+    "RunId": { "type": "string", "format": "uuid" },
+    "RequestId": { "type": "string", "format": "uuid" },
+    "ToolCallId": { "type": "string", "format": "uuid" },
+    "MessageId": { "type": "string", "format": "uuid" },
+    "EventId": { "type": "string", "format": "uuid" },
+    "PermissionId": { "type": "string", "format": "uuid" },
+    "Timestamp": { "type": "string", "format": "date-time" },
+
+    "Attachment": {
+      "type": "object",
+      "required": ["mime_type", "data"],
+      "properties": {
+        "mime_type": { "type": "string" },
+        "data": {
+          "type": "string",
+          "description": "Base64-encoded bytes; the Rust type is Vec<u8>, which serde_json encodes as a JSON array of numbers by default, NOT base64. This schema documents the intended SDK-facing contract from sdk_plan.md SDK-503, not necessarily the exact byte-array shape emitted by the current Rust serde derive. Verify against a live CreateSession/Prompt round trip before relying on this field's exact wire shape."
+        }
+      }
+    },
+    "UserInput": {
+      "type": "object",
+      "required": ["text", "attachments"],
+      "properties": {
+        "text": { "type": "string" },
+        "attachments": { "type": "array", "items": { "$ref": "#/definitions/Attachment" } }
+      }
+    },
+    "PermissionDecision": { "enum": ["Approved", "Denied"] },
+    "AgentStatus": {
+      "enum": [
+        "Idle", "PreparingContext", "WaitingForBackend", "Streaming", "Executing",
+        "WaitingForPermission", "WaitingForChildren", "Paused", "Completed", "Cancelled", "Failed"
+      ]
+    },
+    "AgentError": {
+      "type": "object",
+      "required": ["message", "code"],
+      "properties": {
+        "message": { "type": "string" },
+        "code": { "type": "string" },
+        "details": {}
+      }
+    },
+    "ToolCall": {
+      "type": "object",
+      "required": ["id", "name", "arguments"],
+      "properties": {
+        "id": { "$ref": "#/definitions/ToolCallId" },
+        "name": { "type": "string" },
+        "arguments": {}
+      }
+    },
+    "ToolProgress": {
+      "type": "object",
+      "required": ["status", "fraction"],
+      "properties": {
+        "status": { "type": "string" },
+        "fraction": { "type": "number" }
+      }
+    },
+    "ToolResultSummary": {
+      "type": "object",
+      "required": ["has_error", "output_preview"],
+      "properties": {
+        "has_error": { "type": "boolean" },
+        "output_preview": { "type": "string" }
+      }
+    },
+    "PermissionRequest": {
+      "type": "object",
+      "required": ["id", "tool_call", "agent_id"],
+      "properties": {
+        "id": { "$ref": "#/definitions/PermissionId" },
+        "tool_call": { "$ref": "#/definitions/ToolCall" },
+        "agent_id": { "$ref": "#/definitions/AgentId" }
+      }
+    },
+    "EventVisibility": { "enum": ["User", "Developer", "Internal"] },
+    "AgentOutcome": { "enum": ["Success", "Cancelled", "Failed"] },
+
+    "AgentEvent": {
+      "description": "Externally-tagged union: exactly one of the properties below is present, named after the Rust enum variant.",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "StateChanged": {
+          "type": "object", "required": ["from", "to"],
+          "properties": { "from": { "$ref": "#/definitions/AgentStatus" }, "to": { "$ref": "#/definitions/AgentStatus" } }
+        },
+        "RunStarted": {
+          "type": "object", "required": ["run_id"],
+          "properties": { "run_id": { "$ref": "#/definitions/RunId" } }
+        },
+        "BackendRequestStarted": {
+          "type": "object", "required": ["request_id"],
+          "properties": { "request_id": { "$ref": "#/definitions/RequestId" } }
+        },
+        "AssistantMessageStarted": {
+          "type": "object", "required": ["message_id"],
+          "properties": { "message_id": { "$ref": "#/definitions/MessageId" } }
+        },
+        "AssistantTextDelta": {
+          "type": "object", "required": ["message_id", "delta"],
+          "properties": { "message_id": { "$ref": "#/definitions/MessageId" }, "delta": { "type": "string" } }
+        },
+        "ReasoningDelta": {
+          "type": "object", "required": ["message_id", "delta"],
+          "properties": { "message_id": { "$ref": "#/definitions/MessageId" }, "delta": { "type": "string" } }
+        },
+        "AssistantMessageCompleted": {
+          "type": "object", "required": ["message_id"],
+          "properties": { "message_id": { "$ref": "#/definitions/MessageId" } }
+        },
+        "ToolCallRequested": {
+          "type": "object", "required": ["call"],
+          "properties": { "call": { "$ref": "#/definitions/ToolCall" } }
+        },
+        "ToolCallStarted": {
+          "type": "object", "required": ["call_id"],
+          "properties": { "call_id": { "$ref": "#/definitions/ToolCallId" } }
+        },
+        "ToolCallProgress": {
+          "type": "object", "required": ["call_id", "progress"],
+          "properties": { "call_id": { "$ref": "#/definitions/ToolCallId" }, "progress": { "$ref": "#/definitions/ToolProgress" } }
+        },
+        "ToolCallCompleted": {
+          "type": "object", "required": ["call_id", "result"],
+          "properties": { "call_id": { "$ref": "#/definitions/ToolCallId" }, "result": { "$ref": "#/definitions/ToolResultSummary" } }
+        },
+        "PermissionRequested": {
+          "type": "object", "required": ["request"],
+          "properties": { "request": { "$ref": "#/definitions/PermissionRequest" } }
+        },
+        "UsageUpdated": {
+          "type": "object", "required": ["usage"],
+          "properties": { "usage": { "type": "object" } }
+        },
+        "ChildAgentSpawned": {
+          "type": "object", "required": ["agent_id"],
+          "properties": { "agent_id": { "$ref": "#/definitions/AgentId" } }
+        },
+        "ChildAgentCompleted": {
+          "type": "object", "required": ["agent_id", "outcome"],
+          "properties": { "agent_id": { "$ref": "#/definitions/AgentId" }, "outcome": { "$ref": "#/definitions/AgentOutcome" } }
+        },
+        "Failed": {
+          "type": "object", "required": ["error"],
+          "properties": { "error": { "$ref": "#/definitions/AgentError" } }
+        },
+        "Completed": {
+          "type": "object", "required": ["outcome"],
+          "properties": { "outcome": { "$ref": "#/definitions/AgentOutcome" } }
+        }
+      }
+    },
+
+    "AgentEventEnvelope": {
+      "type": "object",
+      "required": [
+        "event_id", "session_id", "agent_id", "parent_agent_id", "run_id",
+        "agent_sequence", "session_sequence", "timestamp", "visibility", "event"
+      ],
+      "properties": {
+        "event_id": { "$ref": "#/definitions/EventId" },
+        "session_id": { "$ref": "#/definitions/SessionId" },
+        "agent_id": { "$ref": "#/definitions/AgentId" },
+        "parent_agent_id": { "anyOf": [{ "$ref": "#/definitions/AgentId" }, { "type": "null" }] },
+        "run_id": { "anyOf": [{ "$ref": "#/definitions/RunId" }, { "type": "null" }] },
+        "agent_sequence": { "type": "integer", "minimum": 0 },
+        "session_sequence": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "timestamp": { "$ref": "#/definitions/Timestamp" },
+        "visibility": { "$ref": "#/definitions/EventVisibility" },
+        "event": { "$ref": "#/definitions/AgentEvent" }
+      }
+    },
+
+    "ProtocolCapabilities": {
+      "type": "object",
+      "required": ["resumable_subscribe", "lifecycle_commands"],
+      "properties": {
+        "resumable_subscribe": { "type": "boolean" },
+        "lifecycle_commands": { "type": "boolean", "description": "Whether Steer and FollowUp are accepted." }
+      },
+      "description": "Capabilities advertise optional protocol features. sdk_plan.md SDK-200 tracks typed errors, list-sessions, and cursor pagination."
+    },
+
+    "RpcRequestBody": {
+      "description": "Externally-tagged union. Unit variants (Cancel/Pause/Resume/Snapshot/CloseSession) serialize as a bare string, not an object.",
+      "anyOf": [
+        { "type": "object", "required": ["Hello"], "properties": { "Hello": { "type": "object", "required": ["protocol_version"], "properties": { "protocol_version": { "type": "integer" } } } } },
+        { "type": "object", "required": ["CreateSession"], "properties": { "CreateSession": {
+            "type": "object",
+            "required": ["workspace_root", "integration", "integration_config", "toolset"],
+            "properties": {
+              "workspace_root": { "type": "string" },
+              "integration": { "type": "string" },
+              "integration_config": {},
+              "toolset": { "type": "array", "items": { "type": "string" } }
+            }
+        } } },
+        { "type": "object", "required": ["Prompt"], "properties": { "Prompt": { "$ref": "#/definitions/UserInput" } } },
+        { "type": "object", "required": ["Steer"], "properties": { "Steer": { "$ref": "#/definitions/UserInput" } } },
+        { "type": "object", "required": ["FollowUp"], "properties": { "FollowUp": { "$ref": "#/definitions/UserInput" } } },
+        { "const": "Cancel" },
+        { "const": "Pause" },
+        { "const": "Resume" },
+        { "type": "object", "required": ["ResolvePermission"], "properties": { "ResolvePermission": {
+            "type": "object", "required": ["id", "decision"],
+            "properties": { "id": { "$ref": "#/definitions/PermissionId" }, "decision": { "$ref": "#/definitions/PermissionDecision" } }
+        } } },
+        { "const": "Snapshot" },
+        { "type": "object", "required": ["Subscribe"], "properties": { "Subscribe": {
+            "type": "object", "required": ["since_seq"],
+            "properties": { "since_seq": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] } }
+        } } },
+        { "const": "CloseSession" }
+      ]
+    },
+
+    "RpcRequest": {
+      "type": "object",
+      "required": ["id", "session_id", "body"],
+      "properties": {
+        "id": { "type": "integer", "description": "Client-assigned correlation id, echoed on the matching response." },
+        "session_id": { "anyOf": [{ "$ref": "#/definitions/SessionId" }, { "type": "null" }] },
+        "body": { "$ref": "#/definitions/RpcRequestBody" }
+      }
+    },
+
+    "RpcResponseBody": {
+      "description": "Externally-tagged union. `Ack` is a bare string.",
+      "anyOf": [
+        { "type": "object", "required": ["Hello"], "properties": { "Hello": {
+            "type": "object", "required": ["protocol_version", "capabilities"],
+            "properties": { "protocol_version": { "type": "integer" }, "capabilities": { "$ref": "#/definitions/ProtocolCapabilities" } }
+        } } },
+        { "type": "object", "required": ["SessionCreated"], "properties": { "SessionCreated": {
+            "type": "object", "required": ["session_id"], "properties": { "session_id": { "$ref": "#/definitions/SessionId" } }
+        } } },
+        { "const": "Ack" },
+        { "type": "object", "required": ["Snapshot"], "properties": { "Snapshot": { "type": "object", "description": "Opaque pending sdk_plan.md SDK-400 (stable snapshot schema)." } } },
+        { "type": "object", "required": ["Event"], "properties": { "Event": { "$ref": "#/definitions/AgentEventEnvelope" } } },
+        { "type": "object", "required": ["Error"], "properties": { "Error": {
+            "type": "object", "required": ["message"], "properties": { "message": { "type": "string" } },
+            "description": "Untyped today. sdk_plan.md SDK-200 tracks adding a structured code/category/retryable/details shape."
+        } } }
+      ]
+    },
+
+    "RpcResponse": {
+      "type": "object",
+      "required": ["id", "body"],
+      "properties": {
+        "id": { "anyOf": [{ "type": "integer" }, { "type": "null" }], "description": "null marks a server-pushed event frame rather than a reply." },
+        "body": { "$ref": "#/definitions/RpcResponseBody" }
+      }
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/definitions/RpcRequest" },
+    { "$ref": "#/definitions/RpcResponse" }
+  ]
+}

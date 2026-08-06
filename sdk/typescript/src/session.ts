@@ -22,6 +22,16 @@ export class HarnessSession {
     return this.client.prompt(this.sessionId, text);
   }
 
+  /** Inject input at the active run's next safe command boundary. */
+  steer(text: string): Promise<void> {
+    return this.client.steer(this.sessionId, text);
+  }
+
+  /** Queue input FIFO to run after the active run completes. */
+  followUp(text: string): Promise<void> {
+    return this.client.followUp(this.sessionId, text);
+  }
+
   /** Cancel the active run, if any. */
   cancel(): Promise<void> {
     return this.client.cancel(this.sessionId);

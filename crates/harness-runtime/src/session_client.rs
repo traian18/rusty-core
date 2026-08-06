@@ -129,6 +129,14 @@ impl SessionClient {
         self.runtime.follow_up(input).await
     }
 
+    /// Cancel only the active root-agent run.
+    ///
+    /// The session stays open, and any already-admitted follow-ups remain in
+    /// FIFO order for the long-lived root runner.
+    pub async fn cancel_run(&self) -> Result<(), SessionError> {
+        self.runtime.cancel_run().await
+    }
+
     /// Resolve a permission request originating from the root agent.
     pub async fn resolve_permission(
         &self,

@@ -147,16 +147,27 @@ impl RpcHandler for HarnessRpcHandler {
             RpcRequestBody::CreateSession { .. } => unreachable!("handled above"),
 
             RpcRequestBody::Prompt(input) => {
-                // SessionHandle::send only takes the prompt text today —
-                // UserInput::attachments has no plumbing through the public
-                // engine API yet. Revisit once that's added.
-                match handle.send(&input.text).await {
+                match handle.send_input(input).await {
                     Ok(()) => RpcResponseBody::Ack,
                     Err(error) => RpcResponseBody::Error {
                         message: error.to_string(),
                     },
                 }
             }
+
+            RpcRequestBody::Steer(input) => match handle.steer_input(input).await {
+                Ok(()) => RpcResponseBody::Ack,
+                Err(error) => RpcResponseBody::Error {
+                    message: error.to_string(),
+                },
+            },
+
+            RpcRequestBody::FollowUp(input) => match handle.follow_up_input(input).await {
+                    Ok(()) => RpcResponseBody::Ack,
+                    Err(error) => RpcResponseBody::Error {
+                        message: error.to_string(),
+                    },
+            },
 
             RpcRequestBody::Cancel => match handle.cancel().await {
                 Ok(()) => RpcResponseBody::Ack,
@@ -339,6 +350,42 @@ mod tests {
             .handle(Some(session_id), RpcRequestBody::Snapshot)
             .await;
         assert!(matches!(after_close, RpcResponseBody::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_input_commands_are_admitted() {
+        let (handler, _store_dir) = new_handler().await;
+        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+        let create = handler
+            .handle(
+                None,
+                RpcRequestBody::CreateSession {
+                    workspace_root: workspace_dir.path().to_path_buf(),
+                    integration: "anthropic".to_string(),
+                    integration_config: serde_json::to_value(AnthropicConfig::new("test-key"))
+                        .unwrap(),
+                    toolset: empty_toolset(),
+                },
+            )
+            .await;
+        let session_id = match create {
+            RpcResponseBody::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+
+        for body in [
+            RpcRequestBody::Steer(harness_protocol::commands::UserInput {
+                text: "steer".into(),
+                attachments: vec![],
+            }),
+            RpcRequestBody::FollowUp(harness_protocol::commands::UserInput {
+                text: "follow-up".into(),
+                attachments: vec![],
+            }),
+        ] {
+            let response = handler.handle(Some(session_id), body).await;
+            assert!(matches!(response, RpcResponseBody::Ack));
+        }
     }
 
     #[tokio::test]

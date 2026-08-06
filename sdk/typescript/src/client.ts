@@ -81,7 +81,7 @@ export class HarnessClient {
     const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     const bootstrap = new HarnessClient(
       transport,
-      { resumable_subscribe: false },
+      { resumable_subscribe: false, lifecycle_commands: false },
       requestTimeoutMs,
     );
     const body = await bootstrap.request({
@@ -123,6 +123,22 @@ export class HarnessClient {
   async prompt(sessionId: SessionId, text: string): Promise<void> {
     await this.requestForSession(sessionId, {
       Prompt: { text, attachments: [] },
+    });
+  }
+
+  /** Inject input at the active run's next safe command boundary. */
+  async steer(sessionId: SessionId, text: string): Promise<void> {
+    this.requireLifecycleCommands();
+    await this.requestForSession(sessionId, {
+      Steer: { text, attachments: [] },
+    });
+  }
+
+  /** Queue input FIFO to run after the active run completes. */
+  async followUp(sessionId: SessionId, text: string): Promise<void> {
+    this.requireLifecycleCommands();
+    await this.requestForSession(sessionId, {
+      FollowUp: { text, attachments: [] },
     });
   }
 
@@ -194,6 +210,14 @@ export class HarnessClient {
     body: RpcRequestBody,
   ): Promise<RpcResponseBody> {
     return this.request(body, sessionId);
+  }
+
+  private requireLifecycleCommands(): void {
+    if (!this.capabilities.lifecycle_commands) {
+      throw new HarnessRpcError(
+        "the connected daemon does not support steer/follow-up lifecycle commands",
+      );
+    }
   }
 
   private request(

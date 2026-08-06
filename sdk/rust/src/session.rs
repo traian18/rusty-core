@@ -20,13 +20,6 @@ use crate::events::EventStream;
 /// [`Session::from`], or obtain one already wrapped from
 /// [`crate::Client::restore_session`].
 ///
-/// ## Current limitations
-///
-/// This SDK does not yet expose a distinct `steer` operation (mid-run
-/// instruction injection) or an explicit `close_session`/`shutdown` call
-/// through the session handle — the underlying engine does not expose them
-/// either. See `sdk_plan.md` (SDK-100/SDK-101) and `upgrade_rusty.md`
-/// (RST-002, RST-003) for the tracked work.
 pub struct Session {
     inner: SessionHandle,
 }
@@ -40,9 +33,24 @@ impl Session {
         self.inner.send(prompt).await.map_err(Into::into)
     }
 
+    /// Inject input at the active run's next safe command boundary.
+    pub async fn steer(&self, prompt: &str) -> Result<(), SdkError> {
+        self.inner.steer(prompt).await.map_err(Into::into)
+    }
+
+    /// Queue input FIFO to run after the active run completes.
+    pub async fn follow_up(&self, prompt: &str) -> Result<(), SdkError> {
+        self.inner.follow_up(prompt).await.map_err(Into::into)
+    }
+
     /// Cancel the active run, if any.
     pub async fn cancel(&self) -> Result<(), SdkError> {
         self.inner.cancel().await.map_err(Into::into)
+    }
+
+    /// Close this session permanently and release its scheduler slot.
+    pub async fn close(&self) -> Result<(), SdkError> {
+        self.inner.close().await.map_err(Into::into)
     }
 
     /// Resolve a pending tool-call permission request.

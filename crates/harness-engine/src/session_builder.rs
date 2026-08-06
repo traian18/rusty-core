@@ -430,43 +430,58 @@ impl SessionHandle {
     }
 
     pub async fn send(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.client
-            .send(SessionCommand::Prompt(UserInput {
-                text: prompt.to_string(),
-                attachments: vec![],
-            }))
-            .await?;
+        self.send_input(UserInput {
+            text: prompt.to_string(),
+            attachments: vec![],
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Send a complete user input, preserving any supplied attachments.
+    pub async fn send_input(&self, input: UserInput) -> Result<(), HarnessError> {
+        self.client.send(SessionCommand::Prompt(input)).await?;
         Ok(())
     }
 
     /// Inject additional user input into this session.
     pub async fn steer(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.client
-            .steer(UserInput {
-                text: prompt.to_string(),
-                attachments: vec![],
-            })
-            .await?;
+        self.steer_input(UserInput {
+            text: prompt.to_string(),
+            attachments: vec![],
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Inject complete user input, preserving any supplied attachments.
+    pub async fn steer_input(&self, input: UserInput) -> Result<(), HarnessError> {
+        self.client.steer(input).await?;
         Ok(())
     }
 
     /// Queue a prompt to run after the current command boundary.
     pub async fn follow_up(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.client
-            .follow_up(UserInput {
-                text: prompt.to_string(),
-                attachments: vec![],
-            })
-            .await?;
+        self.follow_up_input(UserInput {
+            text: prompt.to_string(),
+            attachments: vec![],
+        })
+        .await?;
         Ok(())
     }
 
-    /// Cancel the active session run.
+    /// Queue complete user input, preserving any supplied attachments.
+    pub async fn follow_up_input(&self, input: UserInput) -> Result<(), HarnessError> {
+        self.client.follow_up(input).await?;
+        Ok(())
+    }
+
+    /// Cancel the active run without closing the session.
     ///
-    /// This keeps frontends on the public engine API instead of requiring
-    /// access to runtime command types.
+    /// Queued follow-ups are preserved and the handle remains usable for
+    /// future prompts.
     pub async fn cancel(&self) -> Result<(), HarnessError> {
-        self.client.send(SessionCommand::Cancel).await?;
+        self.client.cancel_run().await?;
         Ok(())
     }
 

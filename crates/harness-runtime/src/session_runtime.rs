@@ -444,6 +444,20 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    /// Cancel only the root agent's active run.
+    ///
+    /// This is intentionally mailbox-scoped rather than using the session
+    /// cancellation root: `AgentCommand::Cancel` cancels the active backend,
+    /// tools, and children through their run-scoped tokens, while the
+    /// long-lived root runner remains available to process queued follow-ups
+    /// and future prompts.
+    pub async fn cancel_run(&self) -> Result<(), SessionError> {
+        self.root_agent_tx
+            .send(AgentCommand::Cancel)
+            .await
+            .map_err(|_| SessionError::ChannelClosed)
+    }
+
     /// Send steering input to the root agent.
     ///
     /// Delivery is serialized through the root agent mailbox, preserving
