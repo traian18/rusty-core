@@ -84,7 +84,9 @@ pub struct OpenAiImageUrl {
 /// shape), or a typed parts array once at least one `ContentBlock::Image` is
 /// present, since OpenAI only accepts the array form for multimodal content.
 fn content_blocks_to_openai_content(content: &[ContentBlock]) -> OpenAiContent {
-    let has_image = content.iter().any(|block| matches!(block, ContentBlock::Image { .. }));
+    let has_image = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }));
     if !has_image {
         return OpenAiContent::Text(concat_text(content));
     }
@@ -219,8 +221,16 @@ fn agent_message_to_openai(
                 .collect();
             vec![OpenAiMessage {
                 role: "assistant".to_string(),
-                content: if text.is_empty() { None } else { Some(OpenAiContent::Text(text)) },
-                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                content: if text.is_empty() {
+                    None
+                } else {
+                    Some(OpenAiContent::Text(text))
+                },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
                 tool_call_id: None,
             }]
         }
@@ -231,7 +241,10 @@ fn agent_message_to_openai(
 /// Builds the system-role message (if any) the same way Anthropic's client
 /// does: prefer the request's `system_prompt` field, falling back to
 /// concatenating any `System`-role messages in the transcript.
-pub fn build_system_message(system_prompt: &str, messages: &[AgentMessage]) -> Option<OpenAiMessage> {
+pub fn build_system_message(
+    system_prompt: &str,
+    messages: &[AgentMessage],
+) -> Option<OpenAiMessage> {
     let text = if !system_prompt.is_empty() {
         Some(system_prompt.to_string())
     } else {
@@ -379,7 +392,9 @@ impl OpenAiSseParser {
             cost: OpenAiUsageMapper::calculate_cost(&self.usage, &self.model),
         };
         self.result = Some(result.clone());
-        terminal_events.push(ModelEvent::Completed { result: result.clone() });
+        terminal_events.push(ModelEvent::Completed {
+            result: result.clone(),
+        });
         self.events.extend(terminal_events.iter().cloned());
         Ok((terminal_events, result))
     }
@@ -390,7 +405,11 @@ impl OpenAiSseParser {
         })?;
         let data = block
             .lines()
-            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:").map(str::trim))
+            .filter_map(|line| {
+                line.trim_end_matches('\r')
+                    .strip_prefix("data:")
+                    .map(str::trim)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if data.is_empty() {
@@ -401,13 +420,17 @@ impl OpenAiSseParser {
             return Ok(None);
         }
 
-        let value: serde_json::Value = serde_json::from_str(&data).map_err(|error| ModelError::Protocol {
-            message: format!("invalid chunk: {error}"),
-        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(&data).map_err(|error| ModelError::Protocol {
+                message: format!("invalid chunk: {error}"),
+            })?;
 
         if let Some(error) = value.get("error") {
             return Err(ModelError::BackendError {
-                message: error["message"].as_str().unwrap_or("OpenAI stream error").to_string(),
+                message: error["message"]
+                    .as_str()
+                    .unwrap_or("OpenAI stream error")
+                    .to_string(),
                 code: error["type"].as_str().unwrap_or("stream_error").to_string(),
             });
         }
@@ -418,13 +441,18 @@ impl OpenAiSseParser {
             }
         }
 
-        let choices = value.get("choices").and_then(|c| c.as_array()).filter(|c| !c.is_empty());
+        let choices = value
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .filter(|c| !c.is_empty());
 
         let Some(choices) = choices else {
             if let Some(usage_value) = value.get("usage").filter(|v| !v.is_null()) {
                 if let Ok(raw) = serde_json::from_value::<RawOpenAiUsage>(usage_value.clone()) {
                     self.usage = OpenAiUsageMapper::map_usage(&raw);
-                    return Ok(Some(ModelEvent::UsageUpdate { usage: self.usage.clone() }));
+                    return Ok(Some(ModelEvent::UsageUpdate {
+                        usage: self.usage.clone(),
+                    }));
                 }
             }
             return Ok(None);
@@ -439,7 +467,9 @@ impl OpenAiSseParser {
 
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
-                return Ok(Some(ModelEvent::TextDelta { delta: text.to_string() }));
+                return Ok(Some(ModelEvent::TextDelta {
+                    delta: text.to_string(),
+                }));
             }
         }
 
@@ -455,17 +485,38 @@ impl OpenAiSseParser {
                             .expect("provider tool-id map poisoned")
                             .insert(id, provider_id.to_string());
                     }
-                    let name = tool_call["function"]["name"].as_str().unwrap_or_default().to_string();
-                    self.tools.insert(index, ToolBuffer { id, name: name.clone(), json: String::new() });
+                    let name = tool_call["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    self.tools.insert(
+                        index,
+                        ToolBuffer {
+                            id,
+                            name: name.clone(),
+                            json: String::new(),
+                        },
+                    );
                 }
-                let fragment = tool_call["function"]["arguments"].as_str().unwrap_or_default();
-                let buffer = self.tools.get_mut(&index).expect("just inserted or already present");
+                let fragment = tool_call["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default();
+                let buffer = self
+                    .tools
+                    .get_mut(&index)
+                    .expect("just inserted or already present");
                 buffer.json.push_str(fragment);
 
                 if is_new {
-                    return Ok(Some(ModelEvent::ToolCallStarted { id: buffer.id, name: buffer.name.clone() }));
+                    return Ok(Some(ModelEvent::ToolCallStarted {
+                        id: buffer.id,
+                        name: buffer.name.clone(),
+                    }));
                 } else if !fragment.is_empty() {
-                    return Ok(Some(ModelEvent::ToolCallDelta { id: buffer.id, delta: fragment.to_string() }));
+                    return Ok(Some(ModelEvent::ToolCallDelta {
+                        id: buffer.id,
+                        delta: fragment.to_string(),
+                    }));
                 }
             }
         }
@@ -505,7 +556,9 @@ mod tests {
             temperature: Some(0.5),
             stop: Some(vec!["STOP".to_string()]),
             stream: true,
-            stream_options: StreamOptions { include_usage: true },
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
         let json = serde_json::to_value(&request).expect("serialize OpenAiRequest");
         assert_eq!(json["model"], "gpt-4.1");
@@ -524,7 +577,9 @@ mod tests {
             temperature: None,
             stop: None,
             stream: true,
-            stream_options: StreamOptions { include_usage: true },
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
         let bare_json = serde_json::to_value(&bare).expect("serialize bare OpenAiRequest");
         assert!(bare_json.get("max_tokens").is_none());
@@ -546,7 +601,9 @@ mod tests {
     /// the more verbose typed-parts array form.
     #[test]
     fn a_text_only_message_serializes_content_as_a_plain_string() {
-        let message = user_message(vec![ContentBlock::Text { text: "hello".into() }]);
+        let message = user_message(vec![ContentBlock::Text {
+            text: "hello".into(),
+        }]);
         let openai = agent_message_to_openai(&message, &HashMap::new());
         let json = serde_json::to_value(&openai[0]).expect("serialize OpenAiMessage");
         assert_eq!(json["content"], "hello");
@@ -560,18 +617,30 @@ mod tests {
     #[test]
     fn an_image_block_becomes_a_real_image_url_part_not_silently_dropped() {
         let message = user_message(vec![
-            ContentBlock::Text { text: "what is this?".into() },
-            ContentBlock::Image { mime_type: "image/png".into(), data: vec![1, 2, 3] },
+            ContentBlock::Text {
+                text: "what is this?".into(),
+            },
+            ContentBlock::Image {
+                mime_type: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
         ]);
         let openai = agent_message_to_openai(&message, &HashMap::new());
         let json = serde_json::to_value(&openai[0]).expect("serialize OpenAiMessage");
-        let parts = json["content"].as_array().expect("multimodal content must serialize as an array");
+        let parts = json["content"]
+            .as_array()
+            .expect("multimodal content must serialize as an array");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "what is this?");
         assert_eq!(parts[1]["type"], "image_url");
-        let url = parts[1]["image_url"]["url"].as_str().expect("image_url.url must be a string");
-        assert!(url.starts_with("data:image/png;base64,"), "unexpected image_url shape: {url}");
+        let url = parts[1]["image_url"]["url"]
+            .as_str()
+            .expect("image_url.url must be a string");
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "unexpected image_url shape: {url}"
+        );
         assert!(url.ends_with(&base64::engine::general_purpose::STANDARD.encode([1, 2, 3])));
     }
 
@@ -586,12 +655,18 @@ data: [DONE]\n\n";
         let mut parser = OpenAiSseParser::new();
         let mut events = Vec::new();
         for byte in FIXTURE.as_bytes() {
-            events.extend(parser.push_chunk(std::slice::from_ref(byte)).expect("valid chunk"));
+            events.extend(
+                parser
+                    .push_chunk(std::slice::from_ref(byte))
+                    .expect("valid chunk"),
+            );
         }
         let (terminal, result) = parser.finish().expect("complete fixture");
         events.extend(terminal);
 
-        assert!(events.iter().any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "hi")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "hi")));
         assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
         assert_eq!(result.stop_reason, "stop");
         assert_eq!(result.usage.input_tokens.value(), Some(2));
@@ -628,7 +703,9 @@ data: [DONE]\n\n";
         let completed = events
             .iter()
             .find_map(|e| match e {
-                ModelEvent::ToolCallCompleted { name, input, .. } => Some((name.clone(), input.clone())),
+                ModelEvent::ToolCallCompleted { name, input, .. } => {
+                    Some((name.clone(), input.clone()))
+                }
                 _ => None,
             })
             .expect("a ToolCallCompleted event");

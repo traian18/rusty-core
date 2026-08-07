@@ -23,9 +23,15 @@ pub struct SessionEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalState {
-    Commands { selected: usize },
-    Provider { selected: usize },
-    Account { provider: usize },
+    Commands {
+        selected: usize,
+    },
+    Provider {
+        selected: usize,
+    },
+    Account {
+        provider: usize,
+    },
     Model {
         provider: usize,
         selected: usize,
@@ -117,18 +123,14 @@ impl AppState {
                 continue;
             }
             match message.role {
-                MessageRole::User => self
-                    .transcript
-                    .push(TranscriptBlock::UserMessage { text }),
-                MessageRole::Assistant => self.transcript.push(
-                    TranscriptBlock::AssistantMessage {
-                        id: message.id,
-                        agent_id,
-                        text,
-                        reasoning: String::new(),
-                        complete: true,
-                    },
-                ),
+                MessageRole::User => self.transcript.push(TranscriptBlock::UserMessage { text }),
+                MessageRole::Assistant => self.transcript.push(TranscriptBlock::AssistantMessage {
+                    id: message.id,
+                    agent_id,
+                    text,
+                    reasoning: String::new(),
+                    complete: true,
+                }),
                 MessageRole::System | MessageRole::Tool => {}
             }
         }
@@ -140,8 +142,11 @@ impl AppState {
     }
 
     pub fn open_new_session(&mut self) {
-        if self.providers.is_empty() { self.providers = fallback_options(); }
-        let selected = self.providers
+        if self.providers.is_empty() {
+            self.providers = fallback_options();
+        }
+        let selected = self
+            .providers
             .iter()
             .position(|provider| provider.name == self.provider)
             .unwrap_or(0);
@@ -296,7 +301,9 @@ impl AppState {
     }
 
     pub fn set_provider_options(&mut self, options: Vec<ProviderOption>) {
-        if !options.is_empty() { self.providers = options; }
+        if !options.is_empty() {
+            self.providers = options;
+        }
     }
 
     pub fn set_start_error(&mut self, message: impl Into<String>) {
@@ -372,25 +379,36 @@ impl AppState {
             }
             AgentEvent::AssistantTextDelta { message_id, delta } => {
                 let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { text, .. } = &mut self.transcript[index] {
+                if let TranscriptBlock::AssistantMessage { text, .. } = &mut self.transcript[index]
+                {
                     text.push_str(&delta);
                 }
             }
             AgentEvent::ReasoningDelta { message_id, delta } => {
                 let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { reasoning, .. } = &mut self.transcript[index] {
+                if let TranscriptBlock::AssistantMessage { reasoning, .. } =
+                    &mut self.transcript[index]
+                {
                     reasoning.push_str(&delta);
                 }
             }
             AgentEvent::AssistantMessageCompleted { message_id } => {
                 let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { complete, .. } = &mut self.transcript[index] {
+                if let TranscriptBlock::AssistantMessage { complete, .. } =
+                    &mut self.transcript[index]
+                {
                     *complete = true;
                 }
             }
             AgentEvent::ToolCallRequested { call } => {
                 let index = self.ensure_tool(call.id, agent_id, &call.name);
-                if let TranscriptBlock::ToolCall { name, arguments, state, .. } = &mut self.transcript[index] {
+                if let TranscriptBlock::ToolCall {
+                    name,
+                    arguments,
+                    state,
+                    ..
+                } = &mut self.transcript[index]
+                {
                     *name = call.name;
                     *arguments = call.arguments;
                     *state = ToolCallState::Requested;
@@ -405,16 +423,23 @@ impl AppState {
             AgentEvent::ToolCallProgress { call_id, progress } => {
                 let index = self.ensure_tool(call_id, agent_id, "tool");
                 if let TranscriptBlock::ToolCall { state, .. } = &mut self.transcript[index] {
-                    *state = ToolCallState::Progress { status: progress.status, fraction: progress.fraction };
+                    *state = ToolCallState::Progress {
+                        status: progress.status,
+                        fraction: progress.fraction,
+                    };
                 }
             }
             AgentEvent::ToolCallCompleted { call_id, result } => {
                 let index = self.ensure_tool(call_id, agent_id, "tool");
                 if let TranscriptBlock::ToolCall { state, .. } = &mut self.transcript[index] {
                     *state = if result.has_error {
-                        ToolCallState::Failed { preview: result.output_preview }
+                        ToolCallState::Failed {
+                            preview: result.output_preview,
+                        }
                     } else {
-                        ToolCallState::Succeeded { preview: result.output_preview }
+                        ToolCallState::Succeeded {
+                            preview: result.output_preview,
+                        }
                     };
                 }
             }
@@ -437,7 +462,11 @@ impl AppState {
             }
             AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
                 let index = self.ensure_child(agent_id);
-                if let TranscriptBlock::ChildAgent { outcome: child_outcome, .. } = &mut self.transcript[index] {
+                if let TranscriptBlock::ChildAgent {
+                    outcome: child_outcome,
+                    ..
+                } = &mut self.transcript[index]
+                {
                     *child_outcome = Some(outcome);
                 }
             }
@@ -454,7 +483,8 @@ impl AppState {
     }
 
     fn notice(&mut self, text: impl Into<String>) {
-        self.transcript.push(TranscriptBlock::SystemNotice { text: text.into() });
+        self.transcript
+            .push(TranscriptBlock::SystemNotice { text: text.into() });
     }
 
     fn ensure_message(&mut self, id: MessageId, agent_id: AgentId) -> usize {
@@ -494,7 +524,10 @@ impl AppState {
             return *index;
         }
         let index = self.transcript.len();
-        self.transcript.push(TranscriptBlock::ChildAgent { agent_id, outcome: None });
+        self.transcript.push(TranscriptBlock::ChildAgent {
+            agent_id,
+            outcome: None,
+        });
         self.children.insert(agent_id, index);
         index
     }

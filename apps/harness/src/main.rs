@@ -45,8 +45,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        let alternate_screen =
-            supports_alternate_screen(std::env::var("TERM").ok().as_deref());
+        let alternate_screen = supports_alternate_screen(std::env::var("TERM").ok().as_deref());
         if alternate_screen {
             execute!(io::stdout(), EnterAlternateScreen)?;
         }
@@ -124,7 +123,9 @@ async fn main() -> Result<()> {
                         controller.state_mut().input.pop();
                     }
                     InputAction::OpenCommands => controller.state_mut().open_commands(),
-                    InputAction::ToggleInspector => controller.state_mut().toggle_context_inspector(),
+                    InputAction::ToggleInspector => {
+                        controller.state_mut().toggle_context_inspector()
+                    }
                     InputAction::NewSession => controller.state_mut().open_new_session(),
                     InputAction::PreviousSession => {
                         if let Err(error) = controller.previous_session().await {
@@ -156,17 +157,21 @@ async fn main() -> Result<()> {
                         match prompt.trim() {
                             "/exit" | "/quit" => controller.state_mut().should_quit = true,
                             "/context" => controller.state_mut().toggle_context_inspector(),
-                            "/login" | "/connect" => {
-                                match controller.auth_instruction() {
-                                    Ok(instruction) => controller.state_mut().system_notice(instruction),
-                                    Err(error) => controller.state_mut().set_start_error(error.to_string()),
+                            "/login" | "/connect" => match controller.auth_instruction() {
+                                Ok(instruction) => {
+                                    controller.state_mut().system_notice(instruction)
                                 }
-                            }
+                                Err(error) => {
+                                    controller.state_mut().set_start_error(error.to_string())
+                                }
+                            },
                             "/models" => {
                                 controller.state_mut().status = "Refreshing models".into();
                                 match controller.refresh_active_models().await {
                                     Ok(()) => controller.state_mut().open_new_session(),
-                                    Err(error) => controller.state_mut().set_start_error(format!("Could not refresh models: {error}")),
+                                    Err(error) => controller.state_mut().set_start_error(format!(
+                                        "Could not refresh models: {error}"
+                                    )),
                                 }
                             }
                             "/new" | "/providers" => {

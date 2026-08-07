@@ -42,7 +42,8 @@ impl ToolExecutor for GitDiffTool {
         ToolDescriptor {
             id: ToolId::new("git.diff"),
             name: "Git diff".to_string(),
-            description: "Show a diff for a path or the whole tree (working tree or staged)".to_string(),
+            description: "Show a diff for a path or the whole tree (working tree or staged)"
+                .to_string(),
             input_schema: serde_json::to_value(schema).unwrap_or(json!({})),
         }
     }

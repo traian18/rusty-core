@@ -60,7 +60,9 @@ mod tests {
 
     #[test]
     fn rejects_cloud_metadata_link_local_range() {
-        assert!(!is_safe_target(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(!is_safe_target(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
     }
 
     #[test]

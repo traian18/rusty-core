@@ -373,7 +373,9 @@ mod tests {
         .expect("command should execute");
 
         assert!(!result.is_error);
-        let stdout = result.output["stdout"].as_str().expect("stdout is a string");
+        let stdout = result.output["stdout"]
+            .as_str()
+            .expect("stdout is a string");
         assert!(
             stdout.len() <= MAX_OUTPUT_BYTES + "\n... (output truncated)".len(),
             "captured stdout must not exceed the cap plus the truncation marker, got {} bytes",

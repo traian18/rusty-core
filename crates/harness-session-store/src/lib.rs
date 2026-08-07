@@ -12,8 +12,8 @@
 //! - [`projection`] — side-effect-free trailing state reduction (RC-303).
 //! - [`resolver`] — strict host dependency resolution (RC-304).
 //! - [`retention`] and [`diagnostics`] — lifecycle tooling (RC-305).
-//! - [`testing`] — [`MemoryStore`](testing::MemoryStore) and
-//!   [`FaultInjectingStore`](testing::FaultInjectingStore), used by this
+//! - [`testing`] — [`MemoryStore`] and
+//!   [`FaultInjectingStore`], used by this
 //!   crate's and embedding crates' M2 crash/restart and durability-policy
 //!   fixtures.
 
@@ -44,17 +44,15 @@ pub use resolver::{
     assess_restore, DependencyKind, DependencyResolution, HostDependencyResolver,
     MissingDependency, PermissiveResolver, RestoreError, RestorePolicy, RestoreReport,
 };
-pub use retention::{
-    mark_compacted, plan_compaction, prune_plan, CompactionPlan, RetentionPolicy,
-};
+pub use retention::{mark_compacted, plan_compaction, prune_plan, CompactionPlan, RetentionPolicy};
 pub use sqlite::SqliteSessionStore;
 pub use store::{
     is_durable, summarize_session, DurableSessionEvent, DurableSessionMetadata,
-    DurableSessionSnapshot, RawRecord, SessionStore, SessionSummary, StoredAgentState,
-    StoredPendingToolCall, StoredSession, StoreError,
+    DurableSessionSnapshot, RawRecord, SessionStore, SessionSummary, StoreError, StoredAgentState,
+    StoredPendingToolCall, StoredSession,
 };
 pub use testing::{FaultInjectingStore, MemoryStore};
 pub use version::{
-    check_snapshot_version, migrate_snapshot, SnapshotVersionError,
-    MIN_SUPPORTED_SNAPSHOT_VERSION, SCHEMA_VERSION,
+    check_snapshot_version, migrate_snapshot, SnapshotVersionError, MIN_SUPPORTED_SNAPSHOT_VERSION,
+    SCHEMA_VERSION,
 };

@@ -7,7 +7,7 @@
 //!
 //! RC-300 (truthful persistence and recovery) wiring:
 //!
-//! - [`session_runtime`] — the authoritative [`SessionCommitter`] boundary,
+//! - [`session_runtime`] — the authoritative [`SessionCommitter`](harness_session_store::SessionCommitter) boundary,
 //!   per-agent durable projections, and automatic/on-demand checkpoints.
 //! - [`restore`] — host dependency resolution for restore (RC-304).
 //! - [`session_manager`] — replay validation, snapshot migration, and strict

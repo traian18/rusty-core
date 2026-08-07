@@ -94,8 +94,14 @@ impl IntegrationRegistry {
 
     /// List registered integration factories in stable identifier order.
     pub fn list(&self) -> Result<Vec<(String, BackendDescriptor)>, IntegrationError> {
-        let factories = self.factories.read().map_err(|_| IntegrationError::RegistryPoisoned)?;
-        let mut entries = factories.iter().map(|(id, factory)| (id.clone(), factory.descriptor())).collect::<Vec<_>>();
+        let factories = self
+            .factories
+            .read()
+            .map_err(|_| IntegrationError::RegistryPoisoned)?;
+        let mut entries = factories
+            .iter()
+            .map(|(id, factory)| (id.clone(), factory.descriptor()))
+            .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(entries)
     }
@@ -113,7 +119,12 @@ impl IntegrationRegistry {
             factory
                 .descriptor()
                 .name
-                .eq_ignore_ascii_case(descriptor_name.split(" [").next().unwrap_or(descriptor_name))
+                .eq_ignore_ascii_case(
+                    descriptor_name
+                        .split(" [")
+                        .next()
+                        .unwrap_or(descriptor_name),
+                )
                 .then(|| id.clone())
         }))
     }

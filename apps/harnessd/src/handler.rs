@@ -28,14 +28,23 @@ struct AdmissionCache {
 
 impl AdmissionCache {
     fn new() -> Self {
-        Self { entries: HashMap::new(), order: VecDeque::new() }
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
     fn get(&self, session_id: SessionId, id: CommandId) -> Option<(AdmissionResult, u64)> {
         self.entries.get(&(session_id, id)).cloned()
     }
 
-    fn insert(&mut self, session_id: SessionId, id: CommandId, result: AdmissionResult, revision: u64) {
+    fn insert(
+        &mut self,
+        session_id: SessionId,
+        id: CommandId,
+        result: AdmissionResult,
+        revision: u64,
+    ) {
         let key = (session_id, id);
         if self.entries.contains_key(&key) {
             return;
@@ -113,8 +122,11 @@ impl HarnessRpcHandler {
         let store_scan = if include_store_scan {
             let diagnostics =
                 harness_session_store::diagnose_store(self.harness.session_store().as_ref()).await;
-            let sessions_with_issues =
-                diagnostics.sessions.iter().filter(|session| !session.is_healthy()).count();
+            let sessions_with_issues = diagnostics
+                .sessions
+                .iter()
+                .filter(|session| !session.is_healthy())
+                .count();
             Some(StoreScanSummary {
                 total_sessions: diagnostics.sessions.len(),
                 unreadable_sessions: diagnostics.unreadable.len(),
@@ -163,7 +175,11 @@ impl HarnessRpcHandler {
         integration_config: serde_json::Value,
         toolset: harness_protocol::tools::AgentToolset,
     ) -> RpcResponseBody {
-        let builder = match self.harness.session().integration(integration, integration_config) {
+        let builder = match self
+            .harness
+            .session()
+            .integration(integration, integration_config)
+        {
             Ok(builder) => builder,
             Err(error) => {
                 return Self::error(
@@ -253,7 +269,10 @@ impl HarnessRpcHandler {
                     .lock()
                     .expect("revisions mutex poisoned")
                     .insert(session_id, revision);
-                RpcResponseBody::SessionRestored { session_id, session_revision: revision }
+                RpcResponseBody::SessionRestored {
+                    session_id,
+                    session_revision: revision,
+                }
             }
             Err(error) => Self::error(
                 "session.restore_failed",
@@ -341,7 +360,9 @@ impl HarnessRpcHandler {
         // the honest, less specific `Accepted` rather than a made-up guess.
         let is_run_less_mutation = matches!(
             &command,
-            MutationCommand::Cancel | MutationCommand::ResolvePermission { .. } | MutationCommand::CloseSession
+            MutationCommand::Cancel
+                | MutationCommand::ResolvePermission { .. }
+                | MutationCommand::CloseSession
         );
         let operation = match command {
             MutationCommand::Prompt(input) => handle.send_input(input).await,
@@ -361,7 +382,10 @@ impl HarnessRpcHandler {
                 reason: error.to_string(),
             },
         };
-        let accepted = matches!(result, AdmissionResult::Accepted | AdmissionResult::AcceptedApplied);
+        let accepted = matches!(
+            result,
+            AdmissionResult::Accepted | AdmissionResult::AcceptedApplied
+        );
         let revision = if accepted {
             current_revision.saturating_add(1)
         } else {
@@ -403,7 +427,9 @@ fn wire_status(status: SessionStatus) -> SessionStatusWire {
     }
 }
 
-fn wire_snapshot(snapshot: harness_runtime::session_client::SessionSnapshot) -> SessionSnapshotWire {
+fn wire_snapshot(
+    snapshot: harness_runtime::session_client::SessionSnapshot,
+) -> SessionSnapshotWire {
     SessionSnapshotWire {
         session_id: snapshot.session_id,
         status: wire_status(snapshot.status),
@@ -460,7 +486,10 @@ impl RpcHandler for HarnessRpcHandler {
                 session_id,
                 workspace_root,
                 toolset,
-            } => self.restore_session(session_id, workspace_root, toolset).await,
+            } => {
+                self.restore_session(session_id, workspace_root, toolset)
+                    .await
+            }
             RpcRequestBody::Snapshot => {
                 let Some(session_id) = session_id else {
                     return Self::error(
@@ -522,7 +551,12 @@ mod tests {
         cache.insert(session_id, first, AdmissionResult::Accepted, 1);
         assert!(cache.get(session_id, first).is_some());
         for revision in 2..=(DEDUPLICATION_WINDOW as u64 + 2) {
-            cache.insert(session_id, CommandId::new(), AdmissionResult::Accepted, revision);
+            cache.insert(
+                session_id,
+                CommandId::new(),
+                AdmissionResult::Accepted,
+                revision,
+            );
         }
         assert!(cache.entries.len() <= DEDUPLICATION_WINDOW);
         assert!(cache.get(session_id, first).is_none());

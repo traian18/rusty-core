@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{AgentError, AgentStatus};
 use crate::effects::PermissionRequest;
-use crate::ids::{
-    AgentId, EventId, MessageId, RequestId, RunId, SessionId, Timestamp, ToolCallId,
-};
+use crate::ids::{AgentId, EventId, MessageId, RequestId, RunId, SessionId, Timestamp, ToolCallId};
 use crate::tools::{ToolCall, ToolProgress, ToolResultSummary};
 use crate::usage::AgentUsageSnapshot;
 
@@ -312,10 +310,13 @@ mod tests {
 
     #[test]
     fn event_visibility_roundtrip() {
-        for visibility in &[EventVisibility::User, EventVisibility::Developer, EventVisibility::Internal] {
+        for visibility in &[
+            EventVisibility::User,
+            EventVisibility::Developer,
+            EventVisibility::Internal,
+        ] {
             let json = serde_json::to_string(visibility).expect("serialize");
-            let deserialized: EventVisibility =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: EventVisibility = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(*visibility, deserialized);
         }
     }
@@ -326,10 +327,13 @@ mod tests {
 
     #[test]
     fn agent_outcome_roundtrip() {
-        for outcome in &[AgentOutcome::Success, AgentOutcome::Cancelled, AgentOutcome::Failed] {
+        for outcome in &[
+            AgentOutcome::Success,
+            AgentOutcome::Cancelled,
+            AgentOutcome::Failed,
+        ] {
             let json = serde_json::to_string(outcome).expect("serialize");
-            let deserialized: AgentOutcome =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: AgentOutcome = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(*outcome, deserialized);
         }
     }
@@ -395,8 +399,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::StateChanged { from, to } => {
                 assert_eq!(from, AgentStatus::Idle);
@@ -412,8 +415,7 @@ mod tests {
         let event = AgentEvent::RunStarted { run_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::RunStarted { run_id: rid } => {
                 assert_eq!(rid, run_id);
@@ -428,12 +430,9 @@ mod tests {
         let event = AgentEvent::BackendRequestStarted { request_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::BackendRequestStarted {
-                request_id: rid,
-            } => {
+            AgentEvent::BackendRequestStarted { request_id: rid } => {
                 assert_eq!(rid, request_id);
             }
             other => panic!("expected BackendRequestStarted, got {other:?}"),
@@ -446,12 +445,9 @@ mod tests {
         let event = AgentEvent::AssistantMessageStarted { message_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::AssistantMessageStarted {
-                message_id: mid,
-            } => {
+            AgentEvent::AssistantMessageStarted { message_id: mid } => {
                 assert_eq!(mid, message_id);
             }
             other => panic!("expected AssistantMessageStarted, got {other:?}"),
@@ -467,8 +463,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::AssistantTextDelta {
                 message_id: mid,
@@ -490,8 +485,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::ReasoningDelta {
                 message_id: mid,
@@ -510,12 +504,9 @@ mod tests {
         let event = AgentEvent::AssistantMessageCompleted { message_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::AssistantMessageCompleted {
-                message_id: mid,
-            } => {
+            AgentEvent::AssistantMessageCompleted { message_id: mid } => {
                 assert_eq!(mid, message_id);
             }
             other => panic!("expected AssistantMessageCompleted, got {other:?}"),
@@ -533,8 +524,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::ToolCallRequested { call } => {
                 assert_eq!(call.name, "search");
@@ -549,12 +539,9 @@ mod tests {
         let event = AgentEvent::ToolCallStarted { call_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::ToolCallStarted {
-                call_id: cid,
-            } => {
+            AgentEvent::ToolCallStarted { call_id: cid } => {
                 assert_eq!(cid, call_id);
             }
             other => panic!("expected ToolCallStarted, got {other:?}"),
@@ -573,8 +560,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::ToolCallProgress {
                 call_id: cid,
@@ -600,8 +586,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::ToolCallCompleted {
                 call_id: cid,
@@ -630,8 +615,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::PermissionRequested { request } => {
                 assert_eq!(request.tool_call.name, "fs.read");
@@ -647,8 +631,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::UsageUpdated { usage } => {
                 assert_eq!(usage.timestamp, "");
@@ -663,12 +646,9 @@ mod tests {
         let event = AgentEvent::ChildAgentSpawned { agent_id };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::ChildAgentSpawned {
-                agent_id: aid,
-            } => {
+            AgentEvent::ChildAgentSpawned { agent_id: aid } => {
                 assert_eq!(aid, agent_id);
             }
             other => panic!("expected ChildAgentSpawned, got {other:?}"),
@@ -684,8 +664,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::ChildAgentCompleted {
                 agent_id: aid,
@@ -709,8 +688,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::Failed { error } => {
                 assert_eq!(error.message, "something went wrong");
@@ -728,8 +706,7 @@ mod tests {
         };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
-        let deserialized: AgentEventEnvelope =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
             AgentEvent::Completed { outcome } => {
                 assert_eq!(outcome, AgentOutcome::Success);
@@ -826,8 +803,7 @@ mod tests {
 
         for event in &events {
             let json = serde_json::to_string(event).expect("serialize");
-            let deserialized: AgentEvent =
-                serde_json::from_str(&json).expect("deserialize");
+            let deserialized: AgentEvent = serde_json::from_str(&json).expect("deserialize");
             let expected_tag = std::mem::discriminant(event);
             let actual_tag = std::mem::discriminant(&deserialized);
             assert_eq!(

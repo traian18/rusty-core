@@ -54,7 +54,10 @@ impl ExecutionBackend for InstantBackend {
             id: harness_protocol::ids::BackendId::new(),
             name: "soak-instant".into(),
             description: "Instantly-completing backend for soak testing".into(),
-            capabilities: BackendCapabilities { streaming: true, ..Default::default() },
+            capabilities: BackendCapabilities {
+                streaming: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -74,7 +77,10 @@ impl ExecutionBackend for InstantBackend {
             cost: Cost::default(),
             finish_reason: "end_turn".into(),
         };
-        let _ = sink.send(ExecutionEvent::Completed { request_id: request.request_id, result: result.clone() });
+        let _ = sink.send(ExecutionEvent::Completed {
+            request_id: request.request_id,
+            result: result.clone(),
+        });
         Ok(result)
     }
 }
@@ -97,10 +103,15 @@ impl ToolRegistry for NoTools {
     }
 }
 
-async fn wait_for_completion(rx: &mut broadcast::Receiver<harness_protocol::events::AgentEventEnvelope>) {
+async fn wait_for_completion(
+    rx: &mut broadcast::Receiver<harness_protocol::events::AgentEventEnvelope>,
+) {
     for _ in 0..200 {
         while let Ok(envelope) = rx.try_recv() {
-            if matches!(envelope.event, harness_protocol::events::AgentEvent::Completed { .. }) {
+            if matches!(
+                envelope.event,
+                harness_protocol::events::AgentEvent::Completed { .. }
+            ) {
                 return;
             }
         }
@@ -144,7 +155,11 @@ async fn run_soak_workload(harness: &Harness, iterations: usize) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let snapshot = scheduler.snapshot();
-            let session_permit = snapshot.permits.iter().find(|p| p.kind == "session").unwrap();
+            let session_permit = snapshot
+                .permits
+                .iter()
+                .find(|p| p.kind == "session")
+                .unwrap();
             let agent_permit = snapshot.permits.iter().find(|p| p.kind == "agent").unwrap();
             if session_permit.in_use == 0 && agent_permit.in_use == 0 {
                 break;

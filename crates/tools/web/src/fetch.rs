@@ -108,7 +108,9 @@ async fn fetch(client: &reqwest::Client, url_str: &str) -> Result<FetchOutcome, 
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(format!("unsupported scheme: {}", url.scheme()));
     }
-    let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
     let port = url.port_or_known_default().unwrap_or(443);
 
     validate_host_is_safe(host, port).await?;
@@ -204,7 +206,13 @@ async fn validate_host_is_safe(host: &str, port: u16) -> Result<(), String> {
 /// hugely understate the true decoded size for a bomb) and not by fully
 /// decompressing before measuring.
 async fn read_capped(response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
-    read_capped_stream(response.bytes_stream().map(|chunk| chunk.map_err(|e| e.to_string())), max_bytes).await
+    read_capped_stream(
+        response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| e.to_string())),
+        max_bytes,
+    )
+    .await
 }
 
 /// The actual capping loop, generic over any fallible byte-chunk stream —
@@ -336,9 +344,15 @@ mod tests {
             }
         });
 
-        let result = read_capped_stream(stream, 2_500_000).await.expect("capped read should succeed");
+        let result = read_capped_stream(stream, 2_500_000)
+            .await
+            .expect("capped read should succeed");
 
-        assert_eq!(result.len(), 2_500_000, "output must be truncated to exactly the cap");
+        assert_eq!(
+            result.len(),
+            2_500_000,
+            "output must be truncated to exactly the cap"
+        );
         assert!(
             pulled.load(std::sync::atomic::Ordering::SeqCst) <= 3,
             "must stop pulling chunks once the cap is exceeded, pulled {} of 10",
@@ -349,13 +363,18 @@ mod tests {
     #[tokio::test]
     async fn read_capped_stream_passes_through_content_under_the_cap_unchanged() {
         let stream = futures::stream::iter(vec![ok_chunk(b"hello, "), ok_chunk(b"world")]);
-        let result = read_capped_stream(stream, MAX_RESPONSE_BYTES).await.expect("capped read should succeed");
+        let result = read_capped_stream(stream, MAX_RESPONSE_BYTES)
+            .await
+            .expect("capped read should succeed");
         assert_eq!(result, b"hello, world");
     }
 
     #[tokio::test]
     async fn read_capped_stream_propagates_a_mid_stream_error() {
-        let stream = futures::stream::iter(vec![ok_chunk(b"partial"), Err("connection reset".to_string())]);
+        let stream = futures::stream::iter(vec![
+            ok_chunk(b"partial"),
+            Err("connection reset".to_string()),
+        ]);
         let result = read_capped_stream(stream, MAX_RESPONSE_BYTES).await;
         assert_eq!(result, Err("connection reset".to_string()));
     }

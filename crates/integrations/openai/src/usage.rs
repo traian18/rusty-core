@@ -52,11 +52,15 @@ impl OpenAiUsageMapper {
             input_tokens: UsageValue::new(input),
             output_tokens: UsageValue::new(output),
             cache_read_tokens: UsageValue::new(
-                raw.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens),
+                raw.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens),
             ),
             cache_write_tokens: UsageValue::new(None),
             reasoning_tokens: UsageValue::new(
-                raw.completion_tokens_details.as_ref().and_then(|d| d.reasoning_tokens),
+                raw.completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens),
             ),
             total_tokens: UsageValue::new(total),
         }
@@ -77,13 +81,14 @@ impl OpenAiUsageMapper {
             .value()
             .map(|t| Decimal::from(t) * rate.output_rate / PER_MILLION);
 
-        let total = [input_cost, output_cost]
-            .iter()
-            .fold(None, |acc: Option<Decimal>, cost| match (acc, cost) {
-                (Some(a), Some(c)) => Some(a + c),
-                (None, Some(c)) => Some(*c),
-                (a, None) => a,
-            });
+        let total =
+            [input_cost, output_cost]
+                .iter()
+                .fold(None, |acc: Option<Decimal>, cost| match (acc, cost) {
+                    (Some(a), Some(c)) => Some(a + c),
+                    (None, Some(c)) => Some(*c),
+                    (a, None) => a,
+                });
 
         Cost {
             amount_usd: total,
@@ -105,11 +110,11 @@ struct ModelRate {
 fn lookup_rate(model: &str) -> ModelRate {
     match model {
         m if m.starts_with("gpt-4o-mini") => ModelRate {
-            input_rate: Decimal::from_parts(15, 0, 0, false, 2),  // 0.15
+            input_rate: Decimal::from_parts(15, 0, 0, false, 2), // 0.15
             output_rate: Decimal::from_parts(60, 0, 0, false, 2), // 0.60
         },
         m if m.starts_with("gpt-4o") => ModelRate {
-            input_rate: Decimal::from_parts(250, 0, 0, false, 2),  // 2.50
+            input_rate: Decimal::from_parts(250, 0, 0, false, 2), // 2.50
             output_rate: Decimal::from_parts(1000, 0, 0, false, 2), // 10.00
         },
         m if m.starts_with("gpt-4-turbo") => ModelRate {
@@ -133,8 +138,12 @@ mod tests {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
             total_tokens: Some(150),
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: Some(10) }),
-            completion_tokens_details: Some(CompletionTokensDetails { reasoning_tokens: Some(5) }),
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(10),
+            }),
+            completion_tokens_details: Some(CompletionTokensDetails {
+                reasoning_tokens: Some(5),
+            }),
         };
         let usage = OpenAiUsageMapper::map_usage(&raw);
         assert_eq!(usage.input_tokens.value(), Some(100));
@@ -176,6 +185,9 @@ mod tests {
             ..Default::default()
         };
         let cost = OpenAiUsageMapper::calculate_cost(&usage, "gpt-4o");
-        assert_eq!(cost.amount_usd, Some(Decimal::from_parts(1250, 0, 0, false, 2)));
+        assert_eq!(
+            cost.amount_usd,
+            Some(Decimal::from_parts(1250, 0, 0, false, 2))
+        );
     }
 }

@@ -46,7 +46,10 @@ impl BudgetCheck for AgentBudget {
     fn check_children(&self, current_children: u32) -> Result<(), BudgetError> {
         if let Some(limit) = self.max_children {
             if current_children >= limit {
-                return Err(BudgetError::TooManyChildren { limit, current: current_children });
+                return Err(BudgetError::TooManyChildren {
+                    limit,
+                    current: current_children,
+                });
             }
         }
         Ok(())
@@ -55,7 +58,10 @@ impl BudgetCheck for AgentBudget {
     fn check_depth(&self, current_depth: u32) -> Result<(), BudgetError> {
         if let Some(limit) = self.max_depth {
             if current_depth >= limit {
-                return Err(BudgetError::MaxDepthExceeded { limit, current: current_depth });
+                return Err(BudgetError::MaxDepthExceeded {
+                    limit,
+                    current: current_depth,
+                });
             }
         }
         Ok(())
@@ -71,15 +77,22 @@ mod tests {
 
     #[test]
     fn usage_limit_is_enforced() {
-        let budget = AgentBudget { max_total_tokens: Some(100), ..Default::default() };
-        assert!(budget.check_usage(&ModelUsage {
-            total_tokens: UsageValue::new(Some(101)),
+        let budget = AgentBudget {
+            max_total_tokens: Some(100),
             ..Default::default()
-        }).is_err());
-        assert!(budget.check_usage(&ModelUsage {
-            total_tokens: UsageValue::new(None),
-            ..Default::default()
-        }).is_ok());
+        };
+        assert!(budget
+            .check_usage(&ModelUsage {
+                total_tokens: UsageValue::new(Some(101)),
+                ..Default::default()
+            })
+            .is_err());
+        assert!(budget
+            .check_usage(&ModelUsage {
+                total_tokens: UsageValue::new(None),
+                ..Default::default()
+            })
+            .is_ok());
     }
 
     #[test]
@@ -88,22 +101,30 @@ mod tests {
             max_cost_usd: Some(Decimal::new(10, 0)),
             ..Default::default()
         };
-        assert!(budget.check_cost(&Cost {
-            amount_usd: Some(Decimal::new(11, 0)),
-            source: None,
-        }).is_err());
+        assert!(budget
+            .check_cost(&Cost {
+                amount_usd: Some(Decimal::new(11, 0)),
+                source: None,
+            })
+            .is_err());
         assert!(budget.check_cost(&Cost::default()).is_ok());
     }
 
     #[test]
     fn children_limit_is_enforced() {
-        let budget = AgentBudget { max_children: Some(3), ..Default::default() };
+        let budget = AgentBudget {
+            max_children: Some(3),
+            ..Default::default()
+        };
         // Below the limit passes.
         assert!(budget.check_children(2).is_ok());
         // At the limit is rejected.
         assert_eq!(
             budget.check_children(3),
-            Err(BudgetError::TooManyChildren { limit: 3, current: 3 })
+            Err(BudgetError::TooManyChildren {
+                limit: 3,
+                current: 3
+            })
         );
         // Above the limit is rejected.
         assert!(budget.check_children(4).is_err());
@@ -111,13 +132,19 @@ mod tests {
 
     #[test]
     fn depth_limit_is_enforced() {
-        let budget = AgentBudget { max_depth: Some(3), ..Default::default() };
+        let budget = AgentBudget {
+            max_depth: Some(3),
+            ..Default::default()
+        };
         // Below the limit passes.
         assert!(budget.check_depth(2).is_ok());
         // At the limit is rejected.
         assert_eq!(
             budget.check_depth(3),
-            Err(BudgetError::MaxDepthExceeded { limit: 3, current: 3 })
+            Err(BudgetError::MaxDepthExceeded {
+                limit: 3,
+                current: 3
+            })
         );
         // Above the limit is rejected.
         assert!(budget.check_depth(4).is_err());

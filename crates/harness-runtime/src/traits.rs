@@ -2,15 +2,16 @@
 //! workspaces, and event sinks.
 //!
 //! These are the **behavioral** traits that give life to the wire-format types
-//! defined in [`harness-protocol`].  The protocol crate holds only serializable
-//! data structures ([`ExecutionRequest`], [`ExecutionEvent`], [`ToolCall`],
+//! defined in `harness-protocol`.  The protocol crate holds only serializable
+//! data structures ([`ExecutionRequest`], [`ExecutionEvent`],
+//! [`ToolCall`](harness_protocol::tools::ToolCall),
 //! [`AgentEventEnvelope`], etc.); the traits here drive the actual async I/O,
 //! cancellation, and streaming that implement those contracts.
 //!
 //! # Migrated types
 //!
 //! Tool executor, registry, and workspace types have been moved to the
-//! [`harness-tools`] and [`harness-workspace`] crates respectively.  This
+//! `harness-tools` and `harness-workspace` crates respectively.  This
 //! module re-exports them for backward compatibility during the migration
 //! period.  New code should import directly from the owning crate.
 
@@ -29,11 +30,11 @@ use harness_protocol::events::AgentEventEnvelope;
 // ---------------------------------------------------------------------------
 //
 // Tool-executor and registry types now live in `harness-tools`.
+pub use harness_tools::registry::{RegistrationError, SimpleToolRegistry, ToolRegistry};
 pub use harness_tools::{
     CancellationToken, ExecutionFailure, ExecutionResult, FailureKind, ProgressPhase,
     ToolDescriptor, ToolExecutor, ToolId, ToolInput, ToolProgress, ToolUsage,
 };
-pub use harness_tools::registry::{RegistrationError, SimpleToolRegistry, ToolRegistry};
 
 // ---------------------------------------------------------------------------
 // Backward-compat re-exports from harness-workspace

@@ -71,10 +71,19 @@ impl AppHarness {
     pub async fn provider_options(&self) -> Result<Vec<ProviderOption>> {
         let mut options = Vec::new();
         for provider in self.harness.list_providers()? {
-            let profile = self.harness.list_credential_profiles(&provider.id)?
-                .into_iter().next().ok_or_else(|| anyhow::anyhow!("provider {} has no credential profile", provider.name))?;
+            let profile = self
+                .harness
+                .list_credential_profiles(&provider.id)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("provider {} has no credential profile", provider.name)
+                })?;
             let health = self.harness.provider_health(&provider.id)?;
-            let models = self.harness.list_models(&provider.id, &profile.id, false).await?;
+            let models = self
+                .harness
+                .list_models(&provider.id, &profile.id, false)
+                .await?;
             options.push(option_from_descriptor(provider, profile, health, models));
         }
         options.sort_by_key(|provider| match provider.integration.as_str() {
@@ -88,26 +97,45 @@ impl AppHarness {
         Ok(options)
     }
 
-    pub async fn refresh_provider(&self, provider_key: &harness_engine::ProviderKey) -> Result<ProviderOption> {
-        let provider = self.harness.list_providers()?.into_iter()
+    pub async fn refresh_provider(
+        &self,
+        provider_key: &harness_engine::ProviderKey,
+    ) -> Result<ProviderOption> {
+        let provider = self
+            .harness
+            .list_providers()?
+            .into_iter()
             .find(|candidate| &candidate.id == provider_key)
             .ok_or_else(|| anyhow::anyhow!("unknown provider {provider_key}"))?;
-        let profile = self.harness.list_credential_profiles(provider_key)?.into_iter().next()
-            .ok_or_else(|| anyhow::anyhow!("provider {} has no credential profile", provider.name))?;
+        let profile = self
+            .harness
+            .list_credential_profiles(provider_key)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!("provider {} has no credential profile", provider.name)
+            })?;
         let health = self.harness.provider_health(provider_key)?;
-        let models = self.harness.list_models(provider_key, &profile.id, true).await?;
+        let models = self
+            .harness
+            .list_models(provider_key, &profile.id, true)
+            .await?;
         Ok(option_from_descriptor(provider, profile, health, models))
     }
 
-    pub fn auth_flow(&self, provider: &harness_engine::ProviderKey) -> Result<harness_engine::AuthFlowHandle> {
-        let descriptor = self.harness.list_providers()?.into_iter()
+    pub fn auth_flow(
+        &self,
+        provider: &harness_engine::ProviderKey,
+    ) -> Result<harness_engine::AuthFlowHandle> {
+        let descriptor = self
+            .harness
+            .list_providers()?
+            .into_iter()
             .find(|candidate| &candidate.id == provider)
             .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}"))?;
-        let method = descriptor
-            .auth_methods
-            .first()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("provider {} has no authentication method", descriptor.name))?;
+        let method = descriptor.auth_methods.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("provider {} has no authentication method", descriptor.name)
+        })?;
         Ok(self.harness.begin_auth(provider, method)?)
     }
 
@@ -115,14 +143,14 @@ impl AppHarness {
         Ok(self.harness.list_sessions().await?)
     }
 
-    pub async fn load_session(&self, id: harness_protocol::ids::SessionId) -> Result<StoredSession> {
+    pub async fn load_session(
+        &self,
+        id: harness_protocol::ids::SessionId,
+    ) -> Result<StoredSession> {
         Ok(self.harness.session_store().load_session(id).await?)
     }
 
-    pub async fn restore(
-        &self,
-        id: harness_protocol::ids::SessionId,
-    ) -> Result<SessionHandle> {
+    pub async fn restore(&self, id: harness_protocol::ids::SessionId) -> Result<SessionHandle> {
         Ok(self
             .harness
             .restore_session_with_toolset(id, default_toolset(), self.workspace.clone())
@@ -134,13 +162,14 @@ impl AppHarness {
             serde_json::from_str::<Value>(&options.config_json).unwrap_or_else(|_| json!({}));
         let selection = options.selection();
         if let Some(object) = config.as_object_mut() {
-            object.insert("_backend_selection".into(), serde_json::to_value(
-                harness_protocol::backend::PersistedBackendSelection::v1(
+            object.insert(
+                "_backend_selection".into(),
+                serde_json::to_value(harness_protocol::backend::PersistedBackendSelection::v1(
                     selection.provider_id.to_string(),
                     selection.credential_profile.0,
                     selection.model,
-                )
-            )?);
+                ))?,
+            );
         }
 
         Ok(self
@@ -157,8 +186,13 @@ impl AppHarness {
         if !health.ready {
             anyhow::bail!("{}", health.message);
         }
-        let profiles = self.harness.list_credential_profiles(&selection.provider_id)?;
-        if !profiles.iter().any(|profile| profile.id == selection.credential_profile) {
+        let profiles = self
+            .harness
+            .list_credential_profiles(&selection.provider_id)?;
+        if !profiles
+            .iter()
+            .any(|profile| profile.id == selection.credential_profile)
+        {
             anyhow::bail!(
                 "credential profile {} is not available for {}",
                 selection.credential_profile.0,
@@ -170,9 +204,12 @@ impl AppHarness {
             credential_profile: selection.credential_profile.clone(),
             provider_model_id: selection.model.clone(),
         };
-        Ok(self.harness.session_from_selection(&selection)?
+        Ok(self
+            .harness
+            .session_from_selection(&selection)?
             .toolset(default_toolset(), self.workspace.clone())
-            .start().await?)
+            .start()
+            .await?)
     }
 }
 
@@ -238,7 +275,10 @@ mod tests {
             .map(|tool| (tool.descriptor.name.as_str(), &tool.policy.permission))
             .collect::<HashMap<_, _>>();
 
-        assert!(matches!(policies.get("fs.read"), Some(PermissionMode::Allow)));
+        assert!(matches!(
+            policies.get("fs.read"),
+            Some(PermissionMode::Allow)
+        ));
         assert!(matches!(
             policies.get("workspace.search"),
             Some(PermissionMode::Allow)

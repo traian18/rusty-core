@@ -1,5 +1,3 @@
-
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -392,14 +390,23 @@ mod tests {
     #[tokio::test]
     async fn missing_session_is_reported() {
         let store = JsonlSessionStore::new(temp_dir());
-        let error = store.load_session(SessionId::new()).await.expect_err("missing");
+        let error = store
+            .load_session(SessionId::new())
+            .await
+            .expect_err("missing");
         assert!(matches!(error, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn current_sequence_is_zero_for_fresh_session() {
         let store = JsonlSessionStore::new(temp_dir());
-        assert_eq!(store.current_sequence(SessionId::new()).await.expect("sequence"), 0);
+        assert_eq!(
+            store
+                .current_sequence(SessionId::new())
+                .await
+                .expect("sequence"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -425,7 +432,9 @@ mod tests {
             .open(&path)
             .await
             .expect("open");
-        file.write_all(b"{\"kind\":\"event\"").await.expect("truncate");
+        file.write_all(b"{\"kind\":\"event\"")
+            .await
+            .expect("truncate");
         drop(file);
         let stored = store.load_session(session).await.expect("load");
         assert_eq!(stored.events.len(), 1);

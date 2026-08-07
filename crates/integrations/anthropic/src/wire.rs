@@ -402,8 +402,7 @@ impl AnthropicSseParser {
                     })),
                     Some("input_json_delta") => {
                         if let Some(tool) = self.tools.get_mut(&index) {
-                            let fragment =
-                                delta["partial_json"].as_str().unwrap_or_default();
+                            let fragment = delta["partial_json"].as_str().unwrap_or_default();
                             tool.json.push_str(fragment);
                             Ok(Some(ModelEvent::ToolCallDelta {
                                 id: tool.id.expect("tool id"),
@@ -422,10 +421,8 @@ impl AnthropicSseParser {
                     let input = if tool.json.is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str(&tool.json).map_err(|error| {
-                            ModelError::Protocol {
-                                message: format!("invalid tool input: {error}"),
-                            }
+                        serde_json::from_str(&tool.json).map_err(|error| ModelError::Protocol {
+                            message: format!("invalid tool input: {error}"),
                         })?
                     };
                     return Ok(Some(ModelEvent::ToolCallCompleted {
@@ -468,9 +465,7 @@ impl AnthropicSseParser {
 
 fn find_sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
     match (lf, crlf) {
         (Some(left), Some(right)) if left <= right => Some((left, 2)),
         (Some(_), Some(right)) => Some((right, 4)),
@@ -524,7 +519,6 @@ fn merge_usage(previous: &ModelUsage, raw: &RawUsage) -> ModelUsage {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,7 +541,11 @@ mod tests {
         };
 
         let converted = agent_message_to_anthropic(&message);
-        assert_eq!(converted.content.len(), 1, "image block must not be dropped");
+        assert_eq!(
+            converted.content.len(),
+            1,
+            "image block must not be dropped"
+        );
         match &converted.content[0] {
             AnthropicContentBlock::Image { source } => {
                 assert_eq!(source.kind, "base64");
@@ -580,14 +578,18 @@ data: {"type":"message_stop"}
         let mut parser = AnthropicSseParser::new();
         let mut events = Vec::new();
         for byte in FIXTURE.as_bytes() {
-            events.extend(parser.push_chunk(std::slice::from_ref(byte)).expect("valid chunk"));
+            events.extend(
+                parser
+                    .push_chunk(std::slice::from_ref(byte))
+                    .expect("valid chunk"),
+            );
         }
         let (terminal, result) = parser.finish().expect("complete fixture");
         events.extend(terminal);
 
-        assert!(events.iter().any(|event| {
-            matches!(event, ModelEvent::TextDelta { delta } if delta == "hi")
-        }));
+        assert!(events
+            .iter()
+            .any(|event| { matches!(event, ModelEvent::TextDelta { delta } if delta == "hi") }));
         assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
         assert_eq!(result.usage.input_tokens.value(), Some(2));
         assert_eq!(result.usage.output_tokens.value(), Some(1));

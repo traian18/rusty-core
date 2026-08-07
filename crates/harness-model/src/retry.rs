@@ -52,24 +52,36 @@ mod tests {
     #[test]
     fn standard_seconds_header_is_normalized() {
         let headers = [("retry-after", "3")];
-        assert_eq!(parse_retry_after(lookup_from(&headers)), Some(Duration::from_secs(3)));
+        assert_eq!(
+            parse_retry_after(lookup_from(&headers)),
+            Some(Duration::from_secs(3))
+        );
     }
 
     #[test]
     fn millisecond_header_is_normalized() {
         let headers = [("retry-after-ms", "1250")];
-        assert_eq!(parse_retry_after(lookup_from(&headers)), Some(Duration::from_millis(1250)));
+        assert_eq!(
+            parse_retry_after(lookup_from(&headers)),
+            Some(Duration::from_millis(1250))
+        );
     }
 
     #[test]
     fn millisecond_header_takes_precedence_over_seconds() {
         let headers = [("retry-after-ms", "500"), ("retry-after", "10")];
-        assert_eq!(parse_retry_after(lookup_from(&headers)), Some(Duration::from_millis(500)));
+        assert_eq!(
+            parse_retry_after(lookup_from(&headers)),
+            Some(Duration::from_millis(500))
+        );
     }
 
     #[test]
     fn whitespace_around_values_is_tolerated() {
         let headers = [("retry-after", " 7 ")];
-        assert_eq!(parse_retry_after(lookup_from(&headers)), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after(lookup_from(&headers)),
+            Some(Duration::from_secs(7))
+        );
     }
 }

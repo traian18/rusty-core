@@ -15,8 +15,7 @@ use harness_protocol::ids::SessionId;
 use harness_protocol::tools::AgentToolset;
 use harness_session_store::{
     migrate_snapshot, replay_snapshot, GapPolicy, HostDependencyResolver, ReplayError,
-    ReplayValidator, RestoreError,
-    RestorePolicy, SessionStore, SnapshotVersionError, StoreError,
+    ReplayValidator, RestoreError, RestorePolicy, SessionStore, SnapshotVersionError, StoreError,
 };
 
 use crate::integration::IntegrationRegistry;
@@ -68,10 +67,7 @@ impl SessionManager {
         Self::new_with_store(scheduler, None)
     }
 
-    pub fn new_with_store(
-        scheduler: Arc<Scheduler>,
-        store: Option<Arc<dyn SessionStore>>,
-    ) -> Self {
+    pub fn new_with_store(scheduler: Arc<Scheduler>, store: Option<Arc<dyn SessionStore>>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             session_permits: RwLock::new(HashMap::new()),
@@ -149,9 +145,7 @@ impl SessionManager {
                     %error,
                     "failed to create initial session checkpoint"
                 );
-                runtime.mark_failed(format!(
-                    "initial durable checkpoint failed: {error}"
-                ));
+                runtime.mark_failed(format!("initial durable checkpoint failed: {error}"));
             }
         }
 
@@ -285,23 +279,22 @@ impl SessionManager {
         }
 
         let stored = store.load_session(id).await?;
-        let trailing =
-            ReplayValidator::new(GapPolicy::AllowEphemeralHoles).validate(&stored)?;
-        let snapshot = stored
-            .snapshot
-            .ok_or(SessionManagerError::NoSnapshot(id))?;
+        let trailing = ReplayValidator::new(GapPolicy::AllowEphemeralHoles).validate(&stored)?;
+        let snapshot = stored.snapshot.ok_or(SessionManagerError::NoSnapshot(id))?;
         let snapshot = migrate_snapshot(snapshot)?;
         let snapshot = replay_snapshot(snapshot, &trailing)?;
 
         let resolver = HostRestoreResolver::new(workspace.as_ref(), integrations.clone());
         let report = resolver.resolve(id, &snapshot.metadata).await;
-        harness_session_store::assess_restore(&report, self.restore_policy).inspect_err(|_error| {
-            tracing::error!(
-                %id,
-                missing = ?report.missing,
-                "restore refused: host dependencies could not be resolved"
-            );
-        })?;
+        harness_session_store::assess_restore(&report, self.restore_policy).inspect_err(
+            |_error| {
+                tracing::error!(
+                    %id,
+                    missing = ?report.missing,
+                    "restore refused: host dependencies could not be resolved"
+                );
+            },
+        )?;
 
         let mut backends: HashMap<String, Arc<dyn ExecutionBackend>> = HashMap::new();
         for agent in &snapshot.agents {
@@ -351,12 +344,13 @@ impl SessionManager {
             .find(|agent| agent.agent_id == snapshot.root_agent_id)
             .ok_or(SessionManagerError::NoSnapshot(id))?;
         let root_key = backend_reference_key(&root.backend.reference);
-        let default_backend = backends.remove(&root_key).ok_or_else(|| {
-            SessionManagerError::BackendCreation {
-                integration: root.backend.reference.integration.to_string(),
-                message: "root agent's backend was not re-created".into(),
-            }
-        })?;
+        let default_backend =
+            backends
+                .remove(&root_key)
+                .ok_or_else(|| SessionManagerError::BackendCreation {
+                    integration: root.backend.reference.integration.to_string(),
+                    message: "root agent's backend was not re-created".into(),
+                })?;
 
         let session_permit = self.scheduler.acquire_session_permit().await;
         let runtime = Arc::new(SessionRuntime::from_stored(
@@ -521,8 +515,7 @@ mod tests {
     /// (the runner's own cancel-detection path and any late backend
     /// callback must not both commit a terminal transition).
     #[tokio::test]
-    async fn close_session_races_an_active_run_without_losing_or_duplicating_the_terminal_event()
-    {
+    async fn close_session_races_an_active_run_without_losing_or_duplicating_the_terminal_event() {
         let store = Arc::new(MemoryStore::new());
         let manager = SessionManager::new_with_store(
             Arc::new(Scheduler::new(SchedulerConfig::default())),
@@ -571,10 +564,13 @@ mod tests {
 
         // close_session must return promptly: it cannot and does not wait
         // for the root task to actually exit.
-        tokio::time::timeout(std::time::Duration::from_secs(1), manager.close_session(session_id))
-            .await
-            .expect("close_session must not hang waiting on the in-flight run")
-            .expect("close_session should succeed (the initial checkpoint is healthy)");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.close_session(session_id),
+        )
+        .await
+        .expect("close_session must not hang waiting on the in-flight run")
+        .expect("close_session should succeed (the initial checkpoint is healthy)");
         assert!(manager.session_handle(session_id).await.is_none());
 
         // The root task keeps running in the background after close_session
@@ -678,7 +674,9 @@ mod tests {
                 Arc::new(FakeToolRegistry::new()),
                 Arc::new(FakeWorkspace::new()),
                 Arc::new(NoopSink),
-                AgentToolset { tools: HashMap::new() },
+                AgentToolset {
+                    tools: HashMap::new(),
+                },
             )
             .await
             .expect("create_session should succeed");
@@ -691,7 +689,9 @@ mod tests {
                 Arc::new(FakeToolRegistry::new()),
                 Arc::new(FakeWorkspace::new()),
                 Arc::new(NoopSink),
-                AgentToolset { tools: HashMap::new() },
+                AgentToolset {
+                    tools: HashMap::new(),
+                },
             )
             .await
             .expect("create_session should succeed");
@@ -745,7 +745,11 @@ mod tests {
         // drain time) eventual terminal event, exactly like the single-
         // session close race test above proves for one session at a time.
         assert!(
-            !store.raw_records(idle_id).await.expect("idle session must be loadable").is_empty(),
+            !store
+                .raw_records(idle_id)
+                .await
+                .expect("idle session must be loadable")
+                .is_empty(),
             "the idle session's initial checkpoint must be durable"
         );
         let busy_raw = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -809,12 +813,14 @@ mod tests {
                 delta: format!("chunk {i} "),
             });
         }
-        let backend = Arc::new(FakeBackend::new().with_events(events).with_result(ExecutionResult {
-            request_id,
-            usage: ModelUsage::default(),
-            cost: Cost::default(),
-            finish_reason: "end_turn".into(),
-        }));
+        let backend = Arc::new(FakeBackend::new().with_events(events).with_result(
+            ExecutionResult {
+                request_id,
+                usage: ModelUsage::default(),
+                cost: Cost::default(),
+                finish_reason: "end_turn".into(),
+            },
+        ));
 
         let runtime = manager
             .create_session(
@@ -822,7 +828,9 @@ mod tests {
                 Arc::new(FakeToolRegistry::new()),
                 Arc::new(FakeWorkspace::new()),
                 Arc::new(NoopSink),
-                AgentToolset { tools: HashMap::new() },
+                AgentToolset {
+                    tools: HashMap::new(),
+                },
             )
             .await
             .expect("create_session should succeed");
@@ -854,7 +862,11 @@ mod tests {
         // verified separately below, this is purely "has the run finished."
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if runtime.agent_live_state(root_agent_id).last_outcome.is_some() {
+                if runtime
+                    .agent_live_state(root_agent_id)
+                    .last_outcome
+                    .is_some()
+                {
                     return;
                 }
                 tokio::task::yield_now().await;
@@ -884,13 +896,22 @@ mod tests {
         // Recovery: fetch the complete durable backlog from sequence 0 —
         // must include the full lifecycle (RunStarted...Completed) with no
         // gaps, regardless of how much the live broadcast channel dropped.
-        let backlog = store.events_since(session_id, 0).await.expect("events_since should succeed");
+        let backlog = store
+            .events_since(session_id, 0)
+            .await
+            .expect("events_since should succeed");
         assert!(
-            backlog.iter().any(|event| matches!(event.envelope.event, harness_protocol::events::AgentEvent::RunStarted { .. })),
+            backlog.iter().any(|event| matches!(
+                event.envelope.event,
+                harness_protocol::events::AgentEvent::RunStarted { .. }
+            )),
             "durable backlog must include RunStarted"
         );
         assert!(
-            backlog.iter().any(|event| matches!(event.envelope.event, harness_protocol::events::AgentEvent::Completed { .. })),
+            backlog.iter().any(|event| matches!(
+                event.envelope.event,
+                harness_protocol::events::AgentEvent::Completed { .. }
+            )),
             "durable backlog must include the terminal Completed event"
         );
 
@@ -902,11 +923,19 @@ mod tests {
         let before_dedup = sequences.len();
         sequences.sort_unstable();
         sequences.dedup();
-        assert_eq!(sequences.len(), before_dedup, "events_since must never return a duplicate sequence");
+        assert_eq!(
+            sequences.len(),
+            before_dedup,
+            "events_since must never return a duplicate sequence"
+        );
 
         // A fresh subscription after recovery sees new work cleanly, with
         // no overlap/gap relative to what events_since already delivered.
-        let last_recovered_seq = backlog.iter().filter_map(|event| event.session_sequence).max().unwrap_or(0);
+        let last_recovered_seq = backlog
+            .iter()
+            .filter_map(|event| event.session_sequence)
+            .max()
+            .unwrap_or(0);
         let mut fresh_rx = runtime.event_bus.subscribe();
         runtime
             .send_command(crate::session_runtime::SessionCommand::Prompt(
@@ -920,8 +949,13 @@ mod tests {
         let next_run_started_seq = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Ok(envelope) = fresh_rx.recv().await {
-                    if matches!(envelope.event, harness_protocol::events::AgentEvent::RunStarted { .. }) {
-                        return envelope.session_sequence.expect("durable event must carry a sequence");
+                    if matches!(
+                        envelope.event,
+                        harness_protocol::events::AgentEvent::RunStarted { .. }
+                    ) {
+                        return envelope
+                            .session_sequence
+                            .expect("durable event must carry a sequence");
                     }
                 }
             }
@@ -1067,7 +1101,9 @@ mod tests {
                     Arc::new(FakeToolRegistry::new()),
                     Arc::new(FakeWorkspace::new()),
                     Arc::new(NoopSink),
-                    AgentToolset { tools: HashMap::new() },
+                    AgentToolset {
+                        tools: HashMap::new(),
+                    },
                 )
                 .await
                 .expect("create_session should succeed");
@@ -1086,7 +1122,11 @@ mod tests {
 
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if runtime.agent_live_state(root_agent_id).last_outcome.is_some() {
+                    if runtime
+                        .agent_live_state(root_agent_id)
+                        .last_outcome
+                        .is_some()
+                    {
                         return;
                     }
                     tokio::task::yield_now().await;
@@ -1160,7 +1200,10 @@ mod tests {
         // Restore is read-only with respect to durable history: it must not
         // fabricate or duplicate any event just by reconstructing state.
         assert_eq!(
-            store.current_sequence(session_id).await.expect("current_sequence should succeed"),
+            store
+                .current_sequence(session_id)
+                .await
+                .expect("current_sequence should succeed"),
             sequence_at_crash,
             "restore must not append or duplicate any durable record"
         );
@@ -1189,7 +1232,11 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if restored.agent_live_state(root_agent_id).last_outcome.is_some() {
+                if restored
+                    .agent_live_state(root_agent_id)
+                    .last_outcome
+                    .is_some()
+                {
                     return;
                 }
                 tokio::task::yield_now().await;

@@ -52,7 +52,8 @@ impl ToolExecutor for GitLogTool {
         ToolDescriptor {
             id: ToolId::new("git.log"),
             name: "Git log".to_string(),
-            description: "List recent commits, optionally filtered to those touching a path".to_string(),
+            description: "List recent commits, optionally filtered to those touching a path"
+                .to_string(),
             input_schema: serde_json::to_value(schema).unwrap_or(json!({})),
         }
     }
@@ -90,7 +91,9 @@ impl ToolExecutor for GitLogTool {
 }
 
 fn commit_touches_path(repo: &git2::Repository, commit: &git2::Commit, path: &str) -> bool {
-    let Ok(tree) = commit.tree() else { return false };
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
     let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
     let mut options = git2::DiffOptions::new();
     options.pathspec(path);
@@ -100,7 +103,11 @@ fn commit_touches_path(repo: &git2::Repository, commit: &git2::Commit, path: &st
     }
 }
 
-fn run_log(repo_root: &Path, path: Option<&str>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
+fn run_log(
+    repo_root: &Path,
+    path: Option<&str>,
+    limit: u32,
+) -> Result<Vec<serde_json::Value>, String> {
     let repo = git2::Repository::discover(repo_root).map_err(|e| e.to_string())?;
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
     revwalk.push_head().map_err(|e| e.to_string())?;
@@ -152,7 +159,14 @@ mod tests {
                 .unwrap_or_default();
             let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
             let oid = repo
-                .commit(Some("HEAD"), &sig, &sig, &format!("commit {i}"), &tree, &parent_refs)
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!("commit {i}"),
+                    &tree,
+                    &parent_refs,
+                )
                 .expect("commit");
             parents.push(oid);
         }

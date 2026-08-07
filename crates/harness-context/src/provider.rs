@@ -20,5 +20,9 @@ use harness_runtime::traits::Workspace;
 /// a tool round-trip.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
-    async fn assemble(&self, request: ExecutionRequest, workspace: &dyn Workspace) -> ExecutionRequest;
+    async fn assemble(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+    ) -> ExecutionRequest;
 }

@@ -45,10 +45,7 @@ impl SimpleToolRegistry {
     /// Register a tool executor and its descriptor.
     ///
     /// Returns `Err` if a tool with the same `id` is already registered.
-    pub fn register_tool(
-        &self,
-        executor: Arc<dyn ToolExecutor>,
-    ) -> Result<(), RegistrationError> {
+    pub fn register_tool(&self, executor: Arc<dyn ToolExecutor>) -> Result<(), RegistrationError> {
         let descriptor = executor.descriptor();
         let mut tools = self.tools.lock().unwrap();
         let tool_id_str = descriptor.id.as_str().to_string();

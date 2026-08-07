@@ -118,11 +118,23 @@ async fn two_sessions_stream_concurrently_without_cross_talk() {
     let sink = Arc::new(NoopSink);
 
     let sess_a = manager
-        .create_session(backend_a, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
+        .create_session(
+            backend_a,
+            registry.clone(),
+            workspace.clone(),
+            sink.clone(),
+            empty_toolset(),
+        )
         .await
         .expect("create_session should succeed");
     let sess_b = manager
-        .create_session(backend_b, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
+        .create_session(
+            backend_b,
+            registry.clone(),
+            workspace.clone(),
+            sink.clone(),
+            empty_toolset(),
+        )
         .await
         .expect("create_session should succeed");
 
@@ -159,10 +171,16 @@ async fn two_sessions_stream_concurrently_without_cross_talk() {
         events_a.extend(batch_a);
         events_b.extend(batch_b);
 
-        if events_a.iter().any(|e| matches!(e, AgentEvent::Completed { .. })) {
+        if events_a
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Completed { .. }))
+        {
             completed_a = true;
         }
-        if events_b.iter().any(|e| matches!(e, AgentEvent::Completed { .. })) {
+        if events_b
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Completed { .. }))
+        {
             completed_b = true;
         }
         if completed_a && completed_b {
@@ -186,7 +204,10 @@ async fn two_sessions_stream_concurrently_without_cross_talk() {
         })
         .collect();
     for d in &deltas_a {
-        assert_eq!(*d, "from-session-A", "session A delta should not contain B's text");
+        assert_eq!(
+            *d, "from-session-A",
+            "session A delta should not contain B's text"
+        );
     }
 
     // Verify no text cross-talk: session B's deltas must only contain its own text.
@@ -201,7 +222,10 @@ async fn two_sessions_stream_concurrently_without_cross_talk() {
         })
         .collect();
     for d in &deltas_b {
-        assert_eq!(*d, "from-session-B", "session B delta should not contain A's text");
+        assert_eq!(
+            *d, "from-session-B",
+            "session B delta should not contain A's text"
+        );
     }
 
     // Clean up.
@@ -233,11 +257,23 @@ async fn cancelling_one_session_does_not_cancel_another() {
     let sink = Arc::new(NoopSink);
 
     let sess_a = manager
-        .create_session(backend_a, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
+        .create_session(
+            backend_a,
+            registry.clone(),
+            workspace.clone(),
+            sink.clone(),
+            empty_toolset(),
+        )
         .await
         .expect("create_session should succeed");
     let sess_b = manager
-        .create_session(backend_b, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
+        .create_session(
+            backend_b,
+            registry.clone(),
+            workspace.clone(),
+            sink.clone(),
+            empty_toolset(),
+        )
         .await
         .expect("create_session should succeed");
 
@@ -252,7 +288,10 @@ async fn cancelling_one_session_does_not_cancel_another() {
         text: "go".into(),
         attachments: vec![],
     });
-    sess_a.send_command(prompt.clone()).await.expect("session A start");
+    sess_a
+        .send_command(prompt.clone())
+        .await
+        .expect("session A start");
     sess_b.send_command(prompt).await.expect("session B start");
 
     // Give both runners time to enter the blocking backend call.
@@ -316,7 +355,10 @@ async fn cancelling_one_session_does_not_cancel_another() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(b_cancelled, "session B should report cancellation after its own cancel");
+    assert!(
+        b_cancelled,
+        "session B should report cancellation after its own cancel"
+    );
 
     manager.close_session(id_a).await.expect("close session A");
     manager.close_session(id_b).await.expect("close session B");
@@ -412,9 +454,9 @@ async fn one_session_panic_marks_only_that_session_failed() {
     let mut b_completed = false;
     for _ in 0..50 {
         let batch = drain_events(&mut rx_b);
-        if batch.iter().any(|e| {
-            matches!(e, AgentEvent::Completed { outcome } if *outcome == AgentOutcome::Success)
-        }) {
+        if batch.iter().any(
+            |e| matches!(e, AgentEvent::Completed { outcome } if *outcome == AgentOutcome::Success),
+        ) {
             b_completed = true;
             break;
         }
@@ -772,7 +814,9 @@ async fn create_session_rejects_typed_when_at_capacity_instead_of_hanging() {
 
     match &result {
         Err(harness_runtime::session_manager::SessionManagerError::AtCapacity(_)) => {}
-        Ok(_) => panic!("expected a typed AtCapacity rejection, got Ok — capacity was not enforced"),
+        Ok(_) => {
+            panic!("expected a typed AtCapacity rejection, got Ok — capacity was not enforced")
+        }
         Err(other) => panic!("expected AtCapacity, got a different error: {other}"),
     }
     assert!(

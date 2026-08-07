@@ -21,8 +21,8 @@ use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome};
 use harness_protocol::ids::RequestId;
 use harness_protocol::usage::{Cost, ModelUsage};
 use harness_runtime::traits::ExecutionBackend;
-use harness_tools::ToolDescriptor;
 use harness_tools::registry::ToolRegistry;
+use harness_tools::ToolDescriptor;
 
 // ---------------------------------------------------------------------------
 // ScriptedBackend
@@ -85,7 +85,10 @@ struct NoTools;
 
 #[async_trait]
 impl ToolRegistry for NoTools {
-    fn register(&self, _executor: Arc<dyn harness_tools::ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+    fn register(
+        &self,
+        _executor: Arc<dyn harness_tools::ToolExecutor>,
+    ) -> Result<(), harness_tools::registry::RegistrationError> {
         Ok(())
     }
 
@@ -250,12 +253,12 @@ async fn session_send_subscribe_e2e() {
     let run_started_idx = all_events
         .iter()
         .position(|e| matches!(e, AgentEvent::RunStarted { .. }));
-    let delta1_idx = all_events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::AssistantTextDelta { delta, .. } if delta == "Hello "));
-    let delta2_idx = all_events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::AssistantTextDelta { delta, .. } if delta == "world!"));
+    let delta1_idx = all_events.iter().position(
+        |e| matches!(e, AgentEvent::AssistantTextDelta { delta, .. } if delta == "Hello "),
+    );
+    let delta2_idx = all_events.iter().position(
+        |e| matches!(e, AgentEvent::AssistantTextDelta { delta, .. } if delta == "world!"),
+    );
     let completed_idx = all_events
         .iter()
         .position(|e| matches!(e, AgentEvent::Completed { .. }));

@@ -30,7 +30,11 @@ impl StaticSystemPromptProvider {
 
 #[async_trait]
 impl ContextProvider for StaticSystemPromptProvider {
-    async fn assemble(&self, mut request: ExecutionRequest, _workspace: &dyn Workspace) -> ExecutionRequest {
+    async fn assemble(
+        &self,
+        mut request: ExecutionRequest,
+        _workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
         request.system_prompt = if request.system_prompt.is_empty() {
             self.instructions.clone()
         } else {
@@ -64,7 +68,11 @@ impl Default for WorkspaceInfoProvider {
 
 #[async_trait]
 impl ContextProvider for WorkspaceInfoProvider {
-    async fn assemble(&self, mut request: ExecutionRequest, workspace: &dyn Workspace) -> ExecutionRequest {
+    async fn assemble(
+        &self,
+        mut request: ExecutionRequest,
+        workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
         let root = workspace.root().display().to_string();
         let summary = match workspace.list_files(1).await {
             Ok(files) => {
@@ -80,7 +88,10 @@ impl ContextProvider for WorkspaceInfoProvider {
                 if lines.is_empty() {
                     format!("Workspace root: {root}")
                 } else {
-                    format!("Workspace root: {root}\nTop-level entries:\n{}", lines.join("\n"))
+                    format!(
+                        "Workspace root: {root}\nTop-level entries:\n{}",
+                        lines.join("\n")
+                    )
                 }
             }
             // A workspace that can't list files (e.g. a restricted or
@@ -149,7 +160,11 @@ fn truncation_note(dropped: usize) -> AgentMessage {
 
 #[async_trait]
 impl ContextProvider for TruncatingCompactionProvider {
-    async fn assemble(&self, request: ExecutionRequest, workspace: &dyn Workspace) -> ExecutionRequest {
+    async fn assemble(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
         let mut request = self.inner.assemble(request, workspace).await;
 
         let total_chars: usize = request.messages.iter().map(message_char_len).sum();
@@ -260,7 +275,10 @@ impl PolicyDrivenCompactionProvider {
     /// any. See the struct doc comment for what "durable" does and doesn't
     /// mean here today.
     pub fn last_compaction(&self) -> Option<CompactionRecord> {
-        *self.last_compaction.lock().expect("last_compaction mutex poisoned")
+        *self
+            .last_compaction
+            .lock()
+            .expect("last_compaction mutex poisoned")
     }
 
     /// Total number of times this provider instance has actually compacted
@@ -286,7 +304,11 @@ impl PolicyDrivenCompactionProvider {
 
 #[async_trait]
 impl ContextProvider for PolicyDrivenCompactionProvider {
-    async fn assemble(&self, request: ExecutionRequest, workspace: &dyn Workspace) -> ExecutionRequest {
+    async fn assemble(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
         let request = self.inner.assemble(request, workspace).await;
 
         let Some(context_window) = self.context_window else {
@@ -294,12 +316,16 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
             // still don't want a genuinely unbounded payload — fall back to
             // the flat character cap rather than skip compaction entirely.
             let total_chars: usize = request.messages.iter().map(message_char_len).sum();
-            if total_chars <= self.fallback_max_chars || request.messages.len() <= self.keep_recent {
+            if total_chars <= self.fallback_max_chars || request.messages.len() <= self.keep_recent
+            {
                 return request;
             }
             let kept = self.keep_recent;
             let compacted = self.compact_to(request, kept);
-            *self.last_compaction.lock().expect("last_compaction mutex poisoned") = Some(CompactionRecord {
+            *self
+                .last_compaction
+                .lock()
+                .expect("last_compaction mutex poisoned") = Some(CompactionRecord {
                 projected_input_tokens: (total_chars / APPROX_CHARS_PER_TOKEN) as u64,
                 exact: false,
                 pressure_percent: 0, // unknown window: no policy pressure figure available
@@ -313,7 +339,8 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
         let decision = self.policy.evaluate(Some(context_window), projected_input);
 
         match decision {
-            ContextDecision::Proceed { .. } | ContextDecision::ScheduleBackgroundCompaction { .. } => {
+            ContextDecision::Proceed { .. }
+            | ContextDecision::ScheduleBackgroundCompaction { .. } => {
                 // Soft-limit pressure is a signal for a host to schedule
                 // *background* compaction ahead of the next request; this
                 // provider has no async background task to hand that off to,
@@ -340,7 +367,10 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
                     kept -= 1;
                 }
                 let compacted = self.compact_to(request, kept);
-                *self.last_compaction.lock().expect("last_compaction mutex poisoned") = Some(CompactionRecord {
+                *self
+                    .last_compaction
+                    .lock()
+                    .expect("last_compaction mutex poisoned") = Some(CompactionRecord {
                     projected_input_tokens: projected_input.tokens,
                     exact: projected_input.exact,
                     pressure_percent: budget.pressure_percent,
@@ -368,7 +398,11 @@ impl ChainedContextProvider {
 
 #[async_trait]
 impl ContextProvider for ChainedContextProvider {
-    async fn assemble(&self, mut request: ExecutionRequest, workspace: &dyn Workspace) -> ExecutionRequest {
+    async fn assemble(
+        &self,
+        mut request: ExecutionRequest,
+        workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
         for provider in &self.providers {
             request = provider.assemble(request, workspace).await;
         }
@@ -399,7 +433,9 @@ mod tests {
         AgentMessage {
             id: MessageId::new(),
             role,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             created_at: Timestamp::now(),
         }
     }
@@ -451,7 +487,10 @@ mod tests {
         let workspace = FakeWorkspace::new();
         let mut request = empty_request();
         request.messages = vec![
-            text_message(MessageRole::User, "this message is long enough to exceed budget"),
+            text_message(
+                MessageRole::User,
+                "this message is long enough to exceed budget",
+            ),
             text_message(MessageRole::Assistant, "so is this one honestly"),
             text_message(MessageRole::User, "most recent message"),
         ];
@@ -532,8 +571,13 @@ mod tests {
             result.messages.len()
         );
         assert_eq!(result.messages[0].role, MessageRole::System);
-        let record = provider.last_compaction().expect("a compaction should have been recorded");
-        assert!(record.pressure_percent >= 85, "recorded pressure should reflect the hard-limit trigger");
+        let record = provider
+            .last_compaction()
+            .expect("a compaction should have been recorded");
+        assert!(
+            record.pressure_percent >= 85,
+            "recorded pressure should reflect the hard-limit trigger"
+        );
         assert_eq!(provider.compaction_count(), 1);
     }
 
@@ -543,14 +587,26 @@ mod tests {
         let workspace = FakeWorkspace::new();
         let mut request = empty_request();
         request.messages = vec![
-            text_message(MessageRole::User, "this message is long enough to exceed the fallback cap"),
-            text_message(MessageRole::Assistant, "so is this one, honestly, quite long"),
+            text_message(
+                MessageRole::User,
+                "this message is long enough to exceed the fallback cap",
+            ),
+            text_message(
+                MessageRole::Assistant,
+                "so is this one, honestly, quite long",
+            ),
             text_message(MessageRole::User, "most recent"),
         ];
         let result = provider.assemble(request, &workspace).await;
-        assert_eq!(result.messages.len(), 2, "fallback cap should still compact when the window is unknown");
+        assert_eq!(
+            result.messages.len(),
+            2,
+            "fallback cap should still compact when the window is unknown"
+        );
         assert_eq!(provider.compaction_count(), 1);
-        let record = provider.last_compaction().expect("fallback compaction should be recorded");
+        let record = provider
+            .last_compaction()
+            .expect("fallback compaction should be recorded");
         assert!(!record.exact);
     }
 

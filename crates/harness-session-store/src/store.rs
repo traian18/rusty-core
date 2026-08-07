@@ -354,11 +354,7 @@ pub trait SessionStore: Send + Sync {
     /// implement pruning must document what replay/audit prerequisites they
     /// preserve (typically: a snapshot at or above `sequence` must exist
     /// first). Returns the number of removed events.
-    async fn prune_events_before(
-        &self,
-        _id: SessionId,
-        _sequence: u64,
-    ) -> Result<u64, StoreError> {
+    async fn prune_events_before(&self, _id: SessionId, _sequence: u64) -> Result<u64, StoreError> {
         Err(StoreError::InvalidState(
             "event pruning is not supported by this store".into(),
         ))
@@ -421,7 +417,10 @@ mod tests {
         });
         let snapshot: DurableSessionSnapshot =
             serde_json::from_value(json).expect("legacy snapshot without version fields");
-        assert_eq!(snapshot.schema_version, 0, "pre-RC-300 checkpoints are version 0");
+        assert_eq!(
+            snapshot.schema_version, 0,
+            "pre-RC-300 checkpoints are version 0"
+        );
         assert_eq!(
             snapshot.metadata,
             DurableSessionMetadata::default(),

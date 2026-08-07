@@ -245,7 +245,7 @@ impl BackendLimiters {
 /// # No-op variant
 ///
 /// If no limits have been configured for a backend (via
-/// [`Scheduler::configure_backend_limits`]), [`acquire_backend_specific_permit`]
+/// [`Scheduler::configure_backend_limits`]), [`Scheduler::acquire_backend_specific_permit`]
 /// returns a no-op guard that holds no permit and does nothing on drop.
 ///
 /// # Use with the global permit
@@ -381,7 +381,10 @@ impl Scheduler {
             .await
             .expect("Scheduler semaphore should never be closed");
         Self::record_acquired(
-            PermitKind { label: "session", capacity: self.config.max_active_sessions },
+            PermitKind {
+                label: "session",
+                capacity: self.config.max_active_sessions,
+            },
             &self.sessions,
             start.elapsed(),
         );
@@ -394,8 +397,13 @@ impl Scheduler {
     /// method `SessionManager::create_session` actually calls; the plain
     /// unconditional-wait `acquire_session_permit` remains available for
     /// callers (mostly tests) that genuinely want to wait forever.
-    pub async fn try_acquire_session_permit(self: &Arc<Self>) -> Result<OwnedSemaphorePermit, CapacityError> {
-        let kind = PermitKind { label: "session", capacity: self.config.max_active_sessions };
+    pub async fn try_acquire_session_permit(
+        self: &Arc<Self>,
+    ) -> Result<OwnedSemaphorePermit, CapacityError> {
+        let kind = PermitKind {
+            label: "session",
+            capacity: self.config.max_active_sessions,
+        };
         let start = Instant::now();
         let sem = self.sessions.clone();
         match tokio::time::timeout(self.config.admission_timeout, sem.acquire_owned()).await {
@@ -407,7 +415,10 @@ impl Scheduler {
             Err(_) => {
                 metrics::counter!("harness_scheduler_permit_admission_rejected_total", "kind" => kind.label)
                     .increment(1);
-                Err(CapacityError { kind: kind.label, waited: start.elapsed() })
+                Err(CapacityError {
+                    kind: kind.label,
+                    waited: start.elapsed(),
+                })
             }
         }
     }
@@ -422,7 +433,10 @@ impl Scheduler {
             .await
             .expect("Scheduler semaphore should never be closed");
         Self::record_acquired(
-            PermitKind { label: "agent", capacity: self.config.max_active_agents },
+            PermitKind {
+                label: "agent",
+                capacity: self.config.max_active_agents,
+            },
             &self.agents,
             start.elapsed(),
         );
@@ -442,7 +456,10 @@ impl Scheduler {
             .await
             .expect("Scheduler semaphore should never be closed");
         Self::record_acquired(
-            PermitKind { label: "backend", capacity: self.config.max_concurrent_backend_requests },
+            PermitKind {
+                label: "backend",
+                capacity: self.config.max_concurrent_backend_requests,
+            },
             &self.backend_requests,
             start.elapsed(),
         );
@@ -458,7 +475,10 @@ impl Scheduler {
     ) -> Option<OwnedSemaphorePermit> {
         let start = Instant::now();
         let sem = self.backend_requests.clone();
-        let kind = PermitKind { label: "backend", capacity: self.config.max_concurrent_backend_requests };
+        let kind = PermitKind {
+            label: "backend",
+            capacity: self.config.max_concurrent_backend_requests,
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -486,7 +506,10 @@ impl Scheduler {
             .await
             .expect("Scheduler semaphore should never be closed");
         Self::record_acquired(
-            PermitKind { label: "tool", capacity: self.config.max_concurrent_tool_executions },
+            PermitKind {
+                label: "tool",
+                capacity: self.config.max_concurrent_tool_executions,
+            },
             &self.tool_executions,
             start.elapsed(),
         );
@@ -502,7 +525,10 @@ impl Scheduler {
     ) -> Option<OwnedSemaphorePermit> {
         let start = Instant::now();
         let sem = self.tool_executions.clone();
-        let kind = PermitKind { label: "tool", capacity: self.config.max_concurrent_tool_executions };
+        let kind = PermitKind {
+            label: "tool",
+            capacity: self.config.max_concurrent_tool_executions,
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -527,7 +553,10 @@ impl Scheduler {
             .await
             .expect("Scheduler semaphore should never be closed");
         Self::record_acquired(
-            PermitKind { label: "process", capacity: self.config.max_concurrent_processes },
+            PermitKind {
+                label: "process",
+                capacity: self.config.max_concurrent_processes,
+            },
             &self.processes,
             start.elapsed(),
         );
@@ -543,7 +572,10 @@ impl Scheduler {
     ) -> Option<OwnedSemaphorePermit> {
         let start = Instant::now();
         let sem = self.processes.clone();
-        let kind = PermitKind { label: "process", capacity: self.config.max_concurrent_processes };
+        let kind = PermitKind {
+            label: "process",
+            capacity: self.config.max_concurrent_processes,
+        };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -573,9 +605,21 @@ impl Scheduler {
             permits: vec![
                 permit("session", self.config.max_active_sessions, &self.sessions),
                 permit("agent", self.config.max_active_agents, &self.agents),
-                permit("backend", self.config.max_concurrent_backend_requests, &self.backend_requests),
-                permit("tool", self.config.max_concurrent_tool_executions, &self.tool_executions),
-                permit("process", self.config.max_concurrent_processes, &self.processes),
+                permit(
+                    "backend",
+                    self.config.max_concurrent_backend_requests,
+                    &self.backend_requests,
+                ),
+                permit(
+                    "tool",
+                    self.config.max_concurrent_tool_executions,
+                    &self.tool_executions,
+                ),
+                permit(
+                    "process",
+                    self.config.max_concurrent_processes,
+                    &self.processes,
+                ),
             ],
         }
     }
@@ -611,12 +655,12 @@ impl Scheduler {
 
     /// Acquire a backend-specific permit for the given [`BackendId`].
     ///
-    /// **Must be called in addition to** [`acquire_backend_permit`] — both the
+    /// **Must be called in addition to** [`Self::acquire_backend_permit`] — both the
     /// global semaphore permit and the backend-specific permit are required
     /// before a request may proceed.
     ///
     /// If no limits have been configured for `backend` via
-    /// [`configure_backend_limits`], this method returns a no-op guard
+    /// [`Self::configure_backend_limits`], this method returns a no-op guard
     /// immediately.
     ///
     /// # Rate-limit back-pressure
@@ -789,9 +833,7 @@ mod cancellation_tests {
         );
 
         // Consume the one-per-minute allowance.
-        let _first = scheduler
-            .acquire_backend_specific_permit(backend)
-            .await;
+        let _first = scheduler.acquire_backend_specific_permit(backend).await;
 
         let cancel = CancellationToken::new();
         let waiter_scheduler = scheduler.clone();

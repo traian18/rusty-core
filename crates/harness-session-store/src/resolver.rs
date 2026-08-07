@@ -16,7 +16,7 @@
 //!
 //! # Invariants
 //!
-//! - Secrets never enter snapshots ([`DurableSessionMetadata`](crate::store::DurableSessionMetadata)
+//! - Secrets never enter snapshots ([`DurableSessionMetadata`]
 //!   contains references only).
 //! - Missing dependencies produce distinct errors — never a silent fallback.
 //! - Restore never substitutes a fake workspace, empty tools, or missing
@@ -105,7 +105,8 @@ impl RestoreReport {
             id: id.into(),
         };
         self.missing.push(dependency.clone());
-        self.resolved.push(DependencyResolution::Missing(dependency));
+        self.resolved
+            .push(DependencyResolution::Missing(dependency));
     }
 
     /// `true` when every recorded reference resolved.
@@ -148,8 +149,11 @@ pub enum RestoreError {
 #[async_trait::async_trait]
 pub trait HostDependencyResolver: Send + Sync {
     /// Resolves every reference recorded in `metadata`, returning the report.
-    async fn resolve(&self, session_id: SessionId, metadata: &DurableSessionMetadata)
-        -> RestoreReport;
+    async fn resolve(
+        &self,
+        session_id: SessionId,
+        metadata: &DurableSessionMetadata,
+    ) -> RestoreReport;
 }
 
 /// Applies `policy` to `report`, returning the report or a typed rejection.
@@ -215,7 +219,9 @@ mod tests {
             workspace_identity: Some("/srv/app".into()),
             ..Default::default()
         };
-        let report = PermissiveResolver.resolve(SessionId::new(), &metadata).await;
+        let report = PermissiveResolver
+            .resolve(SessionId::new(), &metadata)
+            .await;
         assert!(!report.is_complete());
         let missing = &report.missing[0];
         assert_eq!(missing.kind, DependencyKind::Workspace);
@@ -231,7 +237,9 @@ mod tests {
             workspace_identity: Some("/srv/app".into()),
             ..Default::default()
         };
-        let report = PermissiveResolver.resolve(SessionId::new(), &metadata).await;
+        let report = PermissiveResolver
+            .resolve(SessionId::new(), &metadata)
+            .await;
         assert!(assess_restore(&report, RestorePolicy::PermitMissing).is_ok());
     }
 }

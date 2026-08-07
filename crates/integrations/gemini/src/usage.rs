@@ -38,13 +38,14 @@ impl GeminiUsageMapper {
             .value()
             .map(|t| Decimal::from(t) * rate.output_rate / PER_MILLION);
 
-        let total = [input_cost, output_cost]
-            .iter()
-            .fold(None, |acc: Option<Decimal>, cost| match (acc, cost) {
-                (Some(a), Some(c)) => Some(a + c),
-                (None, Some(c)) => Some(*c),
-                (a, None) => a,
-            });
+        let total =
+            [input_cost, output_cost]
+                .iter()
+                .fold(None, |acc: Option<Decimal>, cost| match (acc, cost) {
+                    (Some(a), Some(c)) => Some(a + c),
+                    (None, Some(c)) => Some(*c),
+                    (a, None) => a,
+                });
 
         Cost {
             amount_usd: total,
@@ -64,7 +65,7 @@ struct ModelRate {
 fn lookup_rate(model: &str) -> ModelRate {
     match model {
         m if m.starts_with("gemini-1.5-flash") => ModelRate {
-            input_rate: Decimal::from_parts(7, 0, 0, false, 2),  // 0.07 (<=128k context tier)
+            input_rate: Decimal::from_parts(7, 0, 0, false, 2), // 0.07 (<=128k context tier)
             output_rate: Decimal::from_parts(30, 0, 0, false, 2), // 0.30
         },
         m if m.starts_with("gemini-1.5-pro") => ModelRate {
@@ -114,6 +115,9 @@ mod tests {
             ..Default::default()
         };
         let cost = GeminiUsageMapper::calculate_cost(&usage, "gemini-1.5-pro");
-        assert_eq!(cost.amount_usd, Some(Decimal::from_parts(625, 0, 0, false, 2)));
+        assert_eq!(
+            cost.amount_usd,
+            Some(Decimal::from_parts(625, 0, 0, false, 2))
+        );
     }
 }

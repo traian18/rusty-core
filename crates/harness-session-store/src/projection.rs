@@ -112,17 +112,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::store::{
-        DurableSessionMetadata, StoredAgentState,
-    };
+    use crate::store::{DurableSessionMetadata, StoredAgentState};
     use crate::version::SCHEMA_VERSION;
     use harness_protocol::backend::{
         BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
     };
     use harness_protocol::events::{AgentEventEnvelope, AgentOutcome, EventVisibility};
     use harness_protocol::ids::{
-        AgentId, BackendId, ConfigurationId, EventId, IntegrationId, RunId, SessionId,
-        Timestamp,
+        AgentId, BackendId, ConfigurationId, EventId, IntegrationId, RunId, SessionId, Timestamp,
     };
     use harness_protocol::usage::AgentBudget;
 

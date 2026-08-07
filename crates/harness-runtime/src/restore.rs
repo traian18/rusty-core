@@ -1,7 +1,7 @@
 //! Host dependency resolution for restore (RC-304).
 //!
 //! [`HostRestoreResolver`] is the runtime's concrete
-//! [`HostDependencyResolver`](harness_session_store::HostDependencyResolver):
+//! [`HostDependencyResolver`]:
 //! it resolves the references recorded in a snapshot's durable metadata
 //! against the *current* host — the live workspace binding and the
 //! integration registry — so restore never silently substitutes a fake
@@ -23,9 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_protocol::ids::SessionId;
-use harness_session_store::{
-    DependencyKind, HostDependencyResolver, RestoreReport,
-};
+use harness_session_store::{DependencyKind, HostDependencyResolver, RestoreReport};
 
 use crate::integration::IntegrationRegistry;
 use crate::traits::Workspace;
@@ -95,7 +93,9 @@ impl HostDependencyResolver for HostRestoreResolver {
             let resolved = match self.integrations.get(id_part) {
                 Ok(Some(_)) => true,
                 _ => match name_part {
-                    Some(name) => matches!(self.integrations.id_for_descriptor_name(name), Ok(Some(_))),
+                    Some(name) => {
+                        matches!(self.integrations.id_for_descriptor_name(name), Ok(Some(_)))
+                    }
                     None => false,
                 },
             };

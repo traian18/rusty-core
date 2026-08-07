@@ -46,7 +46,9 @@ pub enum MutationCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RpcRequestBody {
-    Hello { protocol_version: u32 },
+    Hello {
+        protocol_version: u32,
+    },
     CreateSession {
         workspace_root: PathBuf,
         integration: String,
@@ -66,7 +68,9 @@ pub enum RpcRequestBody {
         toolset: AgentToolset,
     },
     Snapshot,
-    Subscribe { since_seq: Option<u64> },
+    Subscribe {
+        since_seq: Option<u64>,
+    },
     /// M6: operational health/diagnostics + a Prometheus text metrics
     /// snapshot, over the same RPC transports every other request uses —
     /// deliberately not a separate HTTP `/metrics` listener, so exposing
@@ -165,9 +169,16 @@ pub enum RpcResponseBody {
         protocol_version: u32,
         capabilities: ProtocolCapabilities,
     },
-    SessionCreated { session_id: SessionId },
-    SessionRestored { session_id: SessionId, session_revision: u64 },
-    SessionsListed { sessions: Vec<SessionSummaryWire> },
+    SessionCreated {
+        session_id: SessionId,
+    },
+    SessionRestored {
+        session_id: SessionId,
+        session_revision: u64,
+    },
+    SessionsListed {
+        sessions: Vec<SessionSummaryWire>,
+    },
     Admission {
         metadata: MutationMetadata,
         result: AdmissionResult,

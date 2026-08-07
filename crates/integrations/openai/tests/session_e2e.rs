@@ -116,7 +116,10 @@ async fn openai_backend_runs_a_fixture_backed_session() {
         .expect("start OpenAI fixture session");
 
     let mut events = session.subscribe();
-    session.send("Say hello").await.expect("send fixture prompt");
+    session
+        .send("Say hello")
+        .await
+        .expect("send fixture prompt");
 
     let mut text = String::new();
     let mut completed = false;
@@ -141,7 +144,10 @@ async fn openai_backend_runs_a_fixture_backed_session() {
     assert_eq!(text, "Hello, world!");
 
     let snapshot = session.snapshot();
-    assert_eq!(snapshot.root_agent_status.metrics.total_tokens.value(), Some(15));
+    assert_eq!(
+        snapshot.root_agent_status.metrics.total_tokens.value(),
+        Some(15)
+    );
     assert_eq!(snapshot.usage.cumulative.total_requests, 1);
     assert!(snapshot.usage.cumulative.total_cost.is_some());
 }

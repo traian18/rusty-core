@@ -87,10 +87,17 @@ mod tests {
 
     #[test]
     fn duplicate_preserves_original_outcome() {
-        let original = AdmissionResult::AcceptedStarted { run_id: RunId::new() };
+        let original = AdmissionResult::AcceptedStarted {
+            run_id: RunId::new(),
+        };
         let duplicate = AdmissionResult::Duplicate {
             original: Box::new(original.clone()),
         };
-        assert_eq!(duplicate, AdmissionResult::Duplicate { original: Box::new(original) });
+        assert_eq!(
+            duplicate,
+            AdmissionResult::Duplicate {
+                original: Box::new(original)
+            }
+        );
     }
 }

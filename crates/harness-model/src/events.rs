@@ -17,23 +17,13 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub enum ModelEvent {
     /// A text delta from the model.
-    TextDelta {
-        delta: String,
-    },
+    TextDelta { delta: String },
     /// A reasoning / thinking delta from the model.
-    ReasoningDelta {
-        delta: String,
-    },
+    ReasoningDelta { delta: String },
     /// A tool call has been started — the tool name and ID are now known.
-    ToolCallStarted {
-        id: ToolCallId,
-        name: String,
-    },
+    ToolCallStarted { id: ToolCallId, name: String },
     /// A partial JSON fragment for an in-progress tool call.
-    ToolCallDelta {
-        id: ToolCallId,
-        delta: String,
-    },
+    ToolCallDelta { id: ToolCallId, delta: String },
     /// A tool call has been completed with its full input payload.
     ToolCallCompleted {
         id: ToolCallId,
@@ -43,17 +33,11 @@ pub enum ModelEvent {
     /// An intermediate usage update (may be emitted before [`Completed`]).
     ///
     /// [`Completed`]: ModelEvent::Completed
-    UsageUpdate {
-        usage: ModelUsage,
-    },
+    UsageUpdate { usage: ModelUsage },
     /// The model response completed successfully.
-    Completed {
-        result: ModelResult,
-    },
+    Completed { result: ModelResult },
     /// The model response terminated with an error.
-    Error {
-        error: ModelError,
-    },
+    Error { error: ModelError },
 }
 
 /// The result of a completed model invocation.
@@ -135,7 +119,9 @@ impl ModelError {
             Self::BackendError { code, .. } => {
                 code == "request_failed"
                     || code == "408"
-                    || code.parse::<u16>().is_ok_and(|status| (500..600).contains(&status))
+                    || code
+                        .parse::<u16>()
+                        .is_ok_and(|status| (500..600).contains(&status))
             }
             Self::InvalidRequest { .. }
             | Self::Cancelled
@@ -163,9 +149,22 @@ mod tests {
     fn retryability_is_limited_to_transient_failures() {
         assert!(ModelError::Timeout.is_retryable());
         assert!(ModelError::RateLimited { retry_after: None }.is_retryable());
-        assert!(ModelError::BackendError { message: String::new(), code: "503".into() }.is_retryable());
-        assert!(!ModelError::InvalidRequest { message: String::new() }.is_retryable());
-        assert!(!ModelError::Protocol { message: String::new() }.is_retryable());
-        assert!(!ModelError::CircuitOpen { retry_after: Duration::from_secs(1) }.is_retryable());
+        assert!(ModelError::BackendError {
+            message: String::new(),
+            code: "503".into()
+        }
+        .is_retryable());
+        assert!(!ModelError::InvalidRequest {
+            message: String::new()
+        }
+        .is_retryable());
+        assert!(!ModelError::Protocol {
+            message: String::new()
+        }
+        .is_retryable());
+        assert!(!ModelError::CircuitOpen {
+            retry_after: Duration::from_secs(1)
+        }
+        .is_retryable());
     }
 }

@@ -47,7 +47,10 @@ impl ExecutionBackend for ToolAdvertisingBackend {
     fn descriptor(&self) -> harness_protocol::backend::BackendDescriptor {
         let mut descriptor = self.inner.descriptor();
         if let Some(selection) = &self.selection {
-            descriptor.name = format!("{} [{}:{}]", descriptor.name, selection.provider, selection.provider_model_id);
+            descriptor.name = format!(
+                "{} [{}:{}]",
+                descriptor.name, selection.provider, selection.provider_model_id
+            );
         }
         descriptor
     }
@@ -240,17 +243,17 @@ impl SessionBuilder {
     /// Register an `AgentToolset` into the session.
     ///
     /// This is an alternative to [`tools`](Self::tools) that takes a
-    /// high-level tool policy set and a [`Workspace`] reference, creates
-    /// the appropriate [`ToolExecutor`] instances via
-    /// [`build_executor_for`](Self::build_executor_for), registers them
-    /// into a [`SimpleToolRegistry`], and wires both the registry and the
-    /// toolset into the root agent's capabilities.
+    /// high-level tool policy set and a [`Workspace`](harness_runtime::traits::Workspace)
+    /// reference, creates the appropriate [`ToolExecutor`](harness_runtime::traits::ToolExecutor)
+    /// instances via `build_executor_for`, registers them into a
+    /// [`SimpleToolRegistry`](harness_runtime::traits::SimpleToolRegistry), and wires both the
+    /// registry and the toolset into the root agent's capabilities.
     ///
     /// When this method is used, the builder will automatically populate
     /// the tool registry — there is no need to also call [`tools`](Self::tools).
     ///
-    /// The `workspace` argument provides the [`Workspace`] that filesystem
-    /// tools (`fs.read`, `fs.edit`, `workspace.search`) will delegate to.
+    /// The `workspace` argument provides the [`Workspace`](harness_runtime::traits::Workspace)
+    /// that filesystem tools (`fs.read`, `fs.edit`, `workspace.search`) will delegate to.
     /// Shell tools (`shell.exec`) ignore the workspace.
     pub fn toolset(
         mut self,
@@ -317,9 +320,14 @@ impl SessionBuilder {
         let (backend, persisted_selection) = match (self.backend, self.integration) {
             (Some(backend), _) => (backend, None),
             (None, Some(integration)) => {
-                let persisted_selection = integration.config.get("_backend_selection")
+                let persisted_selection = integration
+                    .config
+                    .get("_backend_selection")
                     .and_then(|value| serde_json::from_value(value.clone()).ok());
-                let backend = self.integrations.create(&integration.id, integration.config).await?;
+                let backend = self
+                    .integrations
+                    .create(&integration.id, integration.config)
+                    .await?;
                 (backend, persisted_selection)
             }
             (None, None) => return Err(HarnessError::MissingBackend),

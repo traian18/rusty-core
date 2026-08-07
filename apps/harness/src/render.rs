@@ -3,12 +3,12 @@ use crate::{
     markdown::{render_markdown, MarkdownTheme},
     model::{PermissionDisplayDecision, ToolCallState, TranscriptBlock},
 };
-use std::path::Path;
-use unicode_width::UnicodeWidthStr;
 use ratatui::{
     prelude::*,
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap},
 };
+use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 const BG: Color = Color::Rgb(13, 15, 19);
 const PANEL: Color = Color::Rgb(20, 23, 29);
@@ -22,7 +22,10 @@ const ERROR: Color = Color::Rgb(240, 110, 120);
 const BORDER: Color = Color::Rgb(48, 54, 66);
 
 pub fn render_startup(frame: &mut Frame, provider: &str, model: &str, workspace: &Path) {
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), frame.area());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BG)),
+        frame.area(),
+    );
 
     let area = centered_fixed(68, 12, frame.area());
     let workspace = workspace
@@ -31,7 +34,10 @@ pub fn render_startup(frame: &mut Frame, provider: &str, model: &str, workspace:
         .unwrap_or("workspace");
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled(" RUSTY ", Style::default().fg(BG).bg(ACCENT).bold())),
+        Line::from(Span::styled(
+            " RUSTY ",
+            Style::default().fg(BG).bg(ACCENT).bold(),
+        )),
         Line::from(Span::styled("Agent workspace", Style::default().fg(MUTED))),
         Line::from(""),
         Line::from(vec![
@@ -67,7 +73,10 @@ pub fn render_startup(frame: &mut Frame, provider: &str, model: &str, workspace:
 }
 
 pub fn render(frame: &mut Frame, state: &AppState) {
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), frame.area());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BG)),
+        frame.area(),
+    );
 
     if let Some(modal) = &state.modal {
         let layout = Layout::vertical([
@@ -83,8 +92,8 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 
     let body = if frame.area().width >= 100 {
-        let columns = Layout::horizontal([Constraint::Length(30), Constraint::Min(60)])
-            .split(frame.area());
+        let columns =
+            Layout::horizontal([Constraint::Length(30), Constraint::Min(60)]).split(frame.area());
         render_sidebar(frame, columns[0], state);
         columns[1]
     } else {
@@ -124,10 +133,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
             let marker = if active { "●" } else { "○" };
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled(format!("{marker} "), Style::default().fg(if active { SUCCESS } else { SUBTLE })),
+                    Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(if active { SUCCESS } else { SUBTLE }),
+                    ),
                     Span::styled(
                         session.title.clone(),
-                        Style::default().fg(if active { TEXT } else { MUTED }).bold(),
+                        Style::default()
+                            .fg(if active { TEXT } else { MUTED })
+                            .bold(),
                     ),
                 ]),
                 Line::from(Span::styled(
@@ -135,7 +149,11 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState) {
                         "   {} · {}{}",
                         session.provider,
                         session.model,
-                        if session.restorable { "" } else { " · history only" }
+                        if session.restorable {
+                            ""
+                        } else {
+                            " · history only"
+                        }
                     ),
                     Style::default().fg(SUBTLE),
                 )),
@@ -162,7 +180,11 @@ fn status_color(status: &str) -> Color {
     let lowered = status.to_lowercase();
     if lowered.contains("error") || lowered.contains("fail") {
         ERROR
-    } else if lowered.contains("run") || lowered.contains("active") || lowered.contains("process") || lowered.contains("connect") {
+    } else if lowered.contains("run")
+        || lowered.contains("active")
+        || lowered.contains("process")
+        || lowered.contains("connect")
+    {
         ACCENT
     } else if lowered.contains("idle") || lowered.contains("ready") || lowered.contains("complet") {
         SUCCESS
@@ -182,7 +204,10 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("   ", Style::default()),
         Span::styled("●", Style::default().fg(dot_color)),
         Span::styled(format!(" {}", state.status), Style::default().fg(MUTED)),
-        Span::styled("   Ctrl+N switch provider/model", Style::default().fg(SUBTLE).italic()),
+        Span::styled(
+            "   Ctrl+N switch provider/model",
+            Style::default().fg(SUBTLE).italic(),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(title)
@@ -241,10 +266,18 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
             lines.push(Line::from(badge("YOU", BG, ACCENT)));
             lines.extend(render_markdown(text, markdown_theme()));
         }
-        TranscriptBlock::AssistantMessage { text, reasoning, complete, .. } => {
+        TranscriptBlock::AssistantMessage {
+            text,
+            reasoning,
+            complete,
+            ..
+        } => {
             let mut header = vec![badge("ASSISTANT", BG, SUCCESS)];
             if !*complete {
-                header.push(Span::styled("  thinking…", Style::default().fg(MUTED).italic()));
+                header.push(Span::styled(
+                    "  thinking…",
+                    Style::default().fg(MUTED).italic(),
+                ));
             }
             lines.push(Line::from(header));
             if !reasoning.is_empty() {
@@ -259,7 +292,12 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
                 lines.extend(render_markdown(text, markdown_theme()));
             }
         }
-        TranscriptBlock::ToolCall { name, arguments, state, .. } => {
+        TranscriptBlock::ToolCall {
+            name,
+            arguments,
+            state,
+            ..
+        } => {
             let (label, color) = match state {
                 ToolCallState::Requested => ("queued".to_owned(), MUTED),
                 ToolCallState::Running => ("running".to_owned(), ACCENT),
@@ -280,20 +318,27 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
                     Style::default().fg(SUBTLE),
                 )));
             }
-            if let ToolCallState::Succeeded { preview } | ToolCallState::Failed { preview } = state {
+            if let ToolCallState::Succeeded { preview } | ToolCallState::Failed { preview } = state
+            {
                 lines.push(Line::from(Span::styled(
                     format!("  {}", single_line_preview(preview, 160)),
                     Style::default().fg(MUTED),
                 )));
             }
         }
-        TranscriptBlock::Permission { tool_name, decision, .. } => {
+        TranscriptBlock::Permission {
+            tool_name,
+            decision,
+            ..
+        } => {
             let (message, color) = match decision {
                 None => (
                     format!("Permission needed for {tool_name} · Ctrl+Y allow / Ctrl+N deny"),
                     WARNING,
                 ),
-                Some(PermissionDisplayDecision::Approved) => (format!("Allowed {tool_name}"), SUCCESS),
+                Some(PermissionDisplayDecision::Approved) => {
+                    (format!("Allowed {tool_name}"), SUCCESS)
+                }
                 Some(PermissionDisplayDecision::Denied) => (format!("Denied {tool_name}"), ERROR),
             };
             lines.push(Line::from(vec![
@@ -302,10 +347,15 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
             ]));
         }
         TranscriptBlock::ChildAgent { agent_id, outcome } => {
-            let state = outcome.map(|value| format!("{value:?}")).unwrap_or_else(|| "running".to_owned());
+            let state = outcome
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "running".to_owned());
             lines.push(Line::from(vec![
                 badge("CHILD", BG, ACCENT),
-                Span::styled(format!("  {}", short_id(&agent_id.to_string())), Style::default().fg(TEXT)),
+                Span::styled(
+                    format!("  {}", short_id(&agent_id.to_string())),
+                    Style::default().fg(TEXT),
+                ),
                 Span::styled(format!("  {state}"), Style::default().fg(MUTED)),
             ]));
         }
@@ -340,7 +390,10 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, focused: boo
         " Prompt · not focused "
     };
     let content = if state.input.is_empty() {
-        Text::from(Span::styled("Ask anything…  (Ctrl+N to switch provider/model)", Style::default().fg(MUTED).italic()))
+        Text::from(Span::styled(
+            "Ask anything…  (Ctrl+N to switch provider/model)",
+            Style::default().fg(MUTED).italic(),
+        ))
     } else {
         Text::from(state.input.clone())
     };
@@ -398,7 +451,10 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let permission = if pending == 0 {
         String::new()
     } else {
-        format!(" · {pending} permission{}", if pending == 1 { "" } else { "s" })
+        format!(
+            " · {pending} permission{}",
+            if pending == 1 { "" } else { "s" }
+        )
     };
     let help = match state.error_banner.as_deref() {
         Some(error) if state.modal.is_none() => format!(" ⚠ {error} "),
@@ -437,7 +493,11 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
 
     let (title, lines) = match modal {
         ModalState::Commands { selected } => {
-            let commands = ["New session / switch provider · model", "Context inspector", "Quit"];
+            let commands = [
+                "New session / switch provider · model",
+                "Context inspector",
+                "Quit",
+            ];
             (
                 " Command palette ",
                 commands
@@ -449,7 +509,8 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
         }
         ModalState::Provider { selected } => (
             " Select provider ",
-            state.providers
+            state
+                .providers
                 .iter()
                 .enumerate()
                 .flat_map(|(index, provider)| {
@@ -457,17 +518,28 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
                     let status_color = if provider.ready { SUCCESS } else { ERROR };
                     vec![
                         Line::from(vec![
-                            Span::styled(if index == *selected { "› " } else { "  " }, Style::default().fg(ACCENT)),
+                            Span::styled(
+                                if index == *selected { "› " } else { "  " },
+                                Style::default().fg(ACCENT),
+                            ),
                             Span::styled(format!("{status} "), Style::default().fg(status_color)),
                             Span::styled(
                                 provider.name.clone(),
                                 Style::default()
                                     .fg(if index == *selected { TEXT } else { MUTED })
-                                    .add_modifier(if index == *selected { Modifier::BOLD } else { Modifier::empty() }),
+                                    .add_modifier(if index == *selected {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
                             ),
                         ]),
                         Line::from(Span::styled(
-                            format!("      {} · {} models", provider.account_hint, provider.models.len()),
+                            format!(
+                                "      {} · {} models",
+                                provider.account_hint,
+                                provider.models.len()
+                            ),
                             Style::default().fg(SUBTLE),
                         )),
                     ]
@@ -479,7 +551,10 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
             (
                 " Select account ",
                 vec![
-                    Line::from(Span::styled(provider.name.clone(), Style::default().fg(ACCENT).bold())),
+                    Line::from(Span::styled(
+                        provider.name.clone(),
+                        Style::default().fg(ACCENT).bold(),
+                    )),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("Profile      ", Style::default().fg(MUTED)),
@@ -487,17 +562,25 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
                     ]),
                     Line::from(vec![
                         Span::styled("Connection   ", Style::default().fg(MUTED)),
-                        Span::styled(provider.credential_state.clone(), Style::default().fg(
-                            if provider.ready { SUCCESS } else { ERROR }
-                        )),
+                        Span::styled(
+                            provider.credential_state.clone(),
+                            Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
+                        ),
                     ]),
                     Line::from(vec![
                         Span::styled("Health       ", Style::default().fg(MUTED)),
-                        Span::styled(provider.health_message.clone(), Style::default().fg(if provider.ready { SUCCESS } else { ERROR })),
+                        Span::styled(
+                            provider.health_message.clone(),
+                            Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
+                        ),
                     ]),
                     Line::from(""),
                     Line::from(Span::styled(
-                        if provider.ready { "Authentication is owned by this profile or its official CLI." } else { "Resolve the connection issue before starting this provider." },
+                        if provider.ready {
+                            "Authentication is owned by this profile or its official CLI."
+                        } else {
+                            "Resolve the connection issue before starting this provider."
+                        },
                         Style::default().fg(SUBTLE),
                     )),
                 ],
@@ -520,7 +603,11 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
                     Style::default().fg(SUBTLE),
                 )),
             ];
-            let selected_index = if *selected == usize::MAX { 0 } else { *selected };
+            let selected_index = if *selected == usize::MAX {
+                0
+            } else {
+                *selected
+            };
             let start = selected_index.saturating_sub(3);
             lines.extend(
                 provider
@@ -539,10 +626,7 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
             }
             lines.extend([
                 Line::from(""),
-                Line::from(Span::styled(
-                    "Model ID",
-                    Style::default().fg(MUTED),
-                )),
+                Line::from(Span::styled("Model ID", Style::default().fg(MUTED))),
                 Line::from(Span::styled(
                     format!("  {value}_"),
                     Style::default().fg(TEXT).bg(Color::Rgb(30, 34, 43)),
@@ -555,7 +639,10 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
     let mut lines = lines;
     if let Some(error) = error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(format!("⚠ {error}"), Style::default().fg(ERROR))));
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {error}"),
+            Style::default().fg(ERROR),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -582,7 +669,6 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
     );
 }
 
-
 fn render_context_inspector(frame: &mut Frame, state: &AppState) {
     let area = centered_rect(68, 56, frame.area());
     frame.render_widget(Clear, area);
@@ -602,21 +688,37 @@ fn render_context_inspector(frame: &mut Frame, state: &AppState) {
         None => vec![Line::from(Span::styled("Context state is not available for this session.", Style::default().fg(MUTED)))],
     };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).style(Style::default().fg(TEXT).bg(PANEL)).block(
-            Block::default().title(" Context inspector ").title_style(Style::default().fg(BG).bg(ACCENT).bold())
-                .borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(ACCENT)).padding(Padding::new(2, 2, 1, 1))
-        ), area,
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL))
+            .block(
+                Block::default()
+                    .title(" Context inspector ")
+                    .title_style(Style::default().fg(BG).bg(ACCENT).bold())
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            ),
+        area,
     );
 }
 
 fn selectable_line(label: &str, selected: bool) -> Line<'static> {
     Line::from(vec![
-        Span::styled(if selected { "› " } else { "  " }, Style::default().fg(ACCENT)),
+        Span::styled(
+            if selected { "› " } else { "  " },
+            Style::default().fg(ACCENT),
+        ),
         Span::styled(
             label.to_owned(),
             Style::default()
                 .fg(if selected { TEXT } else { MUTED })
-                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
     ])
 }
@@ -643,7 +745,8 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let height = height.min(available_height);
     Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y.saturating_add(area.height.saturating_sub(height) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
         width,
         height,
     )

@@ -60,7 +60,10 @@ impl ExecutionBackend for ContextAssemblingBackend {
         sink: broadcast::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let request = self.provider.assemble(request, self.workspace.as_ref()).await;
+        let request = self
+            .provider
+            .assemble(request, self.workspace.as_ref())
+            .await;
         self.inner.execute(request, sink, cancel).await
     }
 }
@@ -82,7 +85,11 @@ mod tests {
 
     #[async_trait]
     impl ContextProvider for RecordingProvider {
-        async fn assemble(&self, mut request: ExecutionRequest, _workspace: &dyn Workspace) -> ExecutionRequest {
+        async fn assemble(
+            &self,
+            mut request: ExecutionRequest,
+            _workspace: &dyn Workspace,
+        ) -> ExecutionRequest {
             *self.received_prompt.lock().unwrap() = Some(request.system_prompt.clone());
             request.system_prompt = self.rewritten_prompt.clone();
             request

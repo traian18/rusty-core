@@ -166,7 +166,9 @@ fn agent_message_to_gemini(
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(text_part(text.clone())),
-                ContentBlock::Image { mime_type, data } => Some(image_part(mime_type.clone(), data)),
+                ContentBlock::Image { mime_type, data } => {
+                    Some(image_part(mime_type.clone(), data))
+                }
                 _ => None,
             })
             .collect(),
@@ -194,7 +196,10 @@ fn agent_message_to_gemini(
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolResult { call_id, result } => {
-                    let name = call_names.get(call_id).cloned().unwrap_or_else(|| call_id.to_string());
+                    let name = call_names
+                        .get(call_id)
+                        .cloned()
+                        .unwrap_or_else(|| call_id.to_string());
                     Some(GeminiPart {
                         text: None,
                         function_call: None,
@@ -218,7 +223,10 @@ fn agent_message_to_gemini(
         MessageRole::Assistant => "model",
         _ => "user",
     };
-    Some(GeminiContent { role: role.to_string(), parts })
+    Some(GeminiContent {
+        role: role.to_string(),
+        parts,
+    })
 }
 
 pub fn convert_messages(messages: &[AgentMessage]) -> Vec<GeminiContent> {
@@ -338,7 +346,9 @@ impl GeminiSseParser {
             cost: GeminiUsageMapper::calculate_cost(&self.usage, &self.model),
         };
         self.result = Some(result.clone());
-        terminal_events.push(ModelEvent::Completed { result: result.clone() });
+        terminal_events.push(ModelEvent::Completed {
+            result: result.clone(),
+        });
         self.events.extend(terminal_events.iter().cloned());
         Ok((terminal_events, result))
     }
@@ -349,21 +359,32 @@ impl GeminiSseParser {
         })?;
         let data = block
             .lines()
-            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:").map(str::trim))
+            .filter_map(|line| {
+                line.trim_end_matches('\r')
+                    .strip_prefix("data:")
+                    .map(str::trim)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        let value: serde_json::Value = serde_json::from_str(&data).map_err(|error| ModelError::Protocol {
-            message: format!("invalid chunk: {error}"),
-        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(&data).map_err(|error| ModelError::Protocol {
+                message: format!("invalid chunk: {error}"),
+            })?;
 
         if let Some(error) = value.get("error") {
             return Err(ModelError::BackendError {
-                message: error["message"].as_str().unwrap_or("Gemini stream error").to_string(),
-                code: error["status"].as_str().unwrap_or("stream_error").to_string(),
+                message: error["message"]
+                    .as_str()
+                    .unwrap_or("Gemini stream error")
+                    .to_string(),
+                code: error["status"]
+                    .as_str()
+                    .unwrap_or("stream_error")
+                    .to_string(),
             });
         }
 
@@ -372,11 +393,17 @@ impl GeminiSseParser {
         if let Some(usage_value) = value.get("usageMetadata") {
             if let Ok(raw) = serde_json::from_value::<RawGeminiUsage>(usage_value.clone()) {
                 self.usage = GeminiUsageMapper::map_usage(&raw);
-                events.push(ModelEvent::UsageUpdate { usage: self.usage.clone() });
+                events.push(ModelEvent::UsageUpdate {
+                    usage: self.usage.clone(),
+                });
             }
         }
 
-        let Some(candidate) = value.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first()) else {
+        let Some(candidate) = value
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+        else {
             return Ok(events);
         };
 
@@ -393,19 +420,34 @@ impl GeminiSseParser {
             for part in parts {
                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                     if !text.is_empty() {
-                        events.push(ModelEvent::TextDelta { delta: text.to_string() });
+                        events.push(ModelEvent::TextDelta {
+                            delta: text.to_string(),
+                        });
                     }
                 }
                 if let Some(function_call) = part.get("functionCall") {
-                    let name = function_call["name"].as_str().unwrap_or_default().to_string();
-                    let args = function_call.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    let name = function_call["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let args = function_call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
                     // Gemini sends the whole function call in one shot — no
                     // provider call ID exists, so the internal ToolCallId is
                     // minted fresh right here and never needs to be mapped
                     // back to anything (see module docs).
                     let id = ToolCallId::new();
-                    events.push(ModelEvent::ToolCallStarted { id, name: name.clone() });
-                    events.push(ModelEvent::ToolCallCompleted { id, name, input: args });
+                    events.push(ModelEvent::ToolCallStarted {
+                        id,
+                        name: name.clone(),
+                    });
+                    events.push(ModelEvent::ToolCallCompleted {
+                        id,
+                        name,
+                        input: args,
+                    });
                 }
             }
         }
@@ -469,8 +511,13 @@ mod tests {
     #[test]
     fn an_image_block_becomes_a_real_inline_data_part_not_silently_dropped() {
         let message = user_message(vec![
-            ContentBlock::Text { text: "what is this?".into() },
-            ContentBlock::Image { mime_type: "image/png".into(), data: vec![1, 2, 3] },
+            ContentBlock::Text {
+                text: "what is this?".into(),
+            },
+            ContentBlock::Image {
+                mime_type: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
         ]);
         let contents = convert_messages(std::slice::from_ref(&message));
         assert_eq!(contents.len(), 1);
@@ -494,7 +541,11 @@ data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"w
         let mut parser = GeminiSseParser::new("gemini-1.5-pro".to_string());
         let mut events = Vec::new();
         for byte in FIXTURE.as_bytes() {
-            events.extend(parser.push_chunk(std::slice::from_ref(byte)).expect("valid chunk"));
+            events.extend(
+                parser
+                    .push_chunk(std::slice::from_ref(byte))
+                    .expect("valid chunk"),
+            );
         }
         let (terminal, result) = parser.finish().expect("complete fixture");
         events.extend(terminal);
@@ -531,7 +582,9 @@ data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"w
         let completed = events
             .iter()
             .find_map(|e| match e {
-                ModelEvent::ToolCallCompleted { name, input, .. } => Some((name.clone(), input.clone())),
+                ModelEvent::ToolCallCompleted { name, input, .. } => {
+                    Some((name.clone(), input.clone()))
+                }
                 _ => None,
             })
             .expect("a ToolCallCompleted event on the very first chunk");
@@ -544,7 +597,11 @@ data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"w
         let mut parser = GeminiSseParser::new("gemini-1.5-pro".to_string());
         let chunk = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"checking...\"},{\"functionCall\":{\"name\":\"get_weather\",\"args\":{}}}]},\"finishReason\":\"STOP\"}]}\n\n";
         let events = parser.push_chunk(chunk).expect("valid chunk");
-        assert!(events.iter().any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "checking...")));
-        assert!(events.iter().any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "checking...")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ModelEvent::ToolCallCompleted { .. })));
     }
 }

@@ -146,7 +146,7 @@ pub enum AgentOperation {
 ///
 /// Each variant corresponds to an external event or user action that the
 /// agent's transition function (`Agent::apply`) processes, returning a
-/// list of [`AgentEffect`]s (defined in `crate::effects`).
+/// list of [`AgentEffect`](crate::effects::AgentEffect)s.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentCommand {
     /// Start a new run with the given user input.

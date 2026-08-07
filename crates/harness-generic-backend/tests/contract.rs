@@ -72,10 +72,7 @@ async fn collect_events(mut rx: broadcast::Receiver<ExecutionEvent>) -> Vec<Exec
 /// [`ExecutionError`] alongside the ordered event list.
 async fn run_execution(
     backend: GenericModelBackend,
-) -> (
-    Result<ExecutionResult, ExecutionError>,
-    Vec<ExecutionEvent>,
-) {
+) -> (Result<ExecutionResult, ExecutionError>, Vec<ExecutionEvent>) {
     let request = make_request();
     let (sink, rx) = broadcast::channel(256);
     let cancel = CancellationToken::new();
@@ -84,9 +81,7 @@ async fn run_execution(
 
     let result = backend.execute(request, sink, cancel).await;
 
-    let events = events_handle
-        .await
-        .expect("event collection task panicked");
+    let events = events_handle.await.expect("event collection task panicked");
 
     (result, events)
 }
@@ -147,9 +142,9 @@ async fn test_streaming_ordering() {
     assert_eq!(text_deltas, vec!["Hello ", "world!", " How are you?"]);
 
     // Verify the terminal Completed event is present.
-    let has_completed = events.iter().any(|e| {
-        matches!(e, ExecutionEvent::Completed { .. })
-    });
+    let has_completed = events
+        .iter()
+        .any(|e| matches!(e, ExecutionEvent::Completed { .. }));
     assert!(
         has_completed,
         "expected a Completed event in the event stream"
@@ -180,9 +175,7 @@ async fn test_cancellation_mid_flight() {
     let parent_token = CancellationToken::new();
     let child_token = parent_token.child_token();
 
-    let handle = tokio::spawn(async move {
-        backend.execute(request, sink, child_token).await
-    });
+    let handle = tokio::spawn(async move { backend.execute(request, sink, child_token).await });
 
     // Give the spawn time to enter the block_until_cancelled wait.
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -206,7 +199,7 @@ async fn test_completion() {
     let client = FakeModelClient::new().with_result(ModelResult {
         stop_reason: "end_turn".into(),
         usage: Default::default(),
-            cost: Default::default(),
+        cost: Default::default(),
     });
 
     let backend = GenericModelBackend::new(Arc::new(client));
@@ -461,7 +454,9 @@ async fn execution_params_are_forwarded_to_the_model_client_unchanged() {
     };
 
     let (sink, _rx) = broadcast::channel(256);
-    let result = backend.execute(request, sink, CancellationToken::new()).await;
+    let result = backend
+        .execute(request, sink, CancellationToken::new())
+        .await;
     assert!(result.is_ok(), "execution should succeed: {result:?}");
 
     let seen = last_request_probe
@@ -476,7 +471,10 @@ async fn execution_params_are_forwarded_to_the_model_client_unchanged() {
         seen.reasoning_effort,
         Some(harness_protocol::backend::ReasoningEffort::High)
     );
-    assert_eq!(seen.provider_options, serde_json::json!({"anthropic": {"top_k": 40}}));
+    assert_eq!(
+        seen.provider_options,
+        serde_json::json!({"anthropic": {"top_k": 40}})
+    );
 }
 
 /// A request that asks for reasoning against a model client that doesn't
@@ -501,7 +499,9 @@ async fn reasoning_request_against_a_non_reasoning_model_is_rejected_before_disp
     request.extended_thinking = true;
 
     let (sink, _rx) = broadcast::channel(256);
-    let result = backend.execute(request, sink, CancellationToken::new()).await;
+    let result = backend
+        .execute(request, sink, CancellationToken::new())
+        .await;
 
     match result {
         Err(ExecutionError::UnsupportedCapability { capability, .. }) => {
@@ -540,7 +540,9 @@ async fn tool_call_request_against_a_non_tool_model_is_rejected_before_dispatch(
     }];
 
     let (sink, _rx) = broadcast::channel(256);
-    let result = backend.execute(request, sink, CancellationToken::new()).await;
+    let result = backend
+        .execute(request, sink, CancellationToken::new())
+        .await;
 
     match result {
         Err(ExecutionError::UnsupportedCapability { capability, .. }) => {
@@ -568,7 +570,10 @@ async fn plain_text_request_passes_capability_checks_against_a_minimal_model() {
 
     let backend = GenericModelBackend::new(Arc::new(client));
     let (result, _events) = run_execution(backend).await;
-    assert!(result.is_ok(), "plain request should not trip capability checks: {result:?}");
+    assert!(
+        result.is_ok(),
+        "plain request should not trip capability checks: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -603,7 +608,10 @@ pub async fn run_backend_contract_suite(backend: Arc<dyn ExecutionBackend>) {
         !descriptor.id.to_string().is_empty(),
         "descriptor id must be non-empty"
     );
-    assert!(!descriptor.name.is_empty(), "descriptor name must be non-empty");
+    assert!(
+        !descriptor.name.is_empty(),
+        "descriptor name must be non-empty"
+    );
 
     let _caps = backend.capabilities();
 

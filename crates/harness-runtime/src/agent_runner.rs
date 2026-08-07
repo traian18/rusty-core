@@ -12,7 +12,9 @@ use harness_core::agent::Agent;
 use harness_core::transcript::validate_transcript;
 use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus, UserInput};
-use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, SpawnMode, ToolRequest};
+use harness_protocol::effects::{
+    AgentEffect, SessionMutation, SpawnAgentSpec, SpawnMode, ToolRequest,
+};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
 use harness_session_store::SessionCommitter;
@@ -464,7 +466,11 @@ impl AgentRunner {
                     // performs no second publication: the runner remains in
                     // WaitingForPermission until the matching
                     // PermissionResolved command arrives.
-                    debug_assert!(self.agent.state.pending_permissions.contains_key(&request.id));
+                    debug_assert!(self
+                        .agent
+                        .state
+                        .pending_permissions
+                        .contains_key(&request.id));
                 }
                 AgentEffect::Persist { mutation } => {
                     self.persist(mutation).await;
@@ -675,7 +681,10 @@ impl AgentRunner {
         };
 
         if let Err(error) = validate_transcript(&self.agent.state.messages) {
-            tracing::error!(?error, "refusing to persist mutation for invalid transcript");
+            tracing::error!(
+                ?error,
+                "refusing to persist mutation for invalid transcript"
+            );
             return;
         }
 
@@ -712,7 +721,10 @@ impl AgentRunner {
     /// never overtaken.
     async fn execute_backend(&mut self, request: ExecutionRequest) {
         if let Err(error) = validate_transcript(&self.agent.state.messages) {
-            tracing::error!(?error, "refusing to dispatch backend request with invalid transcript");
+            tracing::error!(
+                ?error,
+                "refusing to dispatch backend request with invalid transcript"
+            );
             let event = ExecutionEvent::Error {
                 request_id: request.request_id,
                 error: ExecutionError::InvalidRequest {
@@ -951,7 +963,11 @@ impl AgentRunner {
                 }
                 let effects = self.apply_and_publish(AgentCommand::ToolCompleted {
                     call_id,
-                    result: harness_protocol::tools::ToolResult { call_id, output, is_error },
+                    result: harness_protocol::tools::ToolResult {
+                        call_id,
+                        output,
+                        is_error,
+                    },
                 });
                 Box::pin(self.dispatch_effects(effects)).await;
             }
@@ -990,9 +1006,7 @@ impl AgentRunner {
     }
 }
 
-fn to_protocol_tool_error(
-    error: harness_tools::ToolError,
-) -> harness_protocol::tools::ToolError {
+fn to_protocol_tool_error(error: harness_tools::ToolError) -> harness_protocol::tools::ToolError {
     match error {
         harness_tools::ToolError::ExecutionFailed => {
             harness_protocol::tools::ToolError::ExecutionFailed
@@ -1277,7 +1291,11 @@ mod tests {
         // recorded Success outcome) while the mailbox loop is still alive.
         let mut first_completed = false;
         for _ in 0..100 {
-            let live = live_state.lock().expect("live_state mutex poisoned").get(&agent_id).cloned();
+            let live = live_state
+                .lock()
+                .expect("live_state mutex poisoned")
+                .get(&agent_id)
+                .cloned();
             if let Some(live) = live {
                 if live.status == AgentStatus::Idle
                     && matches!(live.last_outcome, Some(AgentOutcome::Success))
@@ -1305,7 +1323,11 @@ mod tests {
 
         let mut second_completed = false;
         for _ in 0..100 {
-            let live = live_state.lock().expect("live_state mutex poisoned").get(&agent_id).cloned();
+            let live = live_state
+                .lock()
+                .expect("live_state mutex poisoned")
+                .get(&agent_id)
+                .cloned();
             if let Some(live) = live {
                 if live.status == AgentStatus::Idle && live.total_requests >= 2 {
                     second_completed = true;
@@ -1580,7 +1602,10 @@ mod tests {
         .await
         .expect("should observe a second RunStarted for the queued follow-up");
 
-        assert_eq!(run_started_count, 2, "the follow-up must eventually start its own run");
+        assert_eq!(
+            run_started_count, 2,
+            "the follow-up must eventually start its own run"
+        );
         assert!(
             saw_first_completed_before_second_start,
             "the queued follow-up must not start until the first run completed"
@@ -1811,11 +1836,8 @@ mod tests {
         // Drain the mailbox briefly: if the second call had reached the
         // executor (not gated), cancelling it produces a ToolFailed for
         // `second_call` promptly.
-        let saw_second_call_complete = tokio::time::timeout(
-            Duration::from_millis(200),
-            runner.task.commands.recv(),
-        )
-        .await;
+        let saw_second_call_complete =
+            tokio::time::timeout(Duration::from_millis(200), runner.task.commands.recv()).await;
         match saw_second_call_complete {
             Ok(Some(AgentCommand::ToolFailed { call_id, .. }))
             | Ok(Some(AgentCommand::ToolCompleted { call_id, .. }))

@@ -6,9 +6,7 @@ use harness_protocol::backend::{
     BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
 };
 use harness_protocol::commands::{AgentCommand, UserInput};
-use harness_protocol::ids::{
-    AgentId, BackendId, ConfigurationId, IntegrationId, SessionId,
-};
+use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::AgentBudget;
 
@@ -69,7 +67,10 @@ fn identical_agent_and_command_produce_identical_state_and_effects() {
     );
     assert_eq!(first.state.status, second.state.status);
     assert_eq!(first.state.active_run, second.state.active_run);
-    assert_eq!(first.state.transition_sequence, second.state.transition_sequence);
+    assert_eq!(
+        first.state.transition_sequence,
+        second.state.transition_sequence
+    );
     assert_eq!(
         serde_json::to_string(&first.state.messages).unwrap(),
         serde_json::to_string(&second.state.messages).unwrap()

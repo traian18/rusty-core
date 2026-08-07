@@ -20,7 +20,9 @@ pub enum ReplayError {
     NotFound(SessionId),
     #[error("snapshot schema version {found} is newer than supported ({supported})")]
     FutureSnapshotVersion { found: u64, supported: u64 },
-    #[error("snapshot schema version {found} is older than the oldest supported version ({supported})")]
+    #[error(
+        "snapshot schema version {found} is older than the oldest supported version ({supported})"
+    )]
     AncientSnapshotVersion { found: u64, supported: u64 },
     #[error("duplicate event id {event_id} at session sequence {session_sequence}")]
     DuplicateEventId {
@@ -96,10 +98,12 @@ pub fn validate_trailing_replay(
     let mut validated = Vec::with_capacity(stored.events.len());
 
     for event in &stored.events {
-        let sequence = event.session_sequence.ok_or_else(|| ReplayError::CorruptPayload {
-            session_sequence: None,
-            reason: "durable event carries no final session sequence".into(),
-        })?;
+        let sequence = event
+            .session_sequence
+            .ok_or_else(|| ReplayError::CorruptPayload {
+                session_sequence: None,
+                reason: "durable event carries no final session sequence".into(),
+            })?;
 
         if event.envelope.session_sequence != Some(sequence) {
             return Err(ReplayError::CorruptPayload {
@@ -136,8 +140,7 @@ pub fn validate_trailing_replay(
                 });
             }
             Some(value)
-                if gap_policy == GapPolicy::Strict
-                    && sequence > value.saturating_add(1) =>
+                if gap_policy == GapPolicy::Strict && sequence > value.saturating_add(1) =>
             {
                 return Err(ReplayError::Gap {
                     expected: value.saturating_add(1),
@@ -157,12 +160,11 @@ pub fn validate_trailing_replay(
 }
 
 fn validate_payload(event: &DurableSessionEvent, sequence: u64) -> Result<(), ReplayError> {
-    let payload = serde_json::to_value(&event.envelope).map_err(|error| {
-        ReplayError::CorruptPayload {
+    let payload =
+        serde_json::to_value(&event.envelope).map_err(|error| ReplayError::CorruptPayload {
             session_sequence: Some(sequence),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     serde_json::to_string(&payload).map_err(|error| ReplayError::CorruptPayload {
         session_sequence: Some(sequence),
         reason: error.to_string(),
@@ -223,9 +225,7 @@ fn is_terminal(status: AgentStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        DurableSessionMetadata, DurableSessionSnapshot, StoredAgentState,
-    };
+    use crate::store::{DurableSessionMetadata, DurableSessionSnapshot, StoredAgentState};
     use crate::version::SCHEMA_VERSION;
     use harness_protocol::backend::{
         BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
@@ -266,12 +266,7 @@ mod tests {
     ) -> DurableSessionEvent {
         DurableSessionEvent {
             session_sequence: Some(seq),
-            envelope: envelope(
-                session,
-                agent,
-                seq,
-                AgentEvent::StateChanged { from, to },
-            ),
+            envelope: envelope(session, agent, seq, AgentEvent::StateChanged { from, to }),
         }
     }
 
@@ -337,7 +332,13 @@ mod tests {
         let session = SessionId::new();
         let agent = AgentId::new();
         let events = vec![
-            state_event(session, agent, 1, AgentStatus::Idle, AgentStatus::PreparingContext),
+            state_event(
+                session,
+                agent,
+                1,
+                AgentStatus::Idle,
+                AgentStatus::PreparingContext,
+            ),
             state_event(
                 session,
                 agent,
@@ -359,7 +360,13 @@ mod tests {
         let session = SessionId::new();
         let agent = AgentId::new();
         let events = vec![
-            state_event(session, agent, 1, AgentStatus::Idle, AgentStatus::PreparingContext),
+            state_event(
+                session,
+                agent,
+                1,
+                AgentStatus::Idle,
+                AgentStatus::PreparingContext,
+            ),
             state_event(
                 session,
                 agent,
@@ -379,7 +386,13 @@ mod tests {
         let session = SessionId::new();
         let agent = AgentId::new();
         let events = vec![
-            state_event(session, agent, 2, AgentStatus::Idle, AgentStatus::PreparingContext),
+            state_event(
+                session,
+                agent,
+                2,
+                AgentStatus::Idle,
+                AgentStatus::PreparingContext,
+            ),
             state_event(
                 session,
                 agent,
@@ -424,8 +437,20 @@ mod tests {
         let first = AgentId::new();
         let second = AgentId::new();
         let events = vec![
-            state_event(session, first, 1, AgentStatus::Idle, AgentStatus::PreparingContext),
-            state_event(session, second, 2, AgentStatus::Idle, AgentStatus::PreparingContext),
+            state_event(
+                session,
+                first,
+                1,
+                AgentStatus::Idle,
+                AgentStatus::PreparingContext,
+            ),
+            state_event(
+                session,
+                second,
+                2,
+                AgentStatus::Idle,
+                AgentStatus::PreparingContext,
+            ),
             state_event(
                 session,
                 first,

@@ -1,4 +1,3 @@
-
 //! Behavioral counterpart of [`harness_protocol::rpc`]'s wire types.
 //!
 //! [`RpcHandler`] decouples "how bytes move" (the transport crates:

@@ -111,8 +111,8 @@ use std::sync::Arc;
 
 use harness_protocol::ids::SessionId;
 use harness_session_store::{
-    migrate_snapshot, DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore,
-    SCHEMA_VERSION, SessionStore, SqliteSessionStore, StoredSession, StoreError,
+    migrate_snapshot, DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, SessionStore,
+    SqliteSessionStore, StoreError, StoredSession, SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -237,14 +237,17 @@ fn load_fixture(name: &str) -> Fixture {
 
 /// The names of the committed `.json` files in `tests/fixtures/`.
 fn committed_fixture_names() -> Vec<String> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|error| panic!("failed to list tests/fixtures: {error}"))
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                path.file_stem().map(|stem| stem.to_string_lossy().into_owned())
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
             } else {
                 None
             }
@@ -285,15 +288,12 @@ fn expectation_for(
             ok: Some(true),
             error: None,
         },
-        Some(map) => map
-            .get(store_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "fixture '{fixture_name}' mutation {mutation_index} declares expectations \
+        Some(map) => map.get(store_name).cloned().unwrap_or_else(|| {
+            panic!(
+                "fixture '{fixture_name}' mutation {mutation_index} declares expectations \
                      but not for the '{store_name}' store — record it explicitly"
-                )
-            }),
+            )
+        }),
     }
 }
 
@@ -368,9 +368,12 @@ async fn replay_fixture(store: &Arc<dyn SessionStore>, store_name: &str, fixture
 
     if let Some(expected) = &fixture.expected_session {
         let session_id: SessionId = expected.session_id;
-        let loaded = store.load_session(session_id).await.unwrap_or_else(|error| {
-            panic!("{store_name} replay of '{fixture_name}': load_session failed: {error:?}")
-        });
+        let loaded = store
+            .load_session(session_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{store_name} replay of '{fixture_name}': load_session failed: {error:?}")
+            });
         assert_stored_sessions_match(expected, &loaded);
     }
 }
@@ -427,9 +430,7 @@ fn legacy_fixture_snapshot_migrates_to_current_version() {
     let expected = fixture
         .expected_session
         .expect("fixture carries an expected session");
-    let snapshot = expected
-        .snapshot
-        .expect("fixture carries a snapshot");
+    let snapshot = expected.snapshot.expect("fixture carries a snapshot");
     assert_eq!(
         snapshot.schema_version, 0,
         "the legacy fixture's snapshot is version 0"

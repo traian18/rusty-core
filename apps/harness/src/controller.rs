@@ -1,9 +1,7 @@
 use anyhow::{anyhow, Result};
 use harness_engine::SessionHandle;
 use harness_protocol::{
-    commands::PermissionDecision,
-    events::AgentEventEnvelope,
-    ids::PermissionId,
+    commands::PermissionDecision, events::AgentEventEnvelope, ids::PermissionId,
 };
 use harness_session_store::SessionSummary;
 use tokio::sync::broadcast;
@@ -33,7 +31,10 @@ impl AppController {
         options: SessionOptions,
         selection: SessionSelection,
     ) -> Result<Self> {
-        let provider_options = harness.provider_options().await.unwrap_or_else(|_| crate::providers::fallback_options());
+        let provider_options = harness
+            .provider_options()
+            .await
+            .unwrap_or_else(|_| crate::providers::fallback_options());
         let catalog = harness.list_sessions().await.unwrap_or_default();
 
         // Honor the requested provider when it is ready. Otherwise fall back to
@@ -55,7 +56,11 @@ impl AppController {
                     format!("Could not start provider session: {error}"),
                 ),
             }
-        } else if let Some(ready) = provider_options.iter().find(|provider| provider.ready).cloned() {
+        } else if let Some(ready) = provider_options
+            .iter()
+            .find(|provider| provider.ready)
+            .cloned()
+        {
             let active = selection_from_option(&ready);
             match harness.start_selected(&active).await {
                 Ok(handle) => live_from_handle(handle, active, provider_options, catalog),
@@ -142,16 +147,12 @@ impl AppController {
             return Ok(());
         };
 
-        if let Some(index) = self
-            .sessions
-            .iter()
-            .position(|session| {
-                session
-                    .handle
-                    .as_ref()
-                    .is_some_and(|handle| handle.session_id() == entry.id)
-            })
-        {
+        if let Some(index) = self.sessions.iter().position(|session| {
+            session
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.session_id() == entry.id)
+        }) {
             self.active = index;
             return Ok(());
         }
@@ -172,14 +173,11 @@ impl AppController {
             .iter()
             .find(|agent| agent.agent_id == snapshot.root_agent_id)
             .ok_or_else(|| anyhow!("session {} has no root agent state", entry.id))?;
-        let selection = selection_for_backend(
-            Some(&root.backend.descriptor.name),
-            &root.backend_config,
-        );
+        let selection =
+            selection_for_backend(Some(&root.backend.descriptor.name), &root.backend_config);
         let handle = self.harness.restore(entry.id).await?;
         let events = handle.subscribe();
-        let mut state =
-            AppState::from_snapshot(handle.snapshot().status, entry.id, selection);
+        let mut state = AppState::from_snapshot(handle.snapshot().status, entry.id, selection);
         state.providers = self.state().providers.clone();
         state.sessions = catalog;
         state.hydrate_messages(root.agent_id, &root.messages);
@@ -198,8 +196,7 @@ impl AppController {
         let handle = self.harness.start_selected(&selection).await?;
         let session_id = handle.session_id();
         let events = handle.subscribe();
-        let mut state =
-            AppState::from_snapshot(handle.snapshot().status, session_id, selection);
+        let mut state = AppState::from_snapshot(handle.snapshot().status, session_id, selection);
         state.providers = self.state().providers.clone();
         let mut entries = self.state().sessions.clone();
         entries.insert(
@@ -226,11 +223,21 @@ impl AppController {
     }
 
     pub async fn refresh_active_models(&mut self) -> Result<()> {
-        let provider_key = self.state().providers.iter().find(|provider| provider.name == self.state().provider)
-            .map(|provider| provider.id.clone()).ok_or_else(|| anyhow!("active provider is not in the catalog"))?;
+        let provider_key = self
+            .state()
+            .providers
+            .iter()
+            .find(|provider| provider.name == self.state().provider)
+            .map(|provider| provider.id.clone())
+            .ok_or_else(|| anyhow!("active provider is not in the catalog"))?;
         let refreshed = self.harness.refresh_provider(&provider_key).await?;
         for session in &mut self.sessions {
-            if let Some(existing) = session.state.providers.iter_mut().find(|provider| provider.id == provider_key) {
+            if let Some(existing) = session
+                .state
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_key)
+            {
                 *existing = refreshed.clone();
             }
         }
@@ -238,14 +245,24 @@ impl AppController {
     }
 
     pub fn auth_instruction(&self) -> Result<String> {
-        let provider = self.state().providers.iter().find(|provider| provider.name == self.state().provider)
+        let provider = self
+            .state()
+            .providers
+            .iter()
+            .find(|provider| provider.name == self.state().provider)
             .ok_or_else(|| anyhow!("active provider is not in the catalog"))?;
         let flow = self.harness.auth_flow(&provider.id)?;
         Ok(match flow.current() {
             Some(harness_engine::AuthFlowState::WaitingForExternalCommand { program, args }) => {
-                format!("Connect in a foreground terminal: {} {}", program, args.join(" "))
+                format!(
+                    "Connect in a foreground terminal: {} {}",
+                    program,
+                    args.join(" ")
+                )
             }
-            Some(harness_engine::AuthFlowState::Connected { profile }) => format!("Connected as {}", profile.label),
+            Some(harness_engine::AuthFlowState::Connected { profile }) => {
+                format!("Connected as {}", profile.label)
+            }
             Some(harness_engine::AuthFlowState::Failed { safe_message }) => safe_message.clone(),
             Some(state) => format!("Authentication state: {state:?}"),
             None => "Authentication flow returned no state".into(),
@@ -298,9 +315,12 @@ fn live_from_handle(
     catalog: Vec<SessionSummary>,
 ) -> LiveSession {
     let events = handle.subscribe();
-    let mut state = AppState::from_snapshot(handle.snapshot().status, handle.session_id(), selection);
+    let mut state =
+        AppState::from_snapshot(handle.snapshot().status, handle.session_id(), selection);
     state.set_provider_options(provider_options);
-    state.sessions.extend(catalog.into_iter().map(entry_from_summary));
+    state
+        .sessions
+        .extend(catalog.into_iter().map(entry_from_summary));
     LiveSession {
         handle: Some(handle),
         events: Some(events),
@@ -316,7 +336,9 @@ fn live_welcome(
 ) -> LiveSession {
     let mut state = AppState::welcome(selection);
     state.set_provider_options(provider_options);
-    state.sessions.extend(catalog.into_iter().map(entry_from_summary));
+    state
+        .sessions
+        .extend(catalog.into_iter().map(entry_from_summary));
     state.open_new_session();
     state.set_start_error(message.into());
     LiveSession {
@@ -337,8 +359,7 @@ fn selection_from_option(option: &ProviderOption) -> SessionSelection {
 }
 
 fn entry_from_summary(summary: SessionSummary) -> SessionEntry {
-    let selection =
-        selection_for_backend(summary.backend_name.as_deref(), &summary.backend_config);
+    let selection = selection_for_backend(summary.backend_name.as_deref(), &summary.backend_config);
     SessionEntry {
         id: summary.session_id,
         title: summary.title,

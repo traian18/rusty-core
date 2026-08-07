@@ -1,4 +1,3 @@
-
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -185,10 +184,12 @@ impl SessionCommitter {
             };
             let append_start = std::time::Instant::now();
             let append_result = self.store.append(durable).await;
-            metrics::histogram!("harness_store_commit_duration_seconds").record(append_start.elapsed().as_secs_f64());
+            metrics::histogram!("harness_store_commit_duration_seconds")
+                .record(append_start.elapsed().as_secs_f64());
             match append_result {
                 Ok(()) => {
-                    metrics::counter!("harness_store_commits_total", "outcome" => "success").increment(1);
+                    metrics::counter!("harness_store_commits_total", "outcome" => "success")
+                        .increment(1);
                     self.note_durable_append(sequence)
                 }
                 Err(StoreError::InvalidState(message))
@@ -203,7 +204,8 @@ impl SessionCommitter {
                         return Err(CommitError::Store(error));
                     }
                     DurabilityPolicy::BestEffort => {
-                        metrics::counter!("harness_store_commits_total", "outcome" => "degraded").increment(1);
+                        metrics::counter!("harness_store_commits_total", "outcome" => "degraded")
+                            .increment(1);
                         tracing::warn!(
                             %sequence,
                             %error,
@@ -393,14 +395,19 @@ mod tests {
         for _ in 0..32 {
             let committer = committer.clone();
             tasks.push(tokio::spawn(async move {
-                committer.commit(event(session, true)).await.expect("commit")
+                committer
+                    .commit(event(session, true))
+                    .await
+                    .expect("commit")
             }));
         }
         for task in tasks {
             task.await.expect("task").expect("published");
         }
         let stored = store.load_session(session).await.expect("load");
-        let sequences = stored.events.iter()
+        let sequences = stored
+            .events
+            .iter()
             .map(|event| event.session_sequence.expect("sequence"))
             .collect::<Vec<_>>();
         assert_eq!(sequences, (1..=32).collect::<Vec<_>>());

@@ -46,8 +46,8 @@ use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::{AgentBudget, UsageRecord};
 use harness_session_store::{
     CheckpointReason, CheckpointRequester, DurableSessionMetadata, DurableSessionSnapshot,
-    SCHEMA_VERSION, SessionCommitter, SessionStore, StoredAgentState, StoredPendingToolCall,
-    StoreError,
+    SessionCommitter, SessionStore, StoreError, StoredAgentState, StoredPendingToolCall,
+    SCHEMA_VERSION,
 };
 use rust_decimal::Decimal;
 
@@ -451,7 +451,7 @@ impl SessionEventBus {
 
     /// Run the event bus's forwarding loop.
     ///
-    /// Polls every registered agent receiver via [`try_recv`],
+    /// Polls every registered agent receiver via `try_recv`,
     /// assigns a monotonically increasing `session_sequence` to each event
     /// that does not already carry one, and forwards to all subscribers.
     /// Exits when `bus_cancel` is triggered.
@@ -564,11 +564,14 @@ impl CheckpointRequester for RuntimeCheckpointRequester {
         tokio::spawn(async move {
             let start = std::time::Instant::now();
             let result = store.save_snapshot(snapshot).await;
-            metrics::histogram!("harness_checkpoint_duration_seconds").record(start.elapsed().as_secs_f64());
+            metrics::histogram!("harness_checkpoint_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
             match result {
-                Ok(()) => metrics::counter!("harness_checkpoints_total", "outcome" => "success").increment(1),
+                Ok(()) => metrics::counter!("harness_checkpoints_total", "outcome" => "success")
+                    .increment(1),
                 Err(error) => {
-                    metrics::counter!("harness_checkpoints_total", "outcome" => "failed").increment(1);
+                    metrics::counter!("harness_checkpoints_total", "outcome" => "failed")
+                        .increment(1);
                     tracing::error!(%error, ?reason, "automatic session checkpoint failed");
                 }
             }
@@ -793,7 +796,7 @@ impl SessionRuntime {
     /// This is what makes a session restorable (RC-304): `restore_session`'s
     /// [`HostDependencyResolver`](harness_session_store::HostDependencyResolver)
     /// resolves a snapshot's `integration_references` by looking up that
-    /// exact id in the live [`IntegrationRegistry`](crate::integration::IntegrationRegistry) —
+    /// exact id in the live [`IntegrationRegistry`] —
     /// a random id minted here and never registered anywhere can never
     /// resolve, which is exactly what [`new_with_scheduler`](Self::new_with_scheduler)
     /// (its `backend_integration_id: None` case, below) produces. Callers
@@ -1040,9 +1043,9 @@ impl SessionRuntime {
                     execution_params: stored.execution_params,
                     messages: stored.messages,
                     context: Default::default(),
-                active_run: stored.active_run,
-                queued_inputs: Default::default(),
-                pending_tools: stored
+                    active_run: stored.active_run,
+                    queued_inputs: Default::default(),
+                    pending_tools: stored
                         .pending_tools
                         .into_iter()
                         .map(|(call_id, pending)| {
@@ -1218,9 +1221,9 @@ impl SessionRuntime {
         runtime
     }
 
-    /// Take the root task's [`JoinHandle`], if it has not been taken already.
+    /// Take the root task's [`JoinHandle`](tokio::task::JoinHandle), if it has not been taken already.
     ///
-    /// This allows a supervisor (e.g. [`SessionManager`]) to await the root
+    /// This allows a supervisor (e.g. [`SessionManager`](crate::session_manager::SessionManager)) to await the root
     /// task and detect panics or unexpected terminations. The handle can only
     /// be taken once; subsequent calls return `None`.
     pub fn take_root_task_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1234,7 +1237,7 @@ impl SessionRuntime {
     ///
     /// This transitions the session's status to [`SessionStatus::Failed`] and
     /// stores the error description. It is called by the supervisor task when
-    /// the root task's `JoinHandle` produces a [`JoinError`].
+    /// the root task's `JoinHandle` produces a [`JoinError`](tokio::task::JoinError).
     pub fn mark_failed(&self, error_msg: String) {
         let mut state = self.state.lock().expect("state mutex poisoned");
         state.status = SessionStatus::Failed;
@@ -1373,7 +1376,8 @@ impl SessionRuntime {
 
     /// Shutdown the entire session, including the event bus.
     ///
-    /// This is the final teardown — called by [`SessionManager::close_session`]
+    /// This is the final teardown — called by
+    /// [`SessionManager::close_session`](crate::session_manager::SessionManager::close_session)
     /// and [`Drop`].  After this, no further events will be forwarded to
     /// subscribers.
     pub fn shutdown(&self) {
@@ -1708,7 +1712,9 @@ mod tests {
     }
 
     /// Drains buffered envelopes from a broadcast receiver non-blockingly.
-    fn drain_envelopes(rx: &mut broadcast::Receiver<AgentEventEnvelope>) -> Vec<AgentEventEnvelope> {
+    fn drain_envelopes(
+        rx: &mut broadcast::Receiver<AgentEventEnvelope>,
+    ) -> Vec<AgentEventEnvelope> {
         let mut envelopes = Vec::new();
         while let Ok(envelope) = rx.try_recv() {
             envelopes.push(envelope);
@@ -2001,8 +2007,7 @@ mod tests {
                 loop {
                     let live = runtime.agent_live_state(root_id);
                     let expected_requests = if prompt == "first" { 1 } else { 2 };
-                    if live.status == AgentStatus::Idle
-                        && live.total_requests >= expected_requests
+                    if live.status == AgentStatus::Idle && live.total_requests >= expected_requests
                     {
                         break;
                     }
@@ -2011,10 +2016,7 @@ mod tests {
             })
             .await
             .expect("run should complete");
-            assert_eq!(
-                runtime.state_snapshot().status,
-                SessionStatus::Completed
-            );
+            assert_eq!(runtime.state_snapshot().status, SessionStatus::Completed);
         }
     }
 
@@ -2223,12 +2225,10 @@ mod tests {
 
         // No streaming delta was persisted.
         assert!(
-            stored_events
-                .iter()
-                .all(|event| !matches!(
-                    event.envelope.event,
-                    AgentEvent::AssistantTextDelta { .. }
-                )),
+            stored_events.iter().all(|event| !matches!(
+                event.envelope.event,
+                AgentEvent::AssistantTextDelta { .. }
+            )),
             "ephemeral deltas are never stored"
         );
 

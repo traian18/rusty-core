@@ -169,10 +169,8 @@ impl SnapshotWorkspace {
     /// Create a new snapshot of `source_root` rooted at
     /// `<temp_dir>/harness-snapshot-<uuid>`.
     pub async fn create(source_root: &Path) -> Result<Self, WorkspaceError> {
-        let temp_root = std::env::temp_dir().join(format!(
-            "harness-snapshot-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("harness-snapshot-{}", uuid::Uuid::new_v4()));
         copy_dir_recursive(source_root.to_path_buf(), temp_root.clone()).await?;
         Ok(Self {
             inner: crate::FsWorkspace::new(temp_root),

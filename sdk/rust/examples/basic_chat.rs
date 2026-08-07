@@ -10,16 +10,14 @@
 use std::sync::Arc;
 
 use rusty_harness_sdk::protocol::{AgentEvent, AgentOutcome};
-use rusty_harness_sdk::{Client, Session, SdkError};
+use rusty_harness_sdk::{Client, SdkError, Session};
 
 #[tokio::main]
 async fn main() -> Result<(), SdkError> {
     tracing_subscriber::fmt::init();
 
     let client = Client::builder()
-        .register_integration(Arc::new(
-            harness_integration_anthropic::AnthropicFactory,
-        ))
+        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
         .build()
         .await?;
 
@@ -31,7 +29,9 @@ async fn main() -> Result<(), SdkError> {
     let session = Session::from(handle);
 
     let mut events = session.events();
-    session.send("In one short sentence, what is a Rust trait?").await?;
+    session
+        .send("In one short sentence, what is a Rust trait?")
+        .await?;
 
     while let Some(event) = events.next().await {
         let envelope = event?;

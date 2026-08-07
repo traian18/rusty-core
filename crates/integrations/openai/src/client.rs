@@ -14,8 +14,8 @@ use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::OpenAiConfig;
 use crate::wire::{
-    build_system_message, convert_messages_with_tool_ids, tool_descriptor_to_openai,
-    OpenAiRequest, OpenAiSseParser, ProviderToolIds, StreamOptions,
+    build_system_message, convert_messages_with_tool_ids, tool_descriptor_to_openai, OpenAiRequest,
+    OpenAiSseParser, ProviderToolIds, StreamOptions,
 };
 
 /// Client for the OpenAI Chat Completions API.
@@ -72,18 +72,28 @@ impl ModelClient for OpenAiClient {
         }
 
         let openai_request = OpenAiRequest {
-            model: request.model.unwrap_or_else(|| self.config.default_model.clone()),
+            model: request
+                .model
+                .unwrap_or_else(|| self.config.default_model.clone()),
             messages,
             tools: if request.tools.is_empty() {
                 None
             } else {
-                Some(request.tools.iter().map(tool_descriptor_to_openai).collect())
+                Some(
+                    request
+                        .tools
+                        .iter()
+                        .map(tool_descriptor_to_openai)
+                        .collect(),
+                )
             },
             max_tokens: Some(request.max_tokens.unwrap_or(self.config.default_max_tokens)),
             temperature: request.temperature,
             stop: (!request.stop_sequences.is_empty()).then_some(request.stop_sequences),
             stream: true,
-            stream_options: StreamOptions { include_usage: true },
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
 
         let url = format!("{}/chat/completions", self.config.base_url);
@@ -110,20 +120,16 @@ impl ModelClient for OpenAiClient {
             "openai",
         );
 
-        let response = request_builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ModelError::Timeout
-                } else {
-                    ModelError::BackendError {
-                        message: format!("HTTP request failed: {e}"),
-                        code: "request_failed".to_string(),
-                    }
+        let response = request_builder.json(&body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ModelError::Timeout
+            } else {
+                ModelError::BackendError {
+                    message: format!("HTTP request failed: {e}"),
+                    code: "request_failed".to_string(),
                 }
-            })?;
+            }
+        })?;
 
         let status = response.status();
         if status.is_success() {
@@ -198,7 +204,9 @@ impl OpenAiClient {
 /// Normalize OpenAI's standard `Retry-After` header (whole seconds) using the
 /// shared, provider-neutral parser.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    harness_model::retry::parse_retry_after(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+    harness_model::retry::parse_retry_after(|name| {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    })
 }
 
 #[cfg(test)]
@@ -210,7 +218,10 @@ mod tests {
     fn standard_retry_after_is_normalized_to_duration() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
-        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_secs(5)));
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(5))
+        );
     }
 
     #[test]

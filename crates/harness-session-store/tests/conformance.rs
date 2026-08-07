@@ -40,8 +40,8 @@ use harness_protocol::commands::AgentStatus;
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, MessageId, RunId, SessionId, Timestamp};
 use harness_session_store::{
-    DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, RawRecord, SCHEMA_VERSION,
-    SessionStore, SqliteSessionStore, StoreError, StoredSession,
+    DurableSessionEvent, DurableSessionSnapshot, JsonlSessionStore, RawRecord, SessionStore,
+    SqliteSessionStore, StoreError, StoredSession, SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -346,7 +346,10 @@ async fn concurrent_appends_are_serialized_and_intact(store: Arc<dyn SessionStor
 async fn current_sequence_tracks_committed_history(store: Arc<dyn SessionStore>) {
     let session = SessionId::new();
     assert_eq!(
-        store.current_sequence(session).await.expect("fresh sequence"),
+        store
+            .current_sequence(session)
+            .await
+            .expect("fresh sequence"),
         0,
         "a session that never existed has no committed sequence"
     );
@@ -360,7 +363,10 @@ async fn current_sequence_tracks_committed_history(store: Arc<dyn SessionStore>)
     store.append(event(session, 3)).await.expect("append event");
 
     assert_eq!(
-        store.current_sequence(session).await.expect("committed sequence"),
+        store
+            .current_sequence(session)
+            .await
+            .expect("committed sequence"),
         3
     );
 }
@@ -399,7 +405,10 @@ async fn raw_records_expose_events_and_snapshot(store: Arc<dyn SessionStore>) {
             }
         }
     }
-    assert_eq!(event_count, 3, "raw_records must not apply the snapshot cutoff");
+    assert_eq!(
+        event_count, 3,
+        "raw_records must not apply the snapshot cutoff"
+    );
     assert!(snapshot_seen);
 }
 

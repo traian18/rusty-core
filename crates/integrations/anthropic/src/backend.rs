@@ -1,4 +1,3 @@
-
 //! Anthropic backend composition and registry factory.
 
 use std::sync::Arc;

@@ -10,7 +10,8 @@
 //! - Retention never destroys replay or audit prerequisites unless the host
 //!   consciously opts in: pruning requires an existing snapshot at or above
 //!   the prune point (verified by [`prune_plan`]), and
-//!   [`SessionStore::prune_events_before`] defaults to *rejecting* the call.
+//!   [`SessionStore::prune_events_before`](crate::store::SessionStore::prune_events_before)
+//!   defaults to *rejecting* the call.
 //! - [`plan_compaction`] is a pure function: it only computes a plan.
 //!   Applying it (writing the snapshot, pruning events) is the caller's
 //!   job, using the plan's [`snapshot_sequence`](CompactionPlan::snapshot_sequence).
@@ -118,7 +119,11 @@ pub fn plan_compaction(stored: &StoredSession, policy: &RetentionPolicy) -> Comp
         // Prune only events covered by a snapshot that will exist at or above
         // the prune point. The previous snapshot's sequence is the safe
         // anchor; events above it stay for replay against the new snapshot.
-        if let Some(previous) = stored.snapshot.as_ref().map(|snapshot| snapshot.session_sequence) {
+        if let Some(previous) = stored
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.session_sequence)
+        {
             plan.prune_through = previous;
         }
     }
@@ -130,10 +135,7 @@ pub fn plan_compaction(stored: &StoredSession, policy: &RetentionPolicy) -> Comp
 /// Returns the first durable sequence that must survive (`sequence + 1`), or
 /// `Err` when no snapshot covers `sequence` (pruning would destroy the
 /// replay/audit prerequisites).
-pub fn prune_plan(
-    stored: &StoredSession,
-    sequence: u64,
-) -> Result<u64, &'static str> {
+pub fn prune_plan(stored: &StoredSession, sequence: u64) -> Result<u64, &'static str> {
     let snapshot_sequence = stored
         .snapshot
         .as_ref()
@@ -152,10 +154,8 @@ pub fn prune_plan(
 /// it from the compaction plan).
 pub fn mark_compacted(mut snapshot: DurableSessionSnapshot) -> DurableSessionSnapshot {
     snapshot.metadata.compacted = true;
-    snapshot.metadata.compaction_generation = snapshot
-        .metadata
-        .compaction_generation
-        .saturating_add(1);
+    snapshot.metadata.compaction_generation =
+        snapshot.metadata.compaction_generation.saturating_add(1);
     snapshot
 }
 

@@ -21,9 +21,7 @@ use harness_protocol::backend::{
 use harness_protocol::commands::{AgentCommand, AgentStatus};
 use harness_protocol::effects::AgentEffect;
 use harness_protocol::events::AgentEvent;
-use harness_protocol::ids::{
-    AgentId, BackendId, ConfigurationId, IntegrationId, SessionId,
-};
+use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::AgentBudget;
 use serde::Deserialize;

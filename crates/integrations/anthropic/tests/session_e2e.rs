@@ -14,8 +14,8 @@ use tokio::net::TcpListener;
 use harness_engine::Harness;
 use harness_integration_anthropic::{AnthropicBackend, AnthropicConfig, AnthropicFactory};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
-use harness_tools::{ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult};
 use harness_tools::registry::ToolRegistry;
+use harness_tools::{ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult};
 
 const TEXT_RESPONSE_SSE: &str = "\
 event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-20250513\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\
@@ -31,7 +31,10 @@ struct NoTools;
 
 #[async_trait]
 impl ToolRegistry for NoTools {
-    fn register(&self, _executor: Arc<dyn ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+    fn register(
+        &self,
+        _executor: Arc<dyn ToolExecutor>,
+    ) -> Result<(), harness_tools::registry::RegistrationError> {
         Ok(())
     }
 
@@ -130,7 +133,10 @@ async fn anthropic_backend_runs_a_fixture_backed_session() {
         .expect("start Anthropic fixture session");
 
     let mut events = session.subscribe();
-    session.send("Say hello").await.expect("send fixture prompt");
+    session
+        .send("Say hello")
+        .await
+        .expect("send fixture prompt");
 
     let mut text = String::new();
     let mut completed = false;
@@ -155,11 +161,13 @@ async fn anthropic_backend_runs_a_fixture_backed_session() {
     assert_eq!(text, "Hello, world!");
 
     let snapshot = session.snapshot();
-    assert_eq!(snapshot.root_agent_status.metrics.total_tokens.value(), Some(15));
+    assert_eq!(
+        snapshot.root_agent_status.metrics.total_tokens.value(),
+        Some(15)
+    );
     assert_eq!(snapshot.usage.cumulative.total_requests, 1);
     assert!(snapshot.usage.cumulative.total_cost.is_some());
 }
-
 
 /// Starts a one-shot fixture server that captures the raw request bytes it
 /// received into `captured` before replying with `body`, for tests that
@@ -219,7 +227,10 @@ async fn provider_options_reach_the_outgoing_anthropic_request_body() {
         .expect("start Anthropic fixture session");
 
     let mut events = session.subscribe();
-    session.send("Say hello").await.expect("send fixture prompt");
+    session
+        .send("Say hello")
+        .await
+        .expect("send fixture prompt");
 
     let mut completed = false;
     for _ in 0..32 {
@@ -244,8 +255,8 @@ async fn provider_options_reach_the_outgoing_anthropic_request_body() {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .expect("captured request must have a header/body boundary");
-    let body: serde_json::Value =
-        serde_json::from_slice(&raw_request[headers_end + 4..]).expect("captured body must be valid JSON");
+    let body: serde_json::Value = serde_json::from_slice(&raw_request[headers_end + 4..])
+        .expect("captured body must be valid JSON");
     assert_eq!(
         body.get("top_k"),
         Some(&serde_json::json!(17)),
@@ -271,7 +282,6 @@ async fn registry_factory_constructs_a_session() {
 
     assert_ne!(session.session_id().to_string(), "");
 }
-
 
 const TOOL_RESPONSE_SSE: &str = r#"event: message_start
 data: {"type":"message_start","message":{"model":"claude-sonnet-4-20250513","usage":{"input_tokens":15,"output_tokens":0}}}
@@ -342,7 +352,10 @@ struct CalculatorTools;
 
 #[async_trait]
 impl ToolRegistry for CalculatorTools {
-    fn register(&self, _executor: Arc<dyn ToolExecutor>) -> Result<(), harness_tools::registry::RegistrationError> {
+    fn register(
+        &self,
+        _executor: Arc<dyn ToolExecutor>,
+    ) -> Result<(), harness_tools::registry::RegistrationError> {
         Ok(())
     }
 
@@ -379,7 +392,10 @@ async fn anthropic_session_completes_a_tool_round_trip() {
         .await
         .expect("start tool fixture session");
     let mut events = session.subscribe();
-    session.send("Calculate 2 + 2").await.expect("send tool prompt");
+    session
+        .send("Calculate 2 + 2")
+        .await
+        .expect("send tool prompt");
 
     let mut requested = false;
     let mut tool_completed = false;
@@ -409,11 +425,17 @@ async fn anthropic_session_completes_a_tool_round_trip() {
     }
 
     assert!(requested, "model tool request was not emitted");
-    assert!(tool_completed, "calculator result was not fed back to the session");
+    assert!(
+        tool_completed,
+        "calculator result was not fed back to the session"
+    );
     assert_eq!(final_text, "4");
     assert!(completed, "tool fixture session did not complete");
 
     let snapshot = session.snapshot();
-    assert_eq!(snapshot.root_agent_status.metrics.total_tokens.value(), Some(33));
+    assert_eq!(
+        snapshot.root_agent_status.metrics.total_tokens.value(),
+        Some(33)
+    );
     assert_eq!(snapshot.usage.cumulative.total_requests, 2);
 }

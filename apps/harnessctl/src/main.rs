@@ -19,7 +19,9 @@ use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::ids::{PermissionId, SessionId, ToolId};
 use harness_protocol::rpc::{MutationCommand, RpcRequestBody, RpcResponseBody};
-use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy};
+use harness_protocol::tools::{
+    AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy,
+};
 
 use client::HarnessClient;
 
@@ -158,9 +160,17 @@ fn parse_session_id(raw: &str) -> Result<SessionId> {
 /// that match statement don't silently drift apart.
 fn known_tool_specs() -> Vec<(&'static str, &'static str, PermissionMode)> {
     vec![
-        ("fs.read", "Read a file from the workspace.", PermissionMode::Allow),
+        (
+            "fs.read",
+            "Read a file from the workspace.",
+            PermissionMode::Allow,
+        ),
         ("fs.edit", "Replace a workspace file.", PermissionMode::Ask),
-        ("workspace.search", "Search workspace files.", PermissionMode::Allow),
+        (
+            "workspace.search",
+            "Search workspace files.",
+            PermissionMode::Allow,
+        ),
         ("shell.exec", "Run a shell command.", PermissionMode::Ask),
         (
             "git.status",
@@ -194,7 +204,10 @@ fn known_tool_specs() -> Vec<(&'static str, &'static str, PermissionMode)> {
 /// `chat`) into a concrete list of tool names.
 fn resolve_tool_names(tools: Vec<String>, all_tools: bool) -> Vec<String> {
     if all_tools {
-        known_tool_specs().into_iter().map(|(name, _, _)| name.to_string()).collect()
+        known_tool_specs()
+            .into_iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect()
     } else {
         tools
     }
@@ -210,7 +223,10 @@ fn build_toolset(names: &[String]) -> Result<AgentToolset> {
             .cloned()
             .with_context(|| {
                 let available: Vec<&str> = known.iter().map(|(n, _, _)| *n).collect();
-                format!("unknown tool '{name}'; known tools: {}", available.join(", "))
+                format!(
+                    "unknown tool '{name}'; known tools: {}",
+                    available.join(", ")
+                )
             })?;
         let id = ToolId::new();
         tools.insert(
@@ -222,7 +238,10 @@ fn build_toolset(names: &[String]) -> Result<AgentToolset> {
                     description: description.to_string(),
                     input_schema: serde_json::json!({ "type": "object" }),
                 },
-                policy: ToolPolicy { permission, enabled: true },
+                policy: ToolPolicy {
+                    permission,
+                    enabled: true,
+                },
                 delegatable: false,
             },
         );
@@ -242,10 +261,17 @@ async fn main() -> Result<()> {
             tools,
             all_tools,
         } => {
-            let integration_config: serde_json::Value = serde_json::from_str(&config_json)
-                .context("--config-json must be valid JSON")?;
+            let integration_config: serde_json::Value =
+                serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
             let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
-            chat::run(&cli.socket, workspace, integration, integration_config, toolset).await
+            chat::run(
+                &cli.socket,
+                workspace,
+                integration,
+                integration_config,
+                toolset,
+            )
+            .await
         }
         Command::Session { command } => {
             let mut client = HarnessClient::connect(&cli.socket).await?;
@@ -267,8 +293,8 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             tools,
             all_tools,
         } => {
-            let integration_config: serde_json::Value = serde_json::from_str(&config_json)
-                .context("--config-json must be valid JSON")?;
+            let integration_config: serde_json::Value =
+                serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
             let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
             let response = client
                 .request(
@@ -295,16 +321,23 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             let response = client
                 .request(
                     Some(session_id),
-                    mutation(session_id, MutationCommand::Prompt(UserInput {
-                        text: prompt,
-                        attachments: vec![],
-                    })),
+                    mutation(
+                        session_id,
+                        MutationCommand::Prompt(UserInput {
+                            text: prompt,
+                            attachments: vec![],
+                        }),
+                    ),
                 )
                 .await?;
             print_ack_or_error(response)
         }
 
-        SessionCommand::Events { session_id, json, since_seq } => {
+        SessionCommand::Events {
+            session_id,
+            json,
+            since_seq,
+        } => {
             let session_id = parse_session_id(&session_id)?;
             client.subscribe(session_id, since_seq).await?;
             loop {
@@ -346,7 +379,10 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
         SessionCommand::Cancel { session_id } => {
             let session_id = parse_session_id(&session_id)?;
             let response = client
-                .request(Some(session_id), mutation(session_id, MutationCommand::Cancel))
+                .request(
+                    Some(session_id),
+                    mutation(session_id, MutationCommand::Cancel),
+                )
                 .await?;
             print_ack_or_error(response)
         }
@@ -354,7 +390,10 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
         SessionCommand::Close { session_id } => {
             let session_id = parse_session_id(&session_id)?;
             let response = client
-                .request(Some(session_id), mutation(session_id, MutationCommand::CloseSession))
+                .request(
+                    Some(session_id),
+                    mutation(session_id, MutationCommand::CloseSession),
+                )
                 .await?;
             print_ack_or_error(response)
         }
@@ -377,10 +416,13 @@ async fn run_permission_command(
             let response = client
                 .request(
                     Some(session_id),
-                    mutation(session_id, MutationCommand::ResolvePermission {
-                        id,
-                        decision: decision.into(),
-                    }),
+                    mutation(
+                        session_id,
+                        MutationCommand::ResolvePermission {
+                            id,
+                            decision: decision.into(),
+                        },
+                    ),
                 )
                 .await?;
             print_ack_or_error(response)

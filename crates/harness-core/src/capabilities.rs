@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 
 use harness_protocol::backend::BackendCapabilities;

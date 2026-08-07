@@ -22,8 +22,7 @@ use async_trait::async_trait;
 use harness_protocol::ids::{SessionId, Timestamp};
 
 use crate::store::{
-    DurableSessionEvent, DurableSessionSnapshot, RawRecord, SessionStore, StoreError,
-    StoredSession,
+    DurableSessionEvent, DurableSessionSnapshot, RawRecord, SessionStore, StoreError, StoredSession,
 };
 
 /// A fully in-memory [`SessionStore`] with configurable append failures.
@@ -387,11 +386,7 @@ impl SessionStore for FaultInjectingStore {
         self.inner.events_since(id, since_seq).await
     }
 
-    async fn prune_events_before(
-        &self,
-        id: SessionId,
-        sequence: u64,
-    ) -> Result<u64, StoreError> {
+    async fn prune_events_before(&self, id: SessionId, sequence: u64) -> Result<u64, StoreError> {
         if let Some(error) = self.check("prune_events_before") {
             return Err(error);
         }
@@ -458,8 +453,8 @@ mod fault_injection_tests {
         // Simulate a restart: clear the fault and build a fresh committer
         // over the same backing store.
         faulty.clear_fault_hook();
-        let restarted = SessionCommitter::new(faulty, session)
-            .with_durability_policy(DurabilityPolicy::Strict);
+        let restarted =
+            SessionCommitter::new(faulty, session).with_durability_policy(DurabilityPolicy::Strict);
         let committed = restarted
             .commit(durable_event(session))
             .await
@@ -499,7 +494,10 @@ mod fault_injection_tests {
             .expect("commit does not error under BestEffort")
             .expect("still published");
 
-        assert!(committed.degraded, "a failed append must be marked degraded");
+        assert!(
+            committed.degraded,
+            "a failed append must be marked degraded"
+        );
         assert_eq!(
             backing.current_sequence(session).await.unwrap_or(0),
             0,
@@ -536,7 +534,14 @@ mod fault_injection_tests {
         assert!(result.is_err());
 
         let stored = backing.load_session(session).await.expect("load");
-        assert_eq!(stored.events.len(), 1, "prior durable events must survive a checkpoint failure");
-        assert!(stored.snapshot.is_none(), "the failed snapshot must not appear saved");
+        assert_eq!(
+            stored.events.len(),
+            1,
+            "prior durable events must survive a checkpoint failure"
+        );
+        assert!(
+            stored.snapshot.is_none(),
+            "the failed snapshot must not appear saved"
+        );
     }
 }

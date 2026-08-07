@@ -15,8 +15,8 @@ use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::AnthropicConfig;
 use crate::wire::{
-    build_system, convert_messages_with_tool_ids, tool_descriptor_to_anthropic,
-    AnthropicRequest, AnthropicSseParser, AnthropicThinking, ProviderToolIds,
+    build_system, convert_messages_with_tool_ids, tool_descriptor_to_anthropic, AnthropicRequest,
+    AnthropicSseParser, AnthropicThinking, ProviderToolIds,
 };
 
 /// Client for the Anthropic Messages API.
@@ -116,9 +116,7 @@ impl ModelClient for AnthropicClient {
         // ------------------------------------------------------------------
         // Step 1: Convert ModelRequest to AnthropicRequest
         // ------------------------------------------------------------------
-        let max_tokens = request
-            .max_tokens
-            .unwrap_or(self.config.default_max_tokens);
+        let max_tokens = request.max_tokens.unwrap_or(self.config.default_max_tokens);
 
         let anthropic_request = AnthropicRequest {
             model: request
@@ -130,10 +128,7 @@ impl ModelClient for AnthropicClient {
                 build_system(&request.messages)
             },
             messages: {
-                let tool_ids = self
-                    .tool_ids
-                    .lock()
-                    .expect("provider tool-id map poisoned");
+                let tool_ids = self.tool_ids.lock().expect("provider tool-id map poisoned");
                 convert_messages_with_tool_ids(&request.messages, &tool_ids)
             },
             tools: if request.tools.is_empty() {
@@ -179,8 +174,10 @@ impl ModelClient for AnthropicClient {
         // see `harness_model::merge_provider_options`'s doc comment for the
         // precedence rule (typed fields above always win).
         let body = harness_model::merge_provider_options(
-            serde_json::to_value(&anthropic_request).map_err(|error| ModelError::InvalidRequest {
-                message: format!("failed to serialize request: {error}"),
+            serde_json::to_value(&anthropic_request).map_err(|error| {
+                ModelError::InvalidRequest {
+                    message: format!("failed to serialize request: {error}"),
+                }
             })?,
             &request.provider_options,
             "anthropic",
@@ -212,13 +209,7 @@ impl ModelClient for AnthropicClient {
         let status = response.status();
 
         if status.is_success() {
-            Self::handle_success_response(
-                response,
-                &events,
-                &cancel,
-                self.tool_ids.clone(),
-            )
-            .await
+            Self::handle_success_response(response, &events, &cancel, self.tool_ids.clone()).await
         } else if status.as_u16() == 429 {
             Self::handle_rate_limit(response)
         } else {
@@ -277,9 +268,7 @@ impl AnthropicClient {
     }
 
     /// Handle an HTTP 429 rate-limit response.
-    fn handle_rate_limit(
-        response: reqwest::Response,
-    ) -> Result<ModelResult, ModelError> {
+    fn handle_rate_limit(response: reqwest::Response) -> Result<ModelResult, ModelError> {
         let retry_after = retry_after_from_headers(response.headers());
 
         Err(ModelError::RateLimited { retry_after })
@@ -301,7 +290,9 @@ impl AnthropicClient {
 /// Normalize Anthropic's `retry-after-ms` and the standard `Retry-After`
 /// (seconds) headers using the shared, provider-neutral parser.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    harness_model::retry::parse_retry_after(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+    harness_model::retry::parse_retry_after(|name| {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    })
 }
 
 #[cfg(test)]
@@ -313,13 +304,19 @@ mod tests {
     fn retry_after_ms_is_normalized_to_duration() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "1250".parse().unwrap());
-        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_millis(1250)));
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_millis(1250))
+        );
     }
 
     #[test]
     fn standard_retry_after_uses_seconds() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
-        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_secs(3)));
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(3))
+        );
     }
 }

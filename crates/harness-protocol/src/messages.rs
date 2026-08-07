@@ -36,8 +36,12 @@ mod base64_bytes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolUse { call: ToolCall },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        call: ToolCall,
+    },
     ToolResult {
         call_id: ToolCallId,
         result: ToolResultSummary,
@@ -94,8 +98,14 @@ mod tests {
         };
         let json = serde_json::to_value(&block).expect("serialize image block");
         // The `data` field must be a JSON string (base64), not an array of numbers.
-        let data_value = json.get("Image").and_then(|v| v.get("data")).expect("data field present");
-        assert!(data_value.is_string(), "image bytes must serialize as a base64 string, got {data_value:?}");
+        let data_value = json
+            .get("Image")
+            .and_then(|v| v.get("data"))
+            .expect("data field present");
+        assert!(
+            data_value.is_string(),
+            "image bytes must serialize as a base64 string, got {data_value:?}"
+        );
 
         let decoded: ContentBlock = serde_json::from_value(json).expect("deserialize image block");
         match decoded {

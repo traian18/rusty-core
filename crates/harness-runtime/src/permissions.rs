@@ -3,8 +3,9 @@
 //! The [`PermissionPolicy`] provides a defense-in-depth layer that re-evaluates
 //! whether a tool call should be allowed, require approval, or be denied,
 //! consulting the agent's [`AgentCapabilities`] and the underlying
-//! [`AgentToolset`] directly — even though the core state machine has already
-//! filtered the tool request during [`Agent::apply`].
+//! [`AgentToolset`](harness_protocol::tools::AgentToolset) directly — even
+//! though the core state machine has already filtered the tool request
+//! during [`Agent::apply`](harness_core::agent::Agent::apply).
 //!
 //! This runtime check ensures that **even if** a bug, misconfiguration, or
 //! malformed effect causes the core to emit an `ExecuteTool` for a tool that
@@ -50,11 +51,7 @@ impl PermissionPolicy {
     ///    - `Allow` → [`Allow`](PermissionOutcome::Allow)
     ///    - `Ask` → [`RequiresApproval`](PermissionOutcome::RequiresApproval)
     ///    - `Deny` → [`Denied`](PermissionOutcome::Denied)
-    pub fn evaluate(
-        &self,
-        capabilities: &AgentCapabilities,
-        tool_name: &str,
-    ) -> PermissionOutcome {
+    pub fn evaluate(&self, capabilities: &AgentCapabilities, tool_name: &str) -> PermissionOutcome {
         // Find the tool capability by descriptor name (the logical tool
         // identifier used in tool calls, e.g. "fs.read").
         let tool_cap = capabilities
@@ -102,9 +99,7 @@ mod tests {
     use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
     use harness_protocol::backend::BackendCapabilities;
     use harness_protocol::ids::ToolId;
-    use harness_protocol::tools::{
-        AgentToolset, ToolCapability, ToolDescriptor,
-    };
+    use harness_protocol::tools::{AgentToolset, ToolCapability, ToolDescriptor};
 
     use super::*;
 

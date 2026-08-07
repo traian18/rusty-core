@@ -59,15 +59,15 @@ pub use session::Session;
 pub mod protocol {
     pub use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
     pub use harness_protocol::commands::{Attachment, PermissionDecision, UserInput};
-    pub use harness_protocol::rpc::{
-        MutationCommand, ProtocolCapabilities, RpcError, RpcErrorCategory, SessionSummaryWire,
-    };
     pub use harness_protocol::events::{
         AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility,
     };
     pub use harness_protocol::ids::{
         AgentId, EventId, MessageId, PermissionId, RequestId, RunId, SessionId, Timestamp,
         ToolCallId,
+    };
+    pub use harness_protocol::rpc::{
+        MutationCommand, ProtocolCapabilities, RpcError, RpcErrorCategory, SessionSummaryWire,
     };
 }
 

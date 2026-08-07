@@ -89,9 +89,19 @@ fn start(agent: &mut Agent) -> harness_protocol::ids::RunId {
             attachments: vec![],
         },
     });
-    assert!(matches!(effects[0], AgentEffect::Emit { event: AgentEvent::StateChanged { .. } }));
+    assert!(matches!(
+        effects[0],
+        AgentEffect::Emit {
+            event: AgentEvent::StateChanged { .. }
+        }
+    ));
     assert!(matches!(effects[1], AgentEffect::ExecuteBackend { .. }));
-    assert!(matches!(effects[2], AgentEffect::Emit { event: AgentEvent::RunStarted { .. } }));
+    assert!(matches!(
+        effects[2],
+        AgentEffect::Emit {
+            event: AgentEvent::RunStarted { .. }
+        }
+    ));
     assert_eq!(agent.state.messages[0].role, MessageRole::User);
     agent.state.active_run.expect("active run")
 }
@@ -130,7 +140,9 @@ fn tool_call_emits_execute_effect() {
             call: tool_call(call_id),
         },
     });
-    assert!(effects.iter().any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
     assert!(agent.state.pending_tools.contains_key(&call_id));
 }
 
@@ -146,19 +158,26 @@ fn permission_ask_blocks_until_resolved() {
             call: tool_call(call_id),
         },
     });
-    let permission_id = effects.iter().find_map(|effect| match effect {
-        AgentEffect::RequestPermission { request } => Some(request.id),
-        _ => None,
-    }).expect("permission request");
+    let permission_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::RequestPermission { request } => Some(request.id),
+            _ => None,
+        })
+        .expect("permission request");
     assert_eq!(agent.state.status, AgentStatus::WaitingForPermission);
-    assert!(!effects.iter().any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
 
     let approved = agent.apply(AgentCommand::PermissionResolved {
         id: permission_id,
         decision: PermissionDecision::Approved,
     });
     assert_eq!(agent.state.status, AgentStatus::Executing);
-    assert!(approved.iter().any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
+    assert!(approved
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteTool { .. })));
 }
 
 #[test]
@@ -174,11 +193,21 @@ fn scripted_vertical_slice() {
             call: tool_call(call_id),
         },
     });
-    assert!(matches!(requested.as_slice(), [
-        AgentEffect::Emit { event: AgentEvent::ToolCallRequested { .. } },
-        AgentEffect::Emit { event: AgentEvent::StateChanged { to: AgentStatus::Executing, .. } },
-        AgentEffect::ExecuteTool { .. }
-    ]));
+    assert!(matches!(
+        requested.as_slice(),
+        [
+            AgentEffect::Emit {
+                event: AgentEvent::ToolCallRequested { .. }
+            },
+            AgentEffect::Emit {
+                event: AgentEvent::StateChanged {
+                    to: AgentStatus::Executing,
+                    ..
+                }
+            },
+            AgentEffect::ExecuteTool { .. }
+        ]
+    ));
 
     let completed = agent.apply(AgentCommand::ToolCompleted {
         call_id,
@@ -188,13 +217,26 @@ fn scripted_vertical_slice() {
             is_error: false,
         },
     });
-    assert!(matches!(completed.as_slice(), [
-        AgentEffect::Emit { event: AgentEvent::ToolCallCompleted { .. } },
-        AgentEffect::Emit { event: AgentEvent::StateChanged { from: AgentStatus::Executing, to: AgentStatus::WaitingForBackend } },
-        AgentEffect::ExecuteBackend { .. }
-    ]));
+    assert!(matches!(
+        completed.as_slice(),
+        [
+            AgentEffect::Emit {
+                event: AgentEvent::ToolCallCompleted { .. }
+            },
+            AgentEffect::Emit {
+                event: AgentEvent::StateChanged {
+                    from: AgentStatus::Executing,
+                    to: AgentStatus::WaitingForBackend
+                }
+            },
+            AgentEffect::ExecuteBackend { .. }
+        ]
+    ));
     assert!(agent.state.pending_tools.is_empty());
-    assert!(matches!(agent.state.messages.last().unwrap().content[0], ContentBlock::ToolResult { .. }));
+    assert!(matches!(
+        agent.state.messages.last().unwrap().content[0],
+        ContentBlock::ToolResult { .. }
+    ));
 
     let finished = agent.apply(AgentCommand::BackendEvent {
         run_id,
@@ -203,11 +245,20 @@ fn scripted_vertical_slice() {
             result: completed_result(),
         },
     });
-    assert!(matches!(finished.as_slice(), [
-        AgentEffect::Emit { event: AgentEvent::StateChanged { .. } },
-        AgentEffect::Emit { event: AgentEvent::Completed { outcome: AgentOutcome::Success } },
-        AgentEffect::FinishRun { .. }
-    ]));
+    assert!(matches!(
+        finished.as_slice(),
+        [
+            AgentEffect::Emit {
+                event: AgentEvent::StateChanged { .. }
+            },
+            AgentEffect::Emit {
+                event: AgentEvent::Completed {
+                    outcome: AgentOutcome::Success
+                }
+            },
+            AgentEffect::FinishRun { .. }
+        ]
+    ));
     assert_eq!(agent.state.status, AgentStatus::Idle);
     assert!(agent.state.active_run.is_none());
 }
@@ -247,7 +298,9 @@ fn cancel_stops_further_effects() {
     let mut agent = create_agent(PermissionMode::Allow);
     let run_id = start(&mut agent);
     let effects = agent.apply(AgentCommand::Cancel);
-    assert!(effects.iter().any(|effect| matches!(effect, AgentEffect::CancelBackend { run_id: id } if *id == run_id)));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, AgentEffect::CancelBackend { run_id: id } if *id == run_id)
+    ));
     assert_eq!(agent.state.status, AgentStatus::Cancelled);
     assert!(agent.state.active_run.is_none());
     assert!(agent.apply(AgentCommand::Pause).is_empty());
@@ -289,12 +342,22 @@ fn follow_ups_are_admitted_fifo_and_start_after_completion() {
     let mut agent = create_agent(PermissionMode::Allow);
     let first_run = start(&mut agent);
 
-    assert!(agent.apply(AgentCommand::FollowUp {
-        input: UserInput { text: "second".into(), attachments: vec![] },
-    }).is_empty());
-    assert!(agent.apply(AgentCommand::FollowUp {
-        input: UserInput { text: "third".into(), attachments: vec![] },
-    }).is_empty());
+    assert!(agent
+        .apply(AgentCommand::FollowUp {
+            input: UserInput {
+                text: "second".into(),
+                attachments: vec![]
+            },
+        })
+        .is_empty());
+    assert!(agent
+        .apply(AgentCommand::FollowUp {
+            input: UserInput {
+                text: "third".into(),
+                attachments: vec![]
+            },
+        })
+        .is_empty());
     assert_eq!(agent.state.queued_inputs.len(), 2);
     assert_eq!(agent.state.messages.len(), 1);
 
@@ -305,11 +368,20 @@ fn follow_ups_are_admitted_fifo_and_start_after_completion() {
             result: completed_result(),
         },
     });
-    assert!(matches!(first_completion.as_slice(), [
-        AgentEffect::Emit { event: AgentEvent::StateChanged { .. } },
-        AgentEffect::Emit { event: AgentEvent::Completed { outcome: AgentOutcome::Success } },
-        AgentEffect::FinishRun { .. }
-    ]));
+    assert!(matches!(
+        first_completion.as_slice(),
+        [
+            AgentEffect::Emit {
+                event: AgentEvent::StateChanged { .. }
+            },
+            AgentEffect::Emit {
+                event: AgentEvent::Completed {
+                    outcome: AgentOutcome::Success
+                }
+            },
+            AgentEffect::FinishRun { .. }
+        ]
+    ));
     let second_start = agent.apply(AgentCommand::StartNextQueuedRun);
     assert!(second_start.iter().any(|effect| matches!(
         effect,
@@ -327,10 +399,14 @@ fn follow_ups_are_admitted_fifo_and_start_after_completion() {
         },
     });
     let third_start = agent.apply(AgentCommand::StartNextQueuedRun);
-    assert!(third_start.iter().any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
+    assert!(third_start
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
     assert!(agent.state.active_run.is_some());
     assert_eq!(agent.state.queued_inputs.len(), 0);
-    assert!(matches!(&agent.state.messages.last().unwrap().content[0], ContentBlock::Text { text } if text == "third"));
+    assert!(
+        matches!(&agent.state.messages.last().unwrap().content[0], ContentBlock::Text { text } if text == "third")
+    );
 }
 
 #[test]
@@ -349,11 +425,21 @@ fn tool_failure_records_result_and_continues() {
         call_id,
         error: ToolError::Timeout,
     });
-    assert!(matches!(effects.as_slice(), [
-        AgentEffect::Emit { event: AgentEvent::ToolCallCompleted { .. } },
-        AgentEffect::Emit { event: AgentEvent::StateChanged { from: AgentStatus::Executing, to: AgentStatus::WaitingForBackend } },
-        AgentEffect::ExecuteBackend { .. }
-    ]));
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            AgentEffect::Emit {
+                event: AgentEvent::ToolCallCompleted { .. }
+            },
+            AgentEffect::Emit {
+                event: AgentEvent::StateChanged {
+                    from: AgentStatus::Executing,
+                    to: AgentStatus::WaitingForBackend
+                }
+            },
+            AgentEffect::ExecuteBackend { .. }
+        ]
+    ));
 }
 
 #[test]
@@ -389,7 +475,10 @@ fn cancellation_wins_over_a_late_permission_approval() {
         id: permission_id,
         decision: PermissionDecision::Approved,
     });
-    assert!(late.is_empty(), "late approval must not execute the cancelled tool");
+    assert!(
+        late.is_empty(),
+        "late approval must not execute the cancelled tool"
+    );
     assert_eq!(agent.state.status, AgentStatus::Cancelled);
 }
 
@@ -447,7 +536,15 @@ fn child_commands_do_not_crash_parent_state() {
         },
     });
     assert!(agent.state.children.is_empty());
-    assert!(matches!(effects[0], AgentEffect::Emit { event: AgentEvent::ChildAgentCompleted { outcome: AgentOutcome::Success, .. } }));
+    assert!(matches!(
+        effects[0],
+        AgentEffect::Emit {
+            event: AgentEvent::ChildAgentCompleted {
+                outcome: AgentOutcome::Success,
+                ..
+            }
+        }
+    ));
 
     let failed_child = AgentId::new();
     agent.state.children.push(failed_child);
@@ -471,7 +568,9 @@ fn pause_and_resume_cover_both_commands() {
     assert_eq!(agent.state.status, AgentStatus::Paused);
     let effects = agent.apply(AgentCommand::Resume);
     assert_eq!(agent.state.status, AgentStatus::WaitingForBackend);
-    assert!(effects.iter().any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
 }
 
 #[test]
@@ -548,7 +647,9 @@ fn non_delegatable_tool_rejected_for_child() {
         },
         backend: BackendCapabilities::default(),
     };
-    assert!(capabilities.derive_child_capabilities(&ToolInheritance::Subset(vec![allowed])).is_ok());
+    assert!(capabilities
+        .derive_child_capabilities(&ToolInheritance::Subset(vec![allowed]))
+        .is_ok());
     assert!(matches!(
         capabilities.derive_child_capabilities(&ToolInheritance::Subset(vec![allowed, blocked])),
         Err(CapabilityError::NotDelegatable(id)) if id == blocked
@@ -641,7 +742,10 @@ fn configure_execution_is_a_pure_state_mutation_with_no_effects() {
             ..Default::default()
         },
     });
-    assert!(effects.is_empty(), "ConfigureExecution must not produce effects");
+    assert!(
+        effects.is_empty(),
+        "ConfigureExecution must not produce effects"
+    );
     assert_eq!(
         agent.state.execution_params.model.as_deref(),
         Some("claude-opus-4-20250514")
@@ -729,7 +833,10 @@ fn default_execution_params_produce_the_prior_hardcoded_behavior() {
         .expect("StartRun must produce an ExecuteBackend effect");
 
     assert!(!request.extended_thinking);
-    assert_eq!(request.params, harness_protocol::backend::ExecutionParams::default());
+    assert_eq!(
+        request.params,
+        harness_protocol::backend::ExecutionParams::default()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -752,8 +859,14 @@ fn image_attachment_becomes_a_real_content_block_not_silently_dropped() {
     });
 
     let message = &agent.state.messages[0];
-    assert_eq!(message.content.len(), 2, "text block + image block, nothing dropped");
-    assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "what's in this image?"));
+    assert_eq!(
+        message.content.len(),
+        2,
+        "text block + image block, nothing dropped"
+    );
+    assert!(
+        matches!(&message.content[0], ContentBlock::Text { text } if text == "what's in this image?")
+    );
     match &message.content[1] {
         ContentBlock::Image { mime_type, data } => {
             assert_eq!(mime_type, "image/png");
@@ -820,7 +933,10 @@ fn a_successful_run_increments_the_runs_counter_in_its_own_finish_effect() {
 
     let effects = agent.apply(AgentCommand::BackendEvent {
         run_id,
-        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
     });
 
     assert_eq!(agent.usage.runs, 1);
@@ -829,7 +945,10 @@ fn a_successful_run_increments_the_runs_counter_in_its_own_finish_effect() {
         _ => None,
     });
     assert_eq!(
-        finish_usage.expect("a successful run must emit FinishRun").inclusive_usage.total_runs,
+        finish_usage
+            .expect("a successful run must emit FinishRun")
+            .inclusive_usage
+            .total_runs,
         1,
         "the completing run's own FinishRun effect must already report the incremented count"
     );
@@ -863,7 +982,9 @@ fn a_cancelled_run_does_not_increment_the_runs_counter() {
     start(&mut agent);
     let effects = agent.apply(AgentCommand::Cancel);
     assert_eq!(agent.usage.runs, 0);
-    assert!(!effects.iter().any(|effect| matches!(effect, AgentEffect::FinishRun { .. })));
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::FinishRun { .. })));
 }
 
 /// Two runs in sequence each increment the counter exactly once — it is a
@@ -874,14 +995,20 @@ fn multiple_runs_accumulate_the_counter() {
     let first_run = start(&mut agent);
     agent.apply(AgentCommand::BackendEvent {
         run_id: first_run,
-        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
     });
     assert_eq!(agent.usage.runs, 1);
 
     let second_run = start(&mut agent);
     agent.apply(AgentCommand::BackendEvent {
         run_id: second_run,
-        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
     });
     assert_eq!(agent.usage.runs, 2);
 }

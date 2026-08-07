@@ -16,9 +16,7 @@ pub struct MarkdownTheme {
 pub fn render_markdown(source: &str, theme: MarkdownTheme) -> Vec<Line<'static>> {
     let parser = Parser::new_ext(
         source,
-        Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TABLES
-            | Options::ENABLE_TASKLISTS,
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS,
     );
     let mut renderer = Renderer::new(theme);
 
@@ -270,16 +268,13 @@ impl Renderer {
 
     fn finish_line(&mut self) {
         if !self.current.is_empty() {
-            self.lines.push(Line::from(std::mem::take(&mut self.current)));
+            self.lines
+                .push(Line::from(std::mem::take(&mut self.current)));
         }
     }
 
     fn blank_line(&mut self) {
-        if self
-            .lines
-            .last()
-            .is_some_and(|line| !line.spans.is_empty())
-        {
+        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
             self.lines.push(Line::default());
         }
     }
@@ -288,11 +283,7 @@ impl Renderer {
         if !self.current.is_empty() {
             self.finish_line();
         }
-        while self
-            .lines
-            .last()
-            .is_some_and(|line| line.spans.is_empty())
-        {
+        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
             self.lines.pop();
         }
         self.lines

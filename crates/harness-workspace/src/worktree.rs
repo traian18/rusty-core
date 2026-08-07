@@ -20,10 +20,7 @@ impl WorktreeWorkspace {
     ///
     /// The synchronous `git2` calls are wrapped in
     /// [`tokio::task::spawn_blocking`] so they never block the async runtime.
-    pub async fn create(
-        repo_root: &Path,
-        branch_hint: &str,
-    ) -> Result<Self, WorkspaceError> {
+    pub async fn create(repo_root: &Path, branch_hint: &str) -> Result<Self, WorkspaceError> {
         let repo_root = repo_root.to_path_buf();
         let worktree_path = repo_root.join(".harness-worktrees").join(branch_hint);
         let repo_root2 = repo_root.clone();
@@ -33,8 +30,7 @@ impl WorktreeWorkspace {
         let branch_hint = branch_hint.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let repo = git2::Repository::open(&repo_root2)
-                .map_err(WorkspaceError::from_git)?;
+            let repo = git2::Repository::open(&repo_root2).map_err(WorkspaceError::from_git)?;
             // git2 does not create intermediate directories for the worktree
             // path; ensure the container directory exists first.
             if let Some(parent) = path2.parent() {
@@ -113,10 +109,7 @@ mod tests {
 
         // A freshly initialized repo may have an unborn HEAD. Commit to HEAD
         // first (creating the initial commit), then make `master` point at it.
-        let parent = repo
-            .head()
-            .ok()
-            .and_then(|head| head.peel_to_commit().ok());
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
 
         let commit_id = match parent {
             Some(parent) => repo
@@ -175,7 +168,10 @@ mod tests {
 
         // The worktree must be a real directory on disk, inside the parent repo.
         let wt_root = ws.worktree_path().to_path_buf();
-        assert!(wt_root.is_dir(), "worktree must be a real directory on disk");
+        assert!(
+            wt_root.is_dir(),
+            "worktree must be a real directory on disk"
+        );
 
         // Child writes a file through the workspace...
         ws.write("child.txt", "child change\n").await.unwrap();

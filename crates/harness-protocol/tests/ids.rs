@@ -99,7 +99,10 @@ fn timestamp_now_is_within_tolerance() {
     );
     // The timestamp should be within 1 second of the wall clock
     let diff = (ts_dt - before).num_seconds().abs();
-    assert!(diff <= 2, "Timestamp::now() is too far from system clock: {diff}s");
+    assert!(
+        diff <= 2,
+        "Timestamp::now() is too far from system clock: {diff}s"
+    );
 }
 
 /// Verify that `Timestamp::from_datetime` and `as_datetime` are inverses.
@@ -134,11 +137,7 @@ macro_rules! test_uniqueness {
             let mut ids = std::collections::HashSet::new();
             for _ in 0..N {
                 let id = <$ty>::new();
-                assert!(
-                    ids.insert(id),
-                    "duplicate {} generated",
-                    stringify!($ty)
-                );
+                assert!(ids.insert(id), "duplicate {} generated", stringify!($ty));
             }
             assert_eq!(ids.len(), N, "expected {N} unique IDs");
         }

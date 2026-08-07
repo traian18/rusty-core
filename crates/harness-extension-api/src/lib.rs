@@ -43,7 +43,9 @@ pub use harness_tools::{
 // ---------------------------------------------------------------------------
 
 pub use harness_generic_backend::GenericModelBackend;
-pub use harness_model::{ModelCapabilities, ModelClient, ModelError, ModelEvent, ModelRequest, ModelResult};
+pub use harness_model::{
+    ModelCapabilities, ModelClient, ModelError, ModelEvent, ModelRequest, ModelResult,
+};
 pub use harness_runtime::traits::ExecutionBackend;
 pub use harness_runtime::IntegrationFactory;
 
@@ -97,7 +99,11 @@ mod tests {
             }
         }
 
-        async fn execute(&self, input: Input, _cancel: CancellationToken) -> std::result::Result<Result_, ToolError> {
+        async fn execute(
+            &self,
+            input: Input,
+            _cancel: CancellationToken,
+        ) -> std::result::Result<Result_, ToolError> {
             Ok(Result_ {
                 call_id: "example.echo".to_string(),
                 output: input.arguments,

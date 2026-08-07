@@ -76,13 +76,10 @@ fn completed() -> ExecutionResult {
 }
 
 fn start(agent: &mut Agent, text: &str) -> harness_protocol::ids::RunId {
-    let effects = agent.apply(AgentCommand::StartRun {
-        input: input(text),
-    });
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        AgentEffect::ExecuteBackend { .. }
-    )));
+    let effects = agent.apply(AgentCommand::StartRun { input: input(text) });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
     agent.state.active_run.expect("run should be active")
 }
 
@@ -94,10 +91,9 @@ fn finish(agent: &mut Agent, run_id: harness_protocol::ids::RunId) {
             result: completed(),
         },
     });
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        AgentEffect::FinishRun { .. }
-    )));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::FinishRun { .. })));
 }
 
 #[test]
@@ -244,20 +240,18 @@ fn failed_run_can_be_followed_by_a_new_prompt() {
             },
         },
     });
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        AgentEffect::FinishRun { .. }
-    )));
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::FinishRun { .. })));
     assert_eq!(agent.state.status, AgentStatus::Failed);
     assert!(agent.state.active_run.is_none());
 
     let next = agent.apply(AgentCommand::StartRun {
         input: input("recover"),
     });
-    assert!(next.iter().any(|effect| matches!(
-        effect,
-        AgentEffect::ExecuteBackend { .. }
-    )));
+    assert!(next
+        .iter()
+        .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
     assert!(agent.state.active_run.is_some());
     assert_eq!(agent.state.status, AgentStatus::PreparingContext);
 }

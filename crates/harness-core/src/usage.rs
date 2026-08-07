@@ -70,7 +70,9 @@ fn add_metrics(left: &AgentUsageMetrics, right: &AgentUsageMetrics) -> AgentUsag
     }
 }
 
-fn aggregate_metrics<'a>(metrics: impl IntoIterator<Item = &'a AgentUsageMetrics>) -> AgentUsageMetrics {
+fn aggregate_metrics<'a>(
+    metrics: impl IntoIterator<Item = &'a AgentUsageMetrics>,
+) -> AgentUsageMetrics {
     let mut metrics = metrics.into_iter();
     let Some(first) = metrics.next() else {
         return AgentUsageMetrics::default();
@@ -87,7 +89,9 @@ fn aggregate_model_usage<'a>(usages: impl IntoIterator<Item = &'a ModelUsage>) -
         input_tokens: total.input_tokens.checked_add(usage.input_tokens),
         output_tokens: total.output_tokens.checked_add(usage.output_tokens),
         cache_read_tokens: total.cache_read_tokens.checked_add(usage.cache_read_tokens),
-        cache_write_tokens: total.cache_write_tokens.checked_add(usage.cache_write_tokens),
+        cache_write_tokens: total
+            .cache_write_tokens
+            .checked_add(usage.cache_write_tokens),
         reasoning_tokens: total.reasoning_tokens.checked_add(usage.reasoning_tokens),
         total_tokens: total.total_tokens.checked_add(usage.total_tokens),
     })
@@ -117,8 +121,10 @@ impl UsageLedger {
             total_runs: self.runs,
             total_requests: self.records.len() as u64,
             total_tool_calls: self.tool_calls,
-            total_tokens: aggregate_model_usage(self.records.iter().map(|record| &record.model_usage))
-                .total_tokens,
+            total_tokens: aggregate_model_usage(
+                self.records.iter().map(|record| &record.model_usage),
+            )
+            .total_tokens,
             total_cost: self
                 .records
                 .iter()
@@ -263,7 +269,11 @@ mod tests {
     #[test]
     fn self_metrics_reports_the_ledgers_real_run_count() {
         let mut ledger = UsageLedger::new();
-        assert_eq!(ledger.self_metrics().total_runs, 0, "a fresh ledger has completed no runs");
+        assert_eq!(
+            ledger.self_metrics().total_runs,
+            0,
+            "a fresh ledger has completed no runs"
+        );
         ledger.runs = 3;
         assert_eq!(ledger.self_metrics().total_runs, 3);
     }
@@ -276,13 +286,25 @@ mod tests {
             ..Default::default()
         };
         let child = AgentUsageSummary {
-            self_usage: AgentUsageMetrics { total_runs: 1, ..Default::default() },
+            self_usage: AgentUsageMetrics {
+                total_runs: 1,
+                ..Default::default()
+            },
             descendant_usage: AgentUsageMetrics::default(),
-            inclusive_usage: AgentUsageMetrics { total_runs: 1, ..Default::default() },
+            inclusive_usage: AgentUsageMetrics {
+                total_runs: 1,
+                ..Default::default()
+            },
         };
         let summary = compute_agent_usage_summary(self_metrics, &[child]);
-        assert_eq!(summary.descendant_usage.total_runs, 1, "only the child's inclusive total counts, not its self total again");
-        assert_eq!(summary.inclusive_usage.total_runs, 3, "this agent's 2 runs plus its child's 1");
+        assert_eq!(
+            summary.descendant_usage.total_runs, 1,
+            "only the child's inclusive total counts, not its self total again"
+        );
+        assert_eq!(
+            summary.inclusive_usage.total_runs, 3,
+            "this agent's 2 runs plus its child's 1"
+        );
     }
 
     #[test]

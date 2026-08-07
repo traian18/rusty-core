@@ -1,4 +1,3 @@
-
 //! OpenAI-compatible backend composition and registry factory.
 //!
 //! Reuses `harness_integration_openai::OpenAiClient` directly — see

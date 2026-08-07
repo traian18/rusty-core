@@ -10,7 +10,9 @@
 //! parent limits any more than existing Rust orchestration code could.
 
 use harness_core::agent::Agent;
-use harness_protocol::effects::{BackendPolicy, SpawnAgentSpec, SpawnMode, ToolInheritance, WorkspacePolicy};
+use harness_protocol::effects::{
+    BackendPolicy, SpawnAgentSpec, SpawnMode, ToolInheritance, WorkspacePolicy,
+};
 use harness_protocol::ids::ToolId;
 use harness_protocol::tools::ToolDescriptor;
 use harness_protocol::usage::AgentBudget;
@@ -221,7 +223,9 @@ fn find_delegatable_tool_id(parent: &Agent, name: &str) -> Option<ToolId> {
         .tools
         .iter()
         .find(|(_, capability)| {
-            capability.descriptor.name == name && capability.delegatable && capability.policy.enabled
+            capability.descriptor.name == name
+                && capability.delegatable
+                && capability.policy.enabled
         })
         .map(|(id, _)| *id)
 }
@@ -292,7 +296,9 @@ pub fn agent_spawn_tool_descriptor(id: ToolId) -> ToolDescriptor {
 mod tests {
     use std::collections::HashMap;
 
-    use harness_protocol::backend::{BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference};
+    use harness_protocol::backend::{
+        BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
+    };
     use harness_protocol::ids::{AgentId, BackendId, ConfigurationId, IntegrationId, SessionId};
     use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolPolicy};
 
@@ -340,10 +346,16 @@ mod tests {
                 },
             },
             AgentCapabilities {
-                tools: AgentToolset { tools: tools.into_iter().collect::<HashMap<_, _>>() },
+                tools: AgentToolset {
+                    tools: tools.into_iter().collect::<HashMap<_, _>>(),
+                },
                 can_spawn_agents: true,
                 max_child_depth: Some(3),
-                workspace: WorkspaceCapabilities { can_read: true, can_write: false, can_search: true },
+                workspace: WorkspaceCapabilities {
+                    can_read: true,
+                    can_write: false,
+                    can_search: true,
+                },
                 backend: BackendCapabilities::default(),
             },
             budget,
@@ -378,7 +390,11 @@ mod tests {
         assert_eq!(spec.mode, SpawnMode::AwaitResult);
         match spec.tools {
             ToolInheritance::Subset(ids) => {
-                assert_eq!(ids, vec![read_tool.0], "fs.edit must not be in the default grant");
+                assert_eq!(
+                    ids,
+                    vec![read_tool.0],
+                    "fs.edit must not be in the default grant"
+                );
             }
             other => panic!("expected Subset, got {other:?}"),
         }
@@ -416,7 +432,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.execution_params.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            spec.execution_params.model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
         assert!(
             matches!(spec.backend, BackendPolicy::Inherit),
             "a model override must not switch the child to a different backend policy"
@@ -446,9 +465,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(warnings.len(), 1, "the ungranted request must be reported, not silent");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the ungranted request must be reported, not silent"
+        );
         match spec.tools {
-            ToolInheritance::Subset(ids) => assert!(ids.is_empty(), "non-delegatable tool must never be granted"),
+            ToolInheritance::Subset(ids) => {
+                assert!(ids.is_empty(), "non-delegatable tool must never be granted")
+            }
             other => panic!("expected Subset, got {other:?}"),
         }
     }
@@ -485,7 +510,10 @@ mod tests {
 
     #[test]
     fn explicit_tighter_budget_override_is_preserved() {
-        let parent_budget = AgentBudget { max_requests: Some(10), ..Default::default() };
+        let parent_budget = AgentBudget {
+            max_requests: Some(10),
+            ..Default::default()
+        };
         let parent = parent_agent(vec![], parent_budget);
 
         let (spec, _) = build_spawn_spec(
@@ -522,6 +550,9 @@ mod tests {
     fn descriptor_has_the_stable_tool_name_and_requires_task() {
         let descriptor = agent_spawn_tool_descriptor(ToolId::new());
         assert_eq!(descriptor.name, AGENT_SPAWN_TOOL_NAME);
-        assert_eq!(descriptor.input_schema["required"], serde_json::json!(["task"]));
+        assert_eq!(
+            descriptor.input_schema["required"],
+            serde_json::json!(["task"])
+        );
     }
 }

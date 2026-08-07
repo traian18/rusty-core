@@ -17,7 +17,7 @@
 //! ```
 //!
 //! - **Writes**: [`SqliteSessionStore::append`] and
-//!   [`SqliteSessionStore::save_snapshot`] send a [`WriteCommand`] over an
+//!   [`SqliteSessionStore::save_snapshot`] send a `WriteCommand` over an
 //!   `mpsc` channel and await a `oneshot` acknowledgement, so every durable
 //!   mutation is executed inside its own transaction by the single writer.
 //!   Concurrent appends from many sessions (or many tasks) can never
@@ -36,7 +36,7 @@
 //! WAL, rolls back interrupted transactions, and the idempotent migration
 //! (`IF NOT EXISTS`, `migrations/0001_init.sql`) re-applies cleanly. The
 //! snapshot-versioning columns (`schema_version`, `metadata`) are added to
-//! pre-existing databases by [`ensure_snapshot_columns`], guarded by
+//! pre-existing databases by `ensure_snapshot_columns`, guarded by
 //! `PRAGMA table_info`.
 //!
 //! # RC-300 additions
@@ -54,7 +54,7 @@
 //!   [`crate::retention::prune_plan`]); the store does not verify that
 //!   precondition, so the runtime must.
 //! - Snapshot rows persist `schema_version` (RC-305) and the
-//!   [`DurableSessionMetadata`](crate::store::DurableSessionMetadata) block
+//!   [`DurableSessionMetadata`] block
 //!   (RC-304) so versioning and dependency recording survive restarts.
 //!
 //! # Schema mapping
@@ -244,10 +244,8 @@ fn ensure_snapshot_columns(conn: &mut Connection) -> Result<(), StoreError> {
         .map_err(|error| map_sqlite_error("add schema_version column", error))?;
     }
     if !columns.iter().any(|column| column == "metadata") {
-        conn.execute_batch(
-            "ALTER TABLE snapshots ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
-        )
-        .map_err(|error| map_sqlite_error("add metadata column", error))?;
+        conn.execute_batch("ALTER TABLE snapshots ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';")
+            .map_err(|error| map_sqlite_error("add metadata column", error))?;
     }
     Ok(())
 }
@@ -514,7 +512,14 @@ fn decode_snapshot_row(
     id: SessionId,
     row: (String, String, i64, String, i64, String),
 ) -> Result<DurableSessionSnapshot, StoreError> {
-    let (root_agent_id, agents_json, session_sequence, timestamp_rfc3339, schema_version, metadata_json) = row;
+    let (
+        root_agent_id,
+        agents_json,
+        session_sequence,
+        timestamp_rfc3339,
+        schema_version,
+        metadata_json,
+    ) = row;
     let agents: Vec<StoredAgentState> = serde_json::from_str(&agents_json)?;
     let root_agent_id = AgentId::from_str(&root_agent_id).map_err(|error| {
         StoreError::InvalidState(format!(
@@ -527,11 +532,12 @@ fn decode_snapshot_row(
                 "corrupt snapshot timestamp {timestamp_rfc3339:?}: {error}"
             ))
         })?;
-    let metadata: DurableSessionMetadata = serde_json::from_str(&metadata_json).map_err(|error| {
-        StoreError::InvalidState(format!(
-            "corrupt snapshot metadata {metadata_json:?}: {error}"
-        ))
-    })?;
+    let metadata: DurableSessionMetadata =
+        serde_json::from_str(&metadata_json).map_err(|error| {
+            StoreError::InvalidState(format!(
+                "corrupt snapshot metadata {metadata_json:?}: {error}"
+            ))
+        })?;
     Ok(DurableSessionSnapshot {
         session_id: id,
         root_agent_id,
@@ -761,9 +767,7 @@ fn map_sqlite_error(operation: &str, error: rusqlite::Error) -> StoreError {
     if let rusqlite::Error::SqliteFailure(code, _) = &error {
         if matches!(
             code.extended_code,
-            SQLITE_CONSTRAINT_FOREIGNKEY
-                | SQLITE_CONSTRAINT_PRIMARYKEY
-                | SQLITE_CONSTRAINT_UNIQUE
+            SQLITE_CONSTRAINT_FOREIGNKEY | SQLITE_CONSTRAINT_PRIMARYKEY | SQLITE_CONSTRAINT_UNIQUE
         ) {
             return StoreError::InvalidState(format!("{operation}: {error}"));
         }
@@ -844,11 +848,7 @@ impl SessionStore for SqliteSessionStore {
             .map_err(|_| StoreError::Backend("SQLite writer task terminated".into()))?
     }
 
-    async fn prune_events_before(
-        &self,
-        id: SessionId,
-        sequence: u64,
-    ) -> Result<u64, StoreError> {
+    async fn prune_events_before(&self, id: SessionId, sequence: u64) -> Result<u64, StoreError> {
         let (reply, acknowledgement) = oneshot::channel();
         self.write_tx
             .send(WriteCommand::Prune {
@@ -920,7 +920,10 @@ mod tests {
     async fn current_sequence_is_zero_for_fresh_session() {
         let store = SqliteSessionStore::open(temp_db("seq-zero")).expect("open store");
         assert_eq!(
-            store.current_sequence(SessionId::new()).await.expect("sequence"),
+            store
+                .current_sequence(SessionId::new())
+                .await
+                .expect("sequence"),
             0
         );
     }
@@ -931,10 +934,7 @@ mod tests {
         let session = SessionId::new();
         store.append(event(session, 1)).await.expect("append 1");
         store.append(event(session, 2)).await.expect("append 2");
-        assert_eq!(
-            store.current_sequence(session).await.expect("sequence"),
-            2
-        );
+        assert_eq!(store.current_sequence(session).await.expect("sequence"), 2);
     }
 
     #[tokio::test]
@@ -945,10 +945,7 @@ mod tests {
         store.append(event(session, 2)).await.expect("append 2");
         store.append(event(session, 3)).await.expect("append 3");
 
-        let removed = store
-            .prune_events_before(session, 2)
-            .await
-            .expect("prune");
+        let removed = store.prune_events_before(session, 2).await.expect("prune");
         assert_eq!(removed, 2);
 
         let stored = store.load_session(session).await.expect("load");
@@ -957,7 +954,11 @@ mod tests {
             .iter()
             .filter_map(|event| event.session_sequence)
             .collect();
-        assert_eq!(sequences, vec![3], "only events above the prune point survive");
+        assert_eq!(
+            sequences,
+            vec![3],
+            "only events above the prune point survive"
+        );
     }
 
     #[tokio::test]

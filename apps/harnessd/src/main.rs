@@ -77,7 +77,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    let sessions_dir = args.sessions_dir.clone().unwrap_or_else(default_sessions_dir);
+    let sessions_dir = args
+        .sessions_dir
+        .clone()
+        .unwrap_or_else(default_sessions_dir);
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("creating sessions dir {}", sessions_dir.display()))?;
 
@@ -101,7 +104,9 @@ async fn main() -> Result<()> {
     // handle is rendered on demand by the `GetDiagnostics` RPC rather than
     // served over its own HTTP listener — see that RPC variant's doc
     // comment for why.
-    let metrics_handle = match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
+    let metrics_handle = match metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+    {
         Ok(handle) => Some(handle),
         Err(error) => {
             tracing::warn!(%error, "failed to install the Prometheus metrics recorder; GetDiagnostics will report empty metrics text");
@@ -162,7 +167,10 @@ async fn main() -> Result<()> {
     // grace period so one stuck session can't hang the whole process.
     shutdown.cancelled().await;
     let drain_grace_period = Duration::from_secs(10);
-    let unclosed = harness.session_manager().close_all_sessions(drain_grace_period).await;
+    let unclosed = harness
+        .session_manager()
+        .close_all_sessions(drain_grace_period)
+        .await;
     if !unclosed.is_empty() {
         tracing::warn!(
             count = unclosed.len(),
@@ -186,8 +194,9 @@ fn spawn_shutdown_listener(shutdown: CancellationToken) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("installing SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}

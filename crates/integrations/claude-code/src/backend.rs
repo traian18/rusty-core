@@ -26,7 +26,9 @@ use harness_runtime::traits::ExecutionBackend;
 use harness_runtime::IntegrationFactory;
 
 use crate::config::ClaudeCodeConfig;
-use crate::wire::{extract_assistant_text, extract_latest_user_text, extract_result, extract_session_id};
+use crate::wire::{
+    extract_assistant_text, extract_latest_user_text, extract_result, extract_session_id,
+};
 
 /// Drives the Claude Code CLI as a subprocess `ExecutionBackend`. One
 /// `claude --print` process is spawned per [`execute`](Self::execute) call;
@@ -80,11 +82,17 @@ impl ExecutionBackend for ClaudeCodeBackend {
         sink: broadcast::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let prompt = extract_latest_user_text(&request.messages).ok_or_else(|| ExecutionError::InvalidRequest {
-            message: "no user message to send to the Claude Code CLI".to_string(),
+        let prompt = extract_latest_user_text(&request.messages).ok_or_else(|| {
+            ExecutionError::InvalidRequest {
+                message: "no user message to send to the Claude Code CLI".to_string(),
+            }
         })?;
 
-        let resume_id = self.session_id.lock().expect("session_id mutex poisoned").clone();
+        let resume_id = self
+            .session_id
+            .lock()
+            .expect("session_id mutex poisoned")
+            .clone();
 
         let mut command = tokio::process::Command::new(&self.config.binary_path);
         command
@@ -96,11 +104,15 @@ impl ExecutionBackend for ClaudeCodeBackend {
         if let Some(id) = &resume_id {
             command.arg("--resume").arg(id);
         } else if !request.system_prompt.is_empty() {
-            command.arg("--append-system-prompt").arg(&request.system_prompt);
+            command
+                .arg("--append-system-prompt")
+                .arg(&request.system_prompt);
         }
 
         if self.config.permission_mode != "interactive" {
-            command.arg("--permission-mode").arg(&self.config.permission_mode);
+            command
+                .arg("--permission-mode")
+                .arg(&self.config.permission_mode);
         }
 
         for arg in &self.config.extra_args {
@@ -113,10 +125,12 @@ impl ExecutionBackend for ClaudeCodeBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|error| ExecutionError::BackendError {
-            message: format!("failed to spawn Claude Code CLI: {error}"),
-            code: "spawn_failed".to_string(),
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| ExecutionError::BackendError {
+                message: format!("failed to spawn Claude Code CLI: {error}"),
+                code: "spawn_failed".to_string(),
+            })?;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -192,7 +206,9 @@ impl ExecutionBackend for ClaudeCodeBackend {
                     ));
                 }
                 let cost = Cost {
-                    amount_usd: result.cost_usd.and_then(|amount| Decimal::try_from(amount).ok()),
+                    amount_usd: result
+                        .cost_usd
+                        .and_then(|amount| Decimal::try_from(amount).ok()),
                     source: result.cost_usd.map(|_| CostSource::ProviderReported),
                 };
                 final_result = Some(ExecutionResult {
@@ -204,10 +220,13 @@ impl ExecutionBackend for ClaudeCodeBackend {
             }
         }
 
-        let status = child.wait().await.map_err(|error| ExecutionError::BackendError {
-            message: format!("Claude Code CLI process error: {error}"),
-            code: "wait_failed".to_string(),
-        })?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| ExecutionError::BackendError {
+                message: format!("Claude Code CLI process error: {error}"),
+                code: "wait_failed".to_string(),
+            })?;
 
         if let Some(id) = new_session_id {
             *self.session_id.lock().expect("session_id mutex poisoned") = Some(id);
@@ -292,7 +311,9 @@ mod tests {
         AgentMessage {
             id: MessageId::new(),
             role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             created_at: Timestamp::now(),
         }
     }
@@ -314,7 +335,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let script = format!("#!/bin/sh\ncat <<'STUB_EOF'\n{body}\nSTUB_EOF\n");
         std::fs::write(path, script).expect("write stub script");
-        let mut perms = std::fs::metadata(path).expect("stat stub script").permissions();
+        let mut perms = std::fs::metadata(path)
+            .expect("stat stub script")
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod stub script");
     }
@@ -339,7 +362,11 @@ mod tests {
 
         let (tx, mut rx) = broadcast::channel(16);
         let result = backend
-            .execute(request_with(vec![user_message("hi")]), tx, CancellationToken::new())
+            .execute(
+                request_with(vec![user_message("hi")]),
+                tx,
+                CancellationToken::new(),
+            )
             .await
             .expect("execute should succeed");
 
@@ -383,7 +410,11 @@ mod tests {
 
         let (tx, _rx) = broadcast::channel(16);
         let result = backend
-            .execute(request_with(vec![user_message("hi")]), tx, CancellationToken::new())
+            .execute(
+                request_with(vec![user_message("hi")]),
+                tx,
+                CancellationToken::new(),
+            )
             .await;
         assert!(matches!(result, Err(ExecutionError::BackendError { .. })));
     }

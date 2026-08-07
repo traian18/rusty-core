@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use harness_tools::{CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult};
+use harness_tools::{
+    CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult,
+};
 use harness_workspace::Workspace;
 
 /// Input for the `fs.edit` tool.
@@ -65,9 +67,9 @@ fn resolve_mode(input: &EditInput) -> Result<EditMode, String> {
         (None, None, None) => {
             Err("one of `content` or (`old_text` and `new_text`) is required".to_string())
         }
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(
-            "`content` is mutually exclusive with `old_text`/`new_text`".to_string(),
-        ),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            Err("`content` is mutually exclusive with `old_text`/`new_text`".to_string())
+        }
         (None, Some(_), None) => Err("`old_text` requires `new_text`".to_string()),
         (None, None, Some(_)) => Err("`new_text` requires `old_text`".to_string()),
     }
@@ -201,7 +203,9 @@ mod tests {
             .expect("execute");
         assert!(!result.is_error);
         assert_eq!(
-            tokio::fs::read_to_string(dir.path().join("a.txt")).await.unwrap(),
+            tokio::fs::read_to_string(dir.path().join("a.txt"))
+                .await
+                .unwrap(),
             "hello world"
         );
     }
@@ -209,9 +213,12 @@ mod tests {
     #[tokio::test]
     async fn find_replace_unique_match_replaces() {
         let dir = tempdir().unwrap();
-        tokio::fs::write(dir.path().join("a.txt"), "fn main() {\n    old_call();\n}\n")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            dir.path().join("a.txt"),
+            "fn main() {\n    old_call();\n}\n",
+        )
+        .await
+        .unwrap();
         let tool = tool_for(dir.path().to_path_buf());
 
         let result = tool
@@ -227,9 +234,15 @@ mod tests {
             )
             .await
             .expect("execute");
-        assert!(!result.is_error, "expected success, got {:?}", result.output);
+        assert!(
+            !result.is_error,
+            "expected success, got {:?}",
+            result.output
+        );
         assert_eq!(
-            tokio::fs::read_to_string(dir.path().join("a.txt")).await.unwrap(),
+            tokio::fs::read_to_string(dir.path().join("a.txt"))
+                .await
+                .unwrap(),
             "fn main() {\n    new_call();\n}\n"
         );
     }
@@ -257,7 +270,9 @@ mod tests {
             .expect("execute");
         assert!(result.is_error);
         assert_eq!(
-            tokio::fs::read_to_string(dir.path().join("a.txt")).await.unwrap(),
+            tokio::fs::read_to_string(dir.path().join("a.txt"))
+                .await
+                .unwrap(),
             "unchanged content",
             "the file must be left untouched when old_text is not found"
         );
@@ -286,7 +301,9 @@ mod tests {
             .expect("execute");
         assert!(result.is_error);
         assert_eq!(
-            tokio::fs::read_to_string(dir.path().join("a.txt")).await.unwrap(),
+            tokio::fs::read_to_string(dir.path().join("a.txt"))
+                .await
+                .unwrap(),
             "dup\ndup\n",
             "the file must be left untouched when old_text is ambiguous"
         );

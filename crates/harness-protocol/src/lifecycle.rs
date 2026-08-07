@@ -209,8 +209,7 @@ mod tests {
 
         for outcome in outcomes {
             let json = serde_json::to_string(&outcome).expect("serialize");
-            let decoded: CancelRunOutcome =
-                serde_json::from_str(&json).expect("deserialize");
+            let decoded: CancelRunOutcome = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(decoded, outcome);
         }
     }

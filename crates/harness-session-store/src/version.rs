@@ -1,7 +1,7 @@
 //! Snapshot/event schema versioning, forward rejection, and backward migration
 //! (RC-305).
 //!
-//! Every [`DurableSessionSnapshot`](crate::store::DurableSessionSnapshot)
+//! Every [`DurableSessionSnapshot`]
 //! written by this build carries [`SCHEMA_VERSION`]. Older checkpoints (the
 //! pre-RC-300 shape, which has no `schema_version` field) deserialize with
 //! version `0` and are upgraded in place by [`migrate_snapshot`] before a
@@ -41,9 +41,7 @@ pub const MIN_SUPPORTED_SNAPSHOT_VERSION: u64 = 0;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotVersionError {
     /// The checkpoint was produced by a newer build and cannot be read.
-    #[error(
-        "snapshot schema version {found} is newer than this build supports ({supported})"
-    )]
+    #[error("snapshot schema version {found} is newer than this build supports ({supported})")]
     FutureVersion {
         /// The version found in the checkpoint.
         found: u64,
@@ -134,19 +132,18 @@ mod tests {
     #[test]
     fn current_version_is_accepted() {
         check_snapshot_version(SCHEMA_VERSION).expect("current version is supported");
-        assert!(migrate_snapshot(snapshot(SCHEMA_VERSION))
-            .expect("current snapshot migrates to itself")
-            .schema_version
-            == SCHEMA_VERSION);
+        assert!(
+            migrate_snapshot(snapshot(SCHEMA_VERSION))
+                .expect("current snapshot migrates to itself")
+                .schema_version
+                == SCHEMA_VERSION
+        );
     }
 
     #[test]
     fn future_version_is_rejected() {
         let error = check_snapshot_version(SCHEMA_VERSION + 1).expect_err("future version");
-        assert!(matches!(
-            error,
-            SnapshotVersionError::FutureVersion { .. }
-        ));
+        assert!(matches!(error, SnapshotVersionError::FutureVersion { .. }));
         assert!(migrate_snapshot(snapshot(SCHEMA_VERSION + 1)).is_err());
     }
 

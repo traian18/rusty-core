@@ -1,4 +1,3 @@
-
 #![warn(clippy::all)]
 
 //! Stdio transport: exposes an [`RpcHandler`] over stdin/stdout using

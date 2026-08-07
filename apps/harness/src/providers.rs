@@ -1,4 +1,6 @@
-use harness_engine::{CredentialProfileId, CredentialProfileSummary, ProviderDescriptor, ProviderKey};
+use harness_engine::{
+    CredentialProfileId, CredentialProfileSummary, ProviderDescriptor, ProviderKey,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,9 +27,18 @@ pub struct SessionSelection {
     pub model: String,
 }
 
-pub fn option_from_descriptor(provider: ProviderDescriptor, profile: CredentialProfileSummary, health: harness_engine::ProviderHealth, models: Vec<harness_engine::ModelDescriptor>) -> ProviderOption {
-    let default_model = models.iter().find(|model| model.is_default).or_else(|| models.first())
-        .map(|model| model.provider_model_id.clone()).unwrap_or_else(|| "default".into());
+pub fn option_from_descriptor(
+    provider: ProviderDescriptor,
+    profile: CredentialProfileSummary,
+    health: harness_engine::ProviderHealth,
+    models: Vec<harness_engine::ModelDescriptor>,
+) -> ProviderOption {
+    let default_model = models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| models.first())
+        .map(|model| model.provider_model_id.clone())
+        .unwrap_or_else(|| "default".into());
     ProviderOption {
         credential_profile: profile.id,
         credential_state: format!("{:?}", profile.state),
@@ -38,7 +49,10 @@ pub fn option_from_descriptor(provider: ProviderDescriptor, profile: CredentialP
         name: provider.name,
         account_hint: provider.credential_hint,
         default_model,
-        models: models.into_iter().map(|model| model.provider_model_id).collect(),
+        models: models
+            .into_iter()
+            .map(|model| model.provider_model_id)
+            .collect(),
         model_hint: "Select a discovered model or enter a custom provider model ID".into(),
     }
 }
@@ -100,17 +114,39 @@ pub fn fallback_options() -> Vec<ProviderOption> {
 
 pub fn selection_for(integration: &str, config: &Value) -> SessionSelection {
     let options = fallback_options();
-    let provider = options.iter().find(|provider| provider.integration == integration).unwrap_or(&options[0]);
-    let configured_model = config.get("_backend_selection").and_then(|selection| selection.get("provider_model_id")).and_then(Value::as_str).map(str::to_owned)
-        .or_else(|| config.get("default_model").and_then(Value::as_str).map(str::to_owned))
-        .or_else(|| config.get("model").and_then(Value::as_str).map(str::to_owned))
-        .or_else(|| config.get("extra_args").and_then(Value::as_array).and_then(|args| {
-            args.windows(2).find_map(|pair| {
-                let flag = pair.first()?.as_str()?;
-                let value = pair.get(1)?.as_str()?;
-                (flag == "--model").then(|| value.to_owned())
-            })
-        }));
+    let provider = options
+        .iter()
+        .find(|provider| provider.integration == integration)
+        .unwrap_or(&options[0]);
+    let configured_model = config
+        .get("_backend_selection")
+        .and_then(|selection| selection.get("provider_model_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            config
+                .get("default_model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            config
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            config
+                .get("extra_args")
+                .and_then(Value::as_array)
+                .and_then(|args| {
+                    args.windows(2).find_map(|pair| {
+                        let flag = pair.first()?.as_str()?;
+                        let value = pair.get(1)?.as_str()?;
+                        (flag == "--model").then(|| value.to_owned())
+                    })
+                })
+        });
     SessionSelection {
         provider_id: provider.id.clone(),
         credential_profile: provider.credential_profile.clone(),
@@ -121,7 +157,11 @@ pub fn selection_for(integration: &str, config: &Value) -> SessionSelection {
 }
 
 pub fn selection_for_backend(backend_name: Option<&str>, config: &Value) -> SessionSelection {
-    let integration = match backend_name.unwrap_or_default().to_ascii_lowercase().as_str() {
+    let integration = match backend_name
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         name if name.contains("anthropic") => "anthropic",
         name if name.contains("claude") => "claude-code",
         name if name.contains("copilot") => "github-copilot",
@@ -131,8 +171,12 @@ pub fn selection_for_backend(backend_name: Option<&str>, config: &Value) -> Sess
     };
     let mut selection = selection_for(integration, config);
     if let Some(model) = backend_name
-        .and_then(|name| name.rsplit_once('[').map(|(_, encoded)| encoded.trim_end_matches(']')))
-        .and_then(|encoded| encoded.split_once(':').map(|(_, model)| model)) {
+        .and_then(|name| {
+            name.rsplit_once('[')
+                .map(|(_, encoded)| encoded.trim_end_matches(']'))
+        })
+        .and_then(|encoded| encoded.split_once(':').map(|(_, model)| model))
+    {
         selection.model = model.to_owned();
     }
     selection
@@ -153,14 +197,16 @@ mod tests {
 
     #[test]
     fn restored_backend_name_recovers_provider_and_model() {
-        let selection = selection_for_backend(Some("OpenAI"), &json!({ "default_model": "gpt-restored" }));
+        let selection =
+            selection_for_backend(Some("OpenAI"), &json!({ "default_model": "gpt-restored" }));
         assert_eq!(selection.integration, "openai");
         assert_eq!(selection.model, "gpt-restored");
     }
 
     #[test]
     fn descriptor_fallback_preserves_exact_model_slug() {
-        let selection = selection_for_backend(Some("OpenAI [openai-api:gpt-exact-2026-08-05]"), &json!({}));
+        let selection =
+            selection_for_backend(Some("OpenAI [openai-api:gpt-exact-2026-08-05]"), &json!({}));
         assert_eq!(selection.model, "gpt-exact-2026-08-05");
     }
 

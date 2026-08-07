@@ -24,7 +24,10 @@ use harness_protocol::usage::{ModelUsage, UsageValue};
 /// blocks — the one new turn to send to `claude -p`, since the CLI's own
 /// `--resume`d session already holds every earlier turn.
 pub fn extract_latest_user_text(messages: &[AgentMessage]) -> Option<String> {
-    let message = messages.iter().rev().find(|m| m.role == MessageRole::User)?;
+    let message = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::User)?;
     let text: String = message
         .content
         .iter()
@@ -45,7 +48,10 @@ pub fn extract_session_id(value: &serde_json::Value) -> Option<String> {
     if value.get("subtype").and_then(|s| s.as_str()) != Some("init") {
         return None;
     }
-    value.get("session_id").and_then(|s| s.as_str()).map(str::to_string)
+    value
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
 }
 
 /// Extracts the full accumulated assistant text from a
@@ -82,8 +88,12 @@ pub fn extract_result(value: &serde_json::Value) -> Option<ResultLine> {
         .to_string();
     let cost_usd = value.get("total_cost_usd").and_then(|c| c.as_f64());
     let usage_value = value.get("usage");
-    let input_tokens = usage_value.and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64());
-    let output_tokens = usage_value.and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64());
+    let input_tokens = usage_value
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage_value
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64());
     let cache_read_tokens = usage_value
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_u64());
@@ -118,7 +128,9 @@ mod tests {
         AgentMessage {
             id: MessageId::new(),
             role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             created_at: Timestamp::now(),
         }
     }
@@ -127,7 +139,9 @@ mod tests {
         AgentMessage {
             id: MessageId::new(),
             role: MessageRole::Assistant,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             created_at: Timestamp::now(),
         }
     }
@@ -139,7 +153,10 @@ mod tests {
             assistant_message("reply"),
             user_message("second"),
         ];
-        assert_eq!(extract_latest_user_text(&messages), Some("second".to_string()));
+        assert_eq!(
+            extract_latest_user_text(&messages),
+            Some("second".to_string())
+        );
     }
 
     #[test]

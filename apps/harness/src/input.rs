@@ -49,8 +49,9 @@ pub fn map_key(key: KeyEvent, permission_prompt: bool, modal_open: bool) -> Inpu
         (KeyCode::Char('n'), KeyModifiers::CONTROL) if permission_prompt => InputAction::Reject,
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => InputAction::NewSession,
         (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => InputAction::Cancel,
-        (KeyCode::Enter, KeyModifiers::ALT)
-        | (KeyCode::Char('j'), KeyModifiers::CONTROL) => InputAction::Newline,
+        (KeyCode::Enter, KeyModifiers::ALT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+            InputAction::Newline
+        }
         (KeyCode::Enter, KeyModifiers::NONE) => InputAction::Submit,
         (KeyCode::Backspace, _) => InputAction::Backspace,
         (KeyCode::PageUp, _) => InputAction::ScrollUp,
@@ -128,11 +129,7 @@ mod tests {
             InputAction::NavigateDown
         );
         assert_eq!(
-            map_key(
-                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                false,
-                true,
-            ),
+            map_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), false, true,),
             InputAction::Cancel
         );
         assert_eq!(

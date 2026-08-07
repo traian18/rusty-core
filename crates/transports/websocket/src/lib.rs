@@ -1,4 +1,3 @@
-
 #![warn(clippy::all)]
 
 //! WebSocket transport: exposes an [`RpcHandler`] over a TCP + WebSocket
@@ -331,8 +330,8 @@ async fn send(out_tx: &mpsc::Sender<String>, response: RpcResponse) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
+    use std::collections::HashMap;
 
     use std::sync::Mutex;
 

@@ -12,12 +12,18 @@ use zeroize::Zeroize;
 pub struct ProviderKey(pub String);
 
 impl ProviderKey {
-    pub fn new(value: impl Into<String>) -> Self { Self(value.into()) }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for ProviderKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Stable non-secret credential profile identifier.
@@ -26,17 +32,29 @@ impl fmt::Display for ProviderKey {
 pub struct CredentialProfileId(pub String);
 
 impl CredentialProfileId {
-    pub fn new(value: impl Into<String>) -> Self { Self(value.into()) }
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AdapterKind { Api, Cli }
+pub enum AdapterKind {
+    Api,
+    Cli,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthMethod { Environment, CliManaged }
+pub enum AuthMethod {
+    Environment,
+    CliManaged,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CredentialState { Available, Missing, ManagedExternally }
+pub enum CredentialState {
+    Available,
+    Missing,
+    ManagedExternally,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialProfileSummary {
@@ -125,16 +143,24 @@ pub struct ProviderHealth {
 pub struct SecretString(String);
 
 impl SecretString {
-    pub fn new(value: String) -> Self { Self(value) }
-    pub fn expose(&self) -> &str { &self.0 }
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("[REDACTED]") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 impl fmt::Display for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("[REDACTED]") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 impl Drop for SecretString {
@@ -156,16 +182,19 @@ pub trait CredentialStore: Send + Sync {
 
 /// Host bridge for an OS keychain or other secure credential service. The
 /// harness stores only the resolver and never serializes returned secrets.
-type CredentialResolver =
-    dyn Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync;
+type CredentialResolver = dyn Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync;
 
 pub struct SecureCredentialStore {
     resolver: Box<CredentialResolver>,
 }
 
 impl SecureCredentialStore {
-    pub fn new(resolver: impl Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync + 'static) -> Self {
-        Self { resolver: Box::new(resolver) }
+    pub fn new(
+        resolver: impl Fn(&CredentialProfileSummary) -> Option<SecretString> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolver: Box::new(resolver),
+        }
     }
 }
 
@@ -185,7 +214,10 @@ impl CredentialStore for EnvironmentCredentialStore {
             "openai-api" => "OPENAI_API_KEY",
             _ => return None,
         };
-        std::env::var(variable).ok().filter(|value| !value.is_empty()).map(SecretString::new)
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(SecretString::new)
     }
 }
 
@@ -242,7 +274,10 @@ fn executable_extensions() -> Vec<String> {
             })
             .filter(|extensions| !extensions.is_empty())
             .unwrap_or_else(|| {
-                ["exe", "cmd", "bat", "ps1"].iter().map(|ext| (*ext).to_owned()).collect()
+                ["exe", "cmd", "bat", "ps1"]
+                    .iter()
+                    .map(|ext| (*ext).to_owned())
+                    .collect()
             })
     } else {
         vec![String::new()]
@@ -252,15 +287,10 @@ fn executable_extensions() -> Vec<String> {
 /// Common install directories a directly-spawned process may not inherit on
 /// `$PATH`. Missing directories are simply skipped by the `is_file()` probe.
 fn fallback_executable_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = [
-        "/usr/local/bin",
-        "/opt/homebrew/bin",
-        "/usr/bin",
-        "/bin",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect();
+    let mut dirs: Vec<PathBuf> = ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
 
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -290,63 +320,149 @@ fn fallback_executable_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-pub(crate) fn descriptor_for(integration: &str, capabilities: BackendCapabilities) -> ProviderDescriptor {
+pub(crate) fn descriptor_for(
+    integration: &str,
+    capabilities: BackendCapabilities,
+) -> ProviderDescriptor {
     let (id, name, kind, auth, hint) = match integration {
-        "anthropic" => ("anthropic-api", "Anthropic API", AdapterKind::Api, AuthMethod::Environment, "ANTHROPIC_API_KEY"),
-        "claude-code" => ("claude-code", "Claude Code", AdapterKind::Cli, AuthMethod::CliManaged, "Claude CLI login"),
-        "openai" => ("openai-api", "OpenAI API", AdapterKind::Api, AuthMethod::Environment, "OPENAI_API_KEY"),
-        "codex" => ("codex", "OpenAI Codex", AdapterKind::Cli, AuthMethod::CliManaged, "Codex CLI login"),
-        "github-copilot" => ("github-copilot", "GitHub Copilot", AdapterKind::Cli, AuthMethod::CliManaged, "Copilot CLI login"),
-        other => (other, other, AdapterKind::Cli, AuthMethod::CliManaged, "External credentials"),
+        "anthropic" => (
+            "anthropic-api",
+            "Anthropic API",
+            AdapterKind::Api,
+            AuthMethod::Environment,
+            "ANTHROPIC_API_KEY",
+        ),
+        "claude-code" => (
+            "claude-code",
+            "Claude Code",
+            AdapterKind::Cli,
+            AuthMethod::CliManaged,
+            "Claude CLI login",
+        ),
+        "openai" => (
+            "openai-api",
+            "OpenAI API",
+            AdapterKind::Api,
+            AuthMethod::Environment,
+            "OPENAI_API_KEY",
+        ),
+        "codex" => (
+            "codex",
+            "OpenAI Codex",
+            AdapterKind::Cli,
+            AuthMethod::CliManaged,
+            "Codex CLI login",
+        ),
+        "github-copilot" => (
+            "github-copilot",
+            "GitHub Copilot",
+            AdapterKind::Cli,
+            AuthMethod::CliManaged,
+            "Copilot CLI login",
+        ),
+        other => (
+            other,
+            other,
+            AdapterKind::Cli,
+            AuthMethod::CliManaged,
+            "External credentials",
+        ),
     };
     ProviderDescriptor {
-        id: ProviderKey::new(id), integration: integration.to_owned(), name: name.to_owned(),
-        adapter_kind: kind, auth_methods: vec![auth], capabilities,
+        id: ProviderKey::new(id),
+        integration: integration.to_owned(),
+        name: name.to_owned(),
+        adapter_kind: kind,
+        auth_methods: vec![auth],
+        capabilities,
         credential_hint: hint.to_owned(),
     }
 }
 
-pub(crate) async fn discover_api_models(provider: &ProviderKey) -> Result<Vec<ModelDescriptor>, String> {
+pub(crate) async fn discover_api_models(
+    provider: &ProviderKey,
+) -> Result<Vec<ModelDescriptor>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()
         .map_err(|_| "could not initialize the provider model client".to_owned())?;
     let response = match provider.as_str() {
         "anthropic-api" => {
-            let key = SecretString::new(std::env::var("ANTHROPIC_API_KEY").map_err(|_| "Anthropic credential unavailable".to_owned())?);
-            client.get("https://api.anthropic.com/v1/models")
+            let key = SecretString::new(
+                std::env::var("ANTHROPIC_API_KEY")
+                    .map_err(|_| "Anthropic credential unavailable".to_owned())?,
+            );
+            client
+                .get("https://api.anthropic.com/v1/models")
                 .header("x-api-key", key.expose())
                 .header("anthropic-version", "2023-06-01")
-                .send().await
+                .send()
+                .await
         }
         "openai-api" => {
-            let key = SecretString::new(std::env::var("OPENAI_API_KEY").map_err(|_| "OpenAI credential unavailable".to_owned())?);
-            client.get("https://api.openai.com/v1/models").bearer_auth(key.expose()).send().await
+            let key = SecretString::new(
+                std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| "OpenAI credential unavailable".to_owned())?,
+            );
+            client
+                .get("https://api.openai.com/v1/models")
+                .bearer_auth(key.expose())
+                .send()
+                .await
         }
         _ => return Ok(default_models(provider)),
-    }.map_err(|_| "provider model catalog request failed".to_owned())?;
-    if !response.status().is_success() {
-        return Err(format!("provider model catalog returned HTTP {}", response.status().as_u16()));
     }
-    let value: serde_json::Value = response.json().await.map_err(|_| "provider model catalog returned invalid JSON".to_owned())?;
-    let data = value.get("data").and_then(serde_json::Value::as_array).ok_or_else(|| "provider model catalog did not contain data".to_owned())?;
-    let mut models = data.iter().filter_map(|item| {
-        let id = item.get("id").and_then(serde_json::Value::as_str)?;
-        if provider.as_str() == "openai-api" && !is_supported_openai_model(id) { return None; }
-        let name = item.get("display_name").and_then(serde_json::Value::as_str).unwrap_or(id);
-        Some(ModelDescriptor {
-            provider: provider.clone(),
-            provider_model_id: id.to_owned(),
-            display_name: name.to_owned(),
-            capabilities: ModelCapabilities { text: true, tools: true, reasoning: id.starts_with('o') },
-            context_window: None,
-            is_default: false,
-            stale: false,
+    .map_err(|_| "provider model catalog request failed".to_owned())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "provider model catalog returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "provider model catalog returned invalid JSON".to_owned())?;
+    let data = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "provider model catalog did not contain data".to_owned())?;
+    let mut models = data
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(serde_json::Value::as_str)?;
+            if provider.as_str() == "openai-api" && !is_supported_openai_model(id) {
+                return None;
+            }
+            let name = item
+                .get("display_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(id);
+            Some(ModelDescriptor {
+                provider: provider.clone(),
+                provider_model_id: id.to_owned(),
+                display_name: name.to_owned(),
+                capabilities: ModelCapabilities {
+                    text: true,
+                    tools: true,
+                    reasoning: id.starts_with('o'),
+                },
+                context_window: None,
+                is_default: false,
+                stale: false,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     models.sort_by(|left, right| left.provider_model_id.cmp(&right.provider_model_id));
-    let preferred = default_models(provider).into_iter().find(|model| model.is_default).map(|model| model.provider_model_id);
-    if let Some(default) = preferred.and_then(|id| models.iter_mut().find(|model| model.provider_model_id == id)) {
+    let preferred = default_models(provider)
+        .into_iter()
+        .find(|model| model.is_default)
+        .map(|model| model.provider_model_id);
+    if let Some(default) = preferred.and_then(|id| {
+        models
+            .iter_mut()
+            .find(|model| model.provider_model_id == id)
+    }) {
         default.is_default = true;
     } else if let Some(first) = models.first_mut() {
         first.is_default = true;
@@ -355,23 +471,47 @@ pub(crate) async fn discover_api_models(provider: &ProviderKey) -> Result<Vec<Mo
 }
 
 fn is_supported_openai_model(id: &str) -> bool {
-    ["gpt-", "chatgpt-", "o1", "o3", "o4"].iter().any(|prefix| id.starts_with(prefix))
+    ["gpt-", "chatgpt-", "o1", "o3", "o4"]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
 }
 
 pub(crate) fn default_models(provider: &ProviderKey) -> Vec<ModelDescriptor> {
     let values: &[(&str, &str, bool)] = match provider.as_str() {
-        "anthropic-api" => &[("claude-sonnet-4-20250514", "Claude Sonnet 4", true), ("claude-opus-4-20250514", "Claude Opus 4", false)],
-        "claude-code" => &[("sonnet", "Sonnet", true), ("opus", "Opus", false), ("haiku", "Haiku", false)],
-        "openai-api" => &[("gpt-4o", "GPT-4o", true), ("gpt-4.1", "GPT-4.1", false), ("o3", "o3", false)],
+        "anthropic-api" => &[
+            ("claude-sonnet-4-20250514", "Claude Sonnet 4", true),
+            ("claude-opus-4-20250514", "Claude Opus 4", false),
+        ],
+        "claude-code" => &[
+            ("sonnet", "Sonnet", true),
+            ("opus", "Opus", false),
+            ("haiku", "Haiku", false),
+        ],
+        "openai-api" => &[
+            ("gpt-4o", "GPT-4o", true),
+            ("gpt-4.1", "GPT-4.1", false),
+            ("o3", "o3", false),
+        ],
         "codex" => &[("default", "Provider default", true)],
         "github-copilot" => &[("auto", "Auto (plan and policy aware)", true)],
         _ => &[("default", "Provider default", true)],
     };
-    values.iter().map(|(id, name, is_default)| ModelDescriptor {
-        provider: provider.clone(), provider_model_id: (*id).to_owned(), display_name: (*name).to_owned(),
-        capabilities: ModelCapabilities { text: true, tools: true, reasoning: false },
-        context_window: None, is_default: *is_default, stale: false,
-    }).collect()
+    values
+        .iter()
+        .map(|(id, name, is_default)| ModelDescriptor {
+            provider: provider.clone(),
+            provider_model_id: (*id).to_owned(),
+            display_name: (*name).to_owned(),
+            capabilities: ModelCapabilities {
+                text: true,
+                tools: true,
+                reasoning: false,
+            },
+            context_window: None,
+            is_default: *is_default,
+            stale: false,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -423,9 +563,13 @@ mod tests {
     fn cancelling_auth_discards_pending_state() {
         let mut flow = AuthFlowHandle {
             provider: ProviderKey::new("codex"),
-            states: vec![AuthFlowState::Starting, AuthFlowState::WaitingForExternalCommand {
-                program: "codex".into(), args: vec!["login".into()],
-            }],
+            states: vec![
+                AuthFlowState::Starting,
+                AuthFlowState::WaitingForExternalCommand {
+                    program: "codex".into(),
+                    args: vec!["login".into()],
+                },
+            ],
         };
         flow.cancel();
         assert_eq!(flow.current(), Some(&AuthFlowState::Cancelled));

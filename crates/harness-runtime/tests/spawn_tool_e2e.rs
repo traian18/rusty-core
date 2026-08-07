@@ -52,13 +52,20 @@ impl RecordingSink {
             .collect()
     }
 
-    fn tool_completed_output(&self, agent_id: AgentId, call_id: ToolCallId) -> Option<serde_json::Value> {
-        self.events_for(agent_id).into_iter().find_map(|event| match event {
-            AgentEvent::ToolCallCompleted { call_id: id, result } if id == call_id => {
-                serde_json::from_str(&result.output_preview).ok()
-            }
-            _ => None,
-        })
+    fn tool_completed_output(
+        &self,
+        agent_id: AgentId,
+        call_id: ToolCallId,
+    ) -> Option<serde_json::Value> {
+        self.events_for(agent_id)
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolCallCompleted {
+                    call_id: id,
+                    result,
+                } if id == call_id => serde_json::from_str(&result.output_preview).ok(),
+                _ => None,
+            })
     }
 }
 
@@ -89,7 +96,10 @@ fn root_agent_with_spawn_tool(
         spawn_tool_id,
         ToolCapability {
             descriptor: agent_spawn_tool_descriptor(spawn_tool_id),
-            policy: ToolPolicy { permission, enabled: true },
+            policy: ToolPolicy {
+                permission,
+                enabled: true,
+            },
             delegatable: false,
         },
     );
@@ -112,7 +122,11 @@ fn root_agent_with_spawn_tool(
             tools: AgentToolset { tools },
             can_spawn_agents: true,
             max_child_depth: Some(4),
-            workspace: WorkspaceCapabilities { can_read: true, can_write: true, can_search: true },
+            workspace: WorkspaceCapabilities {
+                can_read: true,
+                can_write: true,
+                can_search: true,
+            },
             backend: BackendCapabilities::default(),
         },
         budget,
@@ -183,7 +197,11 @@ async fn send_spawn_tool_call(
             run_id,
             event: ExecutionEvent::ToolCallRequested {
                 request_id,
-                call: ToolCall { id: call_id, name: AGENT_SPAWN_TOOL_NAME.to_string(), arguments },
+                call: ToolCall {
+                    id: call_id,
+                    name: AGENT_SPAWN_TOOL_NAME.to_string(),
+                    arguments,
+                },
             },
         })
         .await
@@ -196,7 +214,10 @@ async fn wait_for<F: Fn() -> bool>(predicate: F, timeout: Duration, what: &str) 
         if predicate() {
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for: {what}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
         tokio::task::yield_now().await;
     }
 }
@@ -213,7 +234,10 @@ async fn spawn_tool_await_mode_runs_the_child_and_returns_its_summary() {
     let request_id = RequestId::new();
     let backend: Arc<dyn ExecutionBackend> = Arc::new(
         FakeBackend::new()
-            .with_events(vec![ExecutionEvent::TextDelta { request_id, delta: "child-work".into() }])
+            .with_events(vec![ExecutionEvent::TextDelta {
+                request_id,
+                delta: "child-work".into(),
+            }])
             .with_result(ExecutionResult {
                 request_id,
                 usage: Default::default(),
@@ -226,7 +250,11 @@ async fn spawn_tool_await_mode_runs_the_child_and_returns_its_summary() {
         root_id,
         backend.as_ref(),
         PermissionMode::Allow,
-        AgentBudget { max_children: Some(2), max_depth: Some(4), ..Default::default() },
+        AgentBudget {
+            max_children: Some(2),
+            max_depth: Some(4),
+            ..Default::default()
+        },
     );
     let (commands, sink, _supervisor, root_cancel, runner_task) =
         bootstrap(session_id, root_id, backend, root);
@@ -247,11 +275,16 @@ async fn spawn_tool_await_mode_runs_the_child_and_returns_its_summary() {
     )
     .await;
 
-    let output = sink.tool_completed_output(root_id, call_id).expect("output present");
+    let output = sink
+        .tool_completed_output(root_id, call_id)
+        .expect("output present");
     assert_eq!(output["status"], "completed");
     assert!(output["child_agent_id"].is_string());
     assert!(
-        output["summary"].as_str().unwrap_or_default().contains("end_turn"),
+        output["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("end_turn"),
         "expected the child's real completion summary, got {output:?}"
     );
 
@@ -259,8 +292,12 @@ async fn spawn_tool_await_mode_runs_the_child_and_returns_its_summary() {
     // parent, independent of the tool result — the same lineage a
     // Rust-orchestrated spawn produces (M5.4).
     let parent_events = sink.events_for(root_id);
-    assert!(parent_events.iter().any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })));
-    assert!(parent_events.iter().any(|e| matches!(e, AgentEvent::ChildAgentCompleted { .. })));
+    assert!(parent_events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })));
+    assert!(parent_events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ChildAgentCompleted { .. })));
 
     root_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), runner_task)
@@ -278,16 +315,24 @@ async fn spawn_tool_cannot_escalate_past_the_parents_own_budget() {
     let session_id = SessionId::new();
     let root_id = AgentId::new();
     let request_id = RequestId::new();
-    let backend: Arc<dyn ExecutionBackend> = Arc::new(
-        FakeBackend::new()
-            .with_result(ExecutionResult { request_id, usage: Default::default(), cost: Default::default(), finish_reason: "end_turn".into() }),
-    );
+    let backend: Arc<dyn ExecutionBackend> =
+        Arc::new(FakeBackend::new().with_result(ExecutionResult {
+            request_id,
+            usage: Default::default(),
+            cost: Default::default(),
+            finish_reason: "end_turn".into(),
+        }));
     let (root, run_id) = root_agent_with_spawn_tool(
         session_id,
         root_id,
         backend.as_ref(),
         PermissionMode::Allow,
-        AgentBudget { max_requests: Some(5), max_children: Some(2), max_depth: Some(4), ..Default::default() },
+        AgentBudget {
+            max_requests: Some(5),
+            max_children: Some(2),
+            max_depth: Some(4),
+            ..Default::default()
+        },
     );
     let (commands, sink, _supervisor, root_cancel, runner_task) =
         bootstrap(session_id, root_id, backend, root);
@@ -309,10 +354,18 @@ async fn spawn_tool_cannot_escalate_past_the_parents_own_budget() {
     )
     .await;
 
-    let output = sink.tool_completed_output(root_id, call_id).expect("output present");
-    assert!(output.get("error").is_some(), "escalation must surface as a readable error, got {output:?}");
+    let output = sink
+        .tool_completed_output(root_id, call_id)
+        .expect("output present");
+    assert!(
+        output.get("error").is_some(),
+        "escalation must surface as a readable error, got {output:?}"
+    );
     // No child should ever have been spawned.
-    assert!(!sink.events_for(root_id).iter().any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })));
+    assert!(!sink
+        .events_for(root_id)
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })));
 
     root_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), runner_task)
@@ -330,22 +383,35 @@ async fn spawn_tool_respects_ask_permission_gating() {
     let session_id = SessionId::new();
     let root_id = AgentId::new();
     let request_id = RequestId::new();
-    let backend: Arc<dyn ExecutionBackend> = Arc::new(
-        FakeBackend::new()
-            .with_result(ExecutionResult { request_id, usage: Default::default(), cost: Default::default(), finish_reason: "end_turn".into() }),
-    );
+    let backend: Arc<dyn ExecutionBackend> =
+        Arc::new(FakeBackend::new().with_result(ExecutionResult {
+            request_id,
+            usage: Default::default(),
+            cost: Default::default(),
+            finish_reason: "end_turn".into(),
+        }));
     let (root, run_id) = root_agent_with_spawn_tool(
         session_id,
         root_id,
         backend.as_ref(),
         PermissionMode::Ask,
-        AgentBudget { max_children: Some(2), max_depth: Some(4), ..Default::default() },
+        AgentBudget {
+            max_children: Some(2),
+            max_depth: Some(4),
+            ..Default::default()
+        },
     );
     let (commands, sink, _supervisor, root_cancel, runner_task) =
         bootstrap(session_id, root_id, backend, root);
 
     let call_id = ToolCallId::new();
-    send_spawn_tool_call(&commands, run_id, call_id, serde_json::json!({ "task": "go" })).await;
+    send_spawn_tool_call(
+        &commands,
+        run_id,
+        call_id,
+        serde_json::json!({ "task": "go" }),
+    )
+    .await;
 
     wait_for(
         || {
@@ -361,7 +427,10 @@ async fn spawn_tool_respects_ask_permission_gating() {
     // Give the runner a few ticks to prove it does *not* spawn without approval.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        !sink.events_for(root_id).iter().any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })),
+        !sink
+            .events_for(root_id)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })),
         "a child must never be spawned before the Ask permission is resolved"
     );
 
@@ -386,7 +455,10 @@ async fn cancelling_the_parent_cancels_a_concurrently_spawned_child() {
     // mode this test exists to catch.
     let backend: Arc<dyn ExecutionBackend> = Arc::new(
         FakeBackend::new()
-            .with_events(vec![ExecutionEvent::TextDelta { request_id, delta: "working".into() }])
+            .with_events(vec![ExecutionEvent::TextDelta {
+                request_id,
+                delta: "working".into(),
+            }])
             .blocking_until_cancelled(),
     );
     let (root, run_id) = root_agent_with_spawn_tool(
@@ -394,7 +466,11 @@ async fn cancelling_the_parent_cancels_a_concurrently_spawned_child() {
         root_id,
         backend.as_ref(),
         PermissionMode::Allow,
-        AgentBudget { max_children: Some(2), max_depth: Some(4), ..Default::default() },
+        AgentBudget {
+            max_children: Some(2),
+            max_depth: Some(4),
+            ..Default::default()
+        },
     );
     let (commands, sink, supervisor, root_cancel, runner_task) =
         bootstrap(session_id, root_id, backend, root);
@@ -410,7 +486,11 @@ async fn cancelling_the_parent_cancels_a_concurrently_spawned_child() {
 
     let child_id = {
         wait_for(
-            || sink.events_for(root_id).iter().any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. })),
+            || {
+                sink.events_for(root_id)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::ChildAgentSpawned { .. }))
+            },
             Duration::from_secs(5),
             "ChildAgentSpawned",
         )
@@ -465,7 +545,10 @@ struct ModelRecordingBackend {
 
 impl ModelRecordingBackend {
     fn new(inner: FakeBackend) -> Self {
-        Self { inner, requested_models: Mutex::new(Vec::new()) }
+        Self {
+            inner,
+            requested_models: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -485,7 +568,10 @@ impl ExecutionBackend for ModelRecordingBackend {
         sink: tokio::sync::broadcast::Sender<ExecutionEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ExecutionResult, harness_protocol::backend::ExecutionError> {
-        self.requested_models.lock().expect("requested_models lock poisoned").push(request.params.model.clone());
+        self.requested_models
+            .lock()
+            .expect("requested_models lock poisoned")
+            .push(request.params.model.clone());
         self.inner.execute(request, sink, cancel).await
     }
 }
@@ -502,7 +588,12 @@ async fn spawn_tool_model_override_reaches_the_childs_backend_call() {
     let root_id = AgentId::new();
     let request_id = RequestId::new();
     let recording_backend = Arc::new(ModelRecordingBackend::new(FakeBackend::new().with_result(
-        ExecutionResult { request_id, usage: Default::default(), cost: Default::default(), finish_reason: "end_turn".into() },
+        ExecutionResult {
+            request_id,
+            usage: Default::default(),
+            cost: Default::default(),
+            finish_reason: "end_turn".into(),
+        },
     )));
     let backend: Arc<dyn ExecutionBackend> = recording_backend.clone();
     let (root, run_id) = root_agent_with_spawn_tool(
@@ -510,7 +601,11 @@ async fn spawn_tool_model_override_reaches_the_childs_backend_call() {
         root_id,
         backend.as_ref(),
         PermissionMode::Allow,
-        AgentBudget { max_children: Some(2), max_depth: Some(4), ..Default::default() },
+        AgentBudget {
+            max_children: Some(2),
+            max_depth: Some(4),
+            ..Default::default()
+        },
     );
     let (commands, sink, _supervisor, root_cancel, runner_task) =
         bootstrap(session_id, root_id, backend, root);
@@ -537,7 +632,9 @@ async fn spawn_tool_model_override_reaches_the_childs_backend_call() {
         .expect("requested_models lock poisoned")
         .clone();
     assert!(
-        recorded.iter().any(|model| model.as_deref() == Some("claude-haiku-4-5")),
+        recorded
+            .iter()
+            .any(|model| model.as_deref() == Some("claude-haiku-4-5")),
         "the child's own backend call must carry the requested model override, got {recorded:?}"
     );
 

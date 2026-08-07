@@ -37,8 +37,8 @@ use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicConfig;
 use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::rpc::{
-    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
-    PROTOCOL_VERSION,
+    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse,
+    RpcResponseBody, PROTOCOL_VERSION,
 };
 use harness_protocol::tools::AgentToolset;
 use harness_runtime::rpc::RpcHandler;
@@ -113,7 +113,9 @@ impl WireClient for StdioClient {
 // ---------------------------------------------------------------------------
 
 struct WebSocketClient {
-    socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
 }
 
 #[async_trait]
@@ -125,7 +127,12 @@ impl WireClient for WebSocketClient {
 
     async fn recv(&mut self) -> RpcResponse {
         loop {
-            match self.socket.next().await.expect("socket closed before a response arrived") {
+            match self
+                .socket
+                .next()
+                .await
+                .expect("socket closed before a response arrived")
+            {
                 Ok(Message::Text(text)) => return serde_json::from_str(&text).unwrap(),
                 Ok(_) => continue,
                 Err(error) => panic!("websocket error: {error}"),
@@ -148,7 +155,9 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
         .send(&RpcRequest {
             id: RequestCorrelationId(0),
             session_id: None,
-            body: RpcRequestBody::Hello { protocol_version: PROTOCOL_VERSION },
+            body: RpcRequestBody::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         })
         .await;
     let response = client.recv().await;
@@ -163,7 +172,9 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
                 workspace_root,
                 integration: "anthropic".to_string(),
                 integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),
-                toolset: AgentToolset { tools: std::collections::HashMap::new() },
+                toolset: AgentToolset {
+                    tools: std::collections::HashMap::new(),
+                },
             },
         })
         .await;
@@ -175,7 +186,11 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
     };
 
     client
-        .send(&RpcRequest { id: RequestCorrelationId(2), session_id: Some(session_id), body: RpcRequestBody::Snapshot })
+        .send(&RpcRequest {
+            id: RequestCorrelationId(2),
+            session_id: Some(session_id),
+            body: RpcRequestBody::Snapshot,
+        })
         .await;
     let response = client.recv().await;
     variants.push(variant_name(&response.body));
@@ -185,7 +200,9 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
         .send(&RpcRequest {
             id: RequestCorrelationId(3),
             session_id: None,
-            body: RpcRequestBody::GetDiagnostics { include_store_scan: false },
+            body: RpcRequestBody::GetDiagnostics {
+                include_store_scan: false,
+            },
         })
         .await;
     let response = client.recv().await;
@@ -263,7 +280,9 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut client = IpcClient { stream: stream.expect("connect ipc") };
+        let mut client = IpcClient {
+            stream: stream.expect("connect ipc"),
+        };
         let variants = run_scenario(&mut client, workspace_dir.path().to_path_buf()).await;
         shutdown.cancel();
         variants
@@ -277,7 +296,13 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
         let (server_reader, client_writer) = tokio::io::duplex(64 * 1024);
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = harness_transport_stdio::serve_io(server_reader, server_writer, handler, serve_shutdown).await;
+            let _ = harness_transport_stdio::serve_io(
+                server_reader,
+                server_writer,
+                handler,
+                serve_shutdown,
+            )
+            .await;
         });
         let mut client = StdioClient {
             reader: tokio::io::BufReader::new(client_reader),
@@ -292,11 +317,14 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
     let websocket_variants = {
         let handler = build_handler().await;
         let shutdown = CancellationToken::new();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind websocket listener");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
         let addr = listener.local_addr().expect("local addr");
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = harness_transport_websocket::serve_listener(listener, handler, serve_shutdown).await;
+            let _ = harness_transport_websocket::serve_listener(listener, handler, serve_shutdown)
+                .await;
         });
         let (socket, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await
@@ -307,11 +335,23 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
         variants
     };
 
-    assert_eq!(ipc_variants, stdio_variants, "IPC and stdio must produce the same response sequence");
-    assert_eq!(ipc_variants, websocket_variants, "IPC and WebSocket must produce the same response sequence");
+    assert_eq!(
+        ipc_variants, stdio_variants,
+        "IPC and stdio must produce the same response sequence"
+    );
+    assert_eq!(
+        ipc_variants, websocket_variants,
+        "IPC and WebSocket must produce the same response sequence"
+    );
     assert_eq!(
         ipc_variants,
-        vec!["Hello", "SessionCreated", "Snapshot", "Diagnostics", "Admission"],
+        vec![
+            "Hello",
+            "SessionCreated",
+            "Snapshot",
+            "Diagnostics",
+            "Admission"
+        ],
         "sanity-check the scenario itself produced the expected shape"
     );
 }

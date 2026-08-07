@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use harness_tools::{CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult};
+use harness_tools::{
+    CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult,
+};
 use harness_workspace::Workspace;
 
 /// Input for the `fs.read` tool.
@@ -44,8 +46,7 @@ impl ToolExecutor for ReadTool {
         input: ToolInput,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
-        let input: ReadInput = input.parse()
-            .map_err(|_| ToolError::ExecutionFailed)?;
+        let input: ReadInput = input.parse().map_err(|_| ToolError::ExecutionFailed)?;
 
         if cancel.is_cancelled() {
             return Err(ToolError::Timeout);

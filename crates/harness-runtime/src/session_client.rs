@@ -188,18 +188,37 @@ impl SessionClient {
         };
 
         let context = {
-            let state = self.runtime.state.lock().expect("session state mutex poisoned");
+            let state = self
+                .runtime
+                .state
+                .lock()
+                .expect("session state mutex poisoned");
             let agent = state.agents.get(&runtime_snapshot.root_agent_id);
             match agent {
                 Some(agent) => ContextSnapshot {
                     generation: agent.state.context.generation,
                     estimated_tokens: agent.state.context.last_estimated_tokens,
-                    checkpoint: agent.state.context.active_checkpoint.map(|id| id.to_string()),
+                    checkpoint: agent
+                        .state
+                        .context
+                        .active_checkpoint
+                        .map(|id| id.to_string()),
                     covered_through: agent.state.context.covered_through.map(|id| id.to_string()),
                     pinned_items: agent.state.context.pinned_items.len(),
-                    last_compacted_at: agent.state.context.last_compacted_at.map(|timestamp| timestamp.to_string()),
+                    last_compacted_at: agent
+                        .state
+                        .context
+                        .last_compacted_at
+                        .map(|timestamp| timestamp.to_string()),
                 },
-                None => ContextSnapshot { generation: 0, estimated_tokens: None, checkpoint: None, covered_through: None, pinned_items: 0, last_compacted_at: None },
+                None => ContextSnapshot {
+                    generation: 0,
+                    estimated_tokens: None,
+                    checkpoint: None,
+                    covered_through: None,
+                    pinned_items: 0,
+                    last_compacted_at: None,
+                },
             }
         };
 
@@ -407,7 +426,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(failed_event_seen, "run should fail within the polling window");
+        assert!(
+            failed_event_seen,
+            "run should fail within the polling window"
+        );
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 

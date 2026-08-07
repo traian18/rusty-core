@@ -27,8 +27,10 @@ use tempfile::tempdir;
 use harness_engine::SessionBuilder;
 use harness_protocol::backend::{ExecutionEvent, ExecutionResult};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
-use harness_protocol::ids::{RequestId, ToolId, ToolCallId};
-use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCall, ToolCapability, ToolDescriptor, ToolPolicy};
+use harness_protocol::ids::{RequestId, ToolCallId, ToolId};
+use harness_protocol::tools::{
+    AgentToolset, PermissionMode, ToolCall, ToolCapability, ToolDescriptor, ToolPolicy,
+};
 use harness_protocol::usage::{Cost, ModelUsage};
 use harness_runtime::testing::FakeBackend;
 use harness_runtime::traits::Workspace;
@@ -354,17 +356,19 @@ async fn real_tools_e2e_fs_edit_real_execution() {
 async fn real_tools_e2e_workspace_search_real_execution() {
     // ── GIVEN ────────────────────────────────────────────
     let dir = tempdir().expect("tempdir should succeed");
-    tokio::fs::write(dir.path().join("file1.txt"), "looking for needle here").await.unwrap();
-    tokio::fs::write(dir.path().join("file2.txt"), "no match here").await.unwrap();
+    tokio::fs::write(dir.path().join("file1.txt"), "looking for needle here")
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("file2.txt"), "no match here")
+        .await
+        .unwrap();
 
     let workspace: Arc<dyn Workspace> = Arc::new(FsWorkspace::new(dir.path().to_path_buf()));
     let toolset = all_tools_toolset();
 
     // Backend emits ToolCallRequested for workspace.search.
-    let backend = make_tool_call_backend(
-        "workspace.search",
-        serde_json::json!({ "query": "needle" }),
-    );
+    let backend =
+        make_tool_call_backend("workspace.search", serde_json::json!({ "query": "needle" }));
 
     // ── WHEN — build session and send prompt ──────────────
     let session = SessionBuilder::new()
@@ -467,10 +471,14 @@ async fn session_builds_with_all_four_tools() {
         if !batch.is_empty() {
             all_events.extend(batch);
         }
-        if all_events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Completed { outcome: AgentOutcome::Success }))
-        {
+        if all_events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Completed {
+                    outcome: AgentOutcome::Success
+                }
+            )
+        }) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -478,7 +486,12 @@ async fn session_builds_with_all_four_tools() {
 
     // The run should complete successfully.
     let has_completed_success = all_events.iter().any(|e| {
-        matches!(e, AgentEvent::Completed { outcome: AgentOutcome::Success })
+        matches!(
+            e,
+            AgentEvent::Completed {
+                outcome: AgentOutcome::Success
+            }
+        )
     });
     assert!(
         has_completed_success,

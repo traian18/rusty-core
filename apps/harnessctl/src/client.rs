@@ -72,7 +72,11 @@ impl HarnessClient {
         body: RpcRequestBody,
     ) -> Result<RpcResponseBody> {
         let id = RequestCorrelationId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let request = RpcRequest { id, session_id, body };
+        let request = RpcRequest {
+            id,
+            session_id,
+            body,
+        };
         write_frame(&mut self.stream, &serde_json::to_vec(&request)?).await?;
 
         loop {

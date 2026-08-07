@@ -6,9 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{
-    BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId,
-};
+use crate::ids::{BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId};
 
 use crate::messages::AgentMessage;
 use crate::tools::{ToolCall, ToolDescriptor};
@@ -73,7 +71,9 @@ pub struct BackendCapabilities {
 /// A persistable reference to a backend configuration.
 ///
 /// This is what gets stored in session/agent state so the runtime can
-/// reconstruct a concrete [`ExecutionBackend`] at restore time.
+/// reconstruct a concrete `ExecutionBackend` (defined in `harness-runtime`,
+/// which sits above this crate — see the workspace's dependency-direction
+/// rule) at restore time.
 ///
 /// Credentials are **never** stored in this reference; they belong in
 /// the integration configuration store.
@@ -97,8 +97,17 @@ pub struct PersistedBackendSelection {
 }
 
 impl PersistedBackendSelection {
-    pub fn v1(provider: impl Into<String>, credential_profile: impl Into<String>, provider_model_id: impl Into<String>) -> Self {
-        Self { version: 1, provider: provider.into(), credential_profile: credential_profile.into(), provider_model_id: provider_model_id.into() }
+    pub fn v1(
+        provider: impl Into<String>,
+        credential_profile: impl Into<String>,
+        provider_model_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: 1,
+            provider: provider.into(),
+            credential_profile: credential_profile.into(),
+            provider_model_id: provider_model_id.into(),
+        }
     }
 }
 

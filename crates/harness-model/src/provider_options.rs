@@ -25,7 +25,11 @@ use serde_json::Value;
 /// ignore it rather than erroring", per `ExecutionParams::provider_options`'s
 /// doc comment), and a client should never fail a request just because the
 /// caller sent an oddly-shaped override.
-pub fn merge_provider_options(mut body: Value, provider_options: &Value, provider_id: &str) -> Value {
+pub fn merge_provider_options(
+    mut body: Value,
+    provider_options: &Value,
+    provider_id: &str,
+) -> Value {
     let Some(overrides) = provider_options.get(provider_id).and_then(Value::as_object) else {
         return body;
     };
@@ -65,7 +69,10 @@ mod tests {
         let body = json!({"temperature": 0.7});
         let provider_options = json!({"anthropic": {"temperature": 0.0}});
         let merged = merge_provider_options(body, &provider_options, "anthropic");
-        assert_eq!(merged["temperature"], 0.7, "a typed field the client set must win over provider_options");
+        assert_eq!(
+            merged["temperature"], 0.7,
+            "a typed field the client set must win over provider_options"
+        );
     }
 
     #[test]

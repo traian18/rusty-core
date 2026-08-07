@@ -55,9 +55,10 @@ impl ToolExecutor for GitStatusTool {
         // git2 does blocking filesystem I/O and its `Repository` is not
         // constructed for use across an `.await` — the whole operation runs
         // on a blocking thread and only plain data crosses back.
-        let result = tokio::task::spawn_blocking(move || run_status(&repo_root, input.path.as_deref()))
-            .await
-            .map_err(|_| ToolError::Internal)?;
+        let result =
+            tokio::task::spawn_blocking(move || run_status(&repo_root, input.path.as_deref()))
+                .await
+                .map_err(|_| ToolError::Internal)?;
 
         match result {
             Ok(entries) => Ok(ToolResult {
@@ -74,7 +75,10 @@ impl ToolExecutor for GitStatusTool {
     }
 }
 
-fn run_status(repo_root: &Path, path_filter: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+fn run_status(
+    repo_root: &Path,
+    path_filter: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
     let repo = git2::Repository::discover(repo_root).map_err(|e| e.to_string())?;
 
     let mut options = git2::StatusOptions::new();
@@ -83,7 +87,9 @@ fn run_status(repo_root: &Path, path_filter: Option<&str>) -> Result<Vec<serde_j
         options.pathspec(path);
     }
 
-    let statuses = repo.statuses(Some(&mut options)).map_err(|e| e.to_string())?;
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .map_err(|e| e.to_string())?;
     let entries = statuses
         .iter()
         .map(|entry| {
@@ -143,7 +149,9 @@ mod tests {
 
         assert!(!result.is_error);
         let entries = result.output["entries"].as_array().expect("entries array");
-        assert!(entries.iter().any(|e| e["path"] == "b.txt" && e["wt_new"] == true));
+        assert!(entries
+            .iter()
+            .any(|e| e["path"] == "b.txt" && e["wt_new"] == true));
     }
 
     #[tokio::test]

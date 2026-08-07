@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
@@ -156,26 +155,43 @@ mod tests {
 
     #[test]
     fn formatting_redacts_api_key_and_header_values() {
-        let mut config = OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
+        let mut config =
+            OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
         config.api_key = Some("sk-super-secret-value".to_string());
-        config
-            .extra_headers
-            .insert("Authorization".to_string(), "Bearer sk-also-secret".to_string());
+        config.extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-also-secret".to_string(),
+        );
 
         let displayed = format!("{config}");
-        assert!(!displayed.contains("super-secret-value"), "api_key must not leak: {displayed}");
-        assert!(!displayed.contains("also-secret"), "header value must not leak: {displayed}");
-        assert!(displayed.contains("Authorization"), "header *name* is fine to show: {displayed}");
+        assert!(
+            !displayed.contains("super-secret-value"),
+            "api_key must not leak: {displayed}"
+        );
+        assert!(
+            !displayed.contains("also-secret"),
+            "header value must not leak: {displayed}"
+        );
+        assert!(
+            displayed.contains("Authorization"),
+            "header *name* is fine to show: {displayed}"
+        );
 
         let debugged = format!("{config:?}");
-        assert_eq!(debugged, displayed, "Debug must delegate to the same redacted Display");
+        assert_eq!(
+            debugged, displayed,
+            "Debug must delegate to the same redacted Display"
+        );
     }
 
     #[test]
     fn formatting_handles_no_api_key() {
         let config = OpenAiCompatibleConfig::new("http://localhost:11434/v1", "llama3");
         let displayed = format!("{config}");
-        assert!(displayed.contains("None"), "an absent key must format as None, not panic: {displayed}");
+        assert!(
+            displayed.contains("None"),
+            "an absent key must format as None, not panic: {displayed}"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tracing::info;
 
-use crate::workspace::{Workspace, WorkspaceError, SearchResult, SearchMatch, FileInfo};
+use crate::workspace::{FileInfo, SearchMatch, SearchResult, Workspace, WorkspaceError};
 
 /// M3: caps a single `read` from growing the host process's memory
 /// unbounded on an adversarial or merely huge file. Mirrors the truncation
@@ -129,7 +129,9 @@ impl FsWorkspace {
         // don't exist yet are, by definition, not symlinks and stop the walk
         // (nothing deeper can exist either).
         let mut current = self.root.clone();
-        let relative_to_root = resolved.strip_prefix(&self.root).unwrap_or(resolved.as_path());
+        let relative_to_root = resolved
+            .strip_prefix(&self.root)
+            .unwrap_or(resolved.as_path());
         for component in relative_to_root.components() {
             current.push(component);
             match fs::symlink_metadata(&current).await {
@@ -200,7 +202,10 @@ impl Workspace for FsWorkspace {
         let parent = absolute.parent().unwrap_or(&self.root);
         let temp_name = format!(
             ".{}.tmp-{}",
-            absolute.file_name().and_then(|n| n.to_str()).unwrap_or("write"),
+            absolute
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("write"),
             uuid::Uuid::new_v4(),
         );
         let temp_path = parent.join(temp_name);
@@ -264,7 +269,8 @@ impl FsWorkspace {
         Box::pin(async move {
             let mut entries = fs::read_dir(dir).await?;
             while let Some(entry) = entries.next_entry().await? {
-                if *files_scanned >= MAX_SEARCH_FILES_SCANNED || matches.len() >= MAX_SEARCH_MATCHES {
+                if *files_scanned >= MAX_SEARCH_FILES_SCANNED || matches.len() >= MAX_SEARCH_MATCHES
+                {
                     return Ok(true);
                 }
 
@@ -296,10 +302,28 @@ impl FsWorkspace {
                     if let Some(ext) = path.extension() {
                         let text_ext = matches!(
                             ext.to_string_lossy().as_ref(),
-                            "txt" | "rs" | "toml" | "yaml" | "yml" | "json" | "md"
-                                | "sh" | "py" | "js" | "ts" | "lock" | "cfg"
-                                | "ini" | "conf" | "env" | "log" | "csv" | "html"
-                                | "css" | "xml" | "svg"
+                            "txt"
+                                | "rs"
+                                | "toml"
+                                | "yaml"
+                                | "yml"
+                                | "json"
+                                | "md"
+                                | "sh"
+                                | "py"
+                                | "js"
+                                | "ts"
+                                | "lock"
+                                | "cfg"
+                                | "ini"
+                                | "conf"
+                                | "env"
+                                | "log"
+                                | "csv"
+                                | "html"
+                                | "css"
+                                | "xml"
+                                | "svg"
                         );
 
                         if !text_ext {
@@ -429,9 +453,12 @@ mod tests {
         let outside = tempdir().unwrap();
 
         // The leaf itself is a symlink pointing outside root.
-        tokio::fs::symlink(outside.path().join("clobbered.txt"), dir.path().join("escape.txt"))
-            .await
-            .unwrap();
+        tokio::fs::symlink(
+            outside.path().join("clobbered.txt"),
+            dir.path().join("escape.txt"),
+        )
+        .await
+        .unwrap();
 
         let ws = FsWorkspace::new(dir.path().to_path_buf());
         let result = ws.write("escape.txt", "attacker-controlled content").await;
@@ -467,7 +494,8 @@ mod tests {
             names.push(entry.file_name().to_string_lossy().to_string());
         }
         assert_eq!(
-            names, vec!["data.txt"],
+            names,
+            vec!["data.txt"],
             "no leftover temp file should remain after a successful atomic write"
         );
     }
@@ -484,7 +512,8 @@ mod tests {
         let contents = ws.read("huge.txt").await.unwrap();
 
         assert!(
-            contents.len() <= MAX_READ_BYTES as usize + "\n... (truncated, exceeds read size limit)".len(),
+            contents.len()
+                <= MAX_READ_BYTES as usize + "\n... (truncated, exceeds read size limit)".len(),
             "read result must not exceed the cap plus the truncation marker, got {} bytes",
             contents.len()
         );

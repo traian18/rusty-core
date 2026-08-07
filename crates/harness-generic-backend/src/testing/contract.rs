@@ -26,7 +26,10 @@ fn request() -> ExecutionRequest {
 /// tests without copying the generic backend test implementation.
 pub async fn run_backend_contract_suite(backend: Arc<dyn ExecutionBackend>) {
     let descriptor = backend.descriptor();
-    assert!(!descriptor.id.to_string().is_empty(), "backend id must be set");
+    assert!(
+        !descriptor.id.to_string().is_empty(),
+        "backend id must be set"
+    );
     assert!(!descriptor.name.is_empty(), "backend name must be set");
     let _ = backend.capabilities();
 

@@ -1,7 +1,7 @@
 //! In-memory [`Workspace`] stub for Phase 2 (spec §68.2).
 //!
 //! [`FakeWorkspace`] holds files entirely in memory behind a mutex. It exists
-//! so that [`SessionRuntime`] always has a concrete `Arc<dyn Workspace>` to
+//! so that [`SessionRuntime`](crate::session_runtime::SessionRuntime) always has a concrete `Arc<dyn Workspace>` to
 //! bind without requiring a real filesystem implementation, which arrives in Phase 4.
 
 use std::collections::HashMap;
@@ -72,10 +72,12 @@ impl Workspace for FakeWorkspace {
             .expect("files mutex poisoned")
             .get(relative_path)
             .cloned()
-            .ok_or_else(|| WorkspaceError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("file not found: {}", relative_path),
-            )))
+            .ok_or_else(|| {
+                WorkspaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("file not found: {}", relative_path),
+                ))
+            })
     }
 
     async fn write(&self, relative_path: &str, content: &str) -> Result<(), WorkspaceError> {

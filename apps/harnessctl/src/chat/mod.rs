@@ -139,15 +139,24 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            mutation(session_id, MutationCommand::Prompt(UserInput {
-                                text: prompt,
-                                attachments: vec![],
-                            })),
+                            mutation(
+                                session_id,
+                                MutationCommand::Prompt(UserInput {
+                                    text: prompt,
+                                    attachments: vec![],
+                                }),
+                            ),
                         )
                         .await?;
                     }
                     InputAction::Cancel => {
-                        send(&mut write_half, &mut next_id, session_id, mutation(session_id, MutationCommand::Cancel)).await?;
+                        send(
+                            &mut write_half,
+                            &mut next_id,
+                            session_id,
+                            mutation(session_id, MutationCommand::Cancel),
+                        )
+                        .await?;
                         state.push_log("● cancellation requested".to_string());
                     }
                     InputAction::Approve if state.pending_permission.is_some() => {
@@ -156,7 +165,13 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            mutation(session_id, MutationCommand::ResolvePermission { id, decision: PermissionDecision::Approved }),
+                            mutation(
+                                session_id,
+                                MutationCommand::ResolvePermission {
+                                    id,
+                                    decision: PermissionDecision::Approved,
+                                },
+                            ),
                         )
                         .await?;
                         state.push_log("● permission approved".to_string());
@@ -167,7 +182,13 @@ pub async fn run(
                             &mut write_half,
                             &mut next_id,
                             session_id,
-                            mutation(session_id, MutationCommand::ResolvePermission { id, decision: PermissionDecision::Denied }),
+                            mutation(
+                                session_id,
+                                MutationCommand::ResolvePermission {
+                                    id,
+                                    decision: PermissionDecision::Denied,
+                                },
+                            ),
                         )
                         .await?;
                         state.push_log("● permission rejected".to_string());
@@ -183,10 +204,15 @@ pub async fn run(
     }
 
     // Best-effort — the terminal is about to be restored either way.
-    let _ = send(&mut write_half, &mut next_id, session_id, mutation(session_id, MutationCommand::CloseSession)).await;
+    let _ = send(
+        &mut write_half,
+        &mut next_id,
+        session_id,
+        mutation(session_id, MutationCommand::CloseSession),
+    )
+    .await;
     Ok(())
 }
-
 
 fn mutation(session_id: SessionId, command: MutationCommand) -> RpcRequestBody {
     RpcRequestBody::Mutate {

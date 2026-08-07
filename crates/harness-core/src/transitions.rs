@@ -1,4 +1,3 @@
-
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{
     AgentCommand, AgentError, AgentResult, AgentStatus, Attachment, PermissionDecision, UserInput,
@@ -247,7 +246,12 @@ impl Agent {
         let message_id = self.next_message_id();
         let created_at = self.next_timestamp();
         let mut content = vec![ContentBlock::Text { text: input.text }];
-        content.extend(input.attachments.into_iter().map(attachment_to_content_block));
+        content.extend(
+            input
+                .attachments
+                .into_iter()
+                .map(attachment_to_content_block),
+        );
         self.state.messages.push(AgentMessage {
             id: message_id,
             role: MessageRole::User,
@@ -376,10 +380,7 @@ impl Agent {
             }
             Some(PermissionMode::Ask) => {
                 self.state.status = AgentStatus::WaitingForPermission;
-                effects.push(Self::state_changed(
-                    from,
-                    AgentStatus::WaitingForPermission,
-                ));
+                effects.push(Self::state_changed(from, AgentStatus::WaitingForPermission));
                 let permission_id = self.next_permission_id();
                 self.state
                     .pending_permissions

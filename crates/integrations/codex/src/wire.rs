@@ -34,7 +34,10 @@ pub fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
     if value.get("type").and_then(|t| t.as_str()) != Some("thread.started") {
         return None;
     }
-    value.get("thread_id").and_then(|t| t.as_str()).map(str::to_string)
+    value
+        .get("thread_id")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 /// Returns the text of a completed `agent_message` item, if `value` is one.
@@ -46,7 +49,9 @@ pub fn extract_agent_message_text(value: &serde_json::Value) -> Option<String> {
     if item.get("type").and_then(|t| t.as_str()) != Some("agent_message") {
         return None;
     }
-    item.get("text").and_then(|t| t.as_str()).map(str::to_string)
+    item.get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 pub struct TurnCompleted {
@@ -58,8 +63,12 @@ pub fn extract_turn_completed(value: &serde_json::Value) -> Option<TurnCompleted
         return None;
     }
     let usage_value = value.get("usage");
-    let input_tokens = usage_value.and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64());
-    let output_tokens = usage_value.and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64());
+    let input_tokens = usage_value
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage_value
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64());
     let cache_read_tokens = usage_value
         .and_then(|u| u.get("cached_input_tokens"))
         .and_then(|v| v.as_u64());

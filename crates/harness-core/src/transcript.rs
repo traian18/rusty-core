@@ -45,7 +45,10 @@ pub fn validate_transcript(messages: &[AgentMessage]) -> Result<(), TranscriptEr
                 }) {
                     if let Some(position) = pending.iter().position(|id| *id == call_id) {
                         pending.remove(position);
-                    } else if declarations.get(&call_id).is_some_and(|declared| *declared > index) {
+                    } else if declarations
+                        .get(&call_id)
+                        .is_some_and(|declared| *declared > index)
+                    {
                         return Err(TranscriptError::OutOfOrderToolResult(call_id));
                     } else {
                         return Err(TranscriptError::OrphanToolResult(call_id));

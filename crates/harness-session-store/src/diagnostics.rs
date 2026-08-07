@@ -70,10 +70,9 @@ pub async fn diagnose_store(store: &dyn SessionStore) -> StoreDiagnostics {
     let summaries = match store.list_sessions().await {
         Ok(summaries) => summaries,
         Err(error) => {
-            diagnostics.unreadable.push((
-                SessionId::new(),
-                format!("list_sessions failed: {error}"),
-            ));
+            diagnostics
+                .unreadable
+                .push((SessionId::new(), format!("list_sessions failed: {error}")));
             return diagnostics;
         }
     };
@@ -82,9 +81,7 @@ pub async fn diagnose_store(store: &dyn SessionStore) -> StoreDiagnostics {
         let session_id = summary.session_id;
         match diagnose_session(store, session_id).await {
             Ok(report) => diagnostics.sessions.push(report),
-            Err(error) => diagnostics
-                .unreadable
-                .push((session_id, error.to_string())),
+            Err(error) => diagnostics.unreadable.push((session_id, error.to_string())),
         }
     }
     diagnostics
@@ -261,7 +258,9 @@ mod tests {
         assert_eq!(report.removed_records, 1);
         assert!(report.rewritten);
 
-        let repaired = tokio::fs::read_to_string(&path).await.expect("read repaired");
+        let repaired = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read repaired");
         assert_eq!(repaired.lines().count(), 2);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

@@ -1,12 +1,12 @@
 //! Scripted [`ToolExecutor`] and [`ToolRegistry`] test doubles.
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::traits::{ToolDescriptor, ToolExecutor, ToolInput};
 use crate::traits::ToolRegistry;
+use crate::traits::{ToolDescriptor, ToolExecutor, ToolInput};
 use harness_tools::{ToolError, ToolResult};
 
 /// A test double for [`ToolExecutor`] that always returns a scripted result.
@@ -78,8 +78,7 @@ impl FakeToolRegistry {
     /// Add an executor to the registry.
     pub fn add_executor(&mut self, executor: Arc<dyn ToolExecutor>) {
         let descriptor = executor.descriptor();
-        self.executors
-            .insert(descriptor.id.to_string(), executor);
+        self.executors.insert(descriptor.id.to_string(), executor);
     }
 }
 
@@ -91,7 +90,10 @@ impl Default for FakeToolRegistry {
 
 #[async_trait]
 impl ToolRegistry for FakeToolRegistry {
-    fn register(&self, _executor: Arc<dyn ToolExecutor>) -> Result<(), crate::traits::RegistrationError> {
+    fn register(
+        &self,
+        _executor: Arc<dyn ToolExecutor>,
+    ) -> Result<(), crate::traits::RegistrationError> {
         Ok(())
     }
 

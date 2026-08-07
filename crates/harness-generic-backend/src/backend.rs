@@ -1,4 +1,3 @@
-
 //! Provider-neutral `ModelClient` adapter for the runtime `ExecutionBackend`.
 
 use std::sync::{Arc, Mutex};
@@ -144,7 +143,8 @@ impl GenericModelBackend {
         &self,
         request: &harness_protocol::backend::ExecutionRequest,
     ) -> Option<ModelError> {
-        let wants_reasoning = request.extended_thinking || request.params.reasoning_effort.is_some();
+        let wants_reasoning =
+            request.extended_thinking || request.params.reasoning_effort.is_some();
         if wants_reasoning && !self.capabilities.reasoning_stream {
             return Some(ModelError::UnsupportedCapability {
                 capability: "reasoning".to_string(),
@@ -156,10 +156,12 @@ impl GenericModelBackend {
         }
 
         let wants_images = request.messages.iter().any(|message| {
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, harness_protocol::messages::ContentBlock::Image { .. }))
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    harness_protocol::messages::ContentBlock::Image { .. }
+                )
+            })
         });
         if wants_images && !self.capabilities.images {
             return Some(ModelError::UnsupportedCapability {
@@ -491,7 +493,19 @@ impl ExecutionBackend for GenericModelBackend {
         metrics::counter!("harness_backend_request_attempts_total", "backend" => backend_label)
             .increment(attempt as u64);
         metrics::gauge!("harness_backend_circuit_open", "backend" => self.descriptor.name.clone())
-            .set(if self.circuit.lock().expect("circuit mutex poisoned").open_until.is_some() { 1.0 } else { 0.0 });
+            .set(
+                if self
+                    .circuit
+                    .lock()
+                    .expect("circuit mutex poisoned")
+                    .open_until
+                    .is_some()
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
         emit_terminal(&sink, request_id, &final_result);
         final_result
     }
@@ -650,7 +664,8 @@ mod tests {
         // succeed_on: 3 means the first two calls fail retryable; a 2s
         // retry_after gives ample time to fire cancellation mid-sleep
         // without racing against real-world scheduling jitter.
-        let client = FlakyModelClient::new(calls.clone(), 3).with_retry_after(Duration::from_secs(2));
+        let client =
+            FlakyModelClient::new(calls.clone(), 3).with_retry_after(Duration::from_secs(2));
         let backend = GenericModelBackend::new_with_recovery(
             Arc::new(client),
             RecoveryPolicy {
@@ -718,8 +733,12 @@ mod tests {
     async fn partial_stream_failure_after_some_deltas_is_not_retried() {
         let client = FakeModelClient::new()
             .with_events(vec![
-                ModelEvent::TextDelta { delta: "partial ".to_string() },
-                ModelEvent::TextDelta { delta: "output".to_string() },
+                ModelEvent::TextDelta {
+                    delta: "partial ".to_string(),
+                },
+                ModelEvent::TextDelta {
+                    delta: "output".to_string(),
+                },
             ])
             .with_error(ModelError::BackendError {
                 message: "connection reset mid-stream".to_string(),
@@ -727,7 +746,10 @@ mod tests {
             });
         let backend = GenericModelBackend::new_with_recovery(
             Arc::new(client),
-            RecoveryPolicy { max_attempts: 5, ..RecoveryPolicy::default() },
+            RecoveryPolicy {
+                max_attempts: 5,
+                ..RecoveryPolicy::default()
+            },
         );
         let (sink, mut rx) = broadcast::channel(16);
         let result = backend
@@ -763,7 +785,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(delta_count, 2, "both deltas emitted before the failure must have reached the sink exactly once");
+        assert_eq!(
+            delta_count, 2,
+            "both deltas emitted before the failure must have reached the sink exactly once"
+        );
         assert!(saw_error, "the terminal error must also reach the sink");
     }
 
@@ -815,7 +840,11 @@ mod tests {
 
         impl FlakyModelClient {
             pub fn new(calls: Arc<AtomicUsize>, succeed_on: usize) -> Self {
-                Self { calls, succeed_on, retry_after: Duration::ZERO }
+                Self {
+                    calls,
+                    succeed_on,
+                    retry_after: Duration::ZERO,
+                }
             }
 
             /// M2: configurable retry delay, so a test can cancel mid-sleep

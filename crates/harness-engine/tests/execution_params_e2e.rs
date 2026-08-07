@@ -96,10 +96,15 @@ impl ToolRegistry for NoTools {
     }
 }
 
-async fn wait_for_completion(rx: &mut broadcast::Receiver<harness_protocol::events::AgentEventEnvelope>) {
+async fn wait_for_completion(
+    rx: &mut broadcast::Receiver<harness_protocol::events::AgentEventEnvelope>,
+) {
     for _ in 0..50 {
         while let Ok(envelope) = rx.try_recv() {
-            if matches!(envelope.event, harness_protocol::events::AgentEvent::Completed { .. }) {
+            if matches!(
+                envelope.event,
+                harness_protocol::events::AgentEvent::Completed { .. }
+            ) {
                 return;
             }
         }
@@ -178,7 +183,10 @@ async fn set_execution_params_changes_the_next_prompt_and_preserves_unset_fields
     let recorded = seen.lock().expect("seen mutex poisoned");
     assert_eq!(recorded.len(), 2);
     assert_eq!(recorded[0].temperature, None);
-    assert_eq!(recorded[1].model.as_deref(), Some("claude-sonnet-4-20250514"));
+    assert_eq!(
+        recorded[1].model.as_deref(),
+        Some("claude-sonnet-4-20250514")
+    );
     assert_eq!(recorded[1].max_tokens, Some(4096));
     assert_eq!(recorded[1].temperature, Some(0.9));
 }

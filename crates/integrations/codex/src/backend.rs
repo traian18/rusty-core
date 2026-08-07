@@ -27,14 +27,19 @@ use harness_runtime::traits::ExecutionBackend;
 use harness_runtime::IntegrationFactory;
 
 use crate::config::CodexConfig;
-use crate::wire::{extract_agent_message_text, extract_error, extract_thread_id, extract_turn_completed};
+use crate::wire::{
+    extract_agent_message_text, extract_error, extract_thread_id, extract_turn_completed,
+};
 
 /// Finds the most recent `User`-role message's concatenated `Text` content —
 /// the one new turn to send, since a resumed Codex thread already holds
 /// every earlier turn (mirrors `harness-integration-claude-code`'s
 /// `extract_latest_user_text`).
 fn latest_user_text(messages: &[harness_protocol::messages::AgentMessage]) -> Option<String> {
-    let message = messages.iter().rev().find(|m| m.role == MessageRole::User)?;
+    let message = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::User)?;
     let text: String = message
         .content
         .iter()
@@ -96,11 +101,16 @@ impl ExecutionBackend for CodexBackend {
         sink: broadcast::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let prompt = latest_user_text(&request.messages).ok_or_else(|| ExecutionError::InvalidRequest {
-            message: "no user message to send to the codex CLI".to_string(),
-        })?;
+        let prompt =
+            latest_user_text(&request.messages).ok_or_else(|| ExecutionError::InvalidRequest {
+                message: "no user message to send to the codex CLI".to_string(),
+            })?;
 
-        let resume_id = self.thread_id.lock().expect("thread_id mutex poisoned").clone();
+        let resume_id = self
+            .thread_id
+            .lock()
+            .expect("thread_id mutex poisoned")
+            .clone();
 
         let mut command = tokio::process::Command::new(&self.config.binary_path);
         command.arg("exec");
@@ -110,7 +120,11 @@ impl ExecutionBackend for CodexBackend {
                 // `codex exec resume` doesn't accept --sandbox or -C — it
                 // inherits the original session's policy and directory
                 // (verified against CLI 0.146.0).
-                command.arg("resume").arg("--json").arg("--skip-git-repo-check").arg(id);
+                command
+                    .arg("resume")
+                    .arg("--json")
+                    .arg("--skip-git-repo-check")
+                    .arg(id);
             }
             None => {
                 command.arg("--json").arg("--skip-git-repo-check");
@@ -138,10 +152,12 @@ impl ExecutionBackend for CodexBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|error| ExecutionError::BackendError {
-            message: format!("failed to spawn codex CLI: {error}"),
-            code: "spawn_failed".to_string(),
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| ExecutionError::BackendError {
+                message: format!("failed to spawn codex CLI: {error}"),
+                code: "spawn_failed".to_string(),
+            })?;
 
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
@@ -220,10 +236,13 @@ impl ExecutionBackend for CodexBackend {
             }
         }
 
-        let status = child.wait().await.map_err(|error| ExecutionError::BackendError {
-            message: format!("codex CLI process error: {error}"),
-            code: "wait_failed".to_string(),
-        })?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| ExecutionError::BackendError {
+                message: format!("codex CLI process error: {error}"),
+                code: "wait_failed".to_string(),
+            })?;
 
         if let Some(id) = new_thread_id {
             *self.thread_id.lock().expect("thread_id mutex poisoned") = Some(id);
@@ -284,7 +303,11 @@ impl IntegrationFactory for CodexFactory {
         let extra_args = config
             .get("extra_args")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
 
         Ok(Arc::new(CodexBackend::new(CodexConfig {
@@ -326,7 +349,9 @@ mod tests {
         AgentMessage {
             id: MessageId::new(),
             role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
             created_at: Timestamp::now(),
         }
     }
@@ -348,7 +373,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let script = format!("#!/bin/sh\ncat <<'STUB_EOF'\n{body}\nSTUB_EOF\n");
         std::fs::write(path, script).expect("write stub script");
-        let mut perms = std::fs::metadata(path).expect("stat stub script").permissions();
+        let mut perms = std::fs::metadata(path)
+            .expect("stat stub script")
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod stub script");
     }
@@ -373,7 +400,11 @@ mod tests {
 
         let (tx, mut rx) = broadcast::channel(16);
         let result = backend
-            .execute(request_with(vec![user_message("hi")]), tx, CancellationToken::new())
+            .execute(
+                request_with(vec![user_message("hi")]),
+                tx,
+                CancellationToken::new(),
+            )
             .await
             .expect("execute should succeed");
 
@@ -417,7 +448,11 @@ mod tests {
 
         let (tx, _rx) = broadcast::channel(16);
         let result = backend
-            .execute(request_with(vec![user_message("hi")]), tx, CancellationToken::new())
+            .execute(
+                request_with(vec![user_message("hi")]),
+                tx,
+                CancellationToken::new(),
+            )
             .await;
         assert!(matches!(result, Err(ExecutionError::BackendError { .. })));
     }

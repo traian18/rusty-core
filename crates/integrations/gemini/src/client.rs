@@ -33,7 +33,10 @@ impl GeminiClient {
             .timeout(config.request_timeout)
             .build()
             .expect("reqwest::ClientBuilder::build should not fail with default settings");
-        Self { config, http_client }
+        Self {
+            config,
+            http_client,
+        }
     }
 }
 
@@ -56,7 +59,10 @@ impl ModelClient for GeminiClient {
         events: tokio::sync::broadcast::Sender<ModelEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
-        let model = request.model.clone().unwrap_or_else(|| self.config.default_model.clone());
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.config.default_model.clone());
 
         let gemini_request = GeminiRequest {
             contents: convert_messages(&request.messages),
@@ -65,17 +71,27 @@ impl ModelClient for GeminiClient {
                 None
             } else {
                 Some(vec![GeminiTool {
-                    function_declarations: request.tools.iter().map(tool_descriptor_to_gemini).collect(),
+                    function_declarations: request
+                        .tools
+                        .iter()
+                        .map(tool_descriptor_to_gemini)
+                        .collect(),
                 }])
             },
             generation_config: GeminiGenerationConfig {
-                max_output_tokens: Some(request.max_tokens.unwrap_or(self.config.default_max_tokens)),
+                max_output_tokens: Some(
+                    request.max_tokens.unwrap_or(self.config.default_max_tokens),
+                ),
                 temperature: request.temperature,
-                stop_sequences: (!request.stop_sequences.is_empty()).then_some(request.stop_sequences),
+                stop_sequences: (!request.stop_sequences.is_empty())
+                    .then_some(request.stop_sequences),
             },
         };
 
-        let url = format!("{}/models/{}:streamGenerateContent", self.config.base_url, model);
+        let url = format!(
+            "{}/models/{}:streamGenerateContent",
+            self.config.base_url, model
+        );
 
         // M4: merge caller-supplied `provider_options["gemini"]` knobs
         // (e.g. `topK`, `topP`) that have no typed field on
@@ -84,9 +100,10 @@ impl ModelClient for GeminiClient {
         // win). Gemini's generation-tuning knobs all live nested under
         // `generationConfig` on the wire, not at the request's top level,
         // so the merge targets that nested object specifically.
-        let mut body = serde_json::to_value(&gemini_request).map_err(|error| ModelError::InvalidRequest {
-            message: format!("failed to serialize request: {error}"),
-        })?;
+        let mut body =
+            serde_json::to_value(&gemini_request).map_err(|error| ModelError::InvalidRequest {
+                message: format!("failed to serialize request: {error}"),
+            })?;
         if let Some(generation_config) = body.get_mut("generationConfig") {
             *generation_config = harness_model::merge_provider_options(
                 generation_config.take(),
@@ -187,7 +204,9 @@ impl GeminiClient {
 /// Normalize Gemini's standard `Retry-After` header (whole seconds) using the
 /// shared, provider-neutral parser.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    harness_model::retry::parse_retry_after(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+    harness_model::retry::parse_retry_after(|name| {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    })
 }
 
 #[cfg(test)]
@@ -199,7 +218,10 @@ mod tests {
     fn standard_retry_after_is_normalized_to_duration() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
-        assert_eq!(retry_after_from_headers(&headers), Some(Duration::from_secs(2)));
+        assert_eq!(
+            retry_after_from_headers(&headers),
+            Some(Duration::from_secs(2))
+        );
     }
 
     #[test]

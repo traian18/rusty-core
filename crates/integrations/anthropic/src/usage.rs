@@ -17,10 +17,10 @@
 //!
 //! # Cost calculation
 //!
-//! Costs are computed via [`calculate_cost`] using a built-in rate table keyed
-//! by model name. Cache read tokens are billed at the input rate; cache write
-//! tokens are billed at 1.25× the input rate. The returned [`Cost`] always has
-//! `source = CostSource::Calculated`.
+//! Costs are computed via [`AnthropicUsageMapper::calculate_cost`] using a
+//! built-in rate table keyed by model name. Cache read tokens are billed at
+//! the input rate; cache write tokens are billed at 1.25× the input rate.
+//! The returned [`Cost`] always has `source = CostSource::Calculated`.
 
 use rust_decimal::Decimal;
 
@@ -120,9 +120,10 @@ impl AnthropicUsageMapper {
             .value()
             .map(|t| Decimal::from(t) * rate.input_rate / PER_MILLION);
 
-        let cache_write_cost = usage.cache_write_tokens.value().map(|t| {
-            Decimal::from(t) * rate.input_rate * CACHE_WRITE_MULTIPLIER / PER_MILLION
-        });
+        let cache_write_cost = usage
+            .cache_write_tokens
+            .value()
+            .map(|t| Decimal::from(t) * rate.input_rate * CACHE_WRITE_MULTIPLIER / PER_MILLION);
 
         let total = [input_cost, output_cost, cache_read_cost, cache_write_cost]
             .iter()
@@ -169,11 +170,11 @@ struct ModelRate {
 fn lookup_rate(model: &str) -> ModelRate {
     match model {
         m if m.starts_with("claude-sonnet-4-20250513") => ModelRate {
-            input_rate: Decimal::from_parts(300, 0, 0, false, 2),   // 3.00
+            input_rate: Decimal::from_parts(300, 0, 0, false, 2), // 3.00
             output_rate: Decimal::from_parts(1500, 0, 0, false, 2), // 15.00
         },
         m if m.starts_with("claude-3-5-haiku-20241022") => ModelRate {
-            input_rate: Decimal::from_parts(80, 0, 0, false, 2),  // 0.80
+            input_rate: Decimal::from_parts(80, 0, 0, false, 2), // 0.80
             output_rate: Decimal::from_parts(400, 0, 0, false, 2), // 4.00
         },
         _ => ModelRate {

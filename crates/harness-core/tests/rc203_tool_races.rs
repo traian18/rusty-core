@@ -135,10 +135,12 @@ fn cancellation_in_tool_execution_ignores_late_tool_result() {
     });
     assert!(late.is_empty());
     assert!(agent.state.messages.iter().all(|message| {
-        !message.content.iter().any(|content| matches!(
-            content,
-            harness_protocol::messages::ContentBlock::ToolResult { .. }
-        ))
+        !message.content.iter().any(|content| {
+            matches!(
+                content,
+                harness_protocol::messages::ContentBlock::ToolResult { .. }
+            )
+        })
     }));
 }
 

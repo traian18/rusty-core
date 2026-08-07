@@ -111,6 +111,10 @@ async fn context_provider_rewrites_the_request_the_backend_sees() {
     }
 
     let seen = backend.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1, "backend should have received exactly one request");
+    assert_eq!(
+        seen.len(),
+        1,
+        "backend should have received exactly one request"
+    );
     assert_eq!(seen[0].system_prompt, "project instructions");
 }

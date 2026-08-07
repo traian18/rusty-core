@@ -122,6 +122,9 @@ mod tests {
             ]),
         };
         let enabled = toolset.enabled_descriptors();
-        assert_eq!(enabled.iter().map(|tool| tool.id).collect::<Vec<_>>(), vec![first, second]);
+        assert_eq!(
+            enabled.iter().map(|tool| tool.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
     }
 }

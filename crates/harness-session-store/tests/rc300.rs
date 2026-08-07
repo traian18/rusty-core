@@ -16,9 +16,8 @@ use harness_session_store::testing::MemoryStore;
 use harness_session_store::{
     assess_restore, diagnose_store, migrate_snapshot, plan_compaction, validate_trailing_replay,
     DependencyKind, DurabilityPolicy, GapPolicy, HostDependencyResolver, JsonlSessionStore,
-    PermissiveResolver, ReplayError, RestorePolicy, RetentionPolicy, SCHEMA_VERSION,
-    SessionCommitter, SessionStore,
-    SqliteSessionStore, StoredSession,
+    PermissiveResolver, ReplayError, RestorePolicy, RetentionPolicy, SessionCommitter,
+    SessionStore, SqliteSessionStore, StoredSession, SCHEMA_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,7 +98,10 @@ async fn commit_checkpoint_restore_chain_is_truthful() {
 
     // ── Phase 2: restore validation over what a store would load ──
     let stored = store.load_session(session).await.expect("load");
-    assert_eq!(stored.snapshot.as_ref().map(|s| s.session_sequence), Some(2));
+    assert_eq!(
+        stored.snapshot.as_ref().map(|s| s.session_sequence),
+        Some(2)
+    );
     let trailing = validate_trailing_replay(&stored, GapPolicy::Strict).expect("valid replay");
     assert_eq!(trailing.len(), 0, "the checkpoint covers every event");
 
@@ -194,7 +196,10 @@ async fn strict_restore_rejects_missing_workspace_dependency() {
     // Snapshot under a workspace identity.
     let mut snapshot = harness_session_store::testing::test_snapshot(session, 1);
     snapshot.metadata.workspace_identity = Some("/srv/prod".into());
-    store.save_snapshot(snapshot).await.expect("save checkpoint");
+    store
+        .save_snapshot(snapshot)
+        .await
+        .expect("save checkpoint");
 
     // The host's permissive resolver reports the workspace as missing; a
     // strict policy rejects the restore.
@@ -207,8 +212,7 @@ async fn strict_restore_rejects_missing_workspace_dependency() {
     assert_eq!(report.missing[0].kind, DependencyKind::Workspace);
     assert_eq!(report.missing[0].id, "/srv/prod");
 
-    let error =
-        assess_restore(&report, RestorePolicy::RejectMissing).expect_err("strict restore");
+    let error = assess_restore(&report, RestorePolicy::RejectMissing).expect_err("strict restore");
     assert!(matches!(
         error,
         harness_session_store::RestoreError::MissingDependencies { count: 1, .. }
@@ -227,8 +231,7 @@ async fn trailing_replay_rejects_corrupt_stream() {
             harness_session_store::DurableSessionEvent {
                 session_sequence: Some(1),
                 envelope: {
-                    let mut envelope =
-                        state_changed(session, 1, AgentStatus::PreparingContext);
+                    let mut envelope = state_changed(session, 1, AgentStatus::PreparingContext);
                     envelope.session_sequence = Some(1);
                     envelope
                 },
@@ -257,10 +260,7 @@ async fn trailing_replay_rejects_corrupt_stream() {
         metadata: Default::default(),
     });
     let error = validate_trailing_replay(&stored, GapPolicy::Strict).expect_err("future version");
-    assert!(matches!(
-        error,
-        ReplayError::FutureSnapshotVersion { .. }
-    ));
+    assert!(matches!(error, ReplayError::FutureSnapshotVersion { .. }));
 }
 
 /// Retention planning is pure and preserves the replay anchor; pruning the
@@ -272,9 +272,8 @@ async fn retention_plan_preserves_replay_anchor() {
         std::process::id(),
         Timestamp::now().timestamp_millis()
     ));
-    let store = Arc::new(
-        SqliteSessionStore::open(dir.join("store.db")).expect("open sqlite store"),
-    );
+    let store =
+        Arc::new(SqliteSessionStore::open(dir.join("store.db")).expect("open sqlite store"));
     let session = SessionId::new();
 
     let committer = Arc::new(SessionCommitter::new(store.clone(), session));
@@ -298,17 +297,17 @@ async fn retention_plan_preserves_replay_anchor() {
             keep_full_history: true,
         },
     );
-    assert!(!plan.should_compact, "trailing events already fit under the threshold");
+    assert!(
+        !plan.should_compact,
+        "trailing events already fit under the threshold"
+    );
 
     // The SQLite store supports explicit pruning with a snapshot anchor.
     assert_eq!(
         harness_session_store::prune_plan(&stored, 5).expect("anchored"),
         6
     );
-    let removed = store
-        .prune_events_before(session, 4)
-        .await
-        .expect("prune");
+    let removed = store.prune_events_before(session, 4).await.expect("prune");
     assert_eq!(removed, 4);
 
     // Trailing replay over the surviving stream stays valid.
@@ -327,12 +326,13 @@ async fn retention_plan_preserves_replay_anchor() {
 async fn diagnostics_scan_works_across_implementations() {
     for store in impls() {
         let session = SessionId::new();
-        store.append(harness_session_store::DurableSessionEvent {
-            session_sequence: Some(1),
-            envelope: state_changed(session, 1, AgentStatus::PreparingContext),
-        })
-        .await
-        .expect("append");
+        store
+            .append(harness_session_store::DurableSessionEvent {
+                session_sequence: Some(1),
+                envelope: state_changed(session, 1, AgentStatus::PreparingContext),
+            })
+            .await
+            .expect("append");
         store
             .save_snapshot(harness_session_store::testing::test_snapshot(session, 1))
             .await

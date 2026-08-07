@@ -115,12 +115,10 @@ impl ResourceManager {
         holder: SessionId,
     ) -> Result<(), ResourceError> {
         let mut state = self.state.lock().await;
-        let entry = state
-            .entry(key.clone())
-            .or_insert(Holders {
-                shared: vec![],
-                exclusive: None,
-            });
+        let entry = state.entry(key.clone()).or_insert(Holders {
+            shared: vec![],
+            exclusive: None,
+        });
 
         match mode {
             AccessMode::Shared => {

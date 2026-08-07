@@ -17,8 +17,8 @@ use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicConfig;
 use harness_protocol::admission::{CommandId, MutationMetadata};
 use harness_protocol::rpc::{
-    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
-    PROTOCOL_VERSION,
+    MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse,
+    RpcResponseBody, PROTOCOL_VERSION,
 };
 use harness_protocol::tools::AgentToolset;
 use harness_runtime::rpc::RpcHandler;
@@ -57,7 +57,8 @@ async fn full_stack_create_session_snapshot_close() {
         .build()
         .await
         .expect("build harness");
-    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(handler::HarnessRpcHandler::new(Arc::new(harness)));
+    let rpc_handler: Arc<dyn RpcHandler> =
+        Arc::new(handler::HarnessRpcHandler::new(Arc::new(harness)));
 
     let shutdown = CancellationToken::new();
     let serve_path = socket_path.clone();
@@ -142,7 +143,10 @@ async fn full_stack_create_session_snapshot_close() {
     // why this distinction exists and why prompt/steer/follow-up don't
     // (yet) get an equally specific `AcceptedStarted`/`AcceptedQueued`.
     match response.body {
-        RpcResponseBody::Admission { result: harness_protocol::admission::AdmissionResult::AcceptedApplied, .. } => {}
+        RpcResponseBody::Admission {
+            result: harness_protocol::admission::AdmissionResult::AcceptedApplied,
+            ..
+        } => {}
         other => panic!("expected Admission{{AcceptedApplied}}, got {other:?}"),
     }
 
@@ -173,7 +177,8 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
         .build()
         .await
         .expect("build harness");
-    let rpc_handler: Arc<dyn RpcHandler> = Arc::new(handler::HarnessRpcHandler::new(Arc::new(harness)));
+    let rpc_handler: Arc<dyn RpcHandler> =
+        Arc::new(handler::HarnessRpcHandler::new(Arc::new(harness)));
 
     let shutdown = CancellationToken::new();
     let serve_path = socket_path.clone();
@@ -196,7 +201,9 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     let hello = RpcRequest {
         id: RequestCorrelationId(0),
         session_id: None,
-        body: RpcRequestBody::Hello { protocol_version: PROTOCOL_VERSION },
+        body: RpcRequestBody::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
     };
     write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()).await;
     read_frame(&mut stream).await;
@@ -208,7 +215,9 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
             workspace_root: workspace_dir.path().to_path_buf(),
             integration: "anthropic".to_string(),
             integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),
-            toolset: AgentToolset { tools: std::collections::HashMap::new() },
+            toolset: AgentToolset {
+                tools: std::collections::HashMap::new(),
+            },
         },
     };
     write_frame(&mut stream, &serde_json::to_vec(&create).unwrap()).await;
@@ -236,24 +245,45 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
         },
     };
 
-    write_frame(&mut stream, &serde_json::to_vec(&mutate_req(2, None)).unwrap()).await;
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&mutate_req(2, None)).unwrap(),
+    )
+    .await;
     let first_result = match read_frame(&mut stream).await.body {
-        RpcResponseBody::Admission { result, session_revision, .. } => {
-            assert_eq!(session_revision, 1, "the first accepted mutation must advance the session revision");
+        RpcResponseBody::Admission {
+            result,
+            session_revision,
+            ..
+        } => {
+            assert_eq!(
+                session_revision, 1,
+                "the first accepted mutation must advance the session revision"
+            );
             result
         }
         other => panic!("expected Admission, got {other:?}"),
     };
 
-    write_frame(&mut stream, &serde_json::to_vec(&mutate_req(3, None)).unwrap()).await;
+    write_frame(
+        &mut stream,
+        &serde_json::to_vec(&mutate_req(3, None)).unwrap(),
+    )
+    .await;
     match read_frame(&mut stream).await.body {
         RpcResponseBody::Admission {
             result: harness_protocol::admission::AdmissionResult::Duplicate { original },
             session_revision,
             ..
         } => {
-            assert_eq!(*original, first_result, "the duplicate must wrap the exact original result");
-            assert_eq!(session_revision, 1, "replaying a duplicate must not advance the revision a second time");
+            assert_eq!(
+                *original, first_result,
+                "the duplicate must wrap the exact original result"
+            );
+            assert_eq!(
+                session_revision, 1,
+                "replaying a duplicate must not advance the revision a second time"
+            );
         }
         other => panic!("expected Admission{{Duplicate}}, got {other:?}"),
     }
@@ -277,10 +307,16 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     write_frame(&mut stream, &serde_json::to_vec(&stale_req).unwrap()).await;
     match read_frame(&mut stream).await.body {
         RpcResponseBody::Admission {
-            result: harness_protocol::admission::AdmissionResult::RejectedConflict { current_session_revision },
+            result:
+                harness_protocol::admission::AdmissionResult::RejectedConflict {
+                    current_session_revision,
+                },
             ..
         } => {
-            assert_eq!(current_session_revision, 1, "must report the real current revision, not the stale one");
+            assert_eq!(
+                current_session_revision, 1,
+                "must report the real current revision, not the stale one"
+            );
         }
         other => panic!("expected Admission{{RejectedConflict}}, got {other:?}"),
     }
@@ -349,7 +385,9 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
     let hello = RpcRequest {
         id: RequestCorrelationId(0),
         session_id: None,
-        body: RpcRequestBody::Hello { protocol_version: PROTOCOL_VERSION },
+        body: RpcRequestBody::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
     };
     write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()).await;
     let response = read_frame(&mut stream).await;
@@ -363,18 +401,25 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
             workspace_root: workspace_dir.path().to_path_buf(),
             integration: "anthropic".to_string(),
             integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),
-            toolset: AgentToolset { tools: std::collections::HashMap::new() },
+            toolset: AgentToolset {
+                tools: std::collections::HashMap::new(),
+            },
         },
     };
     write_frame(&mut stream, &serde_json::to_vec(&create).unwrap()).await;
     let response = read_frame(&mut stream).await;
-    assert!(matches!(response.body, RpcResponseBody::SessionCreated { .. }));
+    assert!(matches!(
+        response.body,
+        RpcResponseBody::SessionCreated { .. }
+    ));
 
     // Shallow diagnostics: no store scan.
     let diagnostics_req = RpcRequest {
         id: RequestCorrelationId(2),
         session_id: None,
-        body: RpcRequestBody::GetDiagnostics { include_store_scan: false },
+        body: RpcRequestBody::GetDiagnostics {
+            include_store_scan: false,
+        },
     };
     write_frame(&mut stream, &serde_json::to_vec(&diagnostics_req).unwrap()).await;
     let response = read_frame(&mut stream).await;
@@ -382,8 +427,14 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
         RpcResponseBody::Diagnostics(snapshot) => snapshot,
         other => panic!("expected Diagnostics, got {other:?}"),
     };
-    assert_eq!(snapshot.active_sessions, 1, "the session created above must be counted");
-    assert!(snapshot.store_scan.is_none(), "include_store_scan was false");
+    assert_eq!(
+        snapshot.active_sessions, 1,
+        "the session created above must be counted"
+    );
+    assert!(
+        snapshot.store_scan.is_none(),
+        "include_store_scan was false"
+    );
     let session_permit = snapshot
         .scheduler
         .iter()
@@ -392,12 +443,16 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
     assert_eq!(session_permit.in_use, 1);
     assert!(session_permit.capacity >= session_permit.in_use);
     assert!(
-        snapshot.metrics_prometheus_text.contains("harness_scheduler_permit_wait_seconds"),
+        snapshot
+            .metrics_prometheus_text
+            .contains("harness_scheduler_permit_wait_seconds"),
         "the real scheduler instrumentation must show up in the rendered Prometheus text: {}",
         snapshot.metrics_prometheus_text
     );
     assert!(
-        snapshot.metrics_prometheus_text.contains("harness_scheduler_permits_in_use"),
+        snapshot
+            .metrics_prometheus_text
+            .contains("harness_scheduler_permits_in_use"),
         "in-use gauge must be present: {}",
         snapshot.metrics_prometheus_text
     );
@@ -406,7 +461,9 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
     let deep_req = RpcRequest {
         id: RequestCorrelationId(3),
         session_id: None,
-        body: RpcRequestBody::GetDiagnostics { include_store_scan: true },
+        body: RpcRequestBody::GetDiagnostics {
+            include_store_scan: true,
+        },
     };
     write_frame(&mut stream, &serde_json::to_vec(&deep_req).unwrap()).await;
     let response = read_frame(&mut stream).await;
@@ -414,7 +471,10 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
         RpcResponseBody::Diagnostics(snapshot) => snapshot,
         other => panic!("expected Diagnostics, got {other:?}"),
     };
-    assert!(deep_snapshot.store_scan.is_some(), "include_store_scan was true");
+    assert!(
+        deep_snapshot.store_scan.is_some(),
+        "include_store_scan was true"
+    );
 
     shutdown.cancel();
 }

@@ -12,6 +12,10 @@ pub struct GitHubCopilotConfig {
 
 impl Default for GitHubCopilotConfig {
     fn default() -> Self {
-        Self { binary_path: PathBuf::from("copilot"), model: "auto".into(), working_dir: None }
+        Self {
+            binary_path: PathBuf::from("copilot"),
+            model: "auto".into(),
+            working_dir: None,
+        }
     }
 }
