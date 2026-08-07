@@ -234,6 +234,20 @@ pub enum AgentCommand {
 
     /// Resume a previously paused run.
     Resume,
+
+    /// Update the agent's session-level default execution params (model,
+    /// max_tokens, temperature, reasoning, ...).
+    ///
+    /// Applied as a partial update via `ExecutionParams::merge_over` — fields
+    /// left unset in `params` keep their previous value. Takes effect
+    /// starting with the *next* run this agent starts; it never mutates an
+    /// already-in-flight request. This is the only mutation path for
+    /// execution params — both "set the session default at creation" and
+    /// "override for the next prompt" go through this same command, sent
+    /// immediately before `StartRun`/`Steer`/`FollowUp` for the latter case.
+    ConfigureExecution {
+        params: crate::backend::ExecutionParams,
+    },
 }
 
 // ---------------------------------------------------------------------------

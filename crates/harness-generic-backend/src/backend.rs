@@ -110,6 +110,7 @@ impl GenericModelBackend {
             reasoning_stream: model.reasoning,
             tool_calls: model.tool_calls,
             parallel_tool_calls: model.parallel_tool_calls,
+            images: model.images,
             host_managed_tools: true,
             ..Default::default()
         };
@@ -133,6 +134,48 @@ impl GenericModelBackend {
     /// falling back to the default.
     pub fn recovery_policy(&self) -> &RecoveryPolicy {
         &self.recovery
+    }
+
+    /// Validates the request against this backend's advertised capabilities
+    /// *before* any network call is made, so an unsupported request never
+    /// causes a billed call to the provider. Returns `Some(error)` to reject
+    /// the request, or `None` to proceed.
+    fn check_capabilities(
+        &self,
+        request: &harness_protocol::backend::ExecutionRequest,
+    ) -> Option<ModelError> {
+        let wants_reasoning = request.extended_thinking || request.params.reasoning_effort.is_some();
+        if wants_reasoning && !self.capabilities.reasoning_stream {
+            return Some(ModelError::UnsupportedCapability {
+                capability: "reasoning".to_string(),
+                detail: format!(
+                    "{} does not support reasoning/extended thinking",
+                    self.descriptor.name
+                ),
+            });
+        }
+
+        let wants_images = request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, harness_protocol::messages::ContentBlock::Image { .. }))
+        });
+        if wants_images && !self.capabilities.images {
+            return Some(ModelError::UnsupportedCapability {
+                capability: "images".to_string(),
+                detail: format!("{} does not support image input", self.descriptor.name),
+            });
+        }
+
+        if !request.tools.is_empty() && !self.capabilities.tool_calls {
+            return Some(ModelError::UnsupportedCapability {
+                capability: "tool_calls".to_string(),
+                detail: format!("{} does not support tool calls", self.descriptor.name),
+            });
+        }
+
+        None
     }
 
     fn circuit_allows_request(&self) -> Result<(), ModelError> {
@@ -318,6 +361,9 @@ fn to_execution_error(error: ModelError) -> ExecutionError {
             message,
             code: "PROTOCOL_ERROR".to_string(),
         },
+        ModelError::UnsupportedCapability { capability, detail } => {
+            ExecutionError::UnsupportedCapability { capability, detail }
+        }
     }
 }
 
@@ -359,17 +405,28 @@ impl ExecutionBackend for GenericModelBackend {
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutionError> {
         let request_id = request.request_id;
+        let call_start = tokio::time::Instant::now();
+        let backend_label = self.descriptor.name.clone();
+        if let Some(error) = self.check_capabilities(&request) {
+            metrics::counter!("harness_backend_requests_total", "backend" => backend_label.clone(), "outcome" => "rejected_capability").increment(1);
+            let final_result = Err(to_execution_error(error));
+            emit_terminal(&sink, request_id, &final_result);
+            return final_result;
+        }
         let model_request = ModelRequest {
             system_prompt: request.system_prompt,
             messages: request.messages,
             tools: request.tools,
-            model: None,
-            max_tokens: None,
-            temperature: None,
-            stop_sequences: Vec::new(),
+            model: request.params.model,
+            max_tokens: request.params.max_tokens,
+            temperature: request.params.temperature,
+            stop_sequences: request.params.stop_sequences,
             extended_thinking: request.extended_thinking,
+            reasoning_effort: request.params.reasoning_effort,
+            provider_options: request.params.provider_options,
         };
         if let Err(error) = self.circuit_allows_request() {
+            metrics::counter!("harness_backend_requests_total", "backend" => backend_label.clone(), "outcome" => "rejected_circuit_open").increment(1);
             let final_result = Err(to_execution_error(error));
             emit_terminal(&sink, request_id, &final_result);
             return final_result;
@@ -423,6 +480,18 @@ impl ExecutionBackend for GenericModelBackend {
                 self.record_failure(&ModelError::Timeout);
             }
         }
+        metrics::histogram!("harness_backend_request_duration_seconds", "backend" => backend_label.clone())
+            .record(call_start.elapsed().as_secs_f64());
+        metrics::counter!(
+            "harness_backend_requests_total",
+            "backend" => backend_label.clone(),
+            "outcome" => if final_result.is_ok() { "success" } else { "error" }
+        )
+        .increment(1);
+        metrics::counter!("harness_backend_request_attempts_total", "backend" => backend_label)
+            .increment(attempt as u64);
+        metrics::gauge!("harness_backend_circuit_open", "backend" => self.descriptor.name.clone())
+            .set(if self.circuit.lock().expect("circuit mutex poisoned").open_until.is_some() { 1.0 } else { 0.0 });
         emit_terminal(&sink, request_id, &final_result);
         final_result
     }
@@ -431,6 +500,7 @@ impl ExecutionBackend for GenericModelBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::FakeModelClient;
 
     #[test]
     fn recovery_policy_default_matches_prior_hardcoded_values() {
@@ -519,6 +589,7 @@ mod tests {
                     messages: Vec::new(),
                     tools: Vec::new(),
                     extended_thinking: false,
+                    params: Default::default(),
                 },
                 sink,
                 CancellationToken::new(),
@@ -553,6 +624,7 @@ mod tests {
                     messages: Vec::new(),
                     tools: Vec::new(),
                     extended_thinking: false,
+                    params: Default::default(),
                 },
                 sink,
                 CancellationToken::new(),
@@ -561,6 +633,138 @@ mod tests {
 
         assert!(matches!(result, Err(ExecutionError::RateLimited { .. })));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// M2: "cancel during retry delay" — the race the roadmap's M2 section
+    /// long listed as blocked on a retry mechanism that didn't exist yet.
+    /// It exists (this file's own `retry_delay`/backoff `tokio::select!`
+    /// against `cancel.cancelled()`); this test proves cancellation
+    /// firing *during the sleep between attempts* wins the race, returning
+    /// `ExecutionError::Cancelled` promptly rather than waiting out the
+    /// full delay or letting a queued retry fire after cancellation.
+    #[tokio::test]
+    async fn cancel_wins_the_race_against_a_retry_backoff_delay() {
+        use harness_generic_backend_test_support::FlakyModelClient;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // succeed_on: 3 means the first two calls fail retryable; a 2s
+        // retry_after gives ample time to fire cancellation mid-sleep
+        // without racing against real-world scheduling jitter.
+        let client = FlakyModelClient::new(calls.clone(), 3).with_retry_after(Duration::from_secs(2));
+        let backend = GenericModelBackend::new_with_recovery(
+            Arc::new(client),
+            RecoveryPolicy {
+                max_attempts: 5,
+                total_deadline: Duration::from_secs(30),
+                ..RecoveryPolicy::default()
+            },
+        );
+        let (sink, _rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            backend
+                .execute(
+                    harness_protocol::backend::ExecutionRequest {
+                        request_id: RequestId::new(),
+                        run_id: harness_protocol::ids::RunId::new(),
+                        system_prompt: String::new(),
+                        messages: Vec::new(),
+                        tools: Vec::new(),
+                        extended_thinking: false,
+                        params: Default::default(),
+                    },
+                    sink,
+                    cancel_for_task,
+                )
+                .await
+        });
+
+        // Let the first attempt fail and enter its retry sleep, then cancel
+        // well before the 2s retry_after would naturally elapse.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first attempt should have already failed and be sleeping before cancelling"
+        );
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("execute() must return promptly once cancelled mid-retry-delay, not after the full 2s backoff")
+            .expect("task must not panic");
+
+        assert!(
+            matches!(result, Err(ExecutionError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation during the retry delay must prevent the second attempt from ever firing"
+        );
+    }
+
+    /// M2: provider partial-stream failure — an error arriving *after* some
+    /// deltas were already streamed, not just before any output at all.
+    /// This matters because `GenericModelBackend`'s retry logic explicitly
+    /// only retries when `!outcome.emitted_output` (see `execute`) — a
+    /// failure after partial output must NOT be silently retried (that
+    /// would replay/duplicate the already-emitted deltas to the caller); it
+    /// must propagate as a terminal error on the first such failure.
+    #[tokio::test]
+    async fn partial_stream_failure_after_some_deltas_is_not_retried() {
+        let client = FakeModelClient::new()
+            .with_events(vec![
+                ModelEvent::TextDelta { delta: "partial ".to_string() },
+                ModelEvent::TextDelta { delta: "output".to_string() },
+            ])
+            .with_error(ModelError::BackendError {
+                message: "connection reset mid-stream".to_string(),
+                code: "503".to_string(),
+            });
+        let backend = GenericModelBackend::new_with_recovery(
+            Arc::new(client),
+            RecoveryPolicy { max_attempts: 5, ..RecoveryPolicy::default() },
+        );
+        let (sink, mut rx) = broadcast::channel(16);
+        let result = backend
+            .execute(
+                harness_protocol::backend::ExecutionRequest {
+                    request_id: RequestId::new(),
+                    run_id: harness_protocol::ids::RunId::new(),
+                    system_prompt: String::new(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    extended_thinking: false,
+                    params: Default::default(),
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+
+        // 503 is normally retryable, but not after output was already
+        // emitted — the terminal error must surface on the very first
+        // attempt rather than silently retrying and re-emitting deltas.
+        assert!(
+            matches!(result, Err(ExecutionError::BackendError { .. })),
+            "expected the partial-stream failure to surface directly, got {result:?}"
+        );
+
+        let mut delta_count = 0;
+        let mut saw_error = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ExecutionEvent::TextDelta { .. } => delta_count += 1,
+                ExecutionEvent::Error { .. } => saw_error = true,
+                _ => {}
+            }
+        }
+        assert_eq!(delta_count, 2, "both deltas emitted before the failure must have reached the sink exactly once");
+        assert!(saw_error, "the terminal error must also reach the sink");
     }
 
     mod harness_generic_backend_test_support {
@@ -588,6 +792,7 @@ mod tests {
                     reasoning: false,
                     tool_calls: false,
                     parallel_tool_calls: false,
+                    images: false,
                 }
             }
 
@@ -605,11 +810,20 @@ mod tests {
         pub struct FlakyModelClient {
             calls: Arc<AtomicUsize>,
             succeed_on: usize,
+            retry_after: Duration,
         }
 
         impl FlakyModelClient {
             pub fn new(calls: Arc<AtomicUsize>, succeed_on: usize) -> Self {
-                Self { calls, succeed_on }
+                Self { calls, succeed_on, retry_after: Duration::ZERO }
+            }
+
+            /// M2: configurable retry delay, so a test can cancel mid-sleep
+            /// (a zero delay resolves too fast to race against). Used by
+            /// `cancel_wins_the_race_against_a_retry_backoff_delay`.
+            pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
+                self.retry_after = retry_after;
+                self
             }
         }
 
@@ -621,6 +835,7 @@ mod tests {
                     reasoning: false,
                     tool_calls: false,
                     parallel_tool_calls: false,
+                    images: false,
                 }
             }
 
@@ -633,7 +848,7 @@ mod tests {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if attempt < self.succeed_on {
                     Err(ModelError::RateLimited {
-                        retry_after: Some(Duration::ZERO),
+                        retry_after: Some(self.retry_after),
                     })
                 } else {
                     Ok(ModelResult {

@@ -1,7 +1,7 @@
 
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{
-    AgentCommand, AgentError, AgentResult, AgentStatus, PermissionDecision, UserInput,
+    AgentCommand, AgentError, AgentResult, AgentStatus, Attachment, PermissionDecision, UserInput,
 };
 use harness_protocol::effects::{AgentEffect, PermissionRequest, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
@@ -10,11 +10,102 @@ use harness_protocol::ids::{
 };
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 use harness_protocol::tools::{PermissionMode, ToolCall, ToolError, ToolResult, ToolResultSummary};
-use harness_protocol::usage::{AgentUsageMetrics, AgentUsageSummary, UsageRecord};
+use harness_protocol::usage::{AgentUsageSummary, UsageRecord};
 
 use crate::agent::Agent;
 use crate::agent_state::PendingToolCall;
 use crate::transcript::validate_transcript;
+
+/// M3: caps how large a single assistant message's assembled text can grow
+/// across a run's streamed deltas. Without this, a runaway or adversarial
+/// backend stream grows `AgentState.messages` — held for the run's (and,
+/// once persisted, the session's) entire lifetime — without bound.
+const MAX_ASSISTANT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Appends `delta` to `text`, stopping (with a one-time truncation marker)
+/// once `text` would exceed [`MAX_ASSISTANT_TEXT_BYTES`]. Once truncated,
+/// further deltas are silently dropped from the assembled message — the
+/// live per-delta `AssistantTextDelta` event still carries the full delta
+/// (that event stream is bounded separately, by the runtime's broadcast
+/// channel capacity), only the durable, run-lifetime-held assembled text is
+/// capped here.
+const TRUNCATION_MARKER: &str = "\n... (truncated, exceeds assistant message size limit)";
+
+/// M4: caps a single attachment's raw byte size, mirroring the M3 precedent
+/// set by `fs.read`'s 10MB cap. Unlike text truncation, silently truncating
+/// image bytes would just produce a corrupt, undecodable image — so an
+/// oversized attachment fails the run outright (via `Agent::fail`, the same
+/// path `validate_transcript` already uses) rather than being silently
+/// mangled or unboundedly accepted.
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+fn validate_attachments(attachments: &[Attachment]) -> Result<(), String> {
+    for (index, attachment) in attachments.iter().enumerate() {
+        if attachment.data.len() > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment {index} ({} bytes, {}) exceeds the {MAX_ATTACHMENT_BYTES}-byte limit",
+                attachment.data.len(),
+                attachment.mime_type
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Converts one user-supplied [`Attachment`] into a transcript
+/// [`ContentBlock`]. Image MIME types become a real `ContentBlock::Image`
+/// (forwarded to providers that support it — see
+/// `GenericModelBackend::check_capabilities`, which rejects an image-bearing
+/// request against a provider that doesn't). Anything else becomes a
+/// visible text note rather than being silently dropped: this harness does
+/// not yet have a wire format for non-image attachments (e.g. arbitrary
+/// files), and the M4 requirement is "no silent loss," not "every
+/// attachment kind is fully supported."
+fn attachment_to_content_block(attachment: Attachment) -> ContentBlock {
+    if attachment.mime_type.starts_with("image/") {
+        ContentBlock::Image {
+            mime_type: attachment.mime_type,
+            data: attachment.data,
+        }
+    } else {
+        ContentBlock::Text {
+            text: format!(
+                "[attachment: {} bytes, {} — non-image attachments are not yet forwarded as model input]",
+                attachment.data.len(),
+                attachment.mime_type
+            ),
+        }
+    }
+}
+
+fn push_bounded(text: &mut String, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if text.ends_with(TRUNCATION_MARKER) {
+        // Already truncated by an earlier delta; further deltas are
+        // silently dropped from the assembled message rather than
+        // re-appending the marker every time.
+        return;
+    }
+    if text.len() >= MAX_ASSISTANT_TEXT_BYTES {
+        text.push_str(TRUNCATION_MARKER);
+        return;
+    }
+    let remaining = MAX_ASSISTANT_TEXT_BYTES - text.len();
+    if delta.len() <= remaining {
+        text.push_str(delta);
+        return;
+    }
+    // Truncate at a UTF-8 char boundary so we never slice through a
+    // multi-byte codepoint.
+    let mut cut = remaining;
+    while cut > 0 && !delta.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.push_str(&delta[..cut]);
+    text.push_str(TRUNCATION_MARKER);
+}
 
 impl Agent {
     pub fn apply(&mut self, command: AgentCommand) -> Vec<AgentEffect> {
@@ -41,7 +132,19 @@ impl Agent {
             AgentCommand::Cancel => self.cancel(),
             AgentCommand::Pause => self.pause(),
             AgentCommand::Resume => self.resume(),
+            AgentCommand::ConfigureExecution { params } => self.configure_execution(params),
         }
+    }
+
+    /// Applies a partial `ExecutionParams` update over the session-level
+    /// default. Pure state mutation — no effects, no run-lifecycle impact.
+    /// Takes effect starting with the next run this agent starts.
+    fn configure_execution(
+        &mut self,
+        params: harness_protocol::backend::ExecutionParams,
+    ) -> Vec<AgentEffect> {
+        self.state.execution_params = self.state.execution_params.merge_over(&params);
+        Vec::new()
     }
 
     fn take_sequence(&mut self) -> u64 {
@@ -78,13 +181,16 @@ impl Agent {
             .into_iter()
             .cloned()
             .collect();
+        let params = self.state.execution_params.clone();
+        let extended_thinking = params.extended_thinking.unwrap_or(false);
         ExecutionRequest {
             request_id: self.next_request_id(),
             run_id,
             system_prompt: self.state.system_prompt.clone(),
             messages: self.state.messages.clone(),
             tools,
-            extended_thinking: false,
+            extended_thinking,
+            params,
         }
     }
 
@@ -104,6 +210,7 @@ impl Agent {
         self.state.status = AgentStatus::Failed;
         self.state.active_run = None;
         self.state.last_error = Some(error.clone());
+        self.usage.runs = self.usage.runs.saturating_add(1);
         vec![
             Self::state_changed(from, AgentStatus::Failed),
             AgentEffect::Emit {
@@ -132,14 +239,19 @@ impl Agent {
         if let Err(error) = validate_transcript(&self.state.messages) {
             return self.fail("INVALID_TRANSCRIPT", error.to_string());
         }
+        if let Err(error) = validate_attachments(&input.attachments) {
+            return self.fail("ATTACHMENT_TOO_LARGE", error);
+        }
         let from = self.state.status;
         let run_id = self.next_run_id();
         let message_id = self.next_message_id();
         let created_at = self.next_timestamp();
+        let mut content = vec![ContentBlock::Text { text: input.text }];
+        content.extend(input.attachments.into_iter().map(attachment_to_content_block));
         self.state.messages.push(AgentMessage {
             id: message_id,
             role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: input.text }],
+            content,
             created_at,
         });
         self.state.status = AgentStatus::PreparingContext;
@@ -193,6 +305,7 @@ impl Agent {
                 let from = self.state.status;
                 self.state.status = AgentStatus::Idle;
                 self.state.active_run = None;
+                self.usage.runs = self.usage.runs.saturating_add(1);
                 let effects = vec![
                     Self::state_changed(from, AgentStatus::Idle),
                     AgentEffect::Emit {
@@ -320,6 +433,7 @@ impl Agent {
         has_error: bool,
         preview: String,
     ) -> Vec<AgentEffect> {
+        self.usage.tool_calls = self.usage.tool_calls.saturating_add(1);
         let message_id = self.next_message_id();
         let created_at = self.next_timestamp();
         self.state.messages.push(AgentMessage {
@@ -445,37 +559,29 @@ impl Agent {
         effects
     }
 
+    /// Lossless conversion from a completed child's reported (protocol-level)
+    /// usage summary into the shape this agent's ledger stores its children
+    /// under. Both types have identical fields — see
+    /// `crate::usage::AgentUsageSummary`'s doc comment for why the type
+    /// still exists separately from the protocol one.
     fn bridge_usage_summary(
         protocol: &harness_protocol::usage::AgentUsageSummary,
     ) -> crate::usage::AgentUsageSummary {
-        fn to_model_usage(
-            metrics: &harness_protocol::usage::AgentUsageMetrics,
-        ) -> harness_protocol::usage::ModelUsage {
-            harness_protocol::usage::ModelUsage {
-                total_tokens: metrics.total_tokens,
-                ..Default::default()
-            }
-        }
-        crate::usage::AgentUsageSummary {
-            self_usage: to_model_usage(&protocol.self_usage),
-            descendant_usage: to_model_usage(&protocol.descendant_usage),
-            inclusive_usage: to_model_usage(&protocol.inclusive_usage),
-        }
+        crate::usage::AgentUsageSummary::from(protocol.clone())
     }
 
+    /// Builds this agent's final, reportable usage summary: its own request
+    /// count / tool-call count / tokens / cost (`self.usage.self_metrics()`),
+    /// combined with every child's already-aggregated inclusive usage
+    /// (`self.usage.child_usage`) via `compute_agent_usage_summary`, which
+    /// sums children's *inclusive* usage — not `self_usage` — so a
+    /// grandchild's activity is counted exactly once even though it reaches
+    /// this agent through two levels of `ChildCompleted` bridging.
     fn terminal_usage_summary(&self) -> AgentUsageSummary {
-        let self_usage = self.usage.self_usage();
-        AgentUsageSummary {
-            self_usage: AgentUsageMetrics {
-                total_tokens: self_usage.total_tokens,
-                ..Default::default()
-            },
-            descendant_usage: AgentUsageMetrics::default(),
-            inclusive_usage: AgentUsageMetrics {
-                total_tokens: self_usage.total_tokens,
-                ..Default::default()
-            },
-        }
+        let self_metrics = self.usage.self_metrics();
+        let child_summaries: Vec<crate::usage::AgentUsageSummary> =
+            self.usage.child_usage.values().cloned().collect();
+        crate::usage::compute_agent_usage_summary(self_metrics, &child_summaries).into()
     }
 
     fn cancel(&mut self) -> Vec<AgentEffect> {
@@ -579,19 +685,19 @@ impl Agent {
                 .iter_mut()
                 .find(|block| matches!(block, ContentBlock::Text { .. }))
             {
-                text.push_str(delta);
+                push_bounded(text, delta);
                 return message.id;
             }
         }
 
         let id = self.next_message_id();
         let created_at = self.next_timestamp();
+        let mut text = String::new();
+        push_bounded(&mut text, delta);
         self.state.messages.push(AgentMessage {
             id,
             role: MessageRole::Assistant,
-            content: vec![ContentBlock::Text {
-                text: delta.to_owned(),
-            }],
+            content: vec![ContentBlock::Text { text }],
             created_at,
         });
         id

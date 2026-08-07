@@ -17,6 +17,6 @@ pub use policy::{
 };
 pub use provider::ContextProvider;
 pub use providers::{
-    ChainedContextProvider, StaticSystemPromptProvider, TruncatingCompactionProvider,
-    WorkspaceInfoProvider,
+    ChainedContextProvider, CompactionRecord, PolicyDrivenCompactionProvider,
+    StaticSystemPromptProvider, TruncatingCompactionProvider, WorkspaceInfoProvider,
 };

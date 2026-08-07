@@ -183,16 +183,27 @@ impl SessionCommitter {
                 envelope: envelope.clone(),
                 session_sequence: Some(sequence),
             };
-            match self.store.append(durable).await {
-                Ok(()) => self.note_durable_append(sequence),
+            let append_start = std::time::Instant::now();
+            let append_result = self.store.append(durable).await;
+            metrics::histogram!("harness_store_commit_duration_seconds").record(append_start.elapsed().as_secs_f64());
+            match append_result {
+                Ok(()) => {
+                    metrics::counter!("harness_store_commits_total", "outcome" => "success").increment(1);
+                    self.note_durable_append(sequence)
+                }
                 Err(StoreError::InvalidState(message))
                     if message.contains("UNIQUE") || message.contains("unique") =>
                 {
+                    metrics::counter!("harness_store_commits_total", "outcome" => "duplicate_sequence").increment(1);
                     return Err(CommitError::DuplicateSequence(sequence));
                 }
                 Err(error) => match self.policy {
-                    DurabilityPolicy::Strict => return Err(CommitError::Store(error)),
+                    DurabilityPolicy::Strict => {
+                        metrics::counter!("harness_store_commits_total", "outcome" => "failed_strict").increment(1);
+                        return Err(CommitError::Store(error));
+                    }
                     DurabilityPolicy::BestEffort => {
+                        metrics::counter!("harness_store_commits_total", "outcome" => "degraded").increment(1);
                         tracing::warn!(
                             %sequence,
                             %error,

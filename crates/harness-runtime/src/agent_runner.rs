@@ -5,14 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rust_decimal::Decimal;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use harness_core::agent::Agent;
 use harness_core::transcript::validate_transcript;
 use harness_protocol::backend::{ExecutionError, ExecutionEvent, ExecutionRequest};
-use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus};
+use harness_protocol::commands::{AgentCommand, AgentError, AgentResult, AgentStatus, UserInput};
 use harness_protocol::effects::{AgentEffect, SessionMutation, SpawnAgentSpec, SpawnMode, ToolRequest};
 use harness_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use harness_protocol::ids::{AgentId, EventId, RunId, Timestamp, ToolCallId};
@@ -139,6 +138,33 @@ trait SupervisorControl: Send + Sync {
 
     async fn await_child(&self, child_id: AgentId) -> Result<AgentResult, SupervisorError>;
     async fn cancel_child(&self, child_id: AgentId) -> Result<(), SupervisorError>;
+    /// M5: fetches the command channel for a just-spawned child so its
+    /// initial task (`SpawnAgentSpec::task`) can be delivered as a
+    /// `StartRun`. `None` if the child isn't registered (already finished,
+    /// or the id is stale).
+    async fn child_commands(&self, child_id: AgentId) -> Option<mpsc::Sender<AgentCommand>>;
+}
+
+/// Outcome of a spawn attempt, returned so callers other than the plain
+/// `AgentEffect::SpawnAgent` path (namely the `agent.spawn` tool — see
+/// `AgentRunner::execute_tool`) can build a meaningful result of their own
+/// without duplicating any of the supervisor-enforced spawn logic.
+///
+/// `awaited` is best-effort observability only: the *authoritative*
+/// state-machine update always happens independently, via the child's own
+/// runner sending `AgentCommand::ChildCompleted`/`ChildFailed` directly to
+/// this agent's mailbox when it finishes (see
+/// `AgentSupervisor::spawn_child`) — this field exists only so a
+/// tool-triggered `AwaitResult` spawn can report what happened back to the
+/// calling model in its `ToolResult`, not to drive any core state.
+///
+/// Distinct from `agent_supervisor::SpawnOutcome` (which distinguishes
+/// `Detached`/`Awaited` for `spawn_and_drive`'s own callers) — this type is
+/// specifically the `agent_runner`-level view used by the tool-interception
+/// path in `execute_tool`.
+pub(crate) struct ToolSpawnOutcome {
+    pub child_id: AgentId,
+    pub awaited: Option<Result<AgentResult, String>>,
 }
 
 #[async_trait]
@@ -176,6 +202,10 @@ impl SupervisorControl for AgentSupervisor {
 
     async fn cancel_child(&self, child_id: AgentId) -> Result<(), SupervisorError> {
         AgentSupervisor::cancel_child(self, child_id).await
+    }
+
+    async fn child_commands(&self, child_id: AgentId) -> Option<mpsc::Sender<AgentCommand>> {
+        AgentSupervisor::child_commands(self, child_id).await
     }
 }
 
@@ -344,6 +374,11 @@ impl AgentRunner {
     }
 
     fn publish_status(&self) {
+        // M4: `self_metrics()` correctly sums cost with "unknown poisons the
+        // total" semantics (matching `UsageValue`'s existing token-count
+        // discipline) — previously this call site duplicated a *buggy*
+        // version of the same calculation inline, one that silently skipped
+        // unknown-cost records instead of reporting the total as unknown.
         let child_usage = self
             .agent
             .usage
@@ -351,21 +386,9 @@ impl AgentRunner {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let usage = harness_core::usage::compute_agent_usage_summary(
-            &self.agent.usage.records,
-            &child_usage,
-        );
-        let total_cost_usd =
-            self.agent
-                .usage
-                .records
-                .iter()
-                .fold(None::<Decimal>, |acc, record| {
-                    match record.cost.amount_usd {
-                        Some(amount) => Some(acc.unwrap_or(Decimal::ZERO) + amount),
-                        None => acc,
-                    }
-                });
+        let self_metrics = self.agent.usage.self_metrics();
+        let usage =
+            harness_core::usage::compute_agent_usage_summary(self_metrics.clone(), &child_usage);
 
         {
             let mut table = self.live_state.lock().expect("live_state mutex poisoned");
@@ -373,9 +396,9 @@ impl AgentRunner {
             entry.status = self.agent.state.status;
             entry.current_operation = self.agent.state.current_operation.clone();
             entry.last_error = self.agent.state.last_error.clone();
+            entry.total_requests = self_metrics.total_requests;
+            entry.total_cost_usd = self_metrics.total_cost;
             entry.usage = usage;
-            entry.total_requests = self.agent.usage.records.len() as u64;
-            entry.total_cost_usd = total_cost_usd;
         }
 
         // RC-302: publish the durable projection so checkpoints are truthful.
@@ -433,7 +456,7 @@ impl AgentRunner {
                     }
                 }
                 AgentEffect::SpawnAgent { spec } => {
-                    self.spawn_agent(spec).await;
+                    let _ = self.spawn_agent(spec).await;
                 }
                 AgentEffect::RequestPermission { request } => {
                     // The preceding PermissionRequested event is the single
@@ -451,12 +474,14 @@ impl AgentRunner {
         finish
     }
 
-    async fn spawn_agent(&mut self, spec: SpawnAgentSpec) {
+    async fn spawn_agent(&mut self, spec: SpawnAgentSpec) -> Result<ToolSpawnOutcome, String> {
         let Some(supervision) = self.supervision.clone() else {
-            tracing::warn!(?spec, "SpawnAgent requested without a supervisor");
-            return;
+            let message = "SpawnAgent requested without a supervisor".to_string();
+            tracing::warn!(?spec, "{message}");
+            return Err(message);
         };
         let mode = spec.mode;
+        let task = spec.task.clone();
         match supervision
             .supervisor
             .spawn_child(
@@ -473,27 +498,63 @@ impl AgentRunner {
             .await
         {
             Ok(child_id) => {
+                // M5: kick off the child's initial task, if one was given —
+                // before anything might block on `await_child` below, so an
+                // `AwaitResult` spawn doesn't wait on a child that was never
+                // told to do anything. Pre-M5 callers that leave `task: None`
+                // keep the original behavior: an idle child, started by
+                // whatever Rust orchestration code sends it a command later.
+                if let Some(task_text) = task {
+                    match supervision.supervisor.child_commands(child_id).await {
+                        Some(child_tx) => {
+                            let _ = child_tx
+                                .send(AgentCommand::StartRun {
+                                    input: UserInput {
+                                        text: task_text,
+                                        attachments: vec![],
+                                    },
+                                })
+                                .await;
+                        }
+                        None => {
+                            tracing::warn!(
+                                ?child_id,
+                                "spawned child has no command channel; its task was not started"
+                            );
+                        }
+                    }
+                }
+
                 let awaiting = matches!(mode, SpawnMode::AwaitResult);
                 let effects = self.apply_and_publish(AgentCommand::ChildSpawned {
                     agent_id: child_id,
                     awaiting,
                 });
                 Box::pin(self.dispatch_effects(effects)).await;
+                let mut awaited = None;
                 if awaiting {
-                    if let Err(error) = supervision.supervisor.await_child(child_id).await {
-                        let effects = self.apply_and_publish(AgentCommand::ChildFailed {
-                            agent_id: child_id,
-                            error: AgentError {
-                                message: error.to_string(),
-                                code: "CHILD_AWAIT_FAILED".into(),
-                                details: None,
-                            },
-                        });
-                        Box::pin(self.dispatch_effects(effects)).await;
+                    match supervision.supervisor.await_child(child_id).await {
+                        Ok(result) => awaited = Some(Ok(result)),
+                        Err(error) => {
+                            let effects = self.apply_and_publish(AgentCommand::ChildFailed {
+                                agent_id: child_id,
+                                error: AgentError {
+                                    message: error.to_string(),
+                                    code: "CHILD_AWAIT_FAILED".into(),
+                                    details: None,
+                                },
+                            });
+                            Box::pin(self.dispatch_effects(effects)).await;
+                            awaited = Some(Err(error.to_string()));
+                        }
                     }
                 }
+                Ok(ToolSpawnOutcome { child_id, awaited })
             }
-            Err(error) => tracing::warn!(%error, "failed to spawn child agent"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to spawn child agent");
+                Err(error.to_string())
+            }
         }
     }
 
@@ -738,11 +799,37 @@ impl AgentRunner {
         let call_id = request.call.id;
         let name = request.call.name.clone();
         let arguments = request.call.arguments.clone();
+
+        // M5: `agent.spawn` is not a registered `ToolExecutor` — its
+        // implementation needs `&mut self` (to call `spawn_agent`, which
+        // applies `ChildSpawned`/`ChildFailed` against the deterministic
+        // core) that the generic path below cannot give it, since normal
+        // tool execution runs in a detached `tokio::spawn`'d task with no
+        // access back into the runner. Intercepted here, before any
+        // registry lookup, and always routed through the exact same
+        // `spawn_agent` the plain `AgentEffect::SpawnAgent` path already
+        // uses — a model can no more bypass parent budgets, tool
+        // delegation rules, or depth limits through this tool than existing
+        // Rust-orchestrated spawning could.
+        if name == crate::spawn_tool::AGENT_SPAWN_TOOL_NAME {
+            self.execute_spawn_tool(call_id, &arguments).await;
+            return;
+        }
+
         let token = self.cancel.child_token();
         self.tool_tokens.insert(call_id, token.clone());
         let commands = self.task.commands_tx.clone();
         let executor = self.tool_registry.get_executor(&name);
         let scheduler = self.scheduler.clone();
+
+        // M3: `shell.exec` (and any future tool with the same shape) forks a
+        // real OS process, which is a heavier resource than "a tool call" in
+        // general — bound it separately via `max_concurrent_processes` in
+        // addition to the generic tool-execution permit below, so a burst of
+        // shell calls can't spawn unboundedly many processes even while
+        // comfortably inside `max_concurrent_tool_executions`.
+        let spawns_process = name == "shell.exec";
+        let tool_name_for_metrics = name.clone();
 
         tokio::spawn(async move {
             // Like provider capacity, tool capacity is a cancellable queue
@@ -750,6 +837,14 @@ impl AgentRunner {
             let _permit = tokio::select! {
                 permit = scheduler.acquire_tool_permit() => permit,
                 _ = token.cancelled() => return,
+            };
+            let _process_permit = if spawns_process {
+                match scheduler.acquire_process_permit_cancellable(&token).await {
+                    Some(permit) => Some(permit),
+                    None => return,
+                }
+            } else {
+                None
             };
             let Some(executor) = executor else {
                 let _ = commands
@@ -762,7 +857,17 @@ impl AgentRunner {
             };
 
             let input = harness_tools::ToolInput { arguments };
-            match executor.execute(input, token).await {
+            let tool_call_start = std::time::Instant::now();
+            let outcome = executor.execute(input, token).await;
+            metrics::histogram!("harness_tool_call_duration_seconds", "tool" => tool_name_for_metrics.clone())
+                .record(tool_call_start.elapsed().as_secs_f64());
+            metrics::counter!(
+                "harness_tool_calls_total",
+                "tool" => tool_name_for_metrics,
+                "outcome" => if outcome.is_ok() { "success" } else { "error" }
+            )
+            .increment(1);
+            match outcome {
                 Ok(tool_result) => {
                     let result = harness_protocol::tools::ToolResult {
                         call_id,
@@ -781,6 +886,88 @@ impl AgentRunner {
                 }
             }
         });
+    }
+
+    /// M5: `agent.spawn`'s implementation. Always resolves via
+    /// `AgentCommand::ToolCompleted` — never `ToolFailed` — for any spawn
+    /// rejection, whether that's bad arguments, a tool it can't be granted,
+    /// or the supervisor rejecting a budget/depth/capability request
+    /// (`SupervisorError`, e.g. `SpawnNotAllowed`, budget escalation, depth
+    /// exceeded). All of these are meaningful, actionable information for
+    /// the calling model (e.g. "your budget request escalates past your
+    /// own ceiling" is something a model should see and correct), unlike
+    /// `ToolError`'s coarse fixed enum, which has no room for a real
+    /// message and exists for infrastructure failures the model can't
+    /// reason about — mirroring how every other tool in this workspace
+    /// reports its own domain errors as `ToolResult { is_error: true,
+    /// output: <message> }` rather than `ToolFailed`.
+    async fn execute_spawn_tool(&mut self, call_id: ToolCallId, arguments: &serde_json::Value) {
+        let (spec, warnings) = match crate::spawn_tool::build_spawn_spec(arguments, &self.agent) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                let effects = self.apply_and_publish(AgentCommand::ToolCompleted {
+                    call_id,
+                    result: harness_protocol::tools::ToolResult {
+                        call_id,
+                        output: serde_json::json!({ "error": message }),
+                        is_error: true,
+                    },
+                });
+                Box::pin(self.dispatch_effects(effects)).await;
+                return;
+            }
+        };
+
+        match self.spawn_agent(spec).await {
+            Ok(outcome) => {
+                let (is_error, mut output) = match &outcome.awaited {
+                    None => (
+                        false,
+                        serde_json::json!({
+                            "child_agent_id": outcome.child_id.to_string(),
+                            "status": "spawned",
+                            "note": "running concurrently; its own completion will appear as ChildAgentCompleted",
+                        }),
+                    ),
+                    Some(Ok(result)) => (
+                        false,
+                        serde_json::json!({
+                            "child_agent_id": outcome.child_id.to_string(),
+                            "status": "completed",
+                            "summary": result.summary,
+                        }),
+                    ),
+                    Some(Err(message)) => (
+                        true,
+                        serde_json::json!({
+                            "child_agent_id": outcome.child_id.to_string(),
+                            "status": "failed",
+                            "error": message,
+                        }),
+                    ),
+                };
+                if !warnings.is_empty() {
+                    output["warnings"] = serde_json::json!(warnings);
+                }
+                let effects = self.apply_and_publish(AgentCommand::ToolCompleted {
+                    call_id,
+                    result: harness_protocol::tools::ToolResult { call_id, output, is_error },
+                });
+                Box::pin(self.dispatch_effects(effects)).await;
+            }
+            Err(message) => {
+                tracing::warn!(%message, "agent.spawn tool call could not spawn a child");
+                let effects = self.apply_and_publish(AgentCommand::ToolCompleted {
+                    call_id,
+                    result: harness_protocol::tools::ToolResult {
+                        call_id,
+                        output: serde_json::json!({ "error": message }),
+                        is_error: true,
+                    },
+                });
+                Box::pin(self.dispatch_effects(effects)).await;
+            }
+        }
     }
 
     fn cancel_backend(&mut self, run_id: RunId) {
@@ -834,7 +1021,7 @@ mod tests {
     use harness_protocol::usage::AgentBudget;
 
     use crate::scheduler::{Scheduler, SchedulerConfig};
-    use crate::testing::{FakeBackend, FakeToolRegistry};
+    use crate::testing::{FakeBackend, FakeToolExecutor, FakeToolRegistry};
     use crate::workspace::FakeWorkspace;
 
     use super::*;
@@ -1531,6 +1718,116 @@ mod tests {
             runner.agent.state.queued_inputs.is_empty(),
             "the queue must be drained once the follow-up run has started"
         );
+    }
+
+    /// M3: `shell.exec` calls must be bounded separately from generic tool
+    /// concurrency via `SchedulerConfig::max_concurrent_processes` — a real
+    /// OS process is heavier than "a tool call" in general. This proves the
+    /// wiring in `execute_tool` specifically, not just that the underlying
+    /// semaphore serializes (that's a given): with tool-execution
+    /// concurrency generous (10) but process concurrency exhausted (1, held
+    /// by an in-flight `shell.exec` call), a second `shell.exec` call must
+    /// block *before* ever reaching the tool executor. We prove that by
+    /// cancelling the second call's own token while it's still blocked: if
+    /// it were gated correctly, cancellation resolves the scheduler wait
+    /// with `None` and the call returns without ever invoking the executor
+    /// — so no `ToolCompleted`/`ToolFailed` command is ever sent for it. If
+    /// it were *not* gated (the bug this test guards against), the second
+    /// call would have already reached the executor and blocked on
+    /// `cancel.cancelled()` *inside* `FakeToolExecutor`, which resolves
+    /// cancellation by sending `ToolFailed` — a directly observable
+    /// difference.
+    #[tokio::test]
+    async fn shell_exec_calls_are_bounded_by_max_concurrent_processes() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let agent = test_agent(agent_id, session_id);
+        let (task, _sender) = AgentTask::new(agent_id);
+
+        let mut registry = FakeToolRegistry::new();
+        registry.add_executor(Arc::new(
+            FakeToolExecutor::new(harness_tools::ToolDescriptor {
+                id: harness_tools::ToolId::new("shell.exec"),
+                name: "shell.exec".into(),
+                description: "fake shell.exec".into(),
+                input_schema: serde_json::json!({}),
+            })
+            .blocking_until_cancelled(),
+        ));
+
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+            max_concurrent_tool_executions: 10,
+            max_concurrent_processes: 1,
+            ..SchedulerConfig::default()
+        }));
+        let cancel = CancellationToken::new();
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            Arc::new(FakeBackend::new()),
+            Arc::new(registry),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            cancel,
+            live_state,
+            scheduler,
+        );
+
+        let first_call = harness_protocol::ids::ToolCallId::new();
+        runner
+            .execute_tool(ToolRequest {
+                call: harness_protocol::tools::ToolCall {
+                    id: first_call,
+                    name: "shell.exec".into(),
+                    arguments: serde_json::json!({}),
+                },
+                permission: harness_protocol::tools::PermissionMode::Allow,
+            })
+            .await;
+
+        // Give the first call's spawned task time to actually acquire both
+        // permits and enter the executor's blocking wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let second_call = harness_protocol::ids::ToolCallId::new();
+        runner
+            .execute_tool(ToolRequest {
+                call: harness_protocol::tools::ToolCall {
+                    id: second_call,
+                    name: "shell.exec".into(),
+                    arguments: serde_json::json!({}),
+                },
+                permission: harness_protocol::tools::PermissionMode::Allow,
+            })
+            .await;
+
+        // Give the second call's spawned task time to reach (and block on)
+        // whatever it's actually going to block on.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runner.cancel_tool(second_call);
+
+        // Drain the mailbox briefly: if the second call had reached the
+        // executor (not gated), cancelling it produces a ToolFailed for
+        // `second_call` promptly.
+        let saw_second_call_complete = tokio::time::timeout(
+            Duration::from_millis(200),
+            runner.task.commands.recv(),
+        )
+        .await;
+        match saw_second_call_complete {
+            Ok(Some(AgentCommand::ToolFailed { call_id, .. }))
+            | Ok(Some(AgentCommand::ToolCompleted { call_id, .. }))
+                if call_id == second_call =>
+            {
+                panic!(
+                    "the second shell.exec call reached the executor instead of blocking \
+                     on the exhausted process permit — max_concurrent_processes is not enforced"
+                );
+            }
+            _ => {}
+        }
     }
 
     /// M2: `AgentCommand::Cancel` is documented as cancelling only the

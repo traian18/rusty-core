@@ -96,7 +96,7 @@ pub struct RunUsage {
     pub tool_call_count: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentUsageMetrics {
     pub total_runs: u64,
     pub total_requests: u64,

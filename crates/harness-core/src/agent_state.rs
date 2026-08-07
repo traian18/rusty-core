@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use harness_protocol::backend::ExecutionParams;
 use harness_protocol::commands::{AgentError, AgentOperation, AgentStatus, UserInput};
 use harness_protocol::ids::{AgentId, PermissionId, RunId, Timestamp, ToolCallId};
 use harness_protocol::messages::AgentMessage;
@@ -20,6 +21,10 @@ pub struct AgentState {
     pub status: AgentStatus,
     pub current_operation: Option<AgentOperation>,
     pub system_prompt: String,
+    /// Session-level default model/execution parameters. Updated only via
+    /// `AgentCommand::ConfigureExecution`; read by `execution_request()`
+    /// when building each new run's `ExecutionRequest`.
+    pub execution_params: ExecutionParams,
     /// Lossless canonical history. Compaction only changes the prepared inference view.
     pub messages: Vec<AgentMessage>,
     /// Per-agent inference-context checkpoint and pressure bookkeeping.

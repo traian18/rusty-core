@@ -25,6 +25,7 @@ pub mod scheduler;
 pub mod session_client;
 pub mod session_manager;
 pub mod session_runtime;
+pub mod spawn_tool;
 pub mod traits;
 pub mod workspace;
 

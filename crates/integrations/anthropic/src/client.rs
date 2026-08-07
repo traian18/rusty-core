@@ -73,6 +73,7 @@ impl ModelClient for AnthropicClient {
             reasoning: true,
             tool_calls: true,
             parallel_tool_calls: true,
+            images: true,
         }
     }
 
@@ -173,13 +174,25 @@ impl ModelClient for AnthropicClient {
         // ------------------------------------------------------------------
         let url = format!("{}/v1/messages", self.config.base_url);
 
+        // M4: merge caller-supplied `provider_options["anthropic"]` knobs
+        // (e.g. `top_k`) that have no typed field on `AnthropicRequest` —
+        // see `harness_model::merge_provider_options`'s doc comment for the
+        // precedence rule (typed fields above always win).
+        let body = harness_model::merge_provider_options(
+            serde_json::to_value(&anthropic_request).map_err(|error| ModelError::InvalidRequest {
+                message: format!("failed to serialize request: {error}"),
+            })?,
+            &request.provider_options,
+            "anthropic",
+        );
+
         let response = self
             .http_client
             .post(&url)
             .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&anthropic_request)
+            .json(&body)
             .send()
             .await
             .map_err(|error| {

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -11,8 +12,9 @@ use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
 use harness_protocol::rpc::{
-    MutationCommand, RpcError, RpcErrorCategory, RpcRequestBody, RpcResponseBody,
-    SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
+    DiagnosticsSnapshot, MutationCommand, PermitDiagnostic, RpcError, RpcErrorCategory,
+    RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
+    StoreScanSummary,
 };
 use harness_runtime::rpc::RpcHandler;
 use harness_runtime::session_runtime::SessionStatus;
@@ -53,16 +55,88 @@ pub struct HarnessRpcHandler {
     sessions: Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
     revisions: Mutex<HashMap<SessionId, u64>>,
     admissions: Mutex<AdmissionCache>,
+    started_at: Instant,
+    /// `None` when the process didn't install a Prometheus recorder (e.g. a
+    /// test harness) — `GetDiagnostics` still answers everything else, just
+    /// with an empty metrics text rather than failing the whole request.
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 impl HarnessRpcHandler {
+    /// Constructs a handler with no metrics recorder installed —
+    /// `GetDiagnostics` still works, reporting empty metrics text. Used by
+    /// tests and any embedder that doesn't want Prometheus wired in; the
+    /// real daemon binary uses [`Self::new_with_metrics`] instead.
+    ///
+    /// `#[allow(dead_code)]`: `apps/harnessd`'s own `main.rs` never calls
+    /// this (it always installs a real recorder via `new_with_metrics`), so
+    /// rustc sees it as unused *in that specific binary compilation* — but
+    /// `tests/end_to_end.rs` compiles `handler.rs` a second time via
+    /// `#[path = "../src/handler.rs"]` and does call it, and it's a
+    /// legitimate public constructor for any other embedder of this
+    /// module.
+    #[allow(dead_code)]
     pub fn new(harness: Arc<Harness>) -> Self {
+        Self::new_with_metrics(harness, None)
+    }
+
+    pub fn new_with_metrics(
+        harness: Arc<Harness>,
+        metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    ) -> Self {
         Self {
             harness,
             sessions: Mutex::new(HashMap::new()),
             revisions: Mutex::new(HashMap::new()),
             admissions: Mutex::new(AdmissionCache::new()),
+            started_at: Instant::now(),
+            metrics_handle,
         }
+    }
+
+    async fn get_diagnostics(&self, include_store_scan: bool) -> RpcResponseBody {
+        let active_sessions = self.harness.session_manager().active_session_count().await;
+        let scheduler = self
+            .harness
+            .session_manager()
+            .scheduler()
+            .snapshot()
+            .permits
+            .into_iter()
+            .map(|permit| PermitDiagnostic {
+                kind: permit.kind.to_string(),
+                capacity: permit.capacity,
+                in_use: permit.in_use,
+            })
+            .collect();
+
+        let store_scan = if include_store_scan {
+            let diagnostics =
+                harness_session_store::diagnose_store(self.harness.session_store().as_ref()).await;
+            let sessions_with_issues =
+                diagnostics.sessions.iter().filter(|session| !session.is_healthy()).count();
+            Some(StoreScanSummary {
+                total_sessions: diagnostics.sessions.len(),
+                unreadable_sessions: diagnostics.unreadable.len(),
+                sessions_with_issues,
+            })
+        } else {
+            None
+        };
+
+        let metrics_prometheus_text = self
+            .metrics_handle
+            .as_ref()
+            .map(metrics_exporter_prometheus::PrometheusHandle::render)
+            .unwrap_or_default();
+
+        RpcResponseBody::Diagnostics(DiagnosticsSnapshot {
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            active_sessions,
+            scheduler,
+            store_scan,
+            metrics_prometheus_text,
+        })
     }
 
     fn lookup(&self, session_id: SessionId) -> Option<Arc<SessionHandle>> {
@@ -114,6 +188,19 @@ impl HarnessRpcHandler {
                     .insert(session_id, 0);
                 RpcResponseBody::SessionCreated { session_id }
             }
+            // E1: a bounded-wait admission timeout surfaces as its own
+            // typed, retryable RPC error category — distinct from a
+            // generic integration failure, so a caller can tell "the
+            // server is full right now, back off and retry" apart from
+            // "this request is fundamentally broken."
+            Err(harness_engine::HarnessError::SessionManager(
+                harness_runtime::session_manager::SessionManagerError::AtCapacity(capacity_error),
+            )) => Self::error(
+                "session.at_capacity",
+                RpcErrorCategory::Capacity,
+                true,
+                capacity_error.to_string(),
+            ),
             Err(error) => Self::error(
                 "session.create_failed",
                 RpcErrorCategory::Integration,
@@ -237,6 +324,25 @@ impl HarnessRpcHandler {
         };
 
         let is_close = matches!(&command, MutationCommand::CloseSession);
+        // M1 re-verification (2026-08-07): `AdmissionResult` has distinct
+        // `AcceptedStarted`/`AcceptedQueued`/`AcceptedApplied` variants, but
+        // this handler previously collapsed every success to the generic
+        // `Accepted` regardless of which kind of mutation it was — the
+        // variants existed and round-tripped over the wire (see
+        // `admission.rs`'s own tests) but were never actually produced by
+        // the one real admission path. `Cancel`/`ResolvePermission`/
+        // `CloseSession` never start a run, so their success is
+        // unambiguously `AcceptedApplied` — cheap to get right with no new
+        // information needed. `Prompt`/`Steer`/`FollowUp` genuinely can
+        // start immediately *or* queue FIFO behind an active run, and
+        // `SessionClient`'s current methods don't return which (or a
+        // `run_id`) — distinguishing `AcceptedStarted`/`AcceptedQueued`
+        // correctly needs that plumbing added first, so they still report
+        // the honest, less specific `Accepted` rather than a made-up guess.
+        let is_run_less_mutation = matches!(
+            &command,
+            MutationCommand::Cancel | MutationCommand::ResolvePermission { .. } | MutationCommand::CloseSession
+        );
         let operation = match command {
             MutationCommand::Prompt(input) => handle.send_input(input).await,
             MutationCommand::Steer(input) => handle.steer_input(input).await,
@@ -249,12 +355,13 @@ impl HarnessRpcHandler {
         };
 
         let result = match operation {
+            Ok(()) if is_run_less_mutation => AdmissionResult::AcceptedApplied,
             Ok(()) => AdmissionResult::Accepted,
             Err(error) => AdmissionResult::RejectedInvalidState {
                 reason: error.to_string(),
             },
         };
-        let accepted = matches!(result, AdmissionResult::Accepted);
+        let accepted = matches!(result, AdmissionResult::Accepted | AdmissionResult::AcceptedApplied);
         let revision = if accepted {
             current_revision.saturating_add(1)
         } else {
@@ -379,6 +486,9 @@ impl RpcHandler for HarnessRpcHandler {
                 false,
                 "Subscribe must be handled by the transport",
             ),
+            RpcRequestBody::GetDiagnostics { include_store_scan } => {
+                self.get_diagnostics(include_store_scan).await
+            }
         }
     }
 

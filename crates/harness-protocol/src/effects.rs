@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendReference, ExecutionRequest};
+use crate::backend::{BackendReference, ExecutionParams, ExecutionRequest};
 use crate::commands::AgentResult;
 use crate::events::{AgentEvent, AgentEventEnvelope};
 use crate::ids::{AgentId, PermissionId, RunId, ToolCallId, ToolId};
@@ -82,6 +82,34 @@ pub struct SpawnAgentSpec {
     pub workspace: WorkspacePolicy,
     pub budget: AgentBudget,
     pub mode: SpawnMode,
+    /// M5: the child's initial prompt, sent as a `StartRun` immediately
+    /// after the child is registered (before an `AwaitResult` spawn blocks
+    /// on the child's completion). `None` preserves the pre-M5 behavior:
+    /// the child is created idle and something else (Rust orchestration
+    /// code) is responsible for sending it a command later — this is what
+    /// every construction site before M5 already did by hand via
+    /// `AgentSupervisor::child_commands`.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// M5: execution-param overrides (model, max_tokens, temperature, ...)
+    /// applied to the child at construction, before its first run — the
+    /// same mechanism `SessionCommand::ConfigureExecution` already applies
+    /// to an existing agent (`AgentState::execution_params`), just set
+    /// up-front instead of after. This is deliberately *not* routed through
+    /// `BackendPolicy::Explicit`: that path re-creates an entirely new
+    /// backend instance via `IntegrationRegistry::create`, which expects
+    /// each integration's own native config shape (API key, base URL, ...),
+    /// not a serialized `BackendReference` — so it only actually works
+    /// against a test double whose `create()` ignores its config argument,
+    /// never against a real registered integration. Overriding just the
+    /// *model* on the child's otherwise-inherited backend needs no new
+    /// backend instance at all — the existing `ExecutionParams.model` /
+    /// `GenericModelBackend` plumbing already forwards it correctly (M4).
+    /// Left `Default::default()` (i.e. every field unset) preserves the
+    /// pre-this-field behavior: nothing overridden, same as before it
+    /// existed.
+    #[serde(default)]
+    pub execution_params: ExecutionParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

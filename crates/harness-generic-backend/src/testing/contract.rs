@@ -16,6 +16,7 @@ fn request() -> ExecutionRequest {
         messages: Vec::new(),
         tools: Vec::new(),
         extended_thinking: false,
+        params: Default::default(),
     }
 }
 

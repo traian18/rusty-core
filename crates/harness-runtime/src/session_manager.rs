@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock};
 
@@ -47,6 +48,11 @@ pub enum SessionManagerError {
     },
     #[error("session {session} was removed but its final checkpoint failed to persist: {error}")]
     CloseCheckpointFailed { session: SessionId, error: String },
+    /// E1: no session-permit slot became available within the scheduler's
+    /// configured admission timeout — a typed, fail-fast rejection instead
+    /// of blocking the caller indefinitely at capacity.
+    #[error("session admission rejected: {0}")]
+    AtCapacity(#[from] crate::scheduler::CapacityError),
 }
 
 pub struct SessionManager {
@@ -85,6 +91,24 @@ impl SessionManager {
         self
     }
 
+    /// The shared scheduler this manager's sessions acquire permits from —
+    /// exposed for M6 diagnostics (`Scheduler::snapshot`); not otherwise
+    /// meant for callers to acquire permits through directly.
+    pub fn scheduler(&self) -> Arc<Scheduler> {
+        self.scheduler.clone()
+    }
+
+    /// Number of sessions currently tracked as active by this manager.
+    pub async fn active_session_count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    /// E1: bounded-wait admission — waits up to the scheduler's configured
+    /// `admission_timeout` for a session slot, then returns
+    /// `SessionManagerError::AtCapacity` instead of blocking the caller
+    /// indefinitely once `max_active_sessions` is reached. Callers that
+    /// truly want to wait forever (mostly tests) should acquire a permit
+    /// themselves via `Scheduler::acquire_session_permit` first.
     pub async fn create_session(
         &self,
         backend: Arc<dyn ExecutionBackend>,
@@ -92,8 +116,8 @@ impl SessionManager {
         workspace: Arc<dyn Workspace>,
         event_sink: Arc<dyn EventSink>,
         root_toolset: AgentToolset,
-    ) -> Arc<SessionRuntime> {
-        let session_permit = self.scheduler.acquire_session_permit().await;
+    ) -> Result<Arc<SessionRuntime>, SessionManagerError> {
+        let session_permit = self.scheduler.try_acquire_session_permit().await?;
         let session_id = SessionId::new();
         let runtime = Arc::new(SessionRuntime::new_with_scheduler(
             session_id,
@@ -132,7 +156,7 @@ impl SessionManager {
         }
 
         Self::supervise(session_id, &runtime);
-        runtime
+        Ok(runtime)
     }
 
     fn supervise(session_id: SessionId, runtime: &Arc<SessionRuntime>) {
@@ -191,6 +215,52 @@ impl SessionManager {
             });
         }
         Ok(())
+    }
+
+    /// E3: closes every currently-active session, each through the exact
+    /// same `close_session` path (checkpoint-then-shutdown, exactly once,
+    /// never silently skipped) — the drain step the daemon's shutdown
+    /// listener previously had nothing to call. Bounded by `grace_period`
+    /// overall: sessions still open when the deadline passes are logged and
+    /// left as-is rather than letting one stuck session hang the whole
+    /// shutdown indefinitely. Returns the ids of sessions that failed to
+    /// close cleanly (checkpoint failure) or didn't finish before the grace
+    /// period — both cases the caller should treat as "not confirmed
+    /// durable," not as "lost silently," since `close_session` itself
+    /// already guarantees no *duplicate* or *lost* terminal event even on
+    /// checkpoint failure.
+    pub async fn close_all_sessions(&self, grace_period: Duration) -> Vec<SessionId> {
+        let ids: Vec<SessionId> = self.sessions.read().await.keys().copied().collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+
+        let closes = ids.iter().map(|&id| {
+            let manager_self = self;
+            async move {
+                match tokio::time::timeout(grace_period, manager_self.close_session(id)).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => {
+                        tracing::error!(%id, %error, "session did not close cleanly during shutdown drain");
+                        Some(id)
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            %id,
+                            ?grace_period,
+                            "session did not finish closing within the shutdown grace period"
+                        );
+                        Some(id)
+                    }
+                }
+            }
+        });
+
+        futures::future::join_all(closes)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Restores a session without replaying external side effects.
@@ -328,15 +398,24 @@ impl Default for SessionManager {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use harness_protocol::backend::{ExecutionResult};
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use harness_protocol::backend::{
+        BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent, ExecutionRequest,
+        ExecutionResult,
+    };
     use harness_protocol::events::AgentEventEnvelope;
-    use harness_protocol::ids::RequestId;
+    use harness_protocol::ids::{BackendId, RequestId};
     use harness_protocol::usage::{Cost, ModelUsage};
-    use harness_session_store::testing::MemoryStore;
+    use harness_session_store::testing::{FaultInjectingStore, MemoryStore};
 
+    use crate::integration::IntegrationFactory;
     use crate::session_runtime::SessionStatus;
     use crate::testing::{FakeBackend, FakeToolRegistry};
+    use crate::traits::ExecutionBackend;
     use crate::workspace::FakeWorkspace;
 
     use super::*;
@@ -375,7 +454,8 @@ mod tests {
                     tools: HashMap::new(),
                 },
             )
-            .await;
+            .await
+            .expect("create_session should succeed under default (non-exhausted) capacity");
 
         let snapshot = runtime.state_snapshot();
         assert_eq!(snapshot.status, SessionStatus::Failed);
@@ -401,7 +481,8 @@ mod tests {
                     tools: HashMap::new(),
                 },
             )
-            .await;
+            .await
+            .expect("create_session should succeed under default (non-exhausted) capacity");
         assert_eq!(runtime.state_snapshot().status, SessionStatus::Idle);
 
         let ids = manager.active_session_ids().await;
@@ -458,7 +539,8 @@ mod tests {
                     tools: HashMap::new(),
                 },
             )
-            .await;
+            .await
+            .expect("create_session should succeed under default (non-exhausted) capacity");
         let session_id = runtime.session_id;
         let root_agent_id = runtime.state_snapshot().root_agent_id;
 
@@ -572,6 +654,554 @@ mod tests {
             sequences.len(),
             before_dedup,
             "no durable event may duplicate another event's session sequence"
+        );
+    }
+
+    /// E3: the daemon-shutdown-drain scenario, exercised at the
+    /// `SessionManager` level (the actual logic `apps/harnessd/src/main.rs`
+    /// calls into) rather than by faking the whole binary. Two sessions —
+    /// one idle, one with a genuinely in-flight run — must both end up
+    /// durably checkpointed after one `close_all_sessions` call, and the
+    /// manager must report zero active sessions afterward.
+    #[tokio::test]
+    async fn close_all_sessions_drains_every_active_session_including_one_mid_run() {
+        let store = Arc::new(MemoryStore::new());
+        let manager = SessionManager::new_with_store(
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+            Some(store.clone()),
+        );
+
+        // Session A: idle, never sent a prompt.
+        let idle_runtime = manager
+            .create_session(
+                Arc::new(FakeBackend::new()),
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+                AgentToolset { tools: HashMap::new() },
+            )
+            .await
+            .expect("create_session should succeed");
+        let idle_id = idle_runtime.session_id;
+
+        // Session B: a run genuinely in flight at drain time.
+        let busy_runtime = manager
+            .create_session(
+                Arc::new(FakeBackend::new().blocking_until_cancelled()),
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+                AgentToolset { tools: HashMap::new() },
+            )
+            .await
+            .expect("create_session should succeed");
+        let busy_id = busy_runtime.session_id;
+        let busy_root_agent_id = busy_runtime.state_snapshot().root_agent_id;
+        busy_runtime
+            .send_command(crate::session_runtime::SessionCommand::Prompt(
+                harness_protocol::commands::UserInput {
+                    text: "still running when shutdown drains this session".into(),
+                    attachments: vec![],
+                },
+            ))
+            .await
+            .expect("prompt should be accepted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if busy_runtime.agent_live_state(busy_root_agent_id).status
+                    == harness_protocol::commands::AgentStatus::PreparingContext
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run should reach PreparingContext before the drain races it");
+
+        assert_eq!(manager.active_session_count().await, 2);
+
+        // The actual E3 call: one bulk drain, bounded by a grace period —
+        // must not hang on the still-running session B.
+        let unclosed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.close_all_sessions(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("close_all_sessions must not hang past its own grace period");
+
+        assert!(
+            unclosed.is_empty(),
+            "both sessions' initial checkpoints are healthy; neither close should fail: {unclosed:?}"
+        );
+        assert_eq!(
+            manager.active_session_count().await,
+            0,
+            "no session may remain tracked as active after a full drain"
+        );
+
+        // Both sessions must be durably present in the store — the idle one
+        // via its initial checkpoint, the busy one via its (still pending at
+        // drain time) eventual terminal event, exactly like the single-
+        // session close race test above proves for one session at a time.
+        assert!(
+            !store.raw_records(idle_id).await.expect("idle session must be loadable").is_empty(),
+            "the idle session's initial checkpoint must be durable"
+        );
+        let busy_raw = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let raw = store.raw_records(busy_id).await.expect("busy session must be loadable");
+                let has_terminal = raw.iter().any(|record| matches!(
+                    record,
+                    harness_session_store::RawRecord::Event(event)
+                        if matches!(event.envelope.event, harness_protocol::events::AgentEvent::Completed { .. })
+                ));
+                if has_terminal {
+                    return raw;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the busy session's cancellation must still be durably committed after the drain");
+        let terminal_events = busy_raw
+            .iter()
+            .filter(|record| matches!(
+                record,
+                harness_session_store::RawRecord::Event(event)
+                    if matches!(event.envelope.event, harness_protocol::events::AgentEvent::Completed { .. })
+            ))
+            .count();
+        assert_eq!(
+            terminal_events, 1,
+            "the drained in-flight session must commit exactly one terminal event"
+        );
+    }
+
+    /// M2: subscriber lag/reconnect at the `SessionManager`/store level —
+    /// distinct from the transport-level `Subscribe { since_seq }` tests,
+    /// which cover backlog replay through an RPC connection. This proves
+    /// the underlying guarantee those transport tests build on: a live
+    /// subscriber that falls behind the session event bus's bounded
+    /// broadcast channel (capacity 256) and misses messages
+    /// (`RecvError::Lagged`) can still recover a complete, gap-free,
+    /// duplicate-free view of every *durable* event via
+    /// `SessionStore::events_since` — ephemeral events (e.g. streamed text
+    /// deltas) genuinely are not recoverable this way, which is the
+    /// documented, intentional durability boundary (see the README's
+    /// durability table), not a bug this test should paper over.
+    #[tokio::test]
+    async fn a_lagging_subscriber_recovers_the_full_durable_backlog_via_events_since() {
+        let store = Arc::new(MemoryStore::new());
+        let manager = SessionManager::new_with_store(
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+            Some(store.clone()),
+        );
+
+        // A backend that streams far more deltas than the event bus's
+        // 256-capacity broadcast channel, so a subscriber that never reads
+        // is guaranteed to lag.
+        let request_id = RequestId::new();
+        let mut events = Vec::new();
+        for i in 0..500 {
+            events.push(harness_protocol::backend::ExecutionEvent::TextDelta {
+                request_id,
+                delta: format!("chunk {i} "),
+            });
+        }
+        let backend = Arc::new(FakeBackend::new().with_events(events).with_result(ExecutionResult {
+            request_id,
+            usage: ModelUsage::default(),
+            cost: Cost::default(),
+            finish_reason: "end_turn".into(),
+        }));
+
+        let runtime = manager
+            .create_session(
+                backend,
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+                AgentToolset { tools: HashMap::new() },
+            )
+            .await
+            .expect("create_session should succeed");
+        let session_id = runtime.session_id;
+        let root_agent_id = runtime.state_snapshot().root_agent_id;
+
+        // Subscribe, then deliberately never read while the flood of
+        // deltas is produced — the realistic "client fell behind" scenario.
+        let mut rx = runtime.event_bus.subscribe();
+
+        runtime
+            .send_command(crate::session_runtime::SessionCommand::Prompt(
+                harness_protocol::commands::UserInput {
+                    text: "flood the event bus".into(),
+                    attachments: vec![],
+                },
+            ))
+            .await
+            .expect("prompt should be accepted");
+
+        // Wait for the run to actually finish before touching the
+        // subscriber at all, so the lag is unambiguous rather than racing
+        // completion. FakeBackend paces each scripted event by STEP_DELAY
+        // (2ms) to simulate real streaming latency, so 500 events take on
+        // the order of ~1-2s — generous headroom above that here. Polling
+        // live `agent_live_state` (not the store) for a recorded outcome
+        // avoids the terminal-event/snapshot-compaction ambiguity the
+        // close-race test above has to work around — durability is
+        // verified separately below, this is purely "has the run finished."
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if runtime.agent_live_state(root_agent_id).last_outcome.is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the flooded run should complete");
+
+        // The subscriber must now observe a lag — proving the test actually
+        // exercises the scenario it claims to, not a false-positive no-op.
+        let mut observed_lag = false;
+        loop {
+            match rx.try_recv() {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    observed_lag = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            observed_lag,
+            "500 streamed deltas must overflow the 256-capacity event bus and lag this subscriber"
+        );
+
+        // Recovery: fetch the complete durable backlog from sequence 0 —
+        // must include the full lifecycle (RunStarted...Completed) with no
+        // gaps, regardless of how much the live broadcast channel dropped.
+        let backlog = store.events_since(session_id, 0).await.expect("events_since should succeed");
+        assert!(
+            backlog.iter().any(|event| matches!(event.envelope.event, harness_protocol::events::AgentEvent::RunStarted { .. })),
+            "durable backlog must include RunStarted"
+        );
+        assert!(
+            backlog.iter().any(|event| matches!(event.envelope.event, harness_protocol::events::AgentEvent::Completed { .. })),
+            "durable backlog must include the terminal Completed event"
+        );
+
+        // No duplicate/out-of-order sequences in the recovered backlog.
+        let mut sequences: Vec<u64> = backlog
+            .iter()
+            .filter_map(|event| event.session_sequence)
+            .collect();
+        let before_dedup = sequences.len();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), before_dedup, "events_since must never return a duplicate sequence");
+
+        // A fresh subscription after recovery sees new work cleanly, with
+        // no overlap/gap relative to what events_since already delivered.
+        let last_recovered_seq = backlog.iter().filter_map(|event| event.session_sequence).max().unwrap_or(0);
+        let mut fresh_rx = runtime.event_bus.subscribe();
+        runtime
+            .send_command(crate::session_runtime::SessionCommand::Prompt(
+                harness_protocol::commands::UserInput {
+                    text: "a second, normal prompt after recovery".into(),
+                    attachments: vec![],
+                },
+            ))
+            .await
+            .expect("second prompt should be accepted");
+        let next_run_started_seq = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(envelope) = fresh_rx.recv().await {
+                    if matches!(envelope.event, harness_protocol::events::AgentEvent::RunStarted { .. }) {
+                        return envelope.session_sequence.expect("durable event must carry a sequence");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the second run's RunStarted should arrive on the fresh subscription");
+        assert!(
+            next_run_started_seq > last_recovered_seq,
+            "the fresh subscription's events must continue strictly after the recovered backlog, \
+             with no gap and no overlap (recovered up to {last_recovered_seq}, next live event at {next_run_started_seq})"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Engine-level crash/restart fixture (M2 remaining item)
+    // -----------------------------------------------------------------
+
+    /// A [`FakeBackend`]-backed [`ExecutionBackend`] that counts how many
+    /// times `execute` is actually invoked, so a test can assert a run was
+    /// never silently replayed.
+    struct CountingBackend {
+        calls: Arc<AtomicUsize>,
+        inner: FakeBackend,
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for CountingBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                id: BackendId::new(),
+                name: self.name.to_string(),
+                description: "A call-counting scripted backend used for testing.".to_string(),
+                capabilities: self.capabilities(),
+            }
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute(request, sink, cancel).await
+        }
+    }
+
+    /// Re-creates a [`CountingBackend`] on demand so `restore_session` can
+    /// reconstruct the root agent's backend, matched purely by descriptor
+    /// name (the same fallback path a real restart takes, since the
+    /// original session was never given a real registered integration id —
+    /// see `SessionRuntime::new_with_scheduler`, which always mints a fresh
+    /// random `IntegrationId`).
+    struct CountingBackendFactory {
+        id: &'static str,
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IntegrationFactory for CountingBackendFactory {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                id: BackendId::new(),
+                name: self.name.to_string(),
+                description: "restart-time backend factory".to_string(),
+                capabilities: BackendCapabilities::default(),
+            }
+        }
+
+        async fn create(
+            &self,
+            _config: serde_json::Value,
+        ) -> Result<Arc<dyn ExecutionBackend>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Arc::new(CountingBackend {
+                calls: self.calls.clone(),
+                inner: noop_backend_inner(),
+                name: self.name,
+            }))
+        }
+    }
+
+    fn noop_backend_inner() -> FakeBackend {
+        let request_id = RequestId::new();
+        FakeBackend::new().with_result(ExecutionResult {
+            request_id,
+            usage: ModelUsage::default(),
+            cost: Cost::default(),
+            finish_reason: "end_turn".into(),
+        })
+    }
+
+    /// Simulates a process crash (no graceful `close_session`) and restart:
+    /// a fresh `SessionManager` restores the session from the same backing
+    /// store via `restore_session`, and the fixture proves two things a
+    /// commit-boundary-only test cannot:
+    ///
+    /// 1. **No side effects are replayed.** The original backend's call
+    ///    counter stops advancing the instant the process "crashes"; restore
+    ///    never invokes the original backend again, and the freshly
+    ///    re-created backend's own counter stays at zero throughout restore
+    ///    itself (it is only ever invoked by a genuinely new prompt sent
+    ///    afterward).
+    /// 2. **State is correctly reconstructed.** The restored runtime is not
+    ///    just structurally present — it is immediately usable: a brand
+    ///    new prompt against it drives a full run to completion, which is
+    ///    only possible if the deterministic core's reconstructed
+    ///    `AgentState` (status, transition sequence, message history) is
+    ///    actually valid input to the state machine, not merely deserialized.
+    #[tokio::test]
+    async fn a_restored_session_replays_no_side_effects_and_is_immediately_usable() {
+        const BACKEND_NAME: &str = "crash-restart-fake-backend";
+
+        let backing_store = Arc::new(MemoryStore::new());
+        let store: Arc<dyn SessionStore> =
+            Arc::new(FaultInjectingStore::new(backing_store.clone()));
+
+        let original_calls = Arc::new(AtomicUsize::new(0));
+        let original_backend = Arc::new(CountingBackend {
+            calls: original_calls.clone(),
+            inner: noop_backend_inner(),
+            name: BACKEND_NAME,
+        });
+
+        let manager_before_crash = SessionManager::new_with_store(
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+            Some(store.clone()),
+        );
+
+        let session_id = {
+            let runtime = manager_before_crash
+                .create_session(
+                    original_backend.clone(),
+                    Arc::new(FakeToolRegistry::new()),
+                    Arc::new(FakeWorkspace::new()),
+                    Arc::new(NoopSink),
+                    AgentToolset { tools: HashMap::new() },
+                )
+                .await
+                .expect("create_session should succeed");
+            let session_id = runtime.session_id;
+            let root_agent_id = runtime.state_snapshot().root_agent_id;
+
+            runtime
+                .send_command(crate::session_runtime::SessionCommand::Prompt(
+                    harness_protocol::commands::UserInput {
+                        text: "before the crash".into(),
+                        attachments: vec![],
+                    },
+                ))
+                .await
+                .expect("prompt should be accepted");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if runtime.agent_live_state(root_agent_id).last_outcome.is_some() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the pre-crash run should complete");
+
+            session_id
+            // `runtime` (and `manager_before_crash`'s only handle to it) is
+            // dropped here without ever calling `close_session` — a crash,
+            // not a graceful shutdown. Whatever the run's own terminal
+            // checkpoint already made durable is all restore has to work
+            // with.
+        };
+
+        assert_eq!(
+            original_calls.load(Ordering::SeqCst),
+            1,
+            "the pre-crash run must have called the original backend exactly once"
+        );
+        let sequence_at_crash = store
+            .current_sequence(session_id)
+            .await
+            .expect("current_sequence should succeed");
+
+        // "Restart": a brand new manager, integration registry, and backend
+        // factory over the *same* backing store — nothing here is shared
+        // with `manager_before_crash` except the durable data.
+        let integrations = Arc::new(IntegrationRegistry::new());
+        let restart_calls = Arc::new(AtomicUsize::new(0));
+        integrations
+            .register(Arc::new(CountingBackendFactory {
+                id: "crash-restart-integration",
+                name: BACKEND_NAME,
+                calls: restart_calls.clone(),
+            }))
+            .expect("register restart-time backend factory");
+
+        let manager_after_restart = SessionManager::new_with_store(
+            Arc::new(Scheduler::new(SchedulerConfig::default())),
+            Some(store.clone()),
+        );
+
+        let restored = manager_after_restart
+            .restore_session(
+                session_id,
+                integrations,
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+            )
+            .await
+            .expect("restore_session should reconstruct the crashed session");
+
+        // No side effects replayed: restoring never re-invokes the original
+        // backend, and the freshly re-created backend was not invoked
+        // either — restore only reduces stored events onto the migrated
+        // snapshot, it does not re-run the agent.
+        assert_eq!(
+            original_calls.load(Ordering::SeqCst),
+            1,
+            "restore must never call the original (pre-crash) backend again"
+        );
+        assert_eq!(
+            restart_calls.load(Ordering::SeqCst),
+            0,
+            "restore must not invoke the newly re-created backend either — no run is replayed"
+        );
+
+        // Restore is read-only with respect to durable history: it must not
+        // fabricate or duplicate any event just by reconstructing state.
+        assert_eq!(
+            store.current_sequence(session_id).await.expect("current_sequence should succeed"),
+            sequence_at_crash,
+            "restore must not append or duplicate any durable record"
+        );
+
+        // State was correctly reconstructed, not just structurally present:
+        // the snapshot identifies the same session/root agent, ...
+        let snapshot = restored.state_snapshot();
+        assert_eq!(snapshot.session_id, session_id);
+        assert_eq!(snapshot.agent_count, 1);
+
+        // ...and the restored runtime is immediately usable — a genuinely
+        // new prompt drives a full run to completion, which is only
+        // possible if the reconstructed `AgentState` (status, transition
+        // sequence, message history) is valid input to the deterministic
+        // core, not merely deserialized bytes.
+        let root_agent_id = snapshot.root_agent_id;
+        restored
+            .send_command(crate::session_runtime::SessionCommand::Prompt(
+                harness_protocol::commands::UserInput {
+                    text: "after the restart".into(),
+                    attachments: vec![],
+                },
+            ))
+            .await
+            .expect("prompt after restore should be accepted");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if restored.agent_live_state(root_agent_id).last_outcome.is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-restart run should complete");
+
+        assert_eq!(
+            restart_calls.load(Ordering::SeqCst),
+            1,
+            "the post-restart prompt must run against the newly re-created backend exactly once"
         );
     }
 }

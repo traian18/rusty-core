@@ -119,10 +119,12 @@ async fn two_sessions_stream_concurrently_without_cross_talk() {
 
     let sess_a = manager
         .create_session(backend_a, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
-        .await;
+        .await
+        .expect("create_session should succeed");
     let sess_b = manager
         .create_session(backend_b, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
-        .await;
+        .await
+        .expect("create_session should succeed");
 
     // Subscribe to each session's event bus.
     let mut rx_a = sess_a.event_bus.subscribe();
@@ -232,10 +234,12 @@ async fn cancelling_one_session_does_not_cancel_another() {
 
     let sess_a = manager
         .create_session(backend_a, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
-        .await;
+        .await
+        .expect("create_session should succeed");
     let sess_b = manager
         .create_session(backend_b, registry.clone(), workspace.clone(), sink.clone(), empty_toolset())
-        .await;
+        .await
+        .expect("create_session should succeed");
 
     let id_a = sess_a.session_id;
     let id_b = sess_b.session_id;
@@ -343,7 +347,8 @@ async fn one_session_panic_marks_only_that_session_failed() {
             Arc::new(PanicSink),
             empty_toolset(),
         )
-        .await;
+        .await
+        .expect("create_session should succeed");
 
     // Session B: normal.
     let backend_b = Arc::new(make_scripted_backend("B"));
@@ -355,7 +360,8 @@ async fn one_session_panic_marks_only_that_session_failed() {
             Arc::new(NoopSink),
             empty_toolset(),
         )
-        .await;
+        .await
+        .expect("create_session should succeed");
 
     let id_a = sess_a.session_id;
     let id_b = sess_b.session_id;
@@ -711,4 +717,66 @@ async fn shared_access_allows_concurrent_holders_while_blocking_exclusive() {
         .expect("session C exclusive should succeed after all shared holders release");
 
     rm.release(key, sid_c).await;
+}
+
+// ===========================================================================
+// E1 — typed capacity rejection instead of indefinite blocking
+// ===========================================================================
+
+/// At `max_active_sessions: 1` with a short `admission_timeout`, a second
+/// `create_session` call while the first session is still open must reject
+/// typed (`SessionManagerError::AtCapacity`) *promptly* — bounded by the
+/// configured timeout, not hanging until the caller gives up or the process
+/// is killed. This is the concrete fix for the E1 finding: previously
+/// `Scheduler::acquire_session_permit` was a plain unconditional `.await` on
+/// a semaphore, so the caller had no way to distinguish "slow" from "will
+/// never complete."
+#[tokio::test]
+async fn create_session_rejects_typed_when_at_capacity_instead_of_hanging() {
+    let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+        max_active_sessions: 1,
+        admission_timeout: Duration::from_millis(150),
+        ..SchedulerConfig::default()
+    }));
+    let manager = SessionManager::new(scheduler);
+
+    // Occupy the one available session slot.
+    let _first = manager
+        .create_session(
+            Arc::new(FakeBackend::new()),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            empty_toolset(),
+        )
+        .await
+        .expect("first create_session should succeed — the slot is free");
+
+    // The second attempt must fail typed, and must do so within a bounded
+    // window well under "hangs forever" — proving the timeout is actually
+    // enforced, not just declared.
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.create_session(
+            Arc::new(FakeBackend::new()),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            empty_toolset(),
+        ),
+    )
+    .await
+    .expect("create_session must return well within the outer 2s test timeout, not hang");
+    let elapsed = start.elapsed();
+
+    match &result {
+        Err(harness_runtime::session_manager::SessionManagerError::AtCapacity(_)) => {}
+        Ok(_) => panic!("expected a typed AtCapacity rejection, got Ok — capacity was not enforced"),
+        Err(other) => panic!("expected AtCapacity, got a different error: {other}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "rejection took {elapsed:?}, expected it to be bounded by the ~150ms admission_timeout"
+    );
 }

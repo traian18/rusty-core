@@ -80,9 +80,29 @@ impl HostDependencyResolver for HostRestoreResolver {
         }
 
         for integration in &metadata.integration_references {
-            match self.integrations.get(integration) {
-                Ok(Some(_)) => report.resolved(DependencyKind::Integration, integration),
-                _ => report.missing(DependencyKind::Integration, integration),
+            // A snapshot's `integration_references` entries encode
+            // `"{integration_id}::{descriptor_name}"` (see
+            // `checkpoint_snapshot` in session_runtime.rs) so a random
+            // per-session `IntegrationId` that was never itself registered
+            // can still resolve — by the same descriptor-name fallback
+            // `restore_session`'s backend-recreation step already uses.
+            // Older/synthetic entries with no `::` suffix fall back to the
+            // original direct-id-only lookup, unchanged.
+            let (id_part, name_part) = match integration.split_once("::") {
+                Some((id, name)) => (id, Some(name)),
+                None => (integration.as_str(), None),
+            };
+            let resolved = match self.integrations.get(id_part) {
+                Ok(Some(_)) => true,
+                _ => match name_part {
+                    Some(name) => matches!(self.integrations.id_for_descriptor_name(name), Ok(Some(_))),
+                    None => false,
+                },
+            };
+            if resolved {
+                report.resolved(DependencyKind::Integration, integration);
+            } else {
+                report.missing(DependencyKind::Integration, integration);
             }
         }
 

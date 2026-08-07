@@ -67,6 +67,22 @@ pub enum RpcRequestBody {
     },
     Snapshot,
     Subscribe { since_seq: Option<u64> },
+    /// M6: operational health/diagnostics + a Prometheus text metrics
+    /// snapshot, over the same RPC transports every other request uses —
+    /// deliberately not a separate HTTP `/metrics` listener, so exposing
+    /// this needs no new port/surface beyond what a host already accepts.
+    /// Not session-scoped (`session_id` is ignored, like `Hello`/
+    /// `ListSessions`).
+    GetDiagnostics {
+        /// When `true`, additionally scans the durable store for
+        /// consistency issues (`harness_session_store::diagnose_store`) and
+        /// includes a summary count. Off by default because a full store
+        /// scan reads every session's record stream — cheap for a handful
+        /// of sessions, not something a health-check-frequency caller
+        /// should request on every call against a large store.
+        #[serde(default)]
+        include_store_scan: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +186,40 @@ pub enum RpcResponseBody {
     },
     Ack,
     Failure(RpcError),
+    Diagnostics(DiagnosticsSnapshot),
+}
+
+/// One permit kind's point-in-time capacity/utilization — the wire
+/// projection of `harness_runtime::scheduler::PermitSnapshot`, kept as a
+/// separate type here so `harness-protocol` never depends on
+/// `harness-runtime`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermitDiagnostic {
+    pub kind: String,
+    pub capacity: usize,
+    pub in_use: usize,
+}
+
+/// Summary (not per-session detail — see `GetDiagnostics::include_store_scan`)
+/// of a durable-store consistency scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreScanSummary {
+    pub total_sessions: usize,
+    pub unreadable_sessions: usize,
+    pub sessions_with_issues: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticsSnapshot {
+    pub uptime_secs: u64,
+    pub active_sessions: usize,
+    pub scheduler: Vec<PermitDiagnostic>,
+    /// `None` unless `GetDiagnostics::include_store_scan` was `true`.
+    pub store_scan: Option<StoreScanSummary>,
+    /// Rendered Prometheus text exposition format — see
+    /// `docs/production-readiness-roadmap.md`'s M6 section for why this
+    /// rides the RPC contract instead of a dedicated HTTP listener.
+    pub metrics_prometheus_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

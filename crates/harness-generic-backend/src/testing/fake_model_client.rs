@@ -1,5 +1,6 @@
 //! Scripted provider-neutral model client used by backend contract tests.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,6 +19,12 @@ pub struct FakeModelClient {
     result: Option<ModelResult>,
     error: Option<ModelError>,
     block_until_cancelled: bool,
+    capabilities: Option<ModelCapabilities>,
+    /// Records the last `ModelRequest` this client was actually invoked
+    /// with, so contract tests can assert that `GenericModelBackend`
+    /// forwarded the right model/max_tokens/temperature/... rather than
+    /// only checking that *some* request arrived.
+    last_request: Arc<Mutex<Option<ModelRequest>>>,
 }
 
 impl FakeModelClient {
@@ -26,12 +33,22 @@ impl FakeModelClient {
     pub fn with_result(mut self, result: ModelResult) -> Self { self.result = Some(result); self }
     pub fn with_error(mut self, error: ModelError) -> Self { self.error = Some(error); self }
     pub fn block_until_cancelled(mut self) -> Self { self.block_until_cancelled = true; self }
+    /// Override the advertised capabilities (default: everything enabled).
+    /// Used to exercise `GenericModelBackend`'s pre-flight capability checks.
+    pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+    /// The `ModelRequest` this client last saw, if `stream` has been called.
+    pub fn last_request(&self) -> Option<ModelRequest> {
+        self.last_request.lock().expect("last_request mutex poisoned").clone()
+    }
 }
 
 #[async_trait]
 impl ModelClient for FakeModelClient {
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities { streaming: true, reasoning: true, tool_calls: true, parallel_tool_calls: true }
+        self.capabilities.unwrap_or(ModelCapabilities { streaming: true, reasoning: true, tool_calls: true, parallel_tool_calls: true, images: true })
     }
 
     async fn stream(
@@ -40,6 +57,7 @@ impl ModelClient for FakeModelClient {
         events: broadcast::Sender<ModelEvent>,
         cancel: CancellationToken,
     ) -> Result<ModelResult, ModelError> {
+        *self.last_request.lock().expect("last_request mutex poisoned") = Some(_request.clone());
         if self.block_until_cancelled {
             cancel.cancelled().await;
             return Err(ModelError::Cancelled);

@@ -13,9 +13,10 @@ async-trait = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-tls", "gzip", "deflate", "brotli", "zstd"] }
 html2text = { workspace = true }
 futures = { workspace = true }
+bytes = { workspace = true }
 harness-tools = { path = "../../harness-tools" }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

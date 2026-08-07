@@ -161,6 +161,98 @@ async fn anthropic_backend_runs_a_fixture_backed_session() {
 }
 
 
+/// Starts a one-shot fixture server that captures the raw request bytes it
+/// received into `captured` before replying with `body`, for tests that
+/// need to inspect the outgoing wire request rather than just the parsed
+/// response.
+async fn start_capturing_fixture_server(
+    body: &'static str,
+    captured: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture server");
+    let address = listener.local_addr().expect("fixture server address");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept fixture request");
+        let request = read_http_request(&mut socket).await;
+        *captured.lock().expect("captured request mutex poisoned") = Some(request);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write fixture response");
+        socket.shutdown().await.expect("close fixture response");
+    });
+
+    format!("http://{address}")
+}
+
+/// M4: `ExecutionParams::provider_options["anthropic"]` must actually reach
+/// the outgoing Anthropic Messages API request body — this is the wire-level
+/// proof that `merge_provider_options` is really wired into
+/// `AnthropicClient::stream`, not just unit-tested in isolation.
+#[tokio::test]
+async fn provider_options_reach_the_outgoing_anthropic_request_body() {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let base_url = start_capturing_fixture_server(TEXT_RESPONSE_SSE, captured.clone()).await;
+    let mut config = AnthropicConfig::new("fixture-key");
+    config.base_url = base_url;
+    config.request_timeout = Duration::from_secs(5);
+
+    let session = Harness::new()
+        .session()
+        .backend(Arc::new(AnthropicBackend::new(config)))
+        .tools(Arc::new(NoTools))
+        .execution_params(harness_protocol::backend::ExecutionParams {
+            provider_options: serde_json::json!({"anthropic": {"top_k": 17}}),
+            ..Default::default()
+        })
+        .start()
+        .await
+        .expect("start Anthropic fixture session");
+
+    let mut events = session.subscribe();
+    session.send("Say hello").await.expect("send fixture prompt");
+
+    let mut completed = false;
+    for _ in 0..32 {
+        let envelope = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("session event timeout")
+            .expect("session event stream closed");
+        if let AgentEvent::Completed { outcome } = envelope.event {
+            assert_eq!(outcome, AgentOutcome::Success);
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "fixture session did not complete");
+
+    let raw_request = captured
+        .lock()
+        .expect("captured request mutex poisoned")
+        .clone()
+        .expect("fixture server must have captured a request");
+    let headers_end = raw_request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("captured request must have a header/body boundary");
+    let body: serde_json::Value =
+        serde_json::from_slice(&raw_request[headers_end + 4..]).expect("captured body must be valid JSON");
+    assert_eq!(
+        body.get("top_k"),
+        Some(&serde_json::json!(17)),
+        "provider_options[\"anthropic\"] must merge into the outgoing request body: {body}"
+    );
+}
+
 #[tokio::test]
 async fn registry_factory_constructs_a_session() {
     let harness = Harness::new();

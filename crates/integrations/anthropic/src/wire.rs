@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
 use harness_model::events::{ModelError, ModelEvent, ModelResult};
 use harness_protocol::ids::ToolCallId;
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
@@ -58,6 +59,19 @@ pub enum AnthropicContentBlock {
         tool_use_id: String,
         content: String,
     },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
+}
+
+/// Anthropic's Messages API image content block wire shape:
+/// `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`
+/// <https://docs.anthropic.com/en/api/messages> (vision).
+#[derive(Debug, Clone, Serialize)]
+pub struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,22 +97,24 @@ pub fn agent_message_to_anthropic(message: &AgentMessage) -> AnthropicMessage {
     let content = message
         .content
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => {
-                Some(AnthropicContentBlock::Text { text: text.clone() })
-            }
-            ContentBlock::ToolUse { call } => Some(AnthropicContentBlock::ToolUse {
+        .map(|block| match block {
+            ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
+            ContentBlock::ToolUse { call } => AnthropicContentBlock::ToolUse {
                 id: call.id.to_string(),
                 name: call.name.clone(),
                 input: call.arguments.clone(),
-            }),
-            ContentBlock::ToolResult { call_id, result } => {
-                Some(AnthropicContentBlock::ToolResult {
-                    tool_use_id: call_id.to_string(),
-                    content: result.output_preview.clone(),
-                })
-            }
-            ContentBlock::Image { .. } => None,
+            },
+            ContentBlock::ToolResult { call_id, result } => AnthropicContentBlock::ToolResult {
+                tool_use_id: call_id.to_string(),
+                content: result.output_preview.clone(),
+            },
+            ContentBlock::Image { mime_type, data } => AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    kind: "base64",
+                    media_type: mime_type.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                },
+            },
         })
         .collect();
     AnthropicMessage { role, content }
@@ -150,7 +166,7 @@ pub fn convert_messages_with_tool_ids(
             let wire_id = match block {
                 AnthropicContentBlock::ToolUse { id, .. } => Some(id),
                 AnthropicContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
-                AnthropicContentBlock::Text { .. } => None,
+                AnthropicContentBlock::Text { .. } | AnthropicContentBlock::Image { .. } => None,
             };
             if let Some(wire_id) = wire_id {
                 if let Ok(internal_id) = wire_id.parse::<ToolCallId>() {
@@ -512,6 +528,38 @@ fn merge_usage(previous: &ModelUsage, raw: &RawUsage) -> ModelUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_protocol::ids::{MessageId, Timestamp};
+    use harness_protocol::messages::{ContentBlock, MessageRole};
+
+    /// M4: an image content block must reach the wire as a real base64
+    /// `image` block — not be silently dropped, which was the pre-M4
+    /// behavior (`ContentBlock::Image { .. } => None`).
+    #[test]
+    fn image_content_block_becomes_a_real_anthropic_image_block() {
+        let message = AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::User,
+            content: vec![ContentBlock::Image {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3, 4],
+            }],
+            created_at: Timestamp::now(),
+        };
+
+        let converted = agent_message_to_anthropic(&message);
+        assert_eq!(converted.content.len(), 1, "image block must not be dropped");
+        match &converted.content[0] {
+            AnthropicContentBlock::Image { source } => {
+                assert_eq!(source.kind, "base64");
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(
+                    source.data,
+                    base64::engine::general_purpose::STANDARD.encode([1, 2, 3, 4])
+                );
+            }
+            other => panic!("expected an Image block, got {other:?}"),
+        }
+    }
 
     const FIXTURE: &str = r#"event: message_start
 data: {"message":{"model":"claude-sonnet-4-20250513","usage":{"input_tokens":2,"output_tokens":0}}}

@@ -579,3 +579,309 @@ fn unknown_usage_stays_none_through_a_full_run() {
     assert!(usage.input_tokens.is_unknown());
     assert_eq!(usage.output_tokens.value(), Some(0));
 }
+
+/// M3: a runaway or adversarial backend stream must not grow an assistant
+/// message's assembled text unbounded — `AgentState.messages` is held for
+/// the run's (and, once persisted, the session's) entire lifetime.
+#[test]
+fn assistant_text_accumulation_is_capped_across_many_deltas() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+
+    // Feed far more text than the cap across many separate deltas, the way
+    // a real streaming backend would deliver it incrementally.
+    let chunk = "x".repeat(64 * 1024);
+    for _ in 0..100 {
+        agent.apply(AgentCommand::BackendEvent {
+            run_id,
+            event: ExecutionEvent::TextDelta {
+                request_id: RequestId::new(),
+                delta: chunk.clone(),
+            },
+        });
+    }
+
+    let assistant_text: String = agent
+        .state
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // 100 * 64KiB = ~6.25MiB fed in, well past the 4MiB cap.
+    const MAX_ASSISTANT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+    const MARKER: &str = "\n... (truncated, exceeds assistant message size limit)";
+    assert!(
+        assistant_text.len() <= MAX_ASSISTANT_TEXT_BYTES + MARKER.len(),
+        "assembled assistant text must not exceed the cap plus marker, got {} bytes",
+        assistant_text.len()
+    );
+    assert!(
+        assistant_text.ends_with(MARKER),
+        "truncated assistant text must carry an explicit marker"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4: ConfigureExecution / ExecutionParams
+// ---------------------------------------------------------------------------
+
+#[test]
+fn configure_execution_is_a_pure_state_mutation_with_no_effects() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let effects = agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            model: Some("claude-opus-4-20250514".to_string()),
+            max_tokens: Some(8192),
+            ..Default::default()
+        },
+    });
+    assert!(effects.is_empty(), "ConfigureExecution must not produce effects");
+    assert_eq!(
+        agent.state.execution_params.model.as_deref(),
+        Some("claude-opus-4-20250514")
+    );
+    assert_eq!(agent.state.execution_params.max_tokens, Some(8192));
+}
+
+#[test]
+fn configured_execution_params_reach_the_next_runs_execution_request() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            model: Some("gpt-4.1".to_string()),
+            temperature: Some(0.3),
+            extended_thinking: Some(true),
+            ..Default::default()
+        },
+    });
+
+    let effects = agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "hello".into(),
+            attachments: vec![],
+        },
+    });
+    let request = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::ExecuteBackend { request } => Some(request),
+            _ => None,
+        })
+        .expect("StartRun must produce an ExecuteBackend effect");
+
+    assert_eq!(request.params.model.as_deref(), Some("gpt-4.1"));
+    assert_eq!(request.params.temperature, Some(0.3));
+    // The standalone `extended_thinking` bool mirrors `params.extended_thinking`
+    // for source compatibility with existing readers.
+    assert!(request.extended_thinking);
+}
+
+#[test]
+fn configure_execution_is_a_partial_update_that_preserves_unset_fields() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            model: Some("claude-sonnet-4-20250514".to_string()),
+            max_tokens: Some(4096),
+            ..Default::default()
+        },
+    });
+    // Second update only changes temperature; model/max_tokens must survive.
+    agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            temperature: Some(0.9),
+            ..Default::default()
+        },
+    });
+
+    assert_eq!(
+        agent.state.execution_params.model.as_deref(),
+        Some("claude-sonnet-4-20250514")
+    );
+    assert_eq!(agent.state.execution_params.max_tokens, Some(4096));
+    assert_eq!(agent.state.execution_params.temperature, Some(0.9));
+}
+
+#[test]
+fn default_execution_params_produce_the_prior_hardcoded_behavior() {
+    // Before M4, extended_thinking was hardcoded false and no model/params
+    // were ever forwarded. An agent that never receives ConfigureExecution
+    // must reproduce exactly that behavior.
+    let mut agent = create_agent(PermissionMode::Allow);
+    let effects = agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "hello".into(),
+            attachments: vec![],
+        },
+    });
+    let request = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::ExecuteBackend { request } => Some(request),
+            _ => None,
+        })
+        .expect("StartRun must produce an ExecuteBackend effect");
+
+    assert!(!request.extended_thinking);
+    assert_eq!(request.params, harness_protocol::backend::ExecutionParams::default());
+}
+
+// ---------------------------------------------------------------------------
+// M4: attachments
+// ---------------------------------------------------------------------------
+
+use harness_protocol::commands::Attachment;
+
+#[test]
+fn image_attachment_becomes_a_real_content_block_not_silently_dropped() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "what's in this image?".into(),
+            attachments: vec![Attachment {
+                mime_type: "image/png".to_string(),
+                data: vec![1, 2, 3, 4],
+            }],
+        },
+    });
+
+    let message = &agent.state.messages[0];
+    assert_eq!(message.content.len(), 2, "text block + image block, nothing dropped");
+    assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "what's in this image?"));
+    match &message.content[1] {
+        ContentBlock::Image { mime_type, data } => {
+            assert_eq!(mime_type, "image/png");
+            assert_eq!(data, &vec![1, 2, 3, 4]);
+        }
+        other => panic!("expected an Image block, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_image_attachment_becomes_a_visible_text_note_not_silently_dropped() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "see attached".into(),
+            attachments: vec![Attachment {
+                mime_type: "application/pdf".to_string(),
+                data: vec![0; 100],
+            }],
+        },
+    });
+
+    let message = &agent.state.messages[0];
+    assert_eq!(message.content.len(), 2);
+    assert!(matches!(
+        &message.content[1],
+        ContentBlock::Text { text } if text.contains("application/pdf") && text.contains("100 bytes")
+    ));
+}
+
+#[test]
+fn oversized_attachment_fails_the_run_instead_of_silently_truncating_image_bytes() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+    let effects = agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "too big".into(),
+            attachments: vec![Attachment {
+                mime_type: "image/png".to_string(),
+                data: vec![0; MAX_ATTACHMENT_BYTES + 1],
+            }],
+        },
+    });
+
+    assert_eq!(agent.state.status, AgentStatus::Failed);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        AgentEffect::Emit { event: AgentEvent::Failed { error } } if error.code == "ATTACHMENT_TOO_LARGE"
+    )));
+}
+
+// ---------------------------------------------------------------------------
+// `UsageLedger::runs` (M4/M5 total_runs counter)
+// ---------------------------------------------------------------------------
+
+/// A successfully completed run increments `usage.runs`, and that count is
+/// reflected in the very `FinishRun` effect the completing run itself emits
+/// — not just visible to some later run.
+#[test]
+fn a_successful_run_increments_the_runs_counter_in_its_own_finish_effect() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    assert_eq!(agent.usage.runs, 0);
+    let run_id = start(&mut agent);
+
+    let effects = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+    });
+
+    assert_eq!(agent.usage.runs, 1);
+    let finish_usage = effects.iter().find_map(|effect| match effect {
+        AgentEffect::FinishRun { result } => Some(result.usage.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        finish_usage.expect("a successful run must emit FinishRun").inclusive_usage.total_runs,
+        1,
+        "the completing run's own FinishRun effect must already report the incremented count"
+    );
+}
+
+/// A run that fails validation before any backend request is ever made
+/// still goes through `fail()` and so is still counted — see `UsageLedger::runs`'s
+/// doc comment for why that's the accepted, documented definition.
+#[test]
+fn a_run_rejected_by_validation_is_still_counted() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+    agent.apply(AgentCommand::StartRun {
+        input: UserInput {
+            text: "too big".into(),
+            attachments: vec![Attachment {
+                mime_type: "image/png".to_string(),
+                data: vec![0; MAX_ATTACHMENT_BYTES + 1],
+            }],
+        },
+    });
+    assert_eq!(agent.usage.runs, 1);
+}
+
+/// Cancellation does not emit `FinishRun` (see `Agent::cancel`'s doc
+/// comment) and so does not increment `usage.runs` — a cancelled run is not
+/// silently counted as a completed one.
+#[test]
+fn a_cancelled_run_does_not_increment_the_runs_counter() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    start(&mut agent);
+    let effects = agent.apply(AgentCommand::Cancel);
+    assert_eq!(agent.usage.runs, 0);
+    assert!(!effects.iter().any(|effect| matches!(effect, AgentEffect::FinishRun { .. })));
+}
+
+/// Two runs in sequence each increment the counter exactly once — it is a
+/// running total across the agent's lifetime, not a per-run flag.
+#[test]
+fn multiple_runs_accumulate_the_counter() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let first_run = start(&mut agent);
+    agent.apply(AgentCommand::BackendEvent {
+        run_id: first_run,
+        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+    });
+    assert_eq!(agent.usage.runs, 1);
+
+    let second_run = start(&mut agent);
+    agent.apply(AgentCommand::BackendEvent {
+        run_id: second_run,
+        event: ExecutionEvent::Completed { request_id: RequestId::new(), result: completed_result() },
+    });
+    assert_eq!(agent.usage.runs, 2);
+}

@@ -47,6 +47,7 @@ fn make_request() -> ExecutionRequest {
         messages: vec![],
         tools: vec![],
         extended_thinking: false,
+        params: Default::default(),
     }
 }
 
@@ -423,6 +424,151 @@ async fn test_error_normalization_timeout() {
         Err(ExecutionError::Timeout) => { /* expected */ }
         other => panic!("expected Timeout, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// M4: ExecutionParams forwarding and capability validation
+// ===========================================================================
+
+/// `GenericModelBackend::execute` must forward `request.params` into the
+/// `ModelRequest` given to the `ModelClient` verbatim — this is the entire
+/// fix for the pre-M4 bug where model/max_tokens/temperature/stop_sequences
+/// were silently hardcoded to `None`/empty regardless of what a caller
+/// configured.
+#[tokio::test]
+async fn execution_params_are_forwarded_to_the_model_client_unchanged() {
+    let client = FakeModelClient::new().with_result(ModelResult {
+        stop_reason: "end_turn".to_string(),
+        usage: Default::default(),
+        cost: Default::default(),
+    });
+    // Clone a handle to the same underlying recorder before moving the
+    // client into the backend (Arc<dyn ModelClient> erases the concrete
+    // type, so we can't downcast back out afterward).
+    let last_request_probe = client.clone();
+
+    let backend = GenericModelBackend::new(Arc::new(client));
+    let mut request = make_request();
+    request.extended_thinking = true;
+    request.params = harness_protocol::backend::ExecutionParams {
+        model: Some("claude-opus-4-20250514".to_string()),
+        max_tokens: Some(8192),
+        temperature: Some(0.4),
+        stop_sequences: vec!["STOP".to_string()],
+        reasoning_effort: Some(harness_protocol::backend::ReasoningEffort::High),
+        extended_thinking: Some(true),
+        provider_options: serde_json::json!({"anthropic": {"top_k": 40}}),
+    };
+
+    let (sink, _rx) = broadcast::channel(256);
+    let result = backend.execute(request, sink, CancellationToken::new()).await;
+    assert!(result.is_ok(), "execution should succeed: {result:?}");
+
+    let seen = last_request_probe
+        .last_request()
+        .expect("FakeModelClient::stream should have been called");
+    assert_eq!(seen.model.as_deref(), Some("claude-opus-4-20250514"));
+    assert_eq!(seen.max_tokens, Some(8192));
+    assert_eq!(seen.temperature, Some(0.4));
+    assert_eq!(seen.stop_sequences, vec!["STOP".to_string()]);
+    assert!(seen.extended_thinking);
+    assert_eq!(
+        seen.reasoning_effort,
+        Some(harness_protocol::backend::ReasoningEffort::High)
+    );
+    assert_eq!(seen.provider_options, serde_json::json!({"anthropic": {"top_k": 40}}));
+}
+
+/// A request that asks for reasoning against a model client that doesn't
+/// advertise it must be rejected with a typed `UnsupportedCapability` error
+/// *without* `ModelClient::stream` ever being called — proving the check
+/// happens before any (billable) network call.
+#[tokio::test]
+async fn reasoning_request_against_a_non_reasoning_model_is_rejected_before_dispatch() {
+    let client = FakeModelClient::new()
+        .with_capabilities(harness_model::request::ModelCapabilities {
+            streaming: true,
+            reasoning: false,
+            tool_calls: false,
+            parallel_tool_calls: false,
+            images: false,
+        })
+        .with_result(ModelResult::default());
+    let probe = client.clone();
+
+    let backend = GenericModelBackend::new(Arc::new(client));
+    let mut request = make_request();
+    request.extended_thinking = true;
+
+    let (sink, _rx) = broadcast::channel(256);
+    let result = backend.execute(request, sink, CancellationToken::new()).await;
+
+    match result {
+        Err(ExecutionError::UnsupportedCapability { capability, .. }) => {
+            assert_eq!(capability, "reasoning");
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+    assert!(
+        probe.last_request().is_none(),
+        "stream() must never be called for a capability-rejected request"
+    );
+}
+
+/// Same shape, but for tool calls against a model client that doesn't
+/// support them.
+#[tokio::test]
+async fn tool_call_request_against_a_non_tool_model_is_rejected_before_dispatch() {
+    let client = FakeModelClient::new()
+        .with_capabilities(harness_model::request::ModelCapabilities {
+            streaming: true,
+            reasoning: false,
+            tool_calls: false,
+            parallel_tool_calls: false,
+            images: false,
+        })
+        .with_result(ModelResult::default());
+    let probe = client.clone();
+
+    let backend = GenericModelBackend::new(Arc::new(client));
+    let mut request = make_request();
+    request.tools = vec![harness_protocol::tools::ToolDescriptor {
+        id: harness_protocol::ids::ToolId::new(),
+        name: "fs.read".to_string(),
+        description: "read a file".to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }];
+
+    let (sink, _rx) = broadcast::channel(256);
+    let result = backend.execute(request, sink, CancellationToken::new()).await;
+
+    match result {
+        Err(ExecutionError::UnsupportedCapability { capability, .. }) => {
+            assert_eq!(capability, "tool_calls");
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+    assert!(probe.last_request().is_none());
+}
+
+/// A request with no reasoning/images/tools must pass capability validation
+/// unchanged, even against a minimally-capable model client — the checks
+/// must be need-based, not blanket-required.
+#[tokio::test]
+async fn plain_text_request_passes_capability_checks_against_a_minimal_model() {
+    let client = FakeModelClient::new()
+        .with_capabilities(harness_model::request::ModelCapabilities {
+            streaming: true,
+            reasoning: false,
+            tool_calls: false,
+            parallel_tool_calls: false,
+            images: false,
+        })
+        .with_result(ModelResult::default());
+
+    let backend = GenericModelBackend::new(Arc::new(client));
+    let (result, _events) = run_execution(backend).await;
+    assert!(result.is_ok(), "plain request should not trip capability checks: {result:?}");
 }
 
 // ===========================================================================

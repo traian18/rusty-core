@@ -114,6 +114,17 @@ pub enum ModelError {
         /// Description of the protocol error.
         message: String,
     },
+    /// The request asked for a capability (reasoning, images, a specific
+    /// param) the target model/provider does not support. Raised *before*
+    /// any network call is made, so it never causes a billed request.
+    #[error("unsupported capability: {capability}")]
+    UnsupportedCapability {
+        /// Machine-readable name of the unsupported capability
+        /// (e.g. `"reasoning"`, `"images"`).
+        capability: String,
+        /// Human-readable detail (e.g. which model/provider was asked).
+        detail: String,
+    },
 }
 
 impl ModelError {
@@ -129,7 +140,8 @@ impl ModelError {
             Self::InvalidRequest { .. }
             | Self::Cancelled
             | Self::CircuitOpen { .. }
-            | Self::Protocol { .. } => false,
+            | Self::Protocol { .. }
+            | Self::UnsupportedCapability { .. } => false,
         }
     }
 

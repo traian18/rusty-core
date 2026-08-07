@@ -142,6 +142,15 @@ impl AgentSupervisor {
             .await?;
         validate_child_budget(&parent.budget, &spec.budget)?;
 
+        // M3: bound total concurrent agents across the process via
+        // `SchedulerConfig::max_active_agents`, mirroring how
+        // `SessionManager::create_session` already bounds concurrent
+        // sessions. Acquired before any backend/workspace setup work so an
+        // exhausted cap doesn't pay for work that will just be discarded,
+        // and held for the child's entire lifetime (moved into the spawned
+        // task below, released automatically when it ends).
+        let agent_permit = scheduler.acquire_agent_permit().await;
+
         // 2. Inherit the parent backend or instantiate a fresh explicit one.
         let (backend, child_backend_reference) = match &spec.backend {
             BackendPolicy::Inherit => (parent_backend, parent.backend.reference.clone()),
@@ -192,7 +201,7 @@ impl AgentSupervisor {
             .unwrap_or_else(|| self.session_cancel.child_token());
 
         // 7. Construct the child and its runner.
-        let child_agent = Agent::new(
+        let mut child_agent = Agent::new(
             child_id,
             parent.session_id,
             Some(parent.id),
@@ -210,6 +219,12 @@ impl AgentSupervisor {
             capabilities.clone(),
             spec.budget.clone(),
         );
+        // M5: apply any execution-param overrides (e.g. a model override
+        // requested through `agent.spawn`'s `model` argument) before the
+        // child's first run — see `SpawnAgentSpec::execution_params`'s doc
+        // comment for why this is a plain state assignment rather than
+        // going through `BackendPolicy::Explicit`.
+        child_agent.state.execution_params = spec.execution_params.clone();
 
         let (task, commands_tx) = AgentTask::new(child_id);
         let (result_tx, result_rx) = oneshot::channel::<AgentResult>();
@@ -236,6 +251,10 @@ impl AgentSupervisor {
         let completion_commands_tx = parent_commands_tx.clone();
         let (start_tx, start_rx) = oneshot::channel::<()>();
         let join = tokio::spawn(async move {
+            // Held for the entire lifetime of this task; released (and the
+            // agent-concurrency permit freed) whichever way the task ends.
+            let _agent_permit = agent_permit;
+
             // Registration and parent-state notification must happen before
             // the child is allowed to execute or complete.
             if start_rx.await.is_err() {
@@ -421,10 +440,10 @@ impl AgentSupervisor {
 
     /// Purely computes self, descendant, and inclusive usage.
     pub fn inclusive_usage(&self, agent: &Agent) -> harness_core::usage::AgentUsageSummary {
-        let records = agent.usage.records.clone();
+        let self_metrics = agent.usage.self_metrics();
         let children: Vec<harness_core::usage::AgentUsageSummary> =
             agent.usage.child_usage.values().cloned().collect();
-        harness_core::usage::compute_agent_usage_summary(&records, &children)
+        harness_core::usage::compute_agent_usage_summary(self_metrics, &children)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -771,6 +790,8 @@ mod tests {
             workspace: WorkspacePolicy::Inherit,
             budget: AgentBudget::default(),
             mode: SpawnMode::Concurrent,
+            task: None,
+            execution_params: Default::default(),
         };
 
         let child_id = supervisor
@@ -860,6 +881,8 @@ mod tests {
                         workspace: WorkspacePolicy::Inherit,
                         budget: AgentBudget::default(),
                         mode: SpawnMode::AwaitResult,
+                        task: None,
+                        execution_params: Default::default(),
                     },
                 )
                 .await
@@ -944,6 +967,8 @@ mod tests {
             workspace: WorkspacePolicy::Inherit,
             budget: AgentBudget::default(),
             mode: SpawnMode::Concurrent,
+            task: None,
+            execution_params: Default::default(),
         };
 
         // This must return immediately (not block on the child).
@@ -1024,6 +1049,8 @@ mod tests {
             workspace: WorkspacePolicy::Inherit,
             budget: AgentBudget::default(),
             mode: SpawnMode::Concurrent,
+            task: None,
+            execution_params: Default::default(),
         };
 
         let child_id = supervisor
@@ -1048,6 +1075,87 @@ mod tests {
                 AgentEvent::ChildAgentSpawned { agent_id } if *agent_id == child_id
             )),
             "ChildAgentSpawned should be emitted for the new child"
+        );
+    }
+
+    /// M3: total concurrent agents must be bounded by
+    /// `SchedulerConfig::max_active_agents`, the same way concurrent
+    /// sessions are already bounded by `SessionManager`. Previously
+    /// `Scheduler::acquire_agent_permit` existed but had zero call sites —
+    /// `max_active_agents` was configured but silently unenforced. With the
+    /// cap set to 1 and a first (indefinitely long-lived) child already
+    /// spawned, a second concurrent `spawn_child` call must block rather
+    /// than proceed immediately.
+    #[tokio::test]
+    async fn spawn_child_is_bounded_by_max_active_agents() {
+        let session_id = SessionId::new();
+        let supervisor = AgentSupervisor::new(session_id, SessionCancellation::new());
+        let parent = parent(session_id);
+
+        let tool_registry: Arc<dyn ToolRegistry> = Arc::new(FakeToolRegistry::new());
+        let workspace: Arc<dyn Workspace> = Arc::new(FakeWorkspace::new());
+        let event_sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+        let scheduler: Arc<Scheduler> = Arc::new(Scheduler::new(SchedulerConfig {
+            max_active_agents: 1,
+            ..SchedulerConfig::default()
+        }));
+        let integration_registry = IntegrationRegistry::new();
+        let (parent_commands_tx, _parent_commands_rx) = mpsc::channel(64);
+
+        let spec = || SpawnAgentSpec {
+            role: Some("A1".into()),
+            backend: BackendPolicy::Inherit,
+            tools: ToolInheritance::InheritAll,
+            workspace: WorkspacePolicy::Inherit,
+            budget: AgentBudget::default(),
+            mode: SpawnMode::Concurrent,
+            task: None,
+            execution_params: Default::default(),
+        };
+
+        // First child: a backend that blocks until cancelled, so its runner
+        // never finishes on its own and the agent permit it holds is never
+        // released for the duration of this test.
+        let long_lived_backend: Arc<dyn ExecutionBackend> =
+            Arc::new(FakeBackend::new().blocking_until_cancelled());
+        supervisor
+            .spawn_child(
+                &parent,
+                long_lived_backend,
+                &integration_registry,
+                tool_registry.clone(),
+                workspace.clone(),
+                event_sink.clone(),
+                scheduler.clone(),
+                parent_commands_tx.clone(),
+                spec(),
+            )
+            .await
+            .expect("first child should spawn under the cap");
+
+        // Second child: with max_active_agents == 1 already held by the
+        // first child, this must block rather than spawn immediately.
+        let second_backend: Arc<dyn ExecutionBackend> = Arc::new(FakeBackend::new());
+        let result = tokio::time::timeout(
+            Duration::from_millis(300),
+            supervisor.spawn_child(
+                &parent,
+                second_backend,
+                &integration_registry,
+                tool_registry,
+                workspace,
+                event_sink,
+                scheduler,
+                parent_commands_tx,
+                spec(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a second concurrent spawn_child must block while max_active_agents is exhausted, \
+             not proceed immediately"
         );
     }
 
@@ -1103,6 +1211,8 @@ mod tests {
             workspace: WorkspacePolicy::Inherit,
             budget: AgentBudget::default(),
             mode: SpawnMode::Concurrent,
+            task: None,
+            execution_params: Default::default(),
         };
 
         let outcome = supervisor

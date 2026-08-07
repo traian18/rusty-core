@@ -1,5 +1,6 @@
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,14 @@ use harness_integration_openai::OpenAiConfig;
 ///
 /// Unlike [`OpenAiConfig`], nothing here has a sensible cross-provider
 /// default — `base_url` and `model` must be supplied by the caller.
+///
+/// M6 secret-redaction audit: this is the one provider config in the
+/// workspace that previously had **no** redacted `Display`/`Debug` at all
+/// (every other provider config does) — a real gap, since `api_key` is
+/// present here just like the others, and `extra_headers` is a documented,
+/// real mechanism for providers that need a custom auth header beyond
+/// `Authorization` (e.g. some OpenRouter-compatible endpoints). Both are
+/// now redacted the same way the sibling configs already are.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     /// e.g. `"https://openrouter.ai/api/v1"`. No default — required.
@@ -58,6 +67,39 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Duration::from_secs(u64::deserialize(deserializer)?))
+}
+
+impl fmt::Display for OpenAiCompatibleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_key = match &self.api_key {
+            Some(key) if key.len() >= 4 => format!("Some({}***)", &key[..4]),
+            Some(_) => "Some(***)".to_string(),
+            None => "None".to_string(),
+        };
+        // Header *values* may carry a bearer token or similar (this is
+        // exactly why the field exists — a provider-specific auth header
+        // beyond `Authorization`); only the names are safe to show.
+        let mut header_names: Vec<&str> = self.extra_headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        write!(
+            f,
+            "OpenAiCompatibleConfig {{ base_url: {}, api_key: {}, model: {}, default_max_tokens: {}, request_timeout: {:?}, recovery: {:?}, extra_headers: {{{} header(s): {:?}, values redacted}} }}",
+            self.base_url,
+            redacted_key,
+            self.model,
+            self.default_max_tokens,
+            self.request_timeout,
+            self.recovery,
+            header_names.len(),
+            header_names,
+        )
+    }
+}
+
+impl fmt::Debug for OpenAiCompatibleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl OpenAiCompatibleConfig {
@@ -110,6 +152,30 @@ mod tests {
             openai_config.extra_headers.get("HTTP-Referer"),
             Some(&"my-app".to_string())
         );
+    }
+
+    #[test]
+    fn formatting_redacts_api_key_and_header_values() {
+        let mut config = OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
+        config.api_key = Some("sk-super-secret-value".to_string());
+        config
+            .extra_headers
+            .insert("Authorization".to_string(), "Bearer sk-also-secret".to_string());
+
+        let displayed = format!("{config}");
+        assert!(!displayed.contains("super-secret-value"), "api_key must not leak: {displayed}");
+        assert!(!displayed.contains("also-secret"), "header value must not leak: {displayed}");
+        assert!(displayed.contains("Authorization"), "header *name* is fine to show: {displayed}");
+
+        let debugged = format!("{config:?}");
+        assert_eq!(debugged, displayed, "Debug must delegate to the same redacted Display");
+    }
+
+    #[test]
+    fn formatting_handles_no_api_key() {
+        let config = OpenAiCompatibleConfig::new("http://localhost:11434/v1", "llama3");
+        let displayed = format!("{config}");
+        assert!(displayed.contains("None"), "an absent key must format as None, not panic: {displayed}");
     }
 
     #[test]

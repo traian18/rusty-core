@@ -86,6 +86,42 @@ impl Harness {
         }
     }
 
+    /// Validates a model override against this provider's known catalog
+    /// before it's applied via `SessionBuilder::execution_params` /
+    /// `SessionHandle::set_execution_params`.
+    ///
+    /// Best-effort, not exhaustive: it checks the cached catalog from the
+    /// last `list_models(refresh: true)` call, falling back to the static
+    /// `default_models()` list when nothing has been cached yet. A model
+    /// that's real but simply hasn't been discovered/cached yet can produce
+    /// a false rejection here — callers that need certainty should
+    /// `list_models(provider, credential, true)` first. This exists to catch
+    /// the common case (a typo'd or stale model id) before it reaches a
+    /// provider and fails deep inside a run.
+    pub fn validate_model_override(
+        &self,
+        provider: &ProviderKey,
+        provider_model_id: &str,
+    ) -> Result<(), HarnessError> {
+        let cached = self
+            .model_cache
+            .read()
+            .map_err(|_| HarnessError::ProviderCatalog("model cache lock poisoned".into()))?
+            .get(provider)
+            .cloned();
+        let catalog = cached.unwrap_or_else(|| providers::default_models(provider));
+        if catalog
+            .iter()
+            .any(|model| model.provider_model_id == provider_model_id)
+        {
+            return Ok(());
+        }
+        Err(HarnessError::UnknownModel {
+            provider: provider.to_string(),
+            model_id: provider_model_id.to_string(),
+        })
+    }
+
     pub fn provider_health(&self, provider: &ProviderKey) -> Result<ProviderHealth, HarnessError> {
         let profile = self.list_credential_profiles(provider)?.remove(0);
         let program = match provider.as_str() {

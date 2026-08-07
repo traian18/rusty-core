@@ -87,6 +87,8 @@ fn child_spec(role: &str) -> SpawnAgentSpec {
             ..Default::default()
         },
         mode: SpawnMode::Concurrent,
+        task: None,
+        execution_params: Default::default(),
     }
 }
 

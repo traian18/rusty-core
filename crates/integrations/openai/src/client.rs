@@ -51,6 +51,7 @@ impl ModelClient for OpenAiClient {
             reasoning: false,
             tool_calls: true,
             parallel_tool_calls: true,
+            images: true,
         }
     }
 
@@ -96,8 +97,21 @@ impl ModelClient for OpenAiClient {
             request_builder = request_builder.header(key, value);
         }
 
+        // M4: merge caller-supplied `provider_options["openai"]` knobs
+        // (e.g. `top_p`, `frequency_penalty`) that have no typed field on
+        // `OpenAiRequest` — see `harness_model::merge_provider_options`'s
+        // doc comment for the precedence rule (typed fields above always
+        // win).
+        let body = harness_model::merge_provider_options(
+            serde_json::to_value(&openai_request).map_err(|error| ModelError::InvalidRequest {
+                message: format!("failed to serialize request: {error}"),
+            })?,
+            &request.provider_options,
+            "openai",
+        );
+
         let response = request_builder
-            .json(&openai_request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| {

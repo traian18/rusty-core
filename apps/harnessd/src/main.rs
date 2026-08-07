@@ -12,6 +12,7 @@ mod handler;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -92,7 +93,27 @@ async fn main() -> Result<()> {
         .await
         .context("building Harness")?;
 
-    let handler: Arc<dyn RpcHandler> = Arc::new(HarnessRpcHandler::new(Arc::new(harness)));
+    // M6: install the process-wide Prometheus recorder once, here, at
+    // startup. Everywhere else in the workspace only depends on the
+    // lightweight `metrics` facade crate and calls `metrics::counter!`/
+    // `histogram!`/`gauge!` — none of it needs to know a Prometheus
+    // recorder specifically exists, only this binary does. The resulting
+    // handle is rendered on demand by the `GetDiagnostics` RPC rather than
+    // served over its own HTTP listener — see that RPC variant's doc
+    // comment for why.
+    let metrics_handle = match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::warn!(%error, "failed to install the Prometheus metrics recorder; GetDiagnostics will report empty metrics text");
+            None
+        }
+    };
+
+    let harness = Arc::new(harness);
+    let handler: Arc<dyn RpcHandler> = Arc::new(HarnessRpcHandler::new_with_metrics(
+        harness.clone(),
+        metrics_handle,
+    ));
 
     let shutdown = CancellationToken::new();
     spawn_shutdown_listener(shutdown.clone());
@@ -128,6 +149,28 @@ async fn main() -> Result<()> {
                 tracing::error!(%error, "stdio transport exited with an error");
             }
         }));
+    }
+
+    // E3: previously nothing walked active sessions on shutdown at all —
+    // `spawn_shutdown_listener` only cancelled the token that stops
+    // transports from accepting new work, leaving whatever sessions were
+    // active at that instant torn down without their final checkpoint ever
+    // being committed. Wait for the same shutdown signal here, then drain
+    // every active session through `close_session` (checkpoint-then-
+    // shutdown, exactly once — see `SessionManager::close_all_sessions`)
+    // before the transports are allowed to finish exiting, bounded by a
+    // grace period so one stuck session can't hang the whole process.
+    shutdown.cancelled().await;
+    let drain_grace_period = Duration::from_secs(10);
+    let unclosed = harness.session_manager().close_all_sessions(drain_grace_period).await;
+    if !unclosed.is_empty() {
+        tracing::warn!(
+            count = unclosed.len(),
+            ?drain_grace_period,
+            "some sessions did not close cleanly during the shutdown drain; their last \
+             checkpoint before this point remains durable, but any work in flight at \
+             shutdown time may not be"
+        );
     }
 
     for task in tasks {

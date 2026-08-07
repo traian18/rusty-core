@@ -14,6 +14,25 @@ use crate::context_state::AgentContextState;
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageLedger {
     pub records: Vec<harness_protocol::usage::UsageRecord>,
+    /// Count of completed tool calls (success or failure), incremented in
+    /// `Agent::record_tool_result`. Tracked separately from `records`
+    /// because a `UsageRecord` corresponds to one backend request/turn, not
+    /// one tool call — a single turn can request multiple tool calls, and
+    /// tool calls don't themselves produce model usage/cost.
+    pub tool_calls: u64,
+    /// Count of completed runs (success or failure), incremented at every
+    /// `AgentEffect::FinishRun` emission site in `transitions.rs`. Two
+    /// caveats follow directly from that definition: a cancelled run does
+    /// not emit `FinishRun` (see `Agent::cancel`'s own doc comment on why
+    /// cancellation is a distinct, narrower transition) and so is not
+    /// counted here; and a prompt rejected by validation before any run
+    /// actually starts (e.g. an oversized attachment) goes through the same
+    /// `fail()` path a genuine in-flight failure does and so *is* counted,
+    /// even though no backend request was ever made for it. Both are
+    /// accepted consequences of tracking exactly what `FinishRun` already
+    /// represents, rather than inventing a separate "any run that ever
+    /// started" definition this harness has no other signal for.
+    pub runs: u64,
     pub child_usage: HashMap<AgentId, crate::usage::AgentUsageSummary>,
 }
 
@@ -59,6 +78,7 @@ impl Agent {
                 status: AgentStatus::Idle,
                 current_operation: None,
                 system_prompt,
+                execution_params: Default::default(),
                 messages: Vec::new(),
                 context: AgentContextState::default(),
                 active_run: None,

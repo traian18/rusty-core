@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use harness_model::events::{ModelError, ModelEvent, ModelResult};
 use harness_protocol::ids::ToolCallId;
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
@@ -53,6 +54,20 @@ pub struct GeminiPart {
     pub function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_response: Option<GeminiFunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<GeminiInlineData>,
+}
+
+/// Gemini's inline (non-uploaded) media representation:
+/// `{"inlineData":{"mimeType":"image/png","data":"<base64>"}}` — plain
+/// base64, unlike OpenAI/Anthropic which each want a full data URL or a
+/// dedicated `source` object.
+/// <https://ai.google.dev/api/generate-content#blob> (inline media parts).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiInlineData {
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +124,19 @@ fn text_part(text: String) -> GeminiPart {
         text: Some(text),
         function_call: None,
         function_response: None,
+        inline_data: None,
+    }
+}
+
+fn image_part(mime_type: String, data: &[u8]) -> GeminiPart {
+    GeminiPart {
+        text: None,
+        function_call: None,
+        function_response: None,
+        inline_data: Some(GeminiInlineData {
+            mime_type,
+            data: base64::engine::general_purpose::STANDARD.encode(data),
+        }),
     }
 }
 
@@ -138,6 +166,7 @@ fn agent_message_to_gemini(
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Text { text } => Some(text_part(text.clone())),
+                ContentBlock::Image { mime_type, data } => Some(image_part(mime_type.clone(), data)),
                 _ => None,
             })
             .collect(),
@@ -153,6 +182,7 @@ fn agent_message_to_gemini(
                         args: call.arguments.clone(),
                     }),
                     function_response: None,
+                    inline_data: None,
                 }),
                 _ => None,
             })
@@ -172,6 +202,7 @@ fn agent_message_to_gemini(
                             name,
                             response: serde_json::json!({ "result": result.output_preview }),
                         }),
+                        inline_data: None,
                     })
                 }
                 _ => None,
@@ -390,6 +421,69 @@ fn find_sse_boundary(buffer: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4/M4.5: proves `GeminiGenerationConfig`'s JSON field names match the
+    /// `generateContent` API's `camelCase` expectations
+    /// (`maxOutputTokens`/`stopSequences`, via `#[serde(rename_all = ...)]`
+    /// wherever that's declared on the struct) — same rationale as the
+    /// equivalent OpenAI wire-shape test: the M4.1 contract suite proves
+    /// `ModelRequest` carries the right values up to this boundary, not that
+    /// this boundary serializes them the way the real API expects.
+    #[test]
+    fn generation_config_serializes_with_the_expected_gemini_field_names() {
+        let config = GeminiGenerationConfig {
+            max_output_tokens: Some(2048),
+            temperature: Some(0.7),
+            stop_sequences: Some(vec!["STOP".to_string()]),
+        };
+        let json = serde_json::to_value(&config).expect("serialize GeminiGenerationConfig");
+        assert_eq!(json["maxOutputTokens"], 2048);
+        assert_eq!(json["temperature"], 0.7);
+        assert_eq!(json["stopSequences"], serde_json::json!(["STOP"]));
+
+        let bare = GeminiGenerationConfig {
+            max_output_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+        };
+        let bare_json = serde_json::to_value(&bare).expect("serialize bare GeminiGenerationConfig");
+        assert!(bare_json.get("maxOutputTokens").is_none());
+        assert!(bare_json.get("temperature").is_none());
+        assert!(bare_json.get("stopSequences").is_none());
+    }
+
+    fn user_message(content: Vec<ContentBlock>) -> AgentMessage {
+        AgentMessage {
+            id: harness_protocol::ids::MessageId::new(),
+            role: MessageRole::User,
+            content,
+            created_at: harness_protocol::ids::Timestamp::now(),
+        }
+    }
+
+    /// M4: an image content block must convert into a real `inlineData`
+    /// part, not be silently dropped — matching Anthropic's existing image
+    /// pass-through, previously Gemini-specific wire support for it did not
+    /// exist even though the client already advertised `images: true` in
+    /// its capabilities.
+    #[test]
+    fn an_image_block_becomes_a_real_inline_data_part_not_silently_dropped() {
+        let message = user_message(vec![
+            ContentBlock::Text { text: "what is this?".into() },
+            ContentBlock::Image { mime_type: "image/png".into(), data: vec![1, 2, 3] },
+        ]);
+        let contents = convert_messages(std::slice::from_ref(&message));
+        assert_eq!(contents.len(), 1);
+        let json = serde_json::to_value(&contents[0]).expect("serialize GeminiContent");
+        let parts = json["parts"].as_array().expect("parts must be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(
+            parts[1]["inlineData"]["data"],
+            base64::engine::general_purpose::STANDARD.encode([1, 2, 3])
+        );
+    }
 
     const FIXTURE: &str = "\
 data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello, \"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":1,\"totalTokenCount\":11}}\n\n\

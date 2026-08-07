@@ -156,6 +156,34 @@ impl SessionStore for MemoryStore {
         Ok(snapshot_max.max(event_max))
     }
 
+    /// Reads the durable history after `since_seq` directly from the raw
+    /// event log, without applying the snapshot cutoff `load_session` uses.
+    ///
+    /// This must NOT delegate to the default trait-provided implementation
+    /// (which is built on `load_session`): a terminal run's checkpoint can
+    /// fold events at-or-below the snapshot boundary out of `load_session`'s
+    /// trailing view, which is correct for `load_session` but wrong here —
+    /// a reconnecting subscriber asking "everything since sequence N" must
+    /// see those events regardless of snapshot compaction. Both real
+    /// backends (`JsonlSessionStore`, `SqliteSessionStore`) already query
+    /// their raw event log directly for the same reason; this brings the
+    /// in-memory test double's behavior in line with them.
+    async fn events_since(
+        &self,
+        id: SessionId,
+        since_seq: u64,
+    ) -> Result<Vec<DurableSessionEvent>, StoreError> {
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        events.retain(|event| event.session_sequence.is_some_and(|seq| seq > since_seq));
+        Ok(events)
+    }
+
     async fn raw_records(&self, id: SessionId) -> Result<Vec<RawRecord>, StoreError> {
         let mut records = Vec::new();
         let events = self

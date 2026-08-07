@@ -135,6 +135,7 @@ mod tests {
             messages: vec![],
             tools: vec![],
             extended_thinking: false,
+            params: Default::default(),
         }
     }
 

@@ -73,6 +73,13 @@ pub struct SchedulerConfig {
     pub max_concurrent_tool_executions: usize,
     /// Maximum concurrent child processes spawned by tools.
     pub max_concurrent_processes: usize,
+    /// E1: how long a bounded-wait admission point (currently
+    /// `SessionManager::create_session`) waits for a permit before
+    /// rejecting typed rather than queueing forever. Smooths over brief
+    /// bursts without ever leaving a caller unable to tell "slow" apart
+    /// from "will never complete" — see
+    /// `docs/production-readiness-roadmap.md`'s E1 finding.
+    pub admission_timeout: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -84,8 +91,21 @@ impl Default for SchedulerConfig {
             max_concurrent_backend_requests: 8,
             max_concurrent_tool_executions: 16,
             max_concurrent_processes: 8,
+            admission_timeout: Duration::from_secs(5),
         }
     }
+}
+
+/// E1: a bounded-wait admission attempt timed out before a permit became
+/// available — the typed rejection callers get instead of an indefinite
+/// block. `kind` matches the same `PermitKind::label` used for metrics
+/// (`"session"`, `"agent"`, `"tool"`, `"backend"`, `"process"`), and `waited`
+/// is always `>= ` the configured `admission_timeout` for that acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("at capacity: no {kind} permit became available within {waited:?}")]
+pub struct CapacityError {
+    pub kind: &'static str,
+    pub waited: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +283,22 @@ impl BackendPermitGuard {
 /// [`OwnedSemaphorePermit`] that is independent of any borrow on `self`.
 /// This allows permits to be moved into spawned [`tokio::spawn`] tasks
 /// without lifetime headaches.
+/// One permit kind's point-in-time capacity/utilization, part of
+/// [`SchedulerSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermitSnapshot {
+    pub kind: &'static str,
+    pub capacity: usize,
+    pub in_use: usize,
+}
+
+/// Point-in-time snapshot of every [`Scheduler`] permit kind. See
+/// [`Scheduler::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerSnapshot {
+    pub permits: Vec<PermitSnapshot>,
+}
+
 pub struct Scheduler {
     /// Limits the number of concurrently active sessions.
     sessions: Arc<Semaphore>,
@@ -276,6 +312,24 @@ pub struct Scheduler {
     processes: Arc<Semaphore>,
     /// Per-backend rate and concurrency limiters.
     backend_limiters: BackendLimiters,
+    /// Configured capacities, retained (beyond building the semaphores
+    /// above) so `record_acquired`/`in_use_gauge` can report "in use" as
+    /// `capacity - available_permits()` — `Semaphore` itself doesn't expose
+    /// the value it was constructed with. M6: this is what backs the
+    /// `harness_scheduler_permits_in_use` gauge.
+    config: SchedulerConfig,
+}
+
+/// M6: metric-name/capacity pair for one permit kind, so every
+/// `acquire_*_permit*` method emits the same three metrics
+/// (`harness_scheduler_permit_wait_seconds`,
+/// `harness_scheduler_permits_in_use`,
+/// `harness_scheduler_permit_acquisitions_total`) with one shared helper
+/// instead of five hand-duplicated instrumentation blocks — see
+/// `Scheduler::record_acquired`.
+struct PermitKind {
+    label: &'static str,
+    capacity: usize,
 }
 
 impl Scheduler {
@@ -288,7 +342,30 @@ impl Scheduler {
             tool_executions: Arc::new(Semaphore::new(config.max_concurrent_tool_executions)),
             processes: Arc::new(Semaphore::new(config.max_concurrent_processes)),
             backend_limiters: BackendLimiters::new(),
+            config,
         }
+    }
+
+    /// Records the three permit-acquisition metrics for one successful
+    /// acquire: how long the caller waited, how many permits of this kind
+    /// are now in use, and a cumulative acquisition count. `sem` is read
+    /// *after* the permit was taken, so `available_permits()` already
+    /// reflects this acquisition.
+    fn record_acquired(kind: PermitKind, sem: &Semaphore, waited: Duration) {
+        metrics::histogram!("harness_scheduler_permit_wait_seconds", "kind" => kind.label)
+            .record(waited.as_secs_f64());
+        metrics::gauge!("harness_scheduler_permits_in_use", "kind" => kind.label)
+            .set((kind.capacity.saturating_sub(sem.available_permits())) as f64);
+        metrics::counter!("harness_scheduler_permit_acquisitions_total", "kind" => kind.label)
+            .increment(1);
+    }
+
+    /// Records a cancellable acquire that lost the race to cancellation —
+    /// distinct from a successful acquisition so an operator can tell
+    /// "queued and got in eventually" apart from "queued and gave up."
+    fn record_cancelled(kind: PermitKind) {
+        metrics::counter!("harness_scheduler_permit_wait_cancelled_total", "kind" => kind.label)
+            .increment(1);
     }
 
     /// Acquires a permit for creating a new session.
@@ -296,20 +373,60 @@ impl Scheduler {
     /// Blocks until the number of active sessions is below
     /// [`SchedulerConfig::max_active_sessions`].
     pub async fn acquire_session_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        self.sessions
+        let start = Instant::now();
+        let permit = self
+            .sessions
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed")
+            .expect("Scheduler semaphore should never be closed");
+        Self::record_acquired(
+            PermitKind { label: "session", capacity: self.config.max_active_sessions },
+            &self.sessions,
+            start.elapsed(),
+        );
+        permit
+    }
+
+    /// E1: bounded-wait variant of [`Self::acquire_session_permit`] — waits
+    /// up to `self.config.admission_timeout` for a slot, then rejects typed
+    /// (`CapacityError`) instead of queueing indefinitely. This is the
+    /// method `SessionManager::create_session` actually calls; the plain
+    /// unconditional-wait `acquire_session_permit` remains available for
+    /// callers (mostly tests) that genuinely want to wait forever.
+    pub async fn try_acquire_session_permit(self: &Arc<Self>) -> Result<OwnedSemaphorePermit, CapacityError> {
+        let kind = PermitKind { label: "session", capacity: self.config.max_active_sessions };
+        let start = Instant::now();
+        let sem = self.sessions.clone();
+        match tokio::time::timeout(self.config.admission_timeout, sem.acquire_owned()).await {
+            Ok(permit) => {
+                let permit = permit.expect("Scheduler semaphore should never be closed");
+                Self::record_acquired(kind, &self.sessions, start.elapsed());
+                Ok(permit)
+            }
+            Err(_) => {
+                metrics::counter!("harness_scheduler_permit_admission_rejected_total", "kind" => kind.label)
+                    .increment(1);
+                Err(CapacityError { kind: kind.label, waited: start.elapsed() })
+            }
+        }
     }
 
     /// Acquires a permit for spawning a new agent runner.
     pub async fn acquire_agent_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        self.agents
+        let start = Instant::now();
+        let permit = self
+            .agents
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed")
+            .expect("Scheduler semaphore should never be closed");
+        Self::record_acquired(
+            PermitKind { label: "agent", capacity: self.config.max_active_agents },
+            &self.agents,
+            start.elapsed(),
+        );
+        permit
     }
 
     /// Acquires a permit for executing a backend (LLM) request.
@@ -317,11 +434,19 @@ impl Scheduler {
     /// Blocks until the number of in-flight backend requests is below
     /// [`SchedulerConfig::max_concurrent_backend_requests`].
     pub async fn acquire_backend_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        self.backend_requests
+        let start = Instant::now();
+        let permit = self
+            .backend_requests
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed")
+            .expect("Scheduler semaphore should never be closed");
+        Self::record_acquired(
+            PermitKind { label: "backend", capacity: self.config.max_concurrent_backend_requests },
+            &self.backend_requests,
+            start.elapsed(),
+        );
+        permit
     }
 
     /// Cancellable variant of [`Self::acquire_backend_permit`].
@@ -331,11 +456,20 @@ impl Scheduler {
         self: &Arc<Self>,
         cancel: &CancellationToken,
     ) -> Option<OwnedSemaphorePermit> {
+        let start = Instant::now();
         let sem = self.backend_requests.clone();
+        let kind = PermitKind { label: "backend", capacity: self.config.max_concurrent_backend_requests };
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => None,
-            permit = sem.acquire_owned() => Some(permit.expect("Scheduler semaphore should never be closed")),
+            _ = cancel.cancelled() => {
+                Self::record_cancelled(kind);
+                None
+            }
+            permit = sem.acquire_owned() => {
+                let permit = permit.expect("Scheduler semaphore should never be closed");
+                Self::record_acquired(kind, &self.backend_requests, start.elapsed());
+                Some(permit)
+            }
         }
     }
 
@@ -344,11 +478,19 @@ impl Scheduler {
     /// Blocks until the number of in-flight tool executions is below
     /// [`SchedulerConfig::max_concurrent_tool_executions`].
     pub async fn acquire_tool_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        self.tool_executions
+        let start = Instant::now();
+        let permit = self
+            .tool_executions
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed")
+            .expect("Scheduler semaphore should never be closed");
+        Self::record_acquired(
+            PermitKind { label: "tool", capacity: self.config.max_concurrent_tool_executions },
+            &self.tool_executions,
+            start.elapsed(),
+        );
+        permit
     }
 
     /// Cancellable variant of [`Self::acquire_tool_permit`].
@@ -358,21 +500,84 @@ impl Scheduler {
         self: &Arc<Self>,
         cancel: &CancellationToken,
     ) -> Option<OwnedSemaphorePermit> {
+        let start = Instant::now();
         let sem = self.tool_executions.clone();
+        let kind = PermitKind { label: "tool", capacity: self.config.max_concurrent_tool_executions };
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => None,
-            permit = sem.acquire_owned() => Some(permit.expect("Scheduler semaphore should never be closed")),
+            _ = cancel.cancelled() => {
+                Self::record_cancelled(kind);
+                None
+            }
+            permit = sem.acquire_owned() => {
+                let permit = permit.expect("Scheduler semaphore should never be closed");
+                Self::record_acquired(kind, &self.tool_executions, start.elapsed());
+                Some(permit)
+            }
         }
     }
 
     /// Acquires a permit for spawning a child process.
     pub async fn acquire_process_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
-        self.processes
+        let start = Instant::now();
+        let permit = self
+            .processes
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed")
+            .expect("Scheduler semaphore should never be closed");
+        Self::record_acquired(
+            PermitKind { label: "process", capacity: self.config.max_concurrent_processes },
+            &self.processes,
+            start.elapsed(),
+        );
+        permit
+    }
+
+    /// Cancellable variant of [`Self::acquire_process_permit`].
+    ///
+    /// Returns `None` if `cancel` fires before a permit becomes available.
+    pub async fn acquire_process_permit_cancellable(
+        self: &Arc<Self>,
+        cancel: &CancellationToken,
+    ) -> Option<OwnedSemaphorePermit> {
+        let start = Instant::now();
+        let sem = self.processes.clone();
+        let kind = PermitKind { label: "process", capacity: self.config.max_concurrent_processes };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                Self::record_cancelled(kind);
+                None
+            }
+            permit = sem.acquire_owned() => {
+                let permit = permit.expect("Scheduler semaphore should never be closed");
+                Self::record_acquired(kind, &self.processes, start.elapsed());
+                Some(permit)
+            }
+        }
+    }
+
+    /// Point-in-time snapshot of every permit kind's capacity/in-use/queued
+    /// state, for the M6 diagnostics RPC (`GetDiagnostics`) — a
+    /// non-Prometheus, directly-queryable view of the same underlying
+    /// semaphores the metrics above report on, useful for a host that wants
+    /// current saturation without scraping/parsing metrics text.
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        let permit = |label: &'static str, capacity: usize, sem: &Semaphore| PermitSnapshot {
+            kind: label,
+            capacity,
+            in_use: capacity.saturating_sub(sem.available_permits()),
+        };
+        SchedulerSnapshot {
+            permits: vec![
+                permit("session", self.config.max_active_sessions, &self.sessions),
+                permit("agent", self.config.max_active_agents, &self.agents),
+                permit("backend", self.config.max_concurrent_backend_requests, &self.backend_requests),
+                permit("tool", self.config.max_concurrent_tool_executions, &self.tool_executions),
+                permit("process", self.config.max_concurrent_processes, &self.processes),
+            ],
+        }
     }
 
     // -----------------------------------------------------------------------

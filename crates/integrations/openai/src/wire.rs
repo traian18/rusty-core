@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
 use harness_model::events::{ModelError, ModelEvent, ModelResult};
 use harness_protocol::ids::ToolCallId;
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
@@ -41,11 +42,68 @@ pub struct StreamOptions {
 pub struct OpenAiMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<OpenAiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<OpenAiToolCallOut>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// OpenAI's Chat Completions `content` field accepts either a plain string
+/// (the common, text-only case) or an array of typed parts (needed the
+/// moment a message carries an image) — `#[serde(untagged)]` picks whichever
+/// variant matches at serialization time, so a text-only message keeps
+/// serializing exactly as before rather than always paying for the more
+/// verbose array form.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum OpenAiContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+/// One part of a multimodal `content` array.
+/// <https://platform.openai.com/docs/guides/vision> (image_url content parts).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAiContentPart {
+    Text { text: String },
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAiImageUrl {
+    /// A data URL (`data:<mime>;base64,<data>`) — images arrive on the
+    /// harness side as raw bytes with no externally reachable URL, so this
+    /// is the only representation that doesn't require an upload step.
+    pub url: String,
+}
+
+/// Converts one message's content blocks into an [`OpenAiContent`]: plain
+/// text when there are no images (identical to the pre-image-support wire
+/// shape), or a typed parts array once at least one `ContentBlock::Image` is
+/// present, since OpenAI only accepts the array form for multimodal content.
+fn content_blocks_to_openai_content(content: &[ContentBlock]) -> OpenAiContent {
+    let has_image = content.iter().any(|block| matches!(block, ContentBlock::Image { .. }));
+    if !has_image {
+        return OpenAiContent::Text(concat_text(content));
+    }
+    let parts = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(OpenAiContentPart::Text { text: text.clone() }),
+            ContentBlock::Image { mime_type, data } => Some(OpenAiContentPart::ImageUrl {
+                image_url: OpenAiImageUrl {
+                    url: format!(
+                        "data:{mime_type};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    ),
+                },
+            }),
+            _ => None,
+        })
+        .collect();
+    OpenAiContent::Parts(parts)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,7 +187,7 @@ fn agent_message_to_openai(
             .filter_map(|block| match block {
                 ContentBlock::ToolResult { call_id, result } => Some(OpenAiMessage {
                     role: "tool".to_string(),
-                    content: Some(result.output_preview.clone()),
+                    content: Some(OpenAiContent::Text(result.output_preview.clone())),
                     tool_calls: None,
                     tool_call_id: Some(provider_id_for(call_id)),
                 }),
@@ -138,7 +196,7 @@ fn agent_message_to_openai(
             .collect(),
         MessageRole::User => vec![OpenAiMessage {
             role: "user".to_string(),
-            content: Some(concat_text(&message.content)),
+            content: Some(content_blocks_to_openai_content(&message.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
@@ -161,7 +219,7 @@ fn agent_message_to_openai(
                 .collect();
             vec![OpenAiMessage {
                 role: "assistant".to_string(),
-                content: if text.is_empty() { None } else { Some(text) },
+                content: if text.is_empty() { None } else { Some(OpenAiContent::Text(text)) },
                 tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                 tool_call_id: None,
             }]
@@ -190,7 +248,7 @@ pub fn build_system_message(system_prompt: &str, messages: &[AgentMessage]) -> O
     };
     text.map(|content| OpenAiMessage {
         role: "system".to_string(),
-        content: Some(content),
+        content: Some(OpenAiContent::Text(content)),
         tool_calls: None,
         tool_call_id: None,
     })
@@ -429,6 +487,93 @@ fn find_sse_boundary(buffer: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4/M4.5: proves `OpenAiRequest`'s JSON field names/shape match what
+    /// the Chat Completions API actually expects (`max_tokens`,
+    /// `temperature`, `stop` as a bare array, `model` at top level) — a
+    /// wire-format regression here would silently produce a request the
+    /// real API either ignores or rejects, which no test at the
+    /// `GenericModelBackend` layer (M4.1's contract suite) can catch, since
+    /// that layer stops at `ModelRequest`, one level above this JSON.
+    #[test]
+    fn request_serializes_with_the_expected_openai_field_names() {
+        let request = OpenAiRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![],
+            tools: None,
+            max_tokens: Some(4096),
+            temperature: Some(0.5),
+            stop: Some(vec!["STOP".to_string()]),
+            stream: true,
+            stream_options: StreamOptions { include_usage: true },
+        };
+        let json = serde_json::to_value(&request).expect("serialize OpenAiRequest");
+        assert_eq!(json["model"], "gpt-4.1");
+        assert_eq!(json["max_tokens"], 4096);
+        assert_eq!(json["temperature"], 0.5);
+        assert_eq!(json["stop"], serde_json::json!(["STOP"]));
+        assert_eq!(json["stream"], true);
+        // Omitted-when-None fields must actually be absent, not `null`,
+        // since some OpenAI-compatible backends (this wire format is also
+        // used by `openai-compatible`) reject unexpected null fields.
+        let bare = OpenAiRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![],
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            stop: None,
+            stream: true,
+            stream_options: StreamOptions { include_usage: true },
+        };
+        let bare_json = serde_json::to_value(&bare).expect("serialize bare OpenAiRequest");
+        assert!(bare_json.get("max_tokens").is_none());
+        assert!(bare_json.get("temperature").is_none());
+        assert!(bare_json.get("stop").is_none());
+    }
+
+    fn user_message(content: Vec<ContentBlock>) -> AgentMessage {
+        AgentMessage {
+            id: harness_protocol::ids::MessageId::new(),
+            role: MessageRole::User,
+            content,
+            created_at: harness_protocol::ids::Timestamp::now(),
+        }
+    }
+
+    /// M4: a text-only message must keep serializing `content` as a bare
+    /// string (the pre-image-support shape) rather than always paying for
+    /// the more verbose typed-parts array form.
+    #[test]
+    fn a_text_only_message_serializes_content_as_a_plain_string() {
+        let message = user_message(vec![ContentBlock::Text { text: "hello".into() }]);
+        let openai = agent_message_to_openai(&message, &HashMap::new());
+        let json = serde_json::to_value(&openai[0]).expect("serialize OpenAiMessage");
+        assert_eq!(json["content"], "hello");
+    }
+
+    /// M4: an image content block must convert into a real
+    /// `image_url`/`data:` part, not be silently dropped — matching
+    /// Anthropic's existing image pass-through, previously OpenAI-specific
+    /// wire support for it did not exist even though the client already
+    /// advertised `images: true` in its capabilities.
+    #[test]
+    fn an_image_block_becomes_a_real_image_url_part_not_silently_dropped() {
+        let message = user_message(vec![
+            ContentBlock::Text { text: "what is this?".into() },
+            ContentBlock::Image { mime_type: "image/png".into(), data: vec![1, 2, 3] },
+        ]);
+        let openai = agent_message_to_openai(&message, &HashMap::new());
+        let json = serde_json::to_value(&openai[0]).expect("serialize OpenAiMessage");
+        let parts = json["content"].as_array().expect("multimodal content must serialize as an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().expect("image_url.url must be a string");
+        assert!(url.starts_with("data:image/png;base64,"), "unexpected image_url shape: {url}");
+        assert!(url.ends_with(&base64::engine::general_purpose::STANDARD.encode([1, 2, 3])));
+    }
 
     const FIXTURE: &str = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n\
 data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\

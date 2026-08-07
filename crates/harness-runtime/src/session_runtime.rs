@@ -98,6 +98,10 @@ pub enum SessionCommand {
     Pause,
     /// Resume a paused session.
     Resume,
+    /// Update the root agent's session-level default execution params
+    /// (model, max_tokens, temperature, reasoning, ...). See
+    /// `AgentCommand::ConfigureExecution`.
+    ConfigureExecution(harness_protocol::backend::ExecutionParams),
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +253,7 @@ pub(crate) fn stored_agent_state(agent: &Agent) -> StoredAgentState {
         status: agent.state.status,
         current_operation: agent.state.current_operation.clone(),
         system_prompt: agent.state.system_prompt.clone(),
+        execution_params: agent.state.execution_params.clone(),
         messages: agent.state.messages.clone(),
         active_run: agent.state.active_run,
         pending_tools: agent
@@ -301,9 +306,27 @@ fn build_snapshot(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    // RC-304 restore resolves each reference against the *live* integration
+    // registry (see `HostRestoreResolver::resolve`), which keys factories by
+    // their stable string `id()` (e.g. `"anthropic"`) — not by
+    // `BackendReference.integration`, which is an opaque `IntegrationId`
+    // (UUID) minted per-session and never itself registered anywhere. A
+    // bare `reference.integration.to_string()` can therefore never resolve
+    // by direct lookup. Encoding the backend's descriptor name alongside
+    // the id (`"{id}::{descriptor_name}"`) lets the resolver additionally
+    // try `IntegrationRegistry::id_for_descriptor_name`, the same fallback
+    // `restore_session`'s backend-recreation step already relies on for
+    // exactly this reason. A plain id with no `::` suffix (e.g. from an
+    // older snapshot, or a synthetic one built directly in tests) still
+    // resolves via the original direct-id path.
     let mut integration_references: Vec<String> = agents
         .iter()
-        .map(|agent| agent.backend.reference.integration.to_string())
+        .map(|agent| {
+            format!(
+                "{}::{}",
+                agent.backend.reference.integration, agent.backend.descriptor.name
+            )
+        })
         .collect();
     integration_references.sort_unstable();
     integration_references.dedup();
@@ -539,8 +562,15 @@ impl CheckpointRequester for RuntimeCheckpointRequester {
         );
         let store = self.store.clone();
         tokio::spawn(async move {
-            if let Err(error) = store.save_snapshot(snapshot).await {
-                tracing::error!(%error, ?reason, "automatic session checkpoint failed");
+            let start = std::time::Instant::now();
+            let result = store.save_snapshot(snapshot).await;
+            metrics::histogram!("harness_checkpoint_duration_seconds").record(start.elapsed().as_secs_f64());
+            match result {
+                Ok(()) => metrics::counter!("harness_checkpoints_total", "outcome" => "success").increment(1),
+                Err(error) => {
+                    metrics::counter!("harness_checkpoints_total", "outcome" => "failed").increment(1);
+                    tracing::error!(%error, ?reason, "automatic session checkpoint failed");
+                }
             }
         });
     }
@@ -743,6 +773,50 @@ impl SessionRuntime {
         scheduler: Arc<Scheduler>,
         session_store: Option<Arc<dyn SessionStore>>,
     ) -> Self {
+        Self::new_with_scheduler_and_integration_id(
+            session_id,
+            backend,
+            None,
+            tool_registry,
+            workspace,
+            event_sink,
+            root_toolset,
+            scheduler,
+            session_store,
+        )
+    }
+
+    /// Create a session runtime whose root agent's persisted `BackendBinding`
+    /// records `backend_integration_id` as its integration reference,
+    /// instead of a throwaway random one.
+    ///
+    /// This is what makes a session restorable (RC-304): `restore_session`'s
+    /// [`HostDependencyResolver`](harness_session_store::HostDependencyResolver)
+    /// resolves a snapshot's `integration_references` by looking up that
+    /// exact id in the live [`IntegrationRegistry`](crate::integration::IntegrationRegistry) —
+    /// a random id minted here and never registered anywhere can never
+    /// resolve, which is exactly what [`new_with_scheduler`](Self::new_with_scheduler)
+    /// (its `backend_integration_id: None` case, below) produces. Callers
+    /// that create a session through a registered integration (the only
+    /// case where a *stable*, restart-durable id is actually known) should
+    /// use this constructor and pass that id through; callers that inject a
+    /// bare [`ExecutionBackend`] with no registered identity have no stable
+    /// id to give it, so `new_with_scheduler` documents that path as not
+    /// restorable — a random id there is at least honestly never resolvable,
+    /// rather than silently reusing another session's factory by accident.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_scheduler_and_integration_id(
+        session_id: SessionId,
+        backend: Arc<dyn ExecutionBackend>,
+        backend_integration_id: Option<IntegrationId>,
+        tool_registry: Arc<dyn ToolRegistry>,
+        workspace: Arc<dyn Workspace>,
+        event_sink: Arc<dyn EventSink>,
+        root_toolset: AgentToolset,
+        scheduler: Arc<Scheduler>,
+        session_store: Option<Arc<dyn SessionStore>>,
+    ) -> Self {
+        let integration_id = backend_integration_id.unwrap_or_default();
         let enabled_tool_names: Vec<_> = root_toolset
             .enabled_descriptors()
             .into_iter()
@@ -764,7 +838,7 @@ impl SessionRuntime {
             String::new(),
             BackendBinding {
                 reference: BackendReference {
-                    integration: IntegrationId::new(),
+                    integration: integration_id,
                     configuration: ConfigurationId::new(),
                     model: None,
                 },
@@ -963,6 +1037,7 @@ impl SessionRuntime {
                     status: stored.status,
                     current_operation: stored.current_operation,
                     system_prompt: stored.system_prompt,
+                    execution_params: stored.execution_params,
                     messages: stored.messages,
                     context: Default::default(),
                 active_run: stored.active_run,
@@ -1259,6 +1334,9 @@ impl SessionRuntime {
             SessionCommand::Cancel => AgentCommand::Cancel,
             SessionCommand::Pause => AgentCommand::Pause,
             SessionCommand::Resume => AgentCommand::Resume,
+            SessionCommand::ConfigureExecution(params) => {
+                AgentCommand::ConfigureExecution { params }
+            }
         };
 
         self.root_agent_tx
@@ -1545,8 +1623,25 @@ fn try_usage(value: &serde_json::Value) -> Result<UsageLedger, String> {
         }
     }
 
+    // M4, additive: older snapshots predate `tool_calls` — default to 0
+    // rather than rejecting the whole projection, matching the same
+    // graceful-fallback discipline as every other field here.
+    let tool_calls = obj
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    // M4/M5, additive: older snapshots predate `runs` — default to 0 for
+    // exactly the same reason `tool_calls` does, above.
+    let runs = obj
+        .get("runs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
     Ok(UsageLedger {
         records,
+        tool_calls,
+        runs,
         child_usage,
     })
 }
@@ -1793,6 +1888,7 @@ mod tests {
                     usage: ModelUsage {
                         input_tokens: harness_protocol::usage::UsageValue::new(Some(5)),
                         output_tokens: harness_protocol::usage::UsageValue::new(Some(7)),
+                        total_tokens: harness_protocol::usage::UsageValue::new(Some(12)),
                         ..Default::default()
                     },
                     cost: Cost::default(),
@@ -1861,8 +1957,8 @@ mod tests {
             "last_outcome should be Success after the run completes"
         );
         assert_eq!(
-            after.usage.inclusive_usage.input_tokens.value(),
-            Some(5),
+            after.usage.inclusive_usage.total_tokens.value(),
+            Some(12),
             "usage should be populated from the scripted ExecutionResult"
         );
         assert_eq!(after.total_requests, 1);

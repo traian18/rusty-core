@@ -298,6 +298,7 @@ mod tests {
                 status,
                 current_operation: None::<AgentOperation>,
                 system_prompt: String::new(),
+                execution_params: Default::default(),
                 messages: Vec::new(),
                 active_run: None,
                 pending_tools: HashMap::new(),

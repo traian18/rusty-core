@@ -9,6 +9,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+metrics = { workspace = true }
 harness-model = { path = "../harness-model" }
 harness-protocol = { path = "../harness-protocol" }
 harness-runtime = { path = "../harness-runtime" }

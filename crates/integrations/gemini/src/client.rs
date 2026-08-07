@@ -45,6 +45,7 @@ impl ModelClient for GeminiClient {
             reasoning: false,
             tool_calls: true,
             parallel_tool_calls: true,
+            images: true,
         }
     }
 
@@ -76,12 +77,30 @@ impl ModelClient for GeminiClient {
 
         let url = format!("{}/models/{}:streamGenerateContent", self.config.base_url, model);
 
+        // M4: merge caller-supplied `provider_options["gemini"]` knobs
+        // (e.g. `topK`, `topP`) that have no typed field on
+        // `GeminiGenerationConfig` — see `harness_model::merge_provider_options`'s
+        // doc comment for the precedence rule (typed fields above always
+        // win). Gemini's generation-tuning knobs all live nested under
+        // `generationConfig` on the wire, not at the request's top level,
+        // so the merge targets that nested object specifically.
+        let mut body = serde_json::to_value(&gemini_request).map_err(|error| ModelError::InvalidRequest {
+            message: format!("failed to serialize request: {error}"),
+        })?;
+        if let Some(generation_config) = body.get_mut("generationConfig") {
+            *generation_config = harness_model::merge_provider_options(
+                generation_config.take(),
+                &request.provider_options,
+                "gemini",
+            );
+        }
+
         let response = self
             .http_client
             .post(&url)
             .query(&[("alt", "sse"), ("key", self.config.api_key.as_str())])
             .header("content-type", "application/json")
-            .json(&gemini_request)
+            .json(&body)
             .send()
             .await
             .map_err(|e| {

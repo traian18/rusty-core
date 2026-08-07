@@ -101,6 +101,12 @@ pub struct StoredAgentState {
     pub status: AgentStatus,
     pub current_operation: Option<AgentOperation>,
     pub system_prompt: String,
+    /// Session-level default execution params (model, max_tokens,
+    /// temperature, reasoning, ...). Additive field — old snapshots without
+    /// it restore to `ExecutionParams::default()`, matching the pre-M4
+    /// behavior of never overriding provider defaults.
+    #[serde(default)]
+    pub execution_params: harness_protocol::backend::ExecutionParams,
     pub messages: Vec<AgentMessage>,
     pub active_run: Option<RunId>,
     pub pending_tools: HashMap<ToolCallId, StoredPendingToolCall>,
@@ -268,6 +274,18 @@ pub trait SessionStore: Send + Sync {
 
     async fn load_session(&self, id: SessionId) -> Result<StoredSession, StoreError>;
 
+    /// Default implementation only — real backends should override this.
+    ///
+    /// Built on `load_session`, which trims events already folded into a
+    /// snapshot from its trailing view; that's correct for `load_session`
+    /// itself but wrong here, since a caller asking "everything since
+    /// sequence N" needs those events too whenever `since_seq` is below the
+    /// snapshot's cutoff (e.g. right after a terminal run's checkpoint). A
+    /// store backed by a real append-only log should override this to query
+    /// that log directly by sequence, ignoring the snapshot cutoff
+    /// entirely — see `JsonlSessionStore`/`SqliteSessionStore`/`MemoryStore`
+    /// for the pattern. Only a store with no independent raw log (nothing
+    /// beyond `load_session` to query) should rely on this default.
     async fn events_since(
         &self,
         id: SessionId,

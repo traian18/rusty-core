@@ -339,6 +339,7 @@ mod tests {
             messages,
             tools: vec![],
             extended_thinking: false,
+            params: Default::default(),
         }
     }
 

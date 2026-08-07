@@ -53,6 +53,11 @@ pub struct SearchMatch {
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
     pub total_count: usize,
+    /// M3: `true` when traversal was stopped early (files-scanned or
+    /// matches-collected cap reached) rather than having examined the whole
+    /// workspace tree — callers must not treat `matches` as exhaustive.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Metadata about a file in the workspace.

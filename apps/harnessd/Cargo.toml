@@ -30,7 +30,11 @@ harness-integration-openai-compatible = { path = "../../crates/integrations/open
 harness-integration-gemini = { path = "../../crates/integrations/gemini" }
 harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
 harness-integration-codex = { path = "../../crates/integrations/codex" }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }

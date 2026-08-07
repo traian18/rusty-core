@@ -107,7 +107,11 @@ impl Workspace for FakeWorkspace {
             }
         }
 
-        Ok(SearchResult { matches, total_count })
+        Ok(SearchResult {
+            matches,
+            total_count,
+            truncated: false,
+        })
     }
 
     async fn list_files(&self, _max_depth: usize) -> Result<Vec<FileInfo>, WorkspaceError> {

@@ -85,11 +85,19 @@ fn session_status_from_live(live: &AgentLiveState, fallback: SessionStatus) -> S
 
 /// Projects an [`AgentLiveState`] into the coarser [`AgentUsageMetrics`]
 /// shape used by the public snapshot protocol type.
+///
+/// `live.usage.inclusive_usage` (published by `AgentRunner::publish_status`
+/// via `harness_core::usage::compute_agent_usage_summary`) is already the
+/// authoritative self+descendant total for every field — `total_runs` and
+/// `total_tool_calls` used to be hand-rolled here instead (a
+/// last-outcome-is-some boolean and a hardcoded `0`, respectively, both
+/// stale duplicates of logic the ledger now computes correctly) even though
+/// `total_tokens` on the very same struct already read from it correctly.
 fn metrics_from_live(live: &AgentLiveState) -> AgentUsageMetrics {
     AgentUsageMetrics {
-        total_runs: if live.last_outcome.is_some() { 1 } else { 0 },
+        total_runs: live.usage.inclusive_usage.total_runs,
         total_requests: live.total_requests,
-        total_tool_calls: 0,
+        total_tool_calls: live.usage.inclusive_usage.total_tool_calls,
         total_tokens: live.usage.inclusive_usage.total_tokens,
         total_cost: live.total_cost_usd,
     }

@@ -82,6 +82,8 @@ pub enum HarnessError {
     UnknownProvider(String),
     #[error("provider catalog error: {0}")]
     ProviderCatalog(String),
+    #[error("unknown model {model_id:?} for provider {provider}")]
+    UnknownModel { provider: String, model_id: String },
     #[error("missing required field: backend")]
     MissingBackend,
     #[error("missing required field: tool_registry")]
@@ -120,6 +122,10 @@ pub struct SessionBuilder {
     /// Optional context assembly/compaction provider — see
     /// [`context_provider`](Self::context_provider).
     context_provider: Option<Arc<dyn harness_context::ContextProvider>>,
+    /// Session-level default execution params (model, max_tokens,
+    /// temperature, reasoning, ...) applied immediately after the session
+    /// starts — see [`execution_params`](Self::execution_params).
+    execution_params: Option<harness_protocol::backend::ExecutionParams>,
 }
 
 impl SessionBuilder {
@@ -142,6 +148,7 @@ impl SessionBuilder {
             root_toolset: None,
             session_manager: None,
             context_provider: None,
+            execution_params: None,
         }
     }
 
@@ -164,6 +171,7 @@ impl SessionBuilder {
             root_toolset: None,
             session_manager: Some(session_manager),
             context_provider: None,
+            execution_params: None,
         }
     }
 
@@ -200,6 +208,18 @@ impl SessionBuilder {
     /// Set the workspace, defaulting to an empty in-memory workspace.
     pub fn workspace(mut self, workspace: Arc<dyn harness_runtime::traits::Workspace>) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Set the session's default model/execution params (model override,
+    /// max_tokens, temperature, reasoning effort, ...).
+    ///
+    /// Applied immediately after the session starts, before the handle is
+    /// returned — so the very first prompt already uses these params. Call
+    /// [`SessionHandle::set_execution_params`] later to change them mid-session
+    /// (e.g. a per-run override before the next prompt).
+    pub fn execution_params(mut self, params: harness_protocol::backend::ExecutionParams) -> Self {
+        self.execution_params = Some(params);
         self
     }
 
@@ -373,12 +393,19 @@ impl SessionBuilder {
 
         let runtime = session_manager
             .create_session(backend, tool_registry, workspace, event_sink, root_toolset)
-            .await;
+            .await?;
         runtime.integrations.extend_from(&self.integrations)?;
         let session_id = runtime.session_id;
 
+        let client = SessionClient::new(runtime);
+        if let Some(params) = self.execution_params {
+            client
+                .send(SessionCommand::ConfigureExecution(params))
+                .await?;
+        }
+
         Ok(SessionHandle {
-            client: SessionClient::new(runtime),
+            client,
             session_id,
             session_manager,
         })
@@ -473,6 +500,25 @@ impl SessionHandle {
     /// Queue complete user input, preserving any supplied attachments.
     pub async fn follow_up_input(&self, input: UserInput) -> Result<(), HarnessError> {
         self.client.follow_up(input).await?;
+        Ok(())
+    }
+
+    /// Update this session's default model/execution params.
+    ///
+    /// Applied as a partial update — fields left unset in `params` keep
+    /// their previous value (see `ExecutionParams::merge_over`). Takes
+    /// effect starting with the next prompt/steer/follow-up; never mutates
+    /// an already-in-flight run. Use this both to change the session's
+    /// standing default (e.g. "switch this session to opus") and, sent
+    /// immediately before one `send`, as a one-off override for the next
+    /// run only if you follow it with another call reverting the field.
+    pub async fn set_execution_params(
+        &self,
+        params: harness_protocol::backend::ExecutionParams,
+    ) -> Result<(), HarnessError> {
+        self.client
+            .send(SessionCommand::ConfigureExecution(params))
+            .await?;
         Ok(())
     }
 

@@ -133,6 +133,7 @@ mod tests {
             status: AgentStatus::Idle,
             current_operation: None,
             system_prompt: String::new(),
+            execution_params: Default::default(),
             messages: Vec::new(),
             active_run: None,
             pending_tools: HashMap::new(),

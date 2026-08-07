@@ -186,6 +186,8 @@ fn concurrent_spec(
         workspace,
         budget: AgentBudget::default(),
         mode: SpawnMode::Concurrent,
+        task: None,
+        execution_params: Default::default(),
     }
 }
 

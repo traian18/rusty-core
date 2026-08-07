@@ -115,6 +115,82 @@ pub struct BackendBinding {
 // Execution request & context
 // ---------------------------------------------------------------------------
 
+/// Coarse, provider-neutral reasoning effort level.
+///
+/// Providers map this onto their own mechanism: Anthropic maps any non-`None`
+/// level onto `extended_thinking` with a scaled token budget; OpenAI's
+/// reasoning models (`o1`/`o3`/...) pass it through directly as
+/// `reasoning_effort`. A model/provider that doesn't support reasoning at all
+/// rejects a non-`None` request with a typed unsupported-capability error
+/// rather than silently ignoring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+/// Model selection and sampling/output parameters for one execution request.
+///
+/// Every field is optional/empty by default, meaning "use the provider's own
+/// default" — this struct only ever carries explicit overrides. It doubles as
+/// both a resolved value (on [`ExecutionRequest`]) and a partial update (via
+/// [`ExecutionParams::merge_over`]): a `None`/empty field in an update means
+/// "leave whatever was set before," not "clear it." `stop_sequences` can't
+/// distinguish "explicitly clear" from "not specified" under this scheme —
+/// an accepted simplification for now; a caller that wants to clear stop
+/// sequences currently cannot express that as a partial update.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutionParams {
+    /// Provider-specific model identifier override (e.g. `"claude-opus-4-20250514"`).
+    pub model: Option<String>,
+    /// Maximum number of tokens to generate.
+    pub max_tokens: Option<u64>,
+    /// Sampling temperature.
+    pub temperature: Option<f64>,
+    /// Sequences that stop generation when encountered.
+    pub stop_sequences: Vec<String>,
+    /// Coarse reasoning effort; `None` means no explicit reasoning request.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether extended thinking/reasoning was explicitly requested.
+    /// `None` means "not specified" (falls back to `false` at request time),
+    /// distinct from an explicit `Some(false)`.
+    pub extended_thinking: Option<bool>,
+    /// Provider-specific options that don't have a provider-neutral
+    /// equivalent, namespaced by provider id (e.g.
+    /// `{"anthropic": {"top_k": 40}}`). Providers that don't recognize their
+    /// namespace's contents ignore it rather than erroring — this is meant
+    /// for advanced/experimental knobs, not required behavior.
+    pub provider_options: serde_json::Value,
+}
+
+impl ExecutionParams {
+    /// Applies `update` over `self`, keeping `self`'s value for any field
+    /// `update` leaves unset. Used both to apply a session-level
+    /// `ConfigureExecution` command and (in the future) a per-run override.
+    pub fn merge_over(&self, update: &ExecutionParams) -> ExecutionParams {
+        ExecutionParams {
+            model: update.model.clone().or_else(|| self.model.clone()),
+            max_tokens: update.max_tokens.or(self.max_tokens),
+            temperature: update.temperature.or(self.temperature),
+            stop_sequences: if update.stop_sequences.is_empty() {
+                self.stop_sequences.clone()
+            } else {
+                update.stop_sequences.clone()
+            },
+            reasoning_effort: update.reasoning_effort.or(self.reasoning_effort),
+            extended_thinking: update.extended_thinking.or(self.extended_thinking),
+            provider_options: if update.provider_options.is_null() {
+                self.provider_options.clone()
+            } else {
+                update.provider_options.clone()
+            },
+        }
+    }
+}
+
 /// A complete request to be sent to an execution backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRequest {
@@ -129,7 +205,14 @@ pub struct ExecutionRequest {
     /// The tools the agent is allowed to use.
     pub tools: Vec<ToolDescriptor>,
     /// Whether to request extended thinking / reasoning from the backend.
+    /// Kept alongside `params.extended_thinking` for source compatibility
+    /// with existing readers; always equal to
+    /// `params.extended_thinking.unwrap_or(false)` when constructed via
+    /// `harness-core`.
     pub extended_thinking: bool,
+    /// Model selection and sampling/output parameters. See [`ExecutionParams`].
+    #[serde(default)]
+    pub params: ExecutionParams,
 }
 
 /// Parameters that control how a backend executes a request.
@@ -188,6 +271,16 @@ pub enum ExecutionError {
     Cancelled,
     /// The execution timed out.
     Timeout,
+    /// The request asked for a capability the target model/provider does not
+    /// support (e.g. reasoning on a non-reasoning model, images on a
+    /// text-only model). Raised before any network call, so it never causes
+    /// a billed request — see `GenericModelBackend::execute`.
+    UnsupportedCapability {
+        /// Machine-readable capability name (e.g. `"reasoning"`, `"images"`).
+        capability: String,
+        /// Human-readable detail.
+        detail: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +351,56 @@ mod tests {
         assert!(!capabilities.streaming);
         assert!(!capabilities.tool_calls);
         assert!(!capabilities.exact_cost);
+    }
+
+    #[test]
+    fn execution_params_merge_keeps_base_fields_the_update_leaves_unset() {
+        let base = ExecutionParams {
+            model: Some("claude-sonnet-4-20250514".to_string()),
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            stop_sequences: vec!["STOP".to_string()],
+            reasoning_effort: None,
+            extended_thinking: None,
+            provider_options: serde_json::Value::Null,
+        };
+        let update = ExecutionParams {
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let merged = base.merge_over(&update);
+        // The update's explicit field wins...
+        assert_eq!(merged.temperature, Some(0.2));
+        // ...everything the update left unset carries over from base.
+        assert_eq!(merged.model, base.model);
+        assert_eq!(merged.max_tokens, base.max_tokens);
+        assert_eq!(merged.stop_sequences, base.stop_sequences);
+    }
+
+    #[test]
+    fn execution_params_merge_overrides_model_and_reasoning() {
+        let base = ExecutionParams::default();
+        let update = ExecutionParams {
+            model: Some("gpt-4.1".to_string()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            extended_thinking: Some(true),
+            ..Default::default()
+        };
+        let merged = base.merge_over(&update);
+        assert_eq!(merged.model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(merged.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(merged.extended_thinking, Some(true));
+    }
+
+    #[test]
+    fn execution_params_default_is_all_unset() {
+        let params = ExecutionParams::default();
+        assert!(params.model.is_none());
+        assert!(params.max_tokens.is_none());
+        assert!(params.temperature.is_none());
+        assert!(params.stop_sequences.is_empty());
+        assert!(params.reasoning_effort.is_none());
+        assert!(params.extended_thinking.is_none());
     }
 
     #[test]
