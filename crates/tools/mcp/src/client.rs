@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -159,7 +159,11 @@ impl McpClient {
     }
 
     /// Invoke a remote tool by its server-local name.
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<CallToolResult, McpError> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<CallToolResult, McpError> {
         let params = json!({ "name": name, "arguments": arguments });
         let result = self.request("tools/call", Some(params)).await?;
         Ok(serde_json::from_value(result)?)

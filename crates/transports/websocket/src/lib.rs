@@ -578,6 +578,7 @@ mod tests {
                 toolset: harness_protocol::tools::AgentToolset {
                     tools: HashMap::new(),
                 },
+                mcp_servers: Vec::new(),
             },
         };
         ws.send(Message::Text(serde_json::to_string(&request).unwrap()))

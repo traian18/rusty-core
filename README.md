@@ -32,7 +32,7 @@ This README covers what the engine does, how it works, every integration and too
 - **Durable session persistence** — every durable event is written to a `SessionStore` (JSONL or WAL-mode SQLite) as it happens, plus periodic state snapshots. Sessions survive daemon restarts and can be restored via `Harness::restore_session`. Raw streaming deltas stay ephemeral by design (see [Durability](#durability-and-resume)).
 - **Seven pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and the `claude`/`codex`/`copilot` CLIs driven as subprocesses. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is currently wired up.
 - **Built-in resilience** — every HTTP model call goes through retry with exponential backoff + jitter, a shared deadline across attempts, and a circuit breaker. Settings are configurable per provider (see [Provider resilience](#provider-resilience)).
-- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), and model-initiated subagent delegation (`agent.spawn`) ship out of the box; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
+- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), and model-initiated subagent delegation (`agent.spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
 - **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire).
 - **Hierarchical cancellation** — a root `CancellationToken` fans out to every session, agent, backend request, and tool call; cancelling anywhere propagates and is idempotent.
 - **Three wire transports, one RPC contract** — Unix domain socket (length-prefixed JSON), WebSocket, and stdio (newline-delimited JSON) all frame the same `RpcRequestBody`/`RpcResponseBody` types, with a mandatory `Hello` protocol-version handshake on every connection.
@@ -231,6 +231,45 @@ Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay t
 | `budget` | inherits the parent's own budget | a model may only tighten limits, never loosen them |
 | `model` | inherits the parent's model | can select a cheaper/faster model on the *same* provider (e.g. delegate to `claude-haiku-4-5`); cannot switch provider |
 
+### MCP servers
+
+Beyond the ten built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers over stdio — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
+
+- **Handshake**: `initialize` → `notifications/initialized` → `tools/list` (with cursor pagination) → `tools/call`, hand-rolled JSON-RPC over stdio (no `rmcp` dependency — the workspace's own dependency-direction rule keeps that out of a `harness-tool-*` crate's transitive graph anyway).
+- **Scope, deliberately**: stdio transport and `tools/*` only. No resources, prompts, sampling, roots, or the HTTP/streamable-HTTP transport — a server that only exposes those contributes nothing today.
+- **Client only.** The harness can *consume* another MCP server's tools; it cannot *expose itself* as an MCP server for something like Claude Desktop or Cursor to connect into. That's unstarted, separate work.
+- **Failure handling**: a request timeout, a malformed response, or the server process dying mid-call all become the same thing every other tool's error already is here — a logical `ToolResult { is_error: true }` the model can see and react to — not an aborted run. Spawn failures (bad `command`) surface earlier, at session start.
+
+Reachable from all three entry points:
+
+```console
+# harnessctl (repeatable, name=command[,arg1,arg2,...]):
+harnessctl session create --workspace ./repo --integration anthropic \
+  --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp' \
+  --tools fs.read
+
+# apps/harness (standalone TUI), same flag shape, applies to every session
+# the TUI starts for the rest of the run — including ones created later via
+# the provider picker, which has no other way to carry config:
+cargo run -p harness -- --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp'
+
+# Embedding harness-engine directly: the real McpServerConfig builder.
+```
+```rust
+let session = harness
+    .session()
+    .integration("anthropic", serde_json::json!({}))?
+    .mcp_server(
+        harness_engine::McpServerConfig::new("filesystem", "npx")
+            .args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
+    )
+    .toolset(my_toolset, workspace)
+    .start()
+    .await?;
+```
+
+The `--mcp-server name=command[,args...]` CLI flag is a convenience for the common case; it can't express environment variables, a working directory, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/harness-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `harness-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
+
 ---
 
 ## Workspace layout
@@ -241,7 +280,7 @@ Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay t
 | Context | `harness-context` | Injects a system prompt / workspace summary and truncates the transcript when it grows too large |
 | Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
 | Subprocess backends | `crates/integrations/{claude-code,codex,github-copilot}` | Drive the `claude`/`codex`/`copilot` CLIs as subprocesses — the CLI manages its own tools and context, this just translates its output |
-| Tools | `crates/tools/{filesystem,shell,git,web}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
+| Tools | `crates/tools/{filesystem,shell,git,web,mcp}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
 | Transports | `crates/transports/{ipc,websocket,stdio}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
 | SDKs | `sdk/rust`, `sdk/typescript` | Application-agnostic client facades — see [SDKs](#sdks) |
@@ -505,7 +544,7 @@ CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchai
 
 Versions across the workspace are `0.1.x` — nothing here is published to crates.io or npm yet, and no crate makes a semver promise except `harness-extension-api`. Known, current limitations worth knowing before depending on this:
 
-- No MCP (Model Context Protocol) client or server support.
+- MCP support is client-only (the harness can consume another MCP server's tools; it cannot expose itself as one — see [MCP servers](#mcp-servers)), and stdio/`tools`-only within that.
 - The WebSocket transport is unauthenticated and loopback-only by deliberate scope decision (see `crates/transports/websocket/src/lib.rs`) — a remote/multi-tenant deployment needs an auth/TLS layer built on top, not just a different bind address.
 - `github-copilot` isn't yet registered in `harnessd` (see [Integrations](#integrations)).
 - Extension loading is compile-time only (see [Extending the harness](#extending-the-harness)) — no third-party plugin ecosystem without recompiling the host.

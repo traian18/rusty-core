@@ -568,6 +568,7 @@ mod tests {
                 toolset: harness_protocol::tools::AgentToolset {
                     tools: HashMap::new(),
                 },
+                mcp_servers: Vec::new(),
             },
         };
         write_request(&mut client_in_write, &request).await;
