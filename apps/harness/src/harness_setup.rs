@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use harness_engine::{BackendSelection, FsWorkspace, Harness, SessionHandle};
+use harness_engine::{BackendSelection, FsWorkspace, Harness, McpServerConfig, SessionHandle};
 use harness_integration_anthropic::AnthropicFactory;
 use harness_integration_claude_code::ClaudeCodeFactory;
 use harness_integration_codex::CodexFactory;
@@ -74,10 +74,16 @@ impl SessionOptions {
 pub struct AppHarness {
     harness: Harness,
     workspace: Arc<FsWorkspace>,
+    /// MCP servers connected (over stdio) into every session this harness
+    /// starts, from `--mcp-server` at launch. Applied identically by both
+    /// [`start`](Self::start) and [`start_selected`](Self::start_selected)
+    /// so a picker-driven provider switch (which has no per-session config
+    /// path at all — see `SessionOptions`) doesn't silently lose them.
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl AppHarness {
-    pub async fn new(workspace_root: PathBuf) -> Result<Self> {
+    pub async fn new(workspace_root: PathBuf, mcp_servers: Vec<McpServerConfig>) -> Result<Self> {
         let store_root = workspace_root.join(".harness").join("sessions");
         let harness = Harness::builder()
             .register_integration(Arc::new(AnthropicFactory))
@@ -92,6 +98,7 @@ impl AppHarness {
         Ok(Self {
             harness,
             workspace: Arc::new(FsWorkspace::new(workspace_root)),
+            mcp_servers,
         })
     }
 
@@ -207,6 +214,9 @@ impl AppHarness {
         if let Some(params) = reasoning_params_for(&options.integration) {
             builder = builder.execution_params(params);
         }
+        for server in &self.mcp_servers {
+            builder = builder.mcp_server(server.clone());
+        }
 
         Ok(builder.start().await?)
     }
@@ -241,6 +251,9 @@ impl AppHarness {
             .toolset(default_toolset(), self.workspace.clone());
         if let Some(params) = reasoning_params {
             builder = builder.execution_params(params);
+        }
+        for server in &self.mcp_servers {
+            builder = builder.mcp_server(server.clone());
         }
 
         Ok(builder.start().await?)

@@ -112,7 +112,48 @@ pub async fn connect_and_discover(
     Ok(tools
         .into_iter()
         .map(|info| {
-            Arc::new(McpToolExecutor::new(client.clone(), &config.name, info)) as Arc<dyn ToolExecutor>
+            Arc::new(McpToolExecutor::new(client.clone(), &config.name, info))
+                as Arc<dyn ToolExecutor>
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flattens_multiple_text_blocks_joined_by_newline() {
+        let result = CallToolResult {
+            content: vec![
+                json!({ "type": "text", "text": "first" }),
+                json!({ "type": "text", "text": "second" }),
+            ],
+            is_error: Some(false),
+        };
+        let output = call_result_to_output(&result);
+        assert_eq!(output["text"], "first\nsecond");
+        assert_eq!(output["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn non_text_blocks_are_kept_in_content_but_excluded_from_the_text_convenience_field() {
+        let result = CallToolResult {
+            content: vec![
+                json!({ "type": "text", "text": "caption" }),
+                json!({ "type": "image", "data": "base64...", "mimeType": "image/png" }),
+            ],
+            is_error: Some(false),
+        };
+        let output = call_result_to_output(&result);
+        assert_eq!(output["text"], "caption");
+        assert_eq!(output["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_content_produces_empty_text_not_an_error() {
+        let output = call_result_to_output(&CallToolResult::default());
+        assert_eq!(output["text"], "");
+        assert!(output["content"].as_array().unwrap().is_empty());
+    }
 }

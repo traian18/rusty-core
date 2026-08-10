@@ -36,6 +36,34 @@ struct Args {
     /// Backend-specific configuration as JSON
     #[arg(long, default_value = "{}")]
     config_json: String,
+
+    /// MCP server(s) to connect over stdio, as `name=command[,arg1,arg2,...]`.
+    /// Repeatable. Discovered tools are registered as `mcp.<name>.<tool>`
+    /// alongside the built-in toolset, for every session this TUI starts
+    /// (including ones created later via the provider picker). Env vars,
+    /// a working directory, or a non-default timeout aren't expressible
+    /// through this flag — embed `harness-engine` directly and use
+    /// `SessionBuilder::mcp_server` for those.
+    #[arg(long = "mcp-server")]
+    mcp_servers: Vec<String>,
+}
+
+/// Parses one `--mcp-server` value: `name=command[,arg1,arg2,...]`.
+fn parse_mcp_server(raw: &str) -> Result<harness_engine::McpServerConfig> {
+    let (name, rest) = raw.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!("--mcp-server value {raw:?} must be name=command[,arg,...]")
+    })?;
+    if name.is_empty() {
+        anyhow::bail!("--mcp-server value {raw:?} has an empty name before '='");
+    }
+    let mut parts = rest.split(',');
+    let command = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("--mcp-server value {raw:?} is missing a command after '='")
+        })?;
+    Ok(harness_engine::McpServerConfig::new(name, command).args(parts))
 }
 
 struct TerminalGuard {
@@ -72,6 +100,11 @@ fn supports_alternate_screen(term: Option<&str>) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let mcp_servers = args
+        .mcp_servers
+        .iter()
+        .map(|raw| parse_mcp_server(raw))
+        .collect::<Result<Vec<_>>>()?;
     let options = SessionOptions {
         integration: args.integration,
         config_json: args.config_json,
@@ -90,7 +123,7 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let app_harness = AppHarness::new(workspace_root).await?;
+    let app_harness = AppHarness::new(workspace_root, mcp_servers).await?;
     let mut controller = AppController::new(app_harness, options, initial_selection).await?;
     let mut needs_draw = true;
 

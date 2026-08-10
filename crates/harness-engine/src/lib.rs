@@ -10,7 +10,9 @@ pub mod session_builder;
 pub use builder::HarnessBuilder;
 pub use harness::Harness;
 pub use providers::*;
-pub use session_builder::{ContextInspection, HarnessError, SessionBuilder, SessionHandle};
+pub use session_builder::{
+    ContextInspection, HarnessError, McpServerConfig, SessionBuilder, SessionHandle,
+};
 
 // Re-export workspace types for convenience.
 pub use harness_workspace::{

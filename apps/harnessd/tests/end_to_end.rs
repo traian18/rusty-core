@@ -101,6 +101,7 @@ async fn full_stack_create_session_snapshot_close() {
             toolset: AgentToolset {
                 tools: std::collections::HashMap::new(),
             },
+            mcp_servers: Vec::new(),
         },
     };
     write_frame(&mut stream, &serde_json::to_vec(&create).unwrap()).await;
@@ -218,6 +219,7 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
             toolset: AgentToolset {
                 tools: std::collections::HashMap::new(),
             },
+            mcp_servers: Vec::new(),
         },
     };
     write_frame(&mut stream, &serde_json::to_vec(&create).unwrap()).await;
@@ -404,6 +406,7 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
             toolset: AgentToolset {
                 tools: std::collections::HashMap::new(),
             },
+            mcp_servers: Vec::new(),
         },
     };
     write_frame(&mut stream, &serde_json::to_vec(&create).unwrap()).await;
