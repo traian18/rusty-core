@@ -16,6 +16,7 @@ import type {
   AdmissionResult,
   AgentEventEnvelope,
   AgentToolset,
+  McpServerSpec,
   MutationCommand,
   MutationMetadata,
   PermissionDecision,
@@ -39,6 +40,13 @@ export interface CreateSessionOptions {
   integration: string;
   integrationConfig?: unknown;
   toolset?: AgentToolset;
+  /**
+   * MCP servers to connect over stdio at session start; discovered tools
+   * merge into `toolset` under `mcp.<name>.<tool>` ids. Omitted entirely
+   * (rather than sent as `[]`) when unset, matching the Rust side's
+   * `#[serde(default)]` on `RpcRequestBody::CreateSession.mcp_servers`.
+   */
+  mcpServers?: McpServerSpec[];
 }
 
 export interface RestoreSessionOptions {
@@ -139,6 +147,7 @@ export class HarnessClient {
         integration: options.integration,
         integration_config: options.integrationConfig ?? {},
         toolset: options.toolset ?? { tools: {} },
+        ...(options.mcpServers ? { mcp_servers: options.mcpServers } : {}),
       },
     });
     if (body.type !== "session_created") {

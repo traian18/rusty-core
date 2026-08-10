@@ -17,5 +17,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "sync", "rt", "time", "macros", "io-util"] }
 tracing = { workspace = true }
 
+[[bin]]
+name = "fake_mcp_server"
+path = "tests/fixtures/fake_mcp_server.rs"
+test = false
+doc = false
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

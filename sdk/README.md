@@ -14,11 +14,11 @@ of any particular IDE or frontend.
 ## Shared contract
 
 All SDKs are clients of the same behavioral contract: sessions, runs,
-agents, events, and permissions behave the same whether an application
-embeds the Rust engine directly or talks to `harnessd` over the wire. The
-wire shape of that contract is described in
-[`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json)
-and [`../schema/compatibility-policy.md`](../schema/compatibility-policy.md).
+agents, events, permissions, and [MCP server](../README.md#mcp-servers)
+connections behave the same whether an application embeds the Rust engine
+directly or talks to `harnessd` over the wire. The wire shape of that
+contract is described in
+[`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json).
 
 The Rust SDK and the TypeScript SDK are hand-written against that contract
 today. `sdk_plan.md` (SDK-201) tracks generating both from one annotated
@@ -45,4 +45,3 @@ closed.
   reference in [`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json).
 - The full production roadmap, phases, and release gates:
   [`../sdk_plan.md`](../sdk_plan.md).
-- Current v1 feature scope decisions: [`../docs/product-scope-v1.md`](../docs/product-scope-v1.md).

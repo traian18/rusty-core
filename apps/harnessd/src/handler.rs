@@ -7,10 +7,11 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use harness_engine::{FsWorkspace, Harness, SessionHandle};
+use harness_engine::{FsWorkspace, Harness, McpServerConfig, SessionHandle};
 use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
+use harness_protocol::mcp::McpServerSpec;
 use harness_protocol::rpc::{
     DiagnosticsSnapshot, MutationCommand, PermitDiagnostic, RpcError, RpcErrorCategory,
     RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
@@ -174,8 +175,9 @@ impl HarnessRpcHandler {
         integration: String,
         integration_config: serde_json::Value,
         toolset: harness_protocol::tools::AgentToolset,
+        mcp_servers: Vec<McpServerSpec>,
     ) -> RpcResponseBody {
-        let builder = match self
+        let mut builder = match self
             .harness
             .session()
             .integration(integration, integration_config)
@@ -190,6 +192,9 @@ impl HarnessRpcHandler {
                 )
             }
         };
+        for spec in mcp_servers {
+            builder = builder.mcp_server(mcp_config_from_spec(spec));
+        }
         let workspace = Arc::new(FsWorkspace::new(workspace_root));
         match builder.toolset(toolset, workspace).start().await {
             Ok(handle) => {
@@ -417,6 +422,23 @@ impl HarnessRpcHandler {
     }
 }
 
+/// Converts the wire-serializable [`McpServerSpec`] a client sent over
+/// `CreateSession` into the real `McpServerConfig` the engine actually
+/// connects with. Plain field mapping — the only non-trivial bit is
+/// `request_timeout_secs: Option<u64>` becoming a `Duration`.
+fn mcp_config_from_spec(spec: McpServerSpec) -> McpServerConfig {
+    McpServerConfig {
+        name: spec.name,
+        command: spec.command,
+        args: spec.args,
+        env: spec.env,
+        cwd: spec.cwd,
+        request_timeout: spec
+            .request_timeout_secs
+            .map(std::time::Duration::from_secs),
+    }
+}
+
 fn wire_status(status: SessionStatus) -> SessionStatusWire {
     match status {
         SessionStatus::Idle => SessionStatusWire::Idle,
@@ -455,9 +477,16 @@ impl RpcHandler for HarnessRpcHandler {
                 integration,
                 integration_config,
                 toolset,
+                mcp_servers,
             } => {
-                self.create_session(workspace_root, integration, integration_config, toolset)
-                    .await
+                self.create_session(
+                    workspace_root,
+                    integration,
+                    integration_config,
+                    toolset,
+                    mcp_servers,
+                )
+                .await
             }
             RpcRequestBody::Mutate { metadata, command } => {
                 self.mutate(session_id, metadata, command).await

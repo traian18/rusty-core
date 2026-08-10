@@ -20,6 +20,47 @@
       },
       "additionalProperties": false
     },
+    "McpServerSpec": {
+      "description": "Launch spec for one MCP server, connected over stdio when the session that requests it starts. See crates/harness-protocol/src/mcp.rs.",
+      "type": "object",
+      "required": [
+        "name",
+        "command"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_timeout_secs": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "UserInput": {
       "type": "object",
       "required": [
@@ -299,6 +340,12 @@
                 "integration_config": {},
                 "toolset": {
                   "$ref": "#/definitions/AgentToolset"
+                },
+                "mcp_servers": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/McpServerSpec"
+                  }
                 }
               }
             }

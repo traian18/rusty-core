@@ -12,6 +12,7 @@ use crate::admission::{AdmissionResult, MutationMetadata};
 use crate::commands::{PermissionDecision, UserInput};
 use crate::events::AgentEventEnvelope;
 use crate::ids::{AgentId, PermissionId, SessionId, Timestamp};
+use crate::mcp::McpServerSpec;
 use crate::tools::AgentToolset;
 use crate::usage::{AgentUsageSnapshot, SessionUsageSnapshot};
 
@@ -54,6 +55,11 @@ pub enum RpcRequestBody {
         integration: String,
         integration_config: serde_json::Value,
         toolset: AgentToolset,
+        /// MCP servers to connect over stdio at session start; discovered
+        /// tools merge into `toolset` under `mcp.<name>.<tool>` ids. Empty
+        /// by default — most sessions have none.
+        #[serde(default)]
+        mcp_servers: Vec<McpServerSpec>,
     },
     /// Idempotent, revision-aware session mutation.
     Mutate {

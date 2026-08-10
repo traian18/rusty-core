@@ -9,6 +9,7 @@ pub mod effects;
 pub mod events;
 pub mod ids;
 pub mod lifecycle;
+pub mod mcp;
 pub mod messages;
 pub mod rpc;
 pub mod tools;

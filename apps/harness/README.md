@@ -138,6 +138,17 @@ The TUI exposes these workspace tools:
 
 CLI-backed providers may execute tools through their own CLI permission and sandbox systems. Review their local configuration before testing against a sensitive workspace.
 
+### MCP servers
+
+Connect one or more [MCP](https://modelcontextprotocol.io) servers over stdio with repeatable `--mcp-server name=command[,arg1,arg2,...]` flags at launch:
+
+```console
+cargo run -p harness -- \
+  --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp'
+```
+
+Every tool the server advertises is registered as `mcp.<name>.<tool>`, applies to every session for the rest of the run (including ones started later via the provider picker), and shows up in the transcript/activity log like any other tool call. This flag can't express environment variables, a working directory, or a non-default timeout — see the main [README's MCP servers section](../../README.md#mcp-servers) for the embedding API that can.
+
 ## Session storage
 
 Sessions are stored relative to the launch directory:
