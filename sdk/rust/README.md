@@ -75,6 +75,34 @@ while let Some(event) = events.next().await {
 See `examples/basic_chat.rs` for a runnable version that registers a real
 integration and prints streamed text.
 
+## MCP servers
+
+`client.session()` returns `harness_engine::SessionBuilder` directly (see
+"Why this crate exists" above), so [MCP](https://modelcontextprotocol.io)
+server support needs no wrapper here — `SessionBuilder::mcp_server` already
+works exactly as documented in the main
+[README's MCP servers section](../../README.md#mcp-servers):
+
+```rust,no_run
+use rusty_harness_sdk::{Client, McpServerConfig, Session};
+
+# async fn run() -> Result<(), rusty_harness_sdk::SdkError> {
+let client = Client::builder().build().await?;
+
+let handle = client
+    .session()
+    .integration("anthropic", serde_json::json!({}))?
+    .mcp_server(
+        McpServerConfig::new("filesystem", "npx")
+            .args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
+    )
+    .start()
+    .await?;
+let session = Session::from(handle);
+# Ok(())
+# }
+```
+
 ## What this SDK does not yet do
 
 - No `steer`, `follow_up`, or `close_session` operations (engine gap, not

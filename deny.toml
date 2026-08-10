@@ -13,6 +13,10 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # webpki-roots (Mozilla's embedded CA root bundle, pulled in via
+    # reqwest -> hyper-rustls) relicensed its data under CDLA-Permissive-2.0
+    # starting with 1.x. Data license, not code, and permissive.
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "Unicode-3.0",

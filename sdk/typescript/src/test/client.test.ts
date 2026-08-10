@@ -87,6 +87,40 @@ test("protocol v2 creates sessions with the Rust AgentToolset shape", async () =
   });
 });
 
+test("createSession omits mcp_servers entirely when none are configured", async () => {
+  const transport = new MockTransport();
+  const client = await HarnessClient.connect(transport);
+  await client.createSession({ workspaceRoot: "/workspace", integration: "test" });
+
+  const payload = transport.requests[1]?.body;
+  assert.equal(payload?.type, "create_session");
+  assert.ok(
+    payload && payload.type === "create_session" && !("mcp_servers" in payload.payload),
+    "mcp_servers must be omitted, not sent as [], when unset",
+  );
+});
+
+test("createSession forwards MCP server specs verbatim in wire shape", async () => {
+  const transport = new MockTransport();
+  const client = await HarnessClient.connect(transport);
+  await client.createSession({
+    workspaceRoot: "/workspace",
+    integration: "test",
+    mcpServers: [
+      { name: "filesystem", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
+    ],
+  });
+
+  const payload = transport.requests[1]?.body;
+  assert.equal(payload?.type, "create_session");
+  assert.deepEqual(
+    payload?.type === "create_session" ? payload.payload.mcp_servers : undefined,
+    [
+      { name: "filesystem", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
+    ],
+  );
+});
+
 test("mutations carry command identity and return admission revisions", async () => {
   const transport = new MockTransport();
   const client = await HarnessClient.connect(transport);
