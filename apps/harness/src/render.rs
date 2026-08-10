@@ -21,6 +21,19 @@ const WARNING: Color = Color::Rgb(240, 188, 96);
 const ERROR: Color = Color::Rgb(240, 110, 120);
 const BORDER: Color = Color::Rgb(48, 54, 66);
 
+/// Cap on how much of a live/completed reasoning stream is shown inline in
+/// the transcript. The full text is retained in `AppState` regardless (see
+/// `AppState::fold_event`'s `ReasoningDelta` handling) — this only bounds
+/// what gets rendered, so one very long thinking block can't push the rest
+/// of the conversation off-screen.
+const MAX_REASONING_CHARS: usize = 2000;
+
+/// Cap on how much of a tool result preview (including `shell.exec`
+/// stdout/stderr) is shown inline in the transcript — long enough to read
+/// a normal command's output in full, short enough that one very verbose
+/// command can't dominate the scrollback.
+const MAX_TOOL_OUTPUT_CHARS: usize = 3000;
+
 pub fn render_startup(frame: &mut Frame, provider: &str, model: &str, workspace: &Path) {
     frame.render_widget(
         Block::default().style(Style::default().bg(BG)),
@@ -115,12 +128,15 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         frame,
         layout[2],
         state,
-        state.modal.is_none() && !state.context_inspector_open,
+        state.modal.is_none() && !state.context_inspector_open && !state.log_open,
     );
     render_status(frame, layout[3], state);
 
     if state.context_inspector_open {
         render_context_inspector(frame, state);
+    }
+    if state.log_open {
+        render_log_panel(frame, state);
     }
 }
 
@@ -281,10 +297,12 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
             }
             lines.push(Line::from(header));
             if !reasoning.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  ‣ {}", single_line_preview(reasoning, 120)),
+                lines.extend(capped_multiline(
+                    reasoning,
+                    MAX_REASONING_CHARS,
+                    "  ‣ ",
                     Style::default().fg(SUBTLE).italic(),
-                )));
+                ));
             }
             if text.is_empty() {
                 lines.push(Line::from(Span::styled("  …", Style::default().fg(MUTED))));
@@ -320,10 +338,7 @@ fn block_lines(block: &TranscriptBlock) -> Vec<Line<'static>> {
             }
             if let ToolCallState::Succeeded { preview } | ToolCallState::Failed { preview } = state
             {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", single_line_preview(preview, 160)),
-                    Style::default().fg(MUTED),
-                )));
+                lines.extend(tool_output_lines(preview));
             }
         }
         TranscriptBlock::Permission {
@@ -496,6 +511,7 @@ fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppState, bounds:
             let commands = [
                 "New session / switch provider · model",
                 "Context inspector",
+                "Activity log",
                 "Quit",
             ];
             (
@@ -704,6 +720,78 @@ fn render_context_inspector(frame: &mut Frame, state: &AppState) {
     );
 }
 
+/// Raw, chronological event log — every `AgentEvent` the active session has
+/// emitted (except the two highest-frequency streaming-delta kinds; see
+/// `app_state::log_summary`), independent of the curated transcript. Where
+/// the transcript shows a finished conversation, this shows the underlying
+/// activity that produced it: state transitions, backend request timing,
+/// tool-call lifecycles with raw arguments, permission requests, usage
+/// updates — including everything that happens (or fails to happen)
+/// between "Run started" and a terminal error, which the curated transcript
+/// alone doesn't surface.
+fn render_log_panel(frame: &mut Frame, state: &AppState) {
+    let area = centered_rect(84, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    // Show only the most recent entries that could plausibly fit the panel
+    // height; this is a simple always-scrolled-to-bottom view rather than a
+    // scrollable one, matching the context inspector's own lack of
+    // scrolling for now.
+    let visible_rows = area.height.saturating_sub(6) as usize;
+    let start = state.log.len().saturating_sub(visible_rows.max(1));
+
+    let mut lines: Vec<Line> = if state.log.is_empty() {
+        vec![Line::from(Span::styled(
+            "No activity recorded yet for this session.",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        state.log[start..]
+            .iter()
+            .map(|entry| {
+                let color = if entry.text.starts_with("FAILED") {
+                    ERROR
+                } else if entry.text.starts_with("state") || entry.text.starts_with("completed") {
+                    ACCENT
+                } else {
+                    TEXT
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{:>4}] ", entry.sequence),
+                        Style::default().fg(SUBTLE),
+                    ),
+                    Span::styled(
+                        single_line_preview(&entry.text, 200),
+                        Style::default().fg(color),
+                    ),
+                ])
+            })
+            .collect()
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Ctrl+L or /log close",
+        Style::default().fg(ACCENT),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(TEXT).bg(PANEL))
+            .block(
+                Block::default()
+                    .title(" Activity log ")
+                    .title_style(Style::default().fg(BG).bg(ACCENT).bold())
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            ),
+        area,
+    );
+}
+
 fn selectable_line(label: &str, selected: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -763,6 +851,95 @@ fn single_line_preview(value: &str, limit: usize) -> String {
 
 fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
+}
+
+/// Renders `text` as one styled line per `\n`-separated line, each prefixed
+/// with `prefix`, capped at `char_cap` characters with a trailing
+/// truncation marker if it's longer. Unlike `single_line_preview`, this
+/// preserves real line breaks instead of flattening everything onto one
+/// line — used for anything that can legitimately span many lines (a
+/// reasoning stream, a tool's stdout/stderr) and shouldn't be squashed.
+fn capped_multiline(text: &str, char_cap: usize, prefix: &str, style: Style) -> Vec<Line<'static>> {
+    let total_chars = text.chars().count();
+    let truncated = total_chars > char_cap;
+    let shown: String = if truncated {
+        text.chars().take(char_cap).collect()
+    } else {
+        text.to_owned()
+    };
+
+    let mut lines: Vec<Line<'static>> = shown
+        .lines()
+        .map(|line| Line::from(Span::styled(format!("{prefix}{line}"), style)))
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(prefix.to_owned(), style)));
+    }
+    if truncated {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{prefix}… (truncated for display, {} more chars)",
+                total_chars - char_cap
+            ),
+            style,
+        )));
+    }
+    lines
+}
+
+/// Renders a tool result preview. `shell.exec`'s output is a JSON object
+/// shaped `{"stdout", "stderr", "exit_code"}` (see
+/// `crates/tools/shell/src/executor.rs`) — recognized here and shown as
+/// real multi-line stdout/stderr text instead of one escaped JSON blob.
+/// Any other tool's output falls back to pretty-printed JSON, or the raw
+/// string as-is if it isn't JSON at all (e.g. a failed tool's error text).
+fn tool_output_lines(preview: &str) -> Vec<Line<'static>> {
+    let style = Style::default().fg(MUTED);
+    let indent = "    ";
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(preview) else {
+        return capped_multiline(preview, MAX_TOOL_OUTPUT_CHARS, "  ", style);
+    };
+
+    if let Some(object) = value.as_object() {
+        if object.contains_key("stdout") || object.contains_key("stderr") {
+            let mut lines = Vec::new();
+            if let Some(code) = object.get("exit_code") {
+                lines.push(Line::from(Span::styled(
+                    format!("  exit code {code}"),
+                    style,
+                )));
+            }
+            let stdout = object.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+            let stderr = object.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+            if !stdout.is_empty() {
+                lines.push(Line::from(Span::styled("  stdout:", style)));
+                lines.extend(capped_multiline(
+                    stdout,
+                    MAX_TOOL_OUTPUT_CHARS,
+                    indent,
+                    style,
+                ));
+            }
+            if !stderr.is_empty() {
+                let warn = Style::default().fg(WARNING);
+                lines.push(Line::from(Span::styled("  stderr:", warn)));
+                lines.extend(capped_multiline(
+                    stderr,
+                    MAX_TOOL_OUTPUT_CHARS,
+                    indent,
+                    warn,
+                ));
+            }
+            if stdout.is_empty() && stderr.is_empty() {
+                lines.push(Line::from(Span::styled("  (no output)", style)));
+            }
+            return lines;
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| preview.to_owned());
+    capped_multiline(&pretty, MAX_TOOL_OUTPUT_CHARS, "  ", style)
 }
 
 #[cfg(test)]
@@ -826,5 +1003,51 @@ mod tests {
             assert!(screen.contains(provider), "missing provider: {provider}");
         }
         assert!(screen.contains("Enter confirm"));
+    }
+
+    fn flatten(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_output_lines_splits_shell_stdout_and_stderr_with_real_newlines() {
+        let preview = serde_json::json!({
+            "stdout": "line one\nline two",
+            "stderr": "a warning",
+            "exit_code": 0
+        })
+        .to_string();
+
+        let rendered = flatten(&tool_output_lines(&preview));
+        assert!(rendered.contains("exit code 0"));
+        assert!(rendered.contains("line one"));
+        assert!(rendered.contains("line two"));
+        assert!(rendered.contains("a warning"));
+    }
+
+    #[test]
+    fn tool_output_lines_falls_back_to_raw_text_for_non_json_preview() {
+        let rendered = flatten(&tool_output_lines("PermissionDenied"));
+        assert!(rendered.contains("PermissionDenied"));
+    }
+
+    #[test]
+    fn capped_multiline_preserves_line_breaks_and_marks_truncation() {
+        let lines = capped_multiline("a\nb\nc", 100, "> ", Style::default());
+        assert_eq!(flatten(&lines), "> a\n> b\n> c");
+
+        let long = "x".repeat(50);
+        let truncated = capped_multiline(&long, 10, "> ", Style::default());
+        let rendered = flatten(&truncated);
+        assert!(rendered.contains("truncated for display, 40 more chars"));
     }
 }

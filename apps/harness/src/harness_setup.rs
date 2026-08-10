@@ -16,6 +16,33 @@ use serde_json::{json, Value};
 
 use crate::providers::{option_from_descriptor, ProviderOption, SessionSelection};
 
+/// Requests extended thinking/reasoning for integrations that actually
+/// stream it, `None` otherwise.
+///
+/// Today that's `"anthropic"` only: it's the sole integration whose wire
+/// layer translates a `thinking_delta` SSE event into
+/// `ModelEvent::ReasoningDelta` (see `crates/integrations/anthropic/src/wire.rs`).
+/// `claude-code`/`codex`/`openai`/`gemini`/`openai-compatible`/`github-copilot`
+/// all declare `extended_thinking: false` in their capabilities or simply
+/// never emit the event — this is a real backend gap, not a display bug,
+/// and setting `extended_thinking: true` unconditionally for every
+/// integration would actively break the ones that don't support it:
+/// `GenericModelBackend::check_capabilities` rejects *every* request with a
+/// `CapabilityMismatch` error the moment `extended_thinking`/
+/// `reasoning_effort` is requested against a backend whose
+/// `reasoning_stream` capability is `false` — it doesn't silently ignore
+/// the request.
+fn reasoning_params_for(integration: &str) -> Option<harness_protocol::backend::ExecutionParams> {
+    if integration == "anthropic" {
+        Some(harness_protocol::backend::ExecutionParams {
+            extended_thinking: Some(true),
+            ..Default::default()
+        })
+    } else {
+        None
+    }
+}
+
 /// Options for starting a harness session.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
@@ -172,13 +199,16 @@ impl AppHarness {
             );
         }
 
-        Ok(self
+        let mut builder = self
             .harness
             .session()
             .integration(&options.integration, config)?
-            .toolset(default_toolset(), self.workspace.clone())
-            .start()
-            .await?)
+            .toolset(default_toolset(), self.workspace.clone());
+        if let Some(params) = reasoning_params_for(&options.integration) {
+            builder = builder.execution_params(params);
+        }
+
+        Ok(builder.start().await?)
     }
 
     pub async fn start_selected(&self, selection: &SessionSelection) -> Result<SessionHandle> {
@@ -199,17 +229,21 @@ impl AppHarness {
                 selection.provider
             );
         }
+        let reasoning_params = reasoning_params_for(&selection.integration);
         let selection = BackendSelection {
             provider: selection.provider_id.clone(),
             credential_profile: selection.credential_profile.clone(),
             provider_model_id: selection.model.clone(),
         };
-        Ok(self
+        let mut builder = self
             .harness
             .session_from_selection(&selection)?
-            .toolset(default_toolset(), self.workspace.clone())
-            .start()
-            .await?)
+            .toolset(default_toolset(), self.workspace.clone());
+        if let Some(params) = reasoning_params {
+            builder = builder.execution_params(params);
+        }
+
+        Ok(builder.start().await?)
     }
 }
 

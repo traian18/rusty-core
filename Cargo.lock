@@ -916,6 +916,7 @@ dependencies = [
  "harness-session-store",
  "harness-tool-filesystem",
  "harness-tool-git",
+ "harness-tool-mcp",
  "harness-tool-shell",
  "harness-tool-web",
  "harness-tools",
@@ -1183,6 +1184,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harness-tool-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "harness-tools",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

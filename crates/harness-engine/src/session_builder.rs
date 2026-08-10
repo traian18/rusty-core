@@ -23,6 +23,7 @@ use harness_runtime::{IntegrationError, IntegrationRegistry};
 
 use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
 use harness_tool_git::{GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
+pub use harness_tool_mcp::McpServerConfig;
 use harness_tool_shell::ExecTool;
 use harness_tool_web::FetchTool;
 
@@ -95,6 +96,8 @@ pub enum HarnessError {
     InvalidIntegrationConfig(#[from] serde_json::Error),
     #[error("integration error: {0}")]
     Integration(#[from] IntegrationError),
+    #[error("MCP server '{0}' failed: {1}")]
+    Mcp(String, #[source] harness_tool_mcp::McpError),
     #[error("session error: {0}")]
     Session(#[from] SessionError),
     #[error("session manager error: {0}")]
@@ -129,6 +132,9 @@ pub struct SessionBuilder {
     /// temperature, reasoning, ...) applied immediately after the session
     /// starts — see [`execution_params`](Self::execution_params).
     execution_params: Option<harness_protocol::backend::ExecutionParams>,
+    /// MCP servers to connect at [`start`](Self::start) — see
+    /// [`mcp_server`](Self::mcp_server).
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl SessionBuilder {
@@ -152,6 +158,7 @@ impl SessionBuilder {
             session_manager: None,
             context_provider: None,
             execution_params: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -175,6 +182,7 @@ impl SessionBuilder {
             session_manager: Some(session_manager),
             context_provider: None,
             execution_params: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -205,6 +213,20 @@ impl SessionBuilder {
     /// Set the session tool registry.
     pub fn tools(mut self, tool_registry: Arc<dyn ToolRegistry>) -> Self {
         self.tool_registry = Some(tool_registry);
+        self
+    }
+
+    /// Connect an MCP server at [`start`](Self::start) and register every
+    /// tool it advertises alongside the session's other tools.
+    ///
+    /// Resolution is deferred to `start()` for the same reason
+    /// [`integration`](Self::integration) is: connecting means spawning a
+    /// process and awaiting its `initialize` handshake, which needs an
+    /// async context the fluent builder doesn't have. Call this once per
+    /// server; each gets its own process and its tools are namespaced
+    /// `mcp.<name>.<tool>` so servers (and built-in tools) never collide.
+    pub fn mcp_server(mut self, config: McpServerConfig) -> Self {
+        self.mcp_servers.push(config);
         self
     }
 
@@ -336,35 +358,79 @@ impl SessionBuilder {
             .tool_registry
             .ok_or(HarnessError::MissingToolRegistry)?;
 
+        // Connect any configured MCP servers and register their tools into
+        // the same registry as the built-in ones — from here on an MCP
+        // tool and `fs.read` look identical to the rest of the builder.
+        // This needs to happen before `root_toolset` is derived below so
+        // the no-explicit-toolset fallback (which reads straight from
+        // `tool_registry.descriptors()`) picks the MCP tools up too.
+        let mut mcp_descriptors = Vec::new();
+        for config in &self.mcp_servers {
+            let executors = harness_tool_mcp::connect_and_discover(config)
+                .await
+                .map_err(|error| HarnessError::Mcp(config.name.clone(), error))?;
+            for executor in executors {
+                let descriptor = executor.descriptor();
+                let _ = tool_registry.register(executor);
+                let id = harness_protocol::ids::ToolId::new();
+                mcp_descriptors.push((
+                    id,
+                    ToolCapability {
+                        descriptor: harness_protocol::tools::ToolDescriptor {
+                            id,
+                            name: descriptor.id.to_string(),
+                            description: descriptor.description,
+                            input_schema: descriptor.input_schema,
+                        },
+                        policy: ToolPolicy {
+                            permission: PermissionMode::Allow,
+                            enabled: true,
+                        },
+                        delegatable: false,
+                    },
+                ));
+            }
+        }
+
         // A high-level toolset carries explicit policy. For callers that
         // provide a registry directly, derive an enabled/allowed toolset so
         // registered tools are also executable by the root agent.
-        let root_toolset = self.root_toolset.unwrap_or_else(|| {
-            let tools = tool_registry
-                .descriptors()
-                .into_iter()
-                .map(|desc| {
-                    let id = harness_protocol::ids::ToolId::new();
-                    (
-                        id,
-                        ToolCapability {
-                            descriptor: harness_protocol::tools::ToolDescriptor {
-                                id,
-                                name: desc.id.to_string(),
-                                description: desc.description,
-                                input_schema: desc.input_schema,
+        let root_toolset = match self.root_toolset {
+            Some(mut toolset) => {
+                // `.toolset()` already fixed its policy before MCP servers
+                // were connected — merge the newly discovered tools in
+                // rather than rebuilding from the registry, which would
+                // silently drop the caller's explicit choices.
+                toolset.tools.extend(mcp_descriptors);
+                toolset
+            }
+            None => {
+                let tools = tool_registry
+                    .descriptors()
+                    .into_iter()
+                    .map(|desc| {
+                        let id = harness_protocol::ids::ToolId::new();
+                        (
+                            id,
+                            ToolCapability {
+                                descriptor: harness_protocol::tools::ToolDescriptor {
+                                    id,
+                                    name: desc.id.to_string(),
+                                    description: desc.description,
+                                    input_schema: desc.input_schema,
+                                },
+                                policy: ToolPolicy {
+                                    permission: PermissionMode::Allow,
+                                    enabled: true,
+                                },
+                                delegatable: false,
                             },
-                            policy: ToolPolicy {
-                                permission: PermissionMode::Allow,
-                                enabled: true,
-                            },
-                            delegatable: false,
-                        },
-                    )
-                })
-                .collect();
-            AgentToolset { tools }
-        });
+                        )
+                    })
+                    .collect();
+                AgentToolset { tools }
+            }
+        };
         let protocol_descriptors = root_toolset
             .enabled_descriptors()
             .into_iter()

@@ -8,9 +8,76 @@ use harness_protocol::{
 };
 
 use crate::{
-    model::{PermissionDisplayDecision, ToolCallState, TranscriptBlock},
+    model::{LogEntry, PermissionDisplayDecision, ToolCallState, TranscriptBlock},
     providers::{fallback_options, ProviderOption, SessionSelection},
 };
+
+/// Caps the activity log's memory growth over a long-running session.
+/// Streaming text/reasoning deltas never reach the log (see `fold_event`),
+/// so in practice this bound is only ever approached by very long sessions
+/// with many state transitions, tool calls, or child agents — not by a
+/// single verbose run.
+const MAX_LOG_ENTRIES: usize = 500;
+
+/// Formats a one-line activity-log summary for `event`, or `None` for the
+/// two kinds excluded from the log. `AssistantTextDelta`/`ReasoningDelta`
+/// are the only exclusions — a single streamed response can produce
+/// hundreds of those, and their content is already visible, progressively,
+/// in the curated transcript (see `AppState::fold_event`'s own handling of
+/// them). Everything else is included, on purpose, even event kinds the
+/// curated transcript never renders at all (`BackendRequestStarted`,
+/// `PermissionRequested`, `UsageUpdated`) — that's the point of a raw log
+/// next to a curated one: it can't silently go stale the way a hand-picked
+/// `match` does when a new `AgentEvent` variant is added and nobody
+/// remembers to teach the transcript about it.
+fn log_summary(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::AssistantTextDelta { .. } | AgentEvent::ReasoningDelta { .. } => None,
+        AgentEvent::StateChanged { from, to } => Some(format!("state {from:?} → {to:?}")),
+        AgentEvent::RunStarted { run_id } => Some(format!("run started {run_id:?}")),
+        AgentEvent::BackendRequestStarted { request_id } => {
+            Some(format!("backend request started {request_id:?}"))
+        }
+        AgentEvent::AssistantMessageStarted { message_id } => {
+            Some(format!("assistant message started {message_id:?}"))
+        }
+        AgentEvent::AssistantMessageCompleted { message_id } => {
+            Some(format!("assistant message completed {message_id:?}"))
+        }
+        AgentEvent::ToolCallRequested { call } => Some(format!(
+            "tool call requested: {} {}",
+            call.name, call.arguments
+        )),
+        AgentEvent::ToolCallStarted { call_id } => Some(format!("tool call started {call_id:?}")),
+        AgentEvent::ToolCallProgress { call_id, progress } => Some(format!(
+            "tool call progress {call_id:?}: {} ({:.0}%)",
+            progress.status,
+            progress.fraction * 100.0
+        )),
+        AgentEvent::ToolCallCompleted { call_id, result } => Some(format!(
+            "tool call {} {call_id:?}: {}",
+            if result.has_error {
+                "failed"
+            } else {
+                "completed"
+            },
+            result.output_preview
+        )),
+        AgentEvent::PermissionRequested { request } => Some(format!(
+            "permission requested for {} ({:?})",
+            request.tool_call.name, request.id
+        )),
+        AgentEvent::UsageUpdated { usage } => Some(format!("usage updated: {usage:?}")),
+        AgentEvent::ChildAgentSpawned { agent_id } => {
+            Some(format!("child agent spawned {agent_id:?}"))
+        }
+        AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
+            Some(format!("child agent {agent_id:?} completed: {outcome:?}"))
+        }
+        AgentEvent::Failed { error } => Some(format!("FAILED [{}] {}", error.code, error.message)),
+        AgentEvent::Completed { outcome } => Some(format!("completed: {outcome:?}")),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -64,6 +131,8 @@ pub struct AppState {
     pub providers: Vec<ProviderOption>,
     pub context_inspector_open: bool,
     pub context: Option<harness_engine::ContextInspection>,
+    pub log: Vec<LogEntry>,
+    pub log_open: bool,
     seen_events: HashSet<EventId>,
     messages: HashMap<MessageId, usize>,
     tools: HashMap<ToolCallId, usize>,
@@ -179,7 +248,7 @@ impl AppState {
 
     pub fn modal_down(&mut self) {
         match self.modal.as_mut() {
-            Some(ModalState::Commands { selected }) => *selected = (*selected + 1).min(2),
+            Some(ModalState::Commands { selected }) => *selected = (*selected + 1).min(3),
             Some(ModalState::Provider { selected }) => {
                 *selected = (*selected + 1).min(self.providers.len().saturating_sub(1));
             }
@@ -234,6 +303,10 @@ impl AppState {
             }
             Some(ModalState::Commands { selected: 1 }) => {
                 self.context_inspector_open = true;
+                ModalResult::None
+            }
+            Some(ModalState::Commands { selected: 2 }) => {
+                self.log_open = true;
                 ModalResult::None
             }
             Some(ModalState::Commands { .. }) => {
@@ -298,6 +371,10 @@ impl AppState {
 
     pub fn toggle_context_inspector(&mut self) {
         self.context_inspector_open = !self.context_inspector_open;
+    }
+
+    pub fn toggle_log(&mut self) {
+        self.log_open = !self.log_open;
     }
 
     pub fn set_provider_options(&mut self, options: Vec<ProviderOption>) {
@@ -367,6 +444,17 @@ impl AppState {
     pub fn fold_event(&mut self, envelope: AgentEventEnvelope) {
         if !self.seen_events.insert(envelope.event_id) {
             return;
+        }
+
+        if let Some(text) = log_summary(&envelope.event) {
+            self.log.push(LogEntry {
+                sequence: envelope.agent_sequence,
+                text,
+            });
+            if self.log.len() > MAX_LOG_ENTRIES {
+                let overflow = self.log.len() - MAX_LOG_ENTRIES;
+                self.log.drain(..overflow);
+            }
         }
 
         let agent_id = envelope.agent_id;
@@ -591,5 +679,89 @@ mod tests {
                 && text == "hello"
                 && reasoning.is_empty()
         ));
+    }
+
+    #[test]
+    fn activity_log_records_events_the_curated_transcript_never_renders() {
+        let mut state = AppState::default();
+        let agent_id = AgentId::new();
+
+        // BackendRequestStarted has no transcript representation at all
+        // (see `fold_event`'s empty match arm for it) — the whole point of
+        // the activity log is that it's visible there anyway.
+        state.fold_event(envelope(
+            EventId::new(),
+            agent_id,
+            AgentEvent::BackendRequestStarted {
+                request_id: harness_protocol::ids::RequestId::new(),
+            },
+        ));
+
+        assert!(state.transcript.is_empty());
+        assert_eq!(state.log.len(), 1);
+        assert!(state.log[0].text.contains("backend request started"));
+    }
+
+    #[test]
+    fn activity_log_excludes_streaming_deltas() {
+        let mut state = AppState::default();
+        let agent_id = AgentId::new();
+        let message_id = MessageId::new();
+
+        state.fold_event(envelope(
+            EventId::new(),
+            agent_id,
+            AgentEvent::AssistantTextDelta {
+                message_id,
+                delta: "hi".to_owned(),
+            },
+        ));
+        state.fold_event(envelope(
+            EventId::new(),
+            agent_id,
+            AgentEvent::ReasoningDelta {
+                message_id,
+                delta: "thinking".to_owned(),
+            },
+        ));
+
+        // Both events land in the transcript (folded into the same
+        // AssistantMessage block) but neither should reach the log.
+        assert_eq!(state.transcript.len(), 1);
+        assert!(state.log.is_empty());
+    }
+
+    #[test]
+    fn activity_log_survives_a_failed_run_with_a_readable_summary() {
+        let mut state = AppState::default();
+        let agent_id = AgentId::new();
+
+        state.fold_event(envelope(
+            EventId::new(),
+            agent_id,
+            AgentEvent::Failed {
+                error: harness_protocol::commands::AgentError {
+                    code: "spawn_failed".to_owned(),
+                    message: "failed to spawn Claude Code CLI".to_owned(),
+                    details: None,
+                },
+            },
+        ));
+
+        assert_eq!(state.log.len(), 1);
+        assert!(state.log[0].text.starts_with("FAILED [spawn_failed]"));
+        assert!(state.log[0]
+            .text
+            .contains("failed to spawn Claude Code CLI"));
+    }
+
+    #[test]
+    fn toggle_log_flips_visibility() {
+        let mut state = AppState::default();
+        assert!(!state.log_open);
+        state.toggle_log();
+        assert!(state.log_open);
+        state.toggle_log();
+        assert!(!state.log_open);
     }
 }

@@ -102,6 +102,7 @@ Enter these commands in the prompt composer:
 | `/login` or `/connect` | Show the authentication instruction for the selected provider |
 | `/models` | Refresh the active provider's model catalog |
 | `/context` | Toggle the context inspector |
+| `/log` or `/logs` | Toggle the activity log — a raw, chronological record of every event the agent emitted (state transitions, backend request timing, tool-call lifecycles with arguments, permission requests, usage updates), independent of the curated transcript. Also reachable from the command palette (`Ctrl+P`) as "Activity log" |
 | `/exit` or `/quit` | Exit the TUI |
 
 ## Keyboard shortcuts
@@ -114,6 +115,7 @@ Enter these commands in the prompt composer:
 | `Esc` | Close a modal or cancel the active run |
 | `Ctrl+P` | Open the command palette |
 | `Ctrl+I` | Toggle the context inspector |
+| `Ctrl+L` | Toggle the activity log (see `/log` above) |
 | `Ctrl+N` | Switch provider/model (starts a new session), available anytime |
 | `Ctrl+Up` / `Ctrl+Down` | Switch between sessions |
 | `Page Up` / `Page Down` | Scroll the transcript |
@@ -131,6 +133,8 @@ The TUI exposes these workspace tools:
 
 - `fs.read` and `workspace.search` are allowed automatically.
 - `fs.edit` and `shell.exec` require explicit approval.
+
+`shell.exec` results render `stdout`/`stderr` as real multi-line text (not one escaped-JSON line) once the command finishes; reasoning/thinking also renders in full as it streams, not just a one-line preview. Both are capped at a few thousand characters for display so one very verbose command or a long thinking block can't push everything else off-screen — the full data isn't lost, only the render is bounded. Neither streams progressively mid-command today: a shell command's output only appears once it exits, since the tool doesn't emit intermediate progress.
 
 CLI-backed providers may execute tools through their own CLI permission and sandbox systems. Review their local configuration before testing against a sensitive workspace.
 

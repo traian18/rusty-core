@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
                     InputAction::ToggleInspector => {
                         controller.state_mut().toggle_context_inspector()
                     }
+                    InputAction::ToggleLog => controller.state_mut().toggle_log(),
                     InputAction::NewSession => controller.state_mut().open_new_session(),
                     InputAction::PreviousSession => {
                         if let Err(error) = controller.previous_session().await {
@@ -157,6 +158,7 @@ async fn main() -> Result<()> {
                         match prompt.trim() {
                             "/exit" | "/quit" => controller.state_mut().should_quit = true,
                             "/context" => controller.state_mut().toggle_context_inspector(),
+                            "/log" | "/logs" => controller.state_mut().toggle_log(),
                             "/login" | "/connect" => match controller.auth_instruction() {
                                 Ok(instruction) => {
                                     controller.state_mut().system_notice(instruction)

@@ -20,6 +20,7 @@ harness-tool-filesystem = { path = "../tools/filesystem" }
 harness-tool-shell = { path = "../tools/shell" }
 harness-tool-git = { path = "../tools/git" }
 harness-tool-web = { path = "../tools/web" }
+harness-tool-mcp = { path = "../tools/mcp" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

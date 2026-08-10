@@ -23,6 +23,7 @@ members = [
     "crates/tools/shell",
     "crates/tools/git",
     "crates/tools/web",
+    "crates/tools/mcp",
     "crates/transports/websocket",
     "crates/transports/stdio",
     "crates/transports/ipc",
