@@ -544,6 +544,7 @@ CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchai
 
 Versions across the workspace are `0.1.x` — nothing here is published to crates.io or npm yet, and no crate makes a semver promise except `harness-extension-api`. Known, current limitations worth knowing before depending on this:
 
+- **Unix-like platforms only (Linux, macOS) — no Windows support.** `harness-transport-ipc` and `harnessctl`'s client (its only way to reach a daemon) use `tokio::net::UnixListener`/`UnixStream` unconditionally, which don't exist on Windows; the workspace does not currently build there. CI's test matrix reflects this (`ubuntu-latest`/`macos-latest` only). The `stdio` and WebSocket transports have no such dependency — a Windows host embedding `harness-engine` directly, or driving `harnessd --stdio`/`--tcp` from a non-Rust client, isn't affected by this; only `harnessd --unix-socket` and `harnessctl` are.
 - MCP support is client-only (the harness can consume another MCP server's tools; it cannot expose itself as one — see [MCP servers](#mcp-servers)), and stdio/`tools`-only within that.
 - The WebSocket transport is unauthenticated and loopback-only by deliberate scope decision (see `crates/transports/websocket/src/lib.rs`) — a remote/multi-tenant deployment needs an auth/TLS layer built on top, not just a different bind address.
 - `github-copilot` isn't yet registered in `harnessd` (see [Integrations](#integrations)).

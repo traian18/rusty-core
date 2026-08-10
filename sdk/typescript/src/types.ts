@@ -78,6 +78,22 @@ export interface AgentToolset {
   tools: Record<ToolId, ToolCapability>;
 }
 
+/**
+ * Launch spec for one MCP server, connected over stdio when the session
+ * that requests it starts. Mirrors `harness_protocol::mcp::McpServerSpec`
+ * field-for-field — see `crates/harness-protocol/src/mcp.rs`. All fields
+ * but `name`/`command` are optional and default to Rust's `#[serde(default)]`
+ * values (empty args/env, no cwd, the client's own 60s request timeout).
+ */
+export interface McpServerSpec {
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string | null;
+  request_timeout_secs?: number | null;
+}
+
 export interface ToolCall {
   id: ToolCallId;
   name: string;
@@ -226,6 +242,7 @@ export type RpcRequestBody =
         integration: string;
         integration_config: unknown;
         toolset: AgentToolset;
+        mcp_servers?: McpServerSpec[];
       };
     }
   | {
