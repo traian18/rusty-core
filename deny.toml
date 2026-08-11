@@ -4,7 +4,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # paste (proc-macro, transitive via ratatui -> harness/harnessctl TUIs)
+    # is unmaintained/archived upstream. No safe upgrade exists per the
+    # advisory itself; ratatui would need to drop it or switch to a fork
+    # (e.g. `pastey`) for this to close. Not a vulnerability, just
+    # abandoned maintenance — accepted until ratatui moves off it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
