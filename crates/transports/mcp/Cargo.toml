@@ -1,0 +1,22 @@
+[package]
+name = "harness-transport-mcp"
+version = "0.1.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-protocol = { path = "../../harness-protocol" }
+harness-runtime = { path = "../../harness-runtime" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "rt", "io-util", "sync", "macros", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

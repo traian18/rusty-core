@@ -60,6 +60,74 @@ struct Args {
     /// Defaults to `<cwd>/.harness/sessions`.
     #[arg(long)]
     sessions_dir: Option<PathBuf>,
+
+    /// Serve as an **MCP server** over stdin/stdout, so Claude Desktop,
+    /// Cursor, or VS Code can drive sessions without a harness-specific
+    /// SDK. Mutually exclusive with `--stdio`: both reserve stdout.
+    ///
+    /// An MCP client can't know which provider this daemon is wired to, so
+    /// `--mcp-integration` and `--mcp-workspace-root` supply what it can't.
+    #[arg(long, conflicts_with = "stdio")]
+    mcp_stdio: bool,
+
+    /// Integration id for sessions created over MCP server mode.
+    #[arg(long, default_value = "anthropic", requires = "mcp_stdio")]
+    mcp_integration: String,
+
+    /// Raw JSON config for `--mcp-integration`.
+    #[arg(long, default_value = "{}", requires = "mcp_stdio")]
+    mcp_integration_config: String,
+
+    /// Workspace root for sessions created over MCP server mode. Defaults
+    /// to the current directory. Fixed here rather than taken from the tool
+    /// call, so a connected IDE can't point the agent at an arbitrary
+    /// directory.
+    #[arg(long, requires = "mcp_stdio")]
+    mcp_workspace_root: Option<PathBuf>,
+}
+
+/// Tools granted to MCP-created sessions.
+///
+/// Every tool is `Allow`: MCP has no channel for answering a permission
+/// prompt, so an `Ask` policy would park the run until it timed out.
+/// `harness_prompt` detects and reports that case rather than hanging, but
+/// the correct configuration is simply not to create it.
+fn mcp_toolset() -> harness_protocol::tools::AgentToolset {
+    use harness_protocol::ids::ToolId;
+    use harness_protocol::tools::{
+        AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy,
+    };
+
+    let mut tools = std::collections::HashMap::new();
+    for (name, description) in [
+        ("fs.read", "Read a file from the workspace."),
+        ("fs.edit", "Create or replace a workspace file."),
+        ("workspace.search", "Search workspace files."),
+        ("shell.exec", "Run a shell command in the workspace."),
+        ("git.status", "Show git status."),
+        ("git.diff", "Show a git diff."),
+        ("git.log", "Show git history."),
+        ("git.show", "Show a git object."),
+    ] {
+        let id = ToolId::new();
+        tools.insert(
+            id,
+            ToolCapability {
+                descriptor: ToolDescriptor {
+                    id,
+                    name: name.to_owned(),
+                    description: description.to_owned(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                },
+                policy: ToolPolicy {
+                    permission: PermissionMode::Allow,
+                    enabled: true,
+                },
+                delegatable: false,
+            },
+        );
+    }
+    AgentToolset { tools }
 }
 
 #[tokio::main]
@@ -71,9 +139,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    if args.unix_socket.is_none() && args.tcp.is_none() && !args.stdio {
+    if args.unix_socket.is_none() && args.tcp.is_none() && !args.stdio && !args.mcp_stdio {
         bail!(
-            "at least one transport must be selected; pass --unix-socket <path>, --tcp <addr>, and/or --stdio"
+            "at least one transport must be selected; pass --unix-socket <path>, --tcp <addr>, --stdio, and/or --mcp-stdio"
         );
     }
 
@@ -153,6 +221,39 @@ async fn main() -> Result<()> {
             if let Err(error) = harness_transport_stdio::serve(handler, shutdown).await {
                 tracing::error!(%error, "stdio transport exited with an error");
             }
+        }));
+    }
+
+    if args.mcp_stdio {
+        let integration_config: serde_json::Value =
+            serde_json::from_str(&args.mcp_integration_config)
+                .context("--mcp-integration-config must be valid JSON")?;
+        let workspace_root = match args.mcp_workspace_root {
+            Some(root) => root,
+            None => std::env::current_dir().context("resolving the MCP workspace root")?,
+        };
+        let config = harness_transport_mcp::McpServeConfig::new(
+            args.mcp_integration.clone(),
+            workspace_root,
+        )
+        .integration_config(integration_config)
+        .toolset(mcp_toolset());
+
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) =
+                harness_transport_mcp::serve(handler, config, shutdown.clone()).await
+            {
+                tracing::error!(%error, "mcp server transport exited with an error");
+            }
+            // MCP server mode is spawned as a subprocess by an IDE, and the
+            // IDE ends it by closing stdin. `serve` returns on that EOF, so
+            // this is the signal to shut the daemon down — without it the
+            // process would sit in the shutdown wait below forever and every
+            // client restart would leak a harnessd.
+            tracing::info!("mcp server transport finished; shutting down");
+            shutdown.cancel();
         }));
     }
 

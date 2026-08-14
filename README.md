@@ -2,7 +2,7 @@
 
 Rust Agent Harness is a reusable, embeddable runtime for building **tool-using AI agents**. It separates deterministic agent and session semantics from asynchronous execution, model providers, tools, persistence, transports, and user interfaces — so the same session behavior can run in a terminal, a daemon, an IDE, a TUI, or any other host application.
 
-The repository is a Cargo workspace of small crates with explicit responsibility boundaries: a pure protocol/type layer, an async runtime, a public session-builder API, pluggable model backends, pluggable tools, durable persistence, and three wire transports that expose all of it to processes that aren't Rust at all.
+The repository is a Cargo workspace of small crates with explicit responsibility boundaries: a pure protocol/type layer, an async runtime, a public session-builder API, pluggable model backends, pluggable tools, durable persistence, and four wire transports that expose all of it to processes that aren't Rust at all.
 
 This README covers what the engine does, how it works, every integration and tool it ships with, and the three ways to use it: **embedding the crates in a Rust application**, **talking to a `harnessd` daemon over a socket/stdio/WebSocket** (directly or via an SDK), or **running one of the ready-made apps** (`harness`, `harnessd` + `harnessctl`).
 
@@ -11,7 +11,7 @@ This README covers what the engine does, how it works, every integration and too
 - [Capabilities at a glance](#capabilities-at-a-glance)
 - [How it works](#how-it-works) — layered architecture, sessions/agents/runs, the event model, durability and resume, protocol capabilities, provider resilience
 - [Integrations](#integrations) — every model backend, its config shape, and where it's wired up
-- [Tools](#tools) — everything an agent can call, including subagent delegation
+- [Tools](#tools) — everything an agent can call, including subagent delegation, MCP (both directions), and skills
 - [Workspace layout](#workspace-layout)
 - [Quick start](#quick-start-run-it-and-make-a-real-request)
 - [Running the standalone TUI](#running-the-standalone-tui)
@@ -36,6 +36,8 @@ This README covers what the engine does, how it works, every integration and too
 - **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire).
 - **Hierarchical cancellation** — a root `CancellationToken` fans out to every session, agent, backend request, and tool call; cancelling anywhere propagates and is idempotent.
 - **Three wire transports, one RPC contract** — Unix domain socket (length-prefixed JSON), WebSocket, and stdio (newline-delimited JSON) all frame the same `RpcRequestBody`/`RpcResponseBody` types, with a mandatory `Hello` protocol-version handshake on every connection.
+- **MCP in both directions** — consume any MCP server's tools over stdio or HTTP, and expose the engine itself as an MCP server so Claude Desktop/Cursor/VS Code can drive it (see [MCP server mode](#mcp-server-mode)).
+- **Runtime-extensible skills** — drop a `SKILL.md` directory into `.harness/skills/` and the agent gains a capability with no recompilation (see [Skills](#skills)).
 - **Works in-process or out-of-process** — the same engine is embedded directly by `apps/harness`'s TUI and exposed by `apps/harnessd` for external clients like `apps/harnessctl` or the Rust/TypeScript SDKs.
 
 ---
@@ -51,12 +53,13 @@ The workspace is split into five layers, each depending only on the ones below i
 │ Apps          harness (TUI) · harnessd (daemon) · harnessctl   │
 │               (CLI + chat TUI)                                  │
 ├────────────────────────────────────────────────────────────────┤
-│ Transports    ipc · websocket · stdio                          │
+│ Transports    ipc · websocket · stdio · mcp (server mode)      │
 │               (one RPC contract: harness_protocol::rpc)        │
 ├────────────────────────────────────────────────────────────────┤
 │ Integrations  anthropic · openai · openai-compatible · gemini  │
 │               · claude-code · codex · github-copilot           │
-│ Tools         filesystem · shell · git · web · agent.spawn     │
+│ Tools         filesystem · shell · git · web · mcp · skills    │
+│               · agent.spawn                                     │
 ├────────────────────────────────────────────────────────────────┤
 │ Engine        harness-engine (public Harness/SessionBuilder)   │
 │               harness-runtime (async orchestration)            │
@@ -240,7 +243,7 @@ Beyond the ten built-in tools, a session can connect any number of [MCP](https:/
   - **streamable HTTP** — POST JSON-RPC to an endpoint; the reply comes back as either `application/json` or an SSE stream. The SSE branch is consumed incrementally and returns the moment the matching reply arrives, so a server that keeps the stream open after answering doesn't stall the call. `Mcp-Session-Id` is captured at `initialize` and echoed thereafter.
 - **Handshake**: `initialize` → `notifications/initialized` → `tools/list` (with cursor pagination) → `tools/call`, hand-rolled JSON-RPC (no `rmcp` dependency — the workspace's own dependency-direction rule keeps that out of a `harness-tool-*` crate's transitive graph anyway).
 - **Scope, deliberately**: `tools/*` only. No resources, prompts, sampling, or roots — a server that only exposes those contributes nothing today.
-- **Client only.** The harness can *consume* another MCP server's tools; it cannot *expose itself* as an MCP server for something like Claude Desktop or Cursor to connect into. That's unstarted, separate work.
+- **Both directions.** The harness can *consume* another MCP server's tools (this section), and *expose itself* as an MCP server so Claude Desktop, Cursor, or VS Code can drive it — see [MCP server mode](#mcp-server-mode).
 - **Failure handling**: a request timeout, a malformed response, an unexpected content type, a non-2xx status, or the server process dying mid-call all become the same thing every other tool's error already is here — a logical `ToolResult { is_error: true }` the model can see and react to — not an aborted run. Spawn failures (bad `command`) surface earlier, at session start.
 
 Reachable from all three entry points:
@@ -281,6 +284,49 @@ let session = harness
 The CLI flag is a convenience for the common case; it can't express environment variables, a working directory, request headers, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/harness-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `harness-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
 
 On the wire, `McpServerSpec` carries an optional tagged `transport` member (`{"kind":"stdio",...}` or `{"kind":"http",...}`). Its absence means the flat `command`/`args`/`env`/`cwd` fields describe a stdio server — the original shape — so an existing client keeps working unchanged and no `PROTOCOL_VERSION` bump was needed. Read it via `McpServerSpec::resolve_transport()` rather than either representation directly.
+
+### MCP server mode
+
+The reverse direction: `harnessd` can present itself as an MCP server, so any MCP-capable client — Claude Desktop, Cursor, VS Code — drives real harness sessions with no harness-specific SDK. Implemented in `harness-transport-mcp` (`crates/transports/mcp`).
+
+```console
+harnessd --mcp-stdio --mcp-integration anthropic --mcp-workspace-root ./repo
+```
+
+In a client's `mcpServers` config:
+
+```json
+{
+  "mcpServers": {
+    "rusty-core": {
+      "command": "/path/to/harnessd",
+      "args": ["--mcp-stdio", "--mcp-integration", "anthropic",
+               "--mcp-workspace-root", "/path/to/repo"]
+    }
+  }
+}
+```
+
+Four tools and one resource family:
+
+| MCP tool | Maps to |
+|---|---|
+| `harness_create_session` | `CreateSession` |
+| `harness_prompt` | `Mutate { Prompt }`, then blocks until the run completes |
+| `harness_cancel` | `Mutate { Cancel }` |
+| `harness_list_sessions` | `ListSessions` |
+
+`harness://session/{id}` renders a session's transcript, built from `events_since(id, 0)` — no protocol addition was needed, since the durable event stream already holds the full history.
+
+**It's built on `Arc<dyn RpcHandler>`, exactly like the other three transports**, not on `Harness` directly. So it depends only on `harness-protocol` + `harness-runtime`, `harnessd` gains it with one flag, and MCP-created sessions flow through the same typed contract, admission cache, and revision tracking as every other client.
+
+Three things worth knowing:
+
+- **`--mcp-stdio` and `--stdio` are mutually exclusive** (enforced by clap). Both reserve stdout for their own framing.
+- **Integration, workspace root, and toolset come from server configuration, not the tool call.** An MCP client can't know which provider the daemon is wired to, and letting it choose a workspace root would let any connected IDE point the agent at an arbitrary directory.
+- **The toolset must be all-`Allow`.** MCP has no channel for answering a permission prompt, so an `Ask` policy would park the run until it timed out. `harness_prompt` detects that case and returns an explanatory error rather than hanging, but the fix is not to configure it that way. `harnessd`'s built-in MCP toolset is all-`Allow` by construction.
+
+`harness_prompt` is the piece with real substance: MCP's `tools/call` is request/response while the harness is event-streamed, so it subscribes **before** admitting the mutation (a `broadcast::Receiver` only delivers what's sent after it exists), then drains to `AgentEvent::Completed`, accumulating `AssistantTextDelta`s. On a lagged subscription it rebuilds from the durable store rather than returning silently truncated text.
 
 ### Skills
 
@@ -357,7 +403,7 @@ Architecturally, skills add **no new seams**. The catalog reaches the model thro
 | Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
 | Subprocess backends | `crates/integrations/{claude-code,codex,github-copilot}` | Drive the `claude`/`codex`/`copilot` CLIs as subprocesses — the CLI manages its own tools and context, this just translates its output |
 | Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client, `skill.load`/`skill.read` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
-| Transports | `crates/transports/{ipc,websocket,stdio}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`) |
+| Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
 | SDKs | `sdk/rust`, `sdk/typescript` | Application-agnostic client facades — see [SDKs](#sdks) |
 

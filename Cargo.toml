@@ -26,6 +26,7 @@ members = [
     "crates/tools/web",
     "crates/tools/mcp",
     "crates/tools/skills",
+    "crates/transports/mcp",
     "crates/transports/websocket",
     "crates/transports/stdio",
     "crates/transports/ipc",

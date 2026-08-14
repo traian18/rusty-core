@@ -14,6 +14,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// The MCP revision this workspace speaks, on both sides of the protocol.
+///
+/// Lives here rather than in either implementation because *two* crates
+/// negotiate it — `harness-tool-mcp` claims it during `initialize` as a
+/// client, and `harness-transport-mcp` answers with it as a server. Two
+/// copies would eventually disagree, and a version mismatch is exactly the
+/// kind of bug that surfaces as an inscrutable handshake failure against
+/// someone else's server. A string constant carries no I/O, so it sits
+/// comfortably inside this crate's no-runtime rule.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
 /// Connection spec for one MCP server, connected when the session that
 /// requests it starts. Mirror of `harness_tool_mcp::McpServerConfig`.
 ///

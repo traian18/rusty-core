@@ -9,6 +9,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+harness-protocol = { path = "../../harness-protocol" }
 harness-tools = { path = "../../harness-tools" }
 async-trait = { workspace = true }
 futures = { workspace = true }
