@@ -108,7 +108,7 @@ fn run_show(repo_root: &Path, rev: &str) -> Result<serde_json::Value, String> {
 
     Ok(json!({
         "sha": commit.id().to_string(),
-        "summary": commit.summary().unwrap_or("").to_string(),
+        "summary": commit.summary().ok().flatten().unwrap_or("").to_string(),
         "author": commit.author().name().unwrap_or("").to_string(),
         "time": commit.time().seconds(),
         "diff": patch,

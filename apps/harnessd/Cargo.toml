@@ -24,6 +24,7 @@ harness-session-store = { path = "../../crates/harness-session-store" }
 harness-transport-ipc = { path = "../../crates/transports/ipc" }
 harness-transport-websocket = { path = "../../crates/transports/websocket" }
 harness-transport-stdio = { path = "../../crates/transports/stdio" }
+harness-transport-mcp = { path = "../../crates/transports/mcp" }
 harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
 harness-integration-openai = { path = "../../crates/integrations/openai" }
 harness-integration-openai-compatible = { path = "../../crates/integrations/openai-compatible" }

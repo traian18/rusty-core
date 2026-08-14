@@ -130,7 +130,7 @@ fn run_log(
 
         entries.push(json!({
             "sha": commit.id().to_string(),
-            "summary": commit.summary().unwrap_or("").to_string(),
+            "summary": commit.summary().ok().flatten().unwrap_or("").to_string(),
             "author": commit.author().name().unwrap_or("").to_string(),
             "time": commit.time().seconds(),
         }));

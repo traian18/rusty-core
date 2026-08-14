@@ -12,5 +12,6 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod messages;
 pub mod rpc;
+pub mod skills;
 pub mod tools;
 pub mod usage;

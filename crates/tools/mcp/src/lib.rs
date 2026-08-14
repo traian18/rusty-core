@@ -11,12 +11,14 @@
 //!
 //! # Scope
 //!
-//! v1 covers the **stdio transport** and **tools** only:
-//! `initialize` → `notifications/initialized` → `tools/list` →
-//! `tools/call`. Resources, prompts, sampling, roots, and the
-//! HTTP/streamable-HTTP transports aren't implemented — nothing here
-//! precludes adding them later, they just aren't needed for "give the
-//! agent more tools" yet.
+//! **Transports**: stdio (spawn a process) and streamable HTTP (POST to an
+//! endpoint, reply as JSON or SSE). Both sit behind one internal trait, so
+//! everything above `McpClient` is written once — see [`transport`].
+//!
+//! **Methods**: `tools/*` only — `initialize` →
+//! `notifications/initialized` → `tools/list` → `tools/call`. Resources,
+//! prompts, sampling, and roots aren't implemented; nothing here precludes
+//! adding them, they just aren't needed for "give the agent more tools".
 //!
 //! # Usage
 //!
@@ -24,20 +26,30 @@
 //! # async fn example() -> Result<(), harness_tool_mcp::McpError> {
 //! use harness_tool_mcp::{connect_and_discover, McpServerConfig};
 //!
-//! let config = McpServerConfig::new("filesystem", "npx")
+//! // A local server, spawned over stdio:
+//! let local = McpServerConfig::new("filesystem", "npx")
 //!     .args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]);
-//! let tools = connect_and_discover(&config).await?;
+//!
+//! // A hosted one, over HTTP:
+//! let remote = McpServerConfig::http("remote", "https://example.com/mcp")
+//!     .header("Authorization", "Bearer ...");
+//!
+//! let tools = connect_and_discover(&local).await?;
 //! // Register each into a ToolRegistry alongside the built-in tools.
+//! # let _ = remote;
 //! # Ok(())
 //! # }
 //! ```
 
 mod client;
 mod config;
+mod error;
 mod protocol;
 mod tool;
+mod transport;
 
-pub use client::{McpClient, McpError};
-pub use config::McpServerConfig;
+pub use client::McpClient;
+pub use config::{McpServerConfig, McpTransportConfig};
+pub use error::McpError;
 pub use protocol::{CallToolResult, McpToolInfo, ServerInfo};
 pub use tool::{connect_and_discover, McpToolExecutor};

@@ -11,6 +11,7 @@ members = [
     "crates/harness-context",
     "crates/harness-workspace",
     "crates/harness-session-store",
+    "crates/harness-skills",
     "crates/harness-extension-api",
     "crates/integrations/anthropic",
     "crates/integrations/openai",
@@ -24,6 +25,8 @@ members = [
     "crates/tools/git",
     "crates/tools/web",
     "crates/tools/mcp",
+    "crates/tools/skills",
+    "crates/transports/mcp",
     "crates/transports/websocket",
     "crates/transports/stdio",
     "crates/transports/ipc",
@@ -33,6 +36,25 @@ members = [
     "sdk/rust",
 ]
 exclude = ["xtask"]
+
+# Build-time profile tuning.
+#
+# Without these, every one of the ~390 resolved dependencies is compiled with
+# full debuginfo, which is what drove `target/` to 70 GB and 600k+ files in
+# `debug/deps`. Cargo never garbage-collects that directory, so the cost is
+# paid on every invocation: resolving artifacts out of it, linking against
+# it, and launching ~50 test binaries from it dominated wall time far more
+# than compiling or running the tests ever did.
+[profile.dev]
+# Enough for `file:line` in panics and backtraces — which is all the test
+# suite and day-to-day debugging actually consume — without emitting full
+# DWARF for every generic instantiation.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Applies to dependencies only, never to workspace members. You do not step
+# into `libgit2-sys` or `ring`, so their debuginfo is pure weight.
+debug = false
 
 [workspace.package]
 edition = "2021"
@@ -59,7 +81,7 @@ thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-git2 = "0.18"
+git2 = "0.21"
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"

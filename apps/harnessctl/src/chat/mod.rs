@@ -61,6 +61,7 @@ pub async fn run(
     integration_config: serde_json::Value,
     toolset: AgentToolset,
     mcp_servers: Vec<harness_protocol::mcp::McpServerSpec>,
+    skills: Option<harness_protocol::skills::SkillsSpec>,
 ) -> Result<()> {
     // `HarnessClient::connect` performs the `Hello` protocol-version
     // handshake before returning, so a version-mismatched daemon fails here
@@ -76,6 +77,7 @@ pub async fn run(
                 integration_config,
                 toolset,
                 mcp_servers,
+                skills,
             },
         )
         .await?

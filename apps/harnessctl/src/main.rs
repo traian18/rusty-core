@@ -62,14 +62,31 @@ enum Command {
         /// Enable every known tool.
         #[arg(long, conflicts_with = "tools")]
         all_tools: bool,
-        /// MCP server(s) to connect over stdio at session start, as
-        /// `name=command[,arg1,arg2,...]`. Repeatable. Discovered tools are
-        /// registered as `mcp.<name>.<tool>`, alongside `--tools`. For env
-        /// vars, a working directory, or a non-default timeout, construct
+        /// MCP server(s) to connect at session start, as
+        /// `name=command[,arg1,arg2,...]` for a stdio server or
+        /// `name=https://host/mcp` for an HTTP one. Repeatable. Discovered
+        /// tools are registered as `mcp.<name>.<tool>`, alongside
+        /// `--tools`. For env vars, a working directory, request headers,
+        /// or a non-default timeout, construct
         /// `RpcRequestBody::CreateSession.mcp_servers` directly instead of
         /// this flag.
         #[arg(long = "mcp-server")]
         mcp_servers: Vec<String>,
+        /// Enable filesystem skills. Scans `<workspace>/.harness/skills`
+        /// plus any `--skills-dir`, registering `skill.load`/`skill.read`
+        /// and adding each skill's one-line description to the system
+        /// prompt. Off unless this or `--skills-dir` is given.
+        #[arg(long)]
+        skills: bool,
+        /// Extra directory to scan for `SKILL.md` files. Repeatable, and
+        /// implies `--skills`. Later directories win on a name collision.
+        #[arg(long = "skills-dir")]
+        skills_dirs: Vec<PathBuf>,
+        /// Also scan the daemon operator's `$HOME/.harness/skills`. Off by
+        /// default: over a socket the daemon's home directory is not the
+        /// caller's, so loading it is an explicit choice.
+        #[arg(long)]
+        user_skills: bool,
     },
     /// Session lifecycle and interaction commands.
     Session {
@@ -107,14 +124,31 @@ enum SessionCommand {
         /// list above.
         #[arg(long, conflicts_with = "tools")]
         all_tools: bool,
-        /// MCP server(s) to connect over stdio at session start, as
-        /// `name=command[,arg1,arg2,...]`. Repeatable. Discovered tools are
-        /// registered as `mcp.<name>.<tool>`, alongside `--tools`. For env
-        /// vars, a working directory, or a non-default timeout, construct
+        /// MCP server(s) to connect at session start, as
+        /// `name=command[,arg1,arg2,...]` for a stdio server or
+        /// `name=https://host/mcp` for an HTTP one. Repeatable. Discovered
+        /// tools are registered as `mcp.<name>.<tool>`, alongside
+        /// `--tools`. For env vars, a working directory, request headers,
+        /// or a non-default timeout, construct
         /// `RpcRequestBody::CreateSession.mcp_servers` directly instead of
         /// this flag.
         #[arg(long = "mcp-server")]
         mcp_servers: Vec<String>,
+        /// Enable filesystem skills. Scans `<workspace>/.harness/skills`
+        /// plus any `--skills-dir`, registering `skill.load`/`skill.read`
+        /// and adding each skill's one-line description to the system
+        /// prompt. Off unless this or `--skills-dir` is given.
+        #[arg(long)]
+        skills: bool,
+        /// Extra directory to scan for `SKILL.md` files. Repeatable, and
+        /// implies `--skills`. Later directories win on a name collision.
+        #[arg(long = "skills-dir")]
+        skills_dirs: Vec<PathBuf>,
+        /// Also scan the daemon operator's `$HOME/.harness/skills`. Off by
+        /// default: over a socket the daemon's home directory is not the
+        /// caller's, so loading it is an explicit choice.
+        #[arg(long)]
+        user_skills: bool,
     },
     /// Send a prompt to a session.
     Send { session_id: String, prompt: String },
@@ -235,32 +269,70 @@ fn resolve_tool_names(tools: Vec<String>, all_tools: bool) -> Vec<String> {
 /// expressible through this flag — construct `McpServerSpec` directly
 /// (over the wire, or via `harness-engine`'s `SessionBuilder::mcp_server`
 /// when embedding) for those.
+/// Parses one `--mcp-server` value.
+///
+/// Two forms, told apart by whether the part after `=` looks like a URL:
+///
+/// - `name=command[,arg1,arg2,...]` — a stdio server
+/// - `name=http://host/mcp` or `name=https://host/mcp` — an HTTP server
+///
+/// A URL is never a plausible executable name, so the discrimination is
+/// unambiguous and needs no extra flag.
 fn parse_mcp_server_spec(raw: &str) -> Result<harness_protocol::mcp::McpServerSpec> {
-    let (name, rest) = raw
-        .split_once('=')
-        .with_context(|| format!("--mcp-server value {raw:?} must be name=command[,arg,...]"))?;
+    use harness_protocol::mcp::{McpServerSpec, McpTransportSpec};
+
+    let (name, rest) = raw.split_once('=').with_context(|| {
+        format!("--mcp-server value {raw:?} must be name=command[,arg,...] or name=URL")
+    })?;
     if name.is_empty() {
         anyhow::bail!("--mcp-server value {raw:?} has an empty name before '='");
     }
+
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        return Ok(McpServerSpec::http(name, rest));
+    }
+
     let mut parts = rest.split(',');
     let command = parts
         .next()
         .filter(|value| !value.is_empty())
         .with_context(|| format!("--mcp-server value {raw:?} is missing a command after '='"))?;
-    Ok(harness_protocol::mcp::McpServerSpec {
-        name: name.to_owned(),
+
+    let mut spec = McpServerSpec::stdio(name, command);
+    spec.transport = Some(McpTransportSpec::Stdio {
         command: command.to_owned(),
         args: parts.map(str::to_owned).collect(),
         env: HashMap::new(),
         cwd: None,
-        request_timeout_secs: None,
-    })
+    });
+    Ok(spec)
 }
 
 fn parse_mcp_servers(raw: &[String]) -> Result<Vec<harness_protocol::mcp::McpServerSpec>> {
     raw.iter()
         .map(|value| parse_mcp_server_spec(value))
         .collect()
+}
+
+/// Builds the `CreateSession.skills` field from the three skill flags.
+///
+/// Returns `None` — skills disabled entirely — unless the caller asked for
+/// them, so a client that never mentions skills gets exactly the behavior it
+/// had before the flags existed. Naming a `--skills-dir` implies `--skills`,
+/// since asking for a directory and then not scanning it would be absurd.
+fn skills_spec(
+    enabled: bool,
+    dirs: Vec<PathBuf>,
+    user: bool,
+) -> Option<harness_protocol::skills::SkillsSpec> {
+    if !enabled && dirs.is_empty() && !user {
+        return None;
+    }
+    Some(harness_protocol::skills::SkillsSpec {
+        include_user_dir: user,
+        include_workspace_dir: true,
+        roots: dirs,
+    })
 }
 
 fn build_toolset(names: &[String]) -> Result<AgentToolset> {
@@ -311,6 +383,9 @@ async fn main() -> Result<()> {
             tools,
             all_tools,
             mcp_servers,
+            skills,
+            skills_dirs,
+            user_skills,
         } => {
             let integration_config: serde_json::Value =
                 serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
@@ -323,6 +398,7 @@ async fn main() -> Result<()> {
                 integration_config,
                 toolset,
                 mcp_servers,
+                skills_spec(skills, skills_dirs, user_skills),
             )
             .await
         }
@@ -346,6 +422,9 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             tools,
             all_tools,
             mcp_servers,
+            skills,
+            skills_dirs,
+            user_skills,
         } => {
             let integration_config: serde_json::Value =
                 serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
@@ -360,6 +439,7 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
                         integration_config,
                         toolset,
                         mcp_servers,
+                        skills: skills_spec(skills, skills_dirs, user_skills),
                     },
                 )
                 .await?;

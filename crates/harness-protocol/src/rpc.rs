@@ -13,6 +13,7 @@ use crate::commands::{PermissionDecision, UserInput};
 use crate::events::AgentEventEnvelope;
 use crate::ids::{AgentId, PermissionId, SessionId, Timestamp};
 use crate::mcp::McpServerSpec;
+use crate::skills::SkillsSpec;
 use crate::tools::AgentToolset;
 use crate::usage::{AgentUsageSnapshot, SessionUsageSnapshot};
 
@@ -60,6 +61,13 @@ pub enum RpcRequestBody {
         /// by default — most sessions have none.
         #[serde(default)]
         mcp_servers: Vec<McpServerSpec>,
+        /// Directories to scan for `SKILL.md` files at session start.
+        /// Discovered skills add their catalog to the system prompt and
+        /// merge `skill.load`/`skill.read` into `toolset`. `None` disables
+        /// skills entirely, which is the default so a client that never
+        /// heard of skills gets exactly the behavior it did before.
+        #[serde(default)]
+        skills: Option<SkillsSpec>,
     },
     /// Idempotent, revision-aware session mutation.
     Mutate {

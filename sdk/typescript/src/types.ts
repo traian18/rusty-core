@@ -79,19 +79,64 @@ export interface AgentToolset {
 }
 
 /**
- * Launch spec for one MCP server, connected over stdio when the session
- * that requests it starts. Mirrors `harness_protocol::mcp::McpServerSpec`
- * field-for-field — see `crates/harness-protocol/src/mcp.rs`. All fields
- * but `name`/`command` are optional and default to Rust's `#[serde(default)]`
- * values (empty args/env, no cwd, the client's own 60s request timeout).
+ * How to reach an MCP server. Mirrors
+ * `harness_protocol::mcp::McpTransportSpec`.
+ */
+export type McpTransportSpec =
+  | {
+      kind: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      cwd?: string | null;
+    }
+  | {
+      kind: "http";
+      url: string;
+      /** Extra request headers — where an `Authorization` goes. */
+      headers?: Record<string, string>;
+    };
+
+/**
+ * Connection spec for one MCP server, connected when the session that
+ * requests it starts. Mirrors `harness_protocol::mcp::McpServerSpec`
+ * field-for-field — see `crates/harness-protocol/src/mcp.rs`.
+ *
+ * The flat `command`/`args`/`env`/`cwd` fields are the original shape, from
+ * when stdio was the only transport, and still describe a stdio server when
+ * `transport` is absent. When `transport` is present it wins and the flat
+ * fields are ignored. Prefer setting `transport` on new code.
  */
 export interface McpServerSpec {
   name: string;
-  command: string;
+  transport?: McpTransportSpec | null;
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string | null;
   request_timeout_secs?: number | null;
+}
+
+/**
+ * Which directories a session scans for `SKILL.md` files. Mirrors
+ * `harness_protocol::skills::SkillsSpec` — see
+ * `crates/harness-protocol/src/skills.rs`.
+ *
+ * There is no workspace root here on purpose: `create_session` already
+ * carries one, and `include_workspace_dir` selects whether to scan
+ * `<that root>/.harness/skills`.
+ */
+export interface SkillsSpec {
+  /**
+   * Scan `$HOME/.harness/skills`. Defaults to `false` over the wire — the
+   * daemon's home directory is not the caller's, so loading the operator's
+   * personal skills is an explicit choice.
+   */
+  include_user_dir?: boolean;
+  /** Scan `<workspace_root>/.harness/skills`. Defaults to `true`. */
+  include_workspace_dir?: boolean;
+  /** Extra roots, scanned last so they win on a name collision. */
+  roots?: string[];
 }
 
 export interface ToolCall {
@@ -243,6 +288,7 @@ export type RpcRequestBody =
         integration_config: unknown;
         toolset: AgentToolset;
         mcp_servers?: McpServerSpec[];
+        skills?: SkillsSpec | null;
       };
     }
   | {

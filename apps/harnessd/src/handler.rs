@@ -7,16 +7,19 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use harness_engine::{FsWorkspace, Harness, McpServerConfig, SessionHandle};
+use harness_engine::{
+    FsWorkspace, Harness, McpServerConfig, McpTransportConfig, SessionHandle, SkillsConfig,
+};
 use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::SessionId;
-use harness_protocol::mcp::McpServerSpec;
+use harness_protocol::mcp::{McpServerSpec, McpTransportSpec};
 use harness_protocol::rpc::{
     DiagnosticsSnapshot, MutationCommand, PermitDiagnostic, RpcError, RpcErrorCategory,
     RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
     StoreScanSummary,
 };
+use harness_protocol::skills::SkillsSpec;
 use harness_runtime::rpc::RpcHandler;
 use harness_runtime::session_runtime::SessionStatus;
 
@@ -176,6 +179,7 @@ impl HarnessRpcHandler {
         integration_config: serde_json::Value,
         toolset: harness_protocol::tools::AgentToolset,
         mcp_servers: Vec<McpServerSpec>,
+        skills: Option<SkillsSpec>,
     ) -> RpcResponseBody {
         let mut builder = match self
             .harness
@@ -194,6 +198,9 @@ impl HarnessRpcHandler {
         };
         for spec in mcp_servers {
             builder = builder.mcp_server(mcp_config_from_spec(spec));
+        }
+        if let Some(spec) = skills {
+            builder = builder.skills(skills_config_from_spec(spec, &workspace_root));
         }
         let workspace = Arc::new(FsWorkspace::new(workspace_root));
         match builder.toolset(toolset, workspace).start().await {
@@ -424,18 +431,48 @@ impl HarnessRpcHandler {
 
 /// Converts the wire-serializable [`McpServerSpec`] a client sent over
 /// `CreateSession` into the real `McpServerConfig` the engine actually
-/// connects with. Plain field mapping — the only non-trivial bit is
-/// `request_timeout_secs: Option<u64>` becoming a `Duration`.
+/// connects with. Plain field mapping — the only non-trivial bits are
+/// `request_timeout_secs: Option<u64>` becoming a `Duration`, and going
+/// through `resolve_transport()` so the legacy flat-field shape is handled
+/// in exactly one place (`harness_protocol::mcp`).
 fn mcp_config_from_spec(spec: McpServerSpec) -> McpServerConfig {
+    let transport = match spec.resolve_transport() {
+        McpTransportSpec::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => McpTransportConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        },
+        McpTransportSpec::Http { url, headers } => McpTransportConfig::Http { url, headers },
+    };
     McpServerConfig {
         name: spec.name,
-        command: spec.command,
-        args: spec.args,
-        env: spec.env,
-        cwd: spec.cwd,
+        transport,
         request_timeout: spec
             .request_timeout_secs
             .map(std::time::Duration::from_secs),
+    }
+}
+
+/// Converts the wire-serializable [`SkillsSpec`] into the engine's real
+/// `SkillsConfig`.
+///
+/// The workspace root comes from `CreateSession`'s own field rather than
+/// from the spec: the client already named it there, and letting the skills
+/// spec carry a second one would let a client point skill discovery at a
+/// directory it isn't otherwise allowed to name.
+fn skills_config_from_spec(spec: SkillsSpec, workspace_root: &std::path::Path) -> SkillsConfig {
+    SkillsConfig {
+        workspace_root: spec
+            .include_workspace_dir
+            .then(|| workspace_root.to_path_buf()),
+        include_user_dir: spec.include_user_dir,
+        extra_roots: spec.roots,
     }
 }
 
@@ -478,6 +515,7 @@ impl RpcHandler for HarnessRpcHandler {
                 integration_config,
                 toolset,
                 mcp_servers,
+                skills,
             } => {
                 self.create_session(
                     workspace_root,
@@ -485,6 +523,7 @@ impl RpcHandler for HarnessRpcHandler {
                     integration_config,
                     toolset,
                     mcp_servers,
+                    skills,
                 )
                 .await
             }

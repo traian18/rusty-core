@@ -13,7 +13,11 @@ use serde_json::Value;
 /// negotiate down to a version they support; a server's response is
 /// accepted regardless of what it echoes back — see the note on
 /// [`super::client::McpClient::connect`].
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+///
+/// Defined in `harness-protocol` so the client here and the server in
+/// `harness-transport-mcp` cannot drift apart on the one value they both
+/// negotiate.
+pub use harness_protocol::mcp::MCP_PROTOCOL_VERSION;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JsonRpcRequest<'a> {

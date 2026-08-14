@@ -48,7 +48,7 @@ mod session;
 pub use client::{Client, ClientBuilder};
 pub use error::SdkError;
 pub use events::EventStream;
-pub use harness_engine::McpServerConfig;
+pub use harness_engine::{McpServerConfig, McpTransportConfig};
 pub use session::Session;
 
 /// Wire-protocol types shared with non-Rust SDKs and `harnessd` clients.

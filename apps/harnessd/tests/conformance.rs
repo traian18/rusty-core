@@ -176,6 +176,7 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
                     tools: std::collections::HashMap::new(),
                 },
                 mcp_servers: Vec::new(),
+                skills: None,
             },
         })
         .await;
