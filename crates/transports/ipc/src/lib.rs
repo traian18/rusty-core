@@ -588,6 +588,7 @@ mod tests {
                     tools: HashMap::new(),
                 },
                 mcp_servers: Vec::new(),
+                skills: None,
             },
         };
         send_request(&mut stream, &request).await;

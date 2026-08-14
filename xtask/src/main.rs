@@ -184,6 +184,13 @@ fn forbidden_reason(name: &str, features: HashSet<String>) -> Option<&'static st
         return Some("transport implementations must remain outside core");
     }
 
+    // Not covered by any of the prefix rules above, and it walks the
+    // filesystem — so it needs naming explicitly, or a `harness-core ->
+    // harness-skills` edge would slip through the guard.
+    if name == "harness-skills" {
+        return Some("skill discovery performs filesystem I/O and must remain outside core");
+    }
+
     match name {
         "reqwest" | "hyper" | "rusqlite" | "sqlx" | "tauri" | "ratatui" | "tokio-tungstenite"
         | "tungstenite" | "jsonrpsee" | "rmcp" => {

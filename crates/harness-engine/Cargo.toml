@@ -21,6 +21,8 @@ harness-tool-shell = { path = "../tools/shell" }
 harness-tool-git = { path = "../tools/git" }
 harness-tool-web = { path = "../tools/web" }
 harness-tool-mcp = { path = "../tools/mcp" }
+harness-skills = { path = "../harness-skills" }
+harness-tool-skills = { path = "../tools/skills" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,3 +35,4 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

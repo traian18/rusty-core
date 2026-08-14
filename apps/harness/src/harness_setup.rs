@@ -1,7 +1,9 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use harness_engine::{BackendSelection, FsWorkspace, Harness, McpServerConfig, SessionHandle};
+use harness_engine::{
+    BackendSelection, FsWorkspace, Harness, McpServerConfig, SessionHandle, SkillsConfig,
+};
 use harness_integration_anthropic::AnthropicFactory;
 use harness_integration_claude_code::ClaudeCodeFactory;
 use harness_integration_codex::CodexFactory;
@@ -80,10 +82,20 @@ pub struct AppHarness {
     /// so a picker-driven provider switch (which has no per-session config
     /// path at all — see `SessionOptions`) doesn't silently lose them.
     mcp_servers: Vec<McpServerConfig>,
+    /// Skill directories scanned by every session this harness starts, from
+    /// `--skills-dir`/`--no-skills` at launch. Applied by both
+    /// [`start`](Self::start) and [`start_selected`](Self::start_selected)
+    /// for the same reason `mcp_servers` is — a picker-driven provider
+    /// switch must not silently drop them. `None` disables skills.
+    skills: Option<SkillsConfig>,
 }
 
 impl AppHarness {
-    pub async fn new(workspace_root: PathBuf, mcp_servers: Vec<McpServerConfig>) -> Result<Self> {
+    pub async fn new(
+        workspace_root: PathBuf,
+        mcp_servers: Vec<McpServerConfig>,
+        skills: Option<SkillsConfig>,
+    ) -> Result<Self> {
         let store_root = workspace_root.join(".harness").join("sessions");
         let harness = Harness::builder()
             .register_integration(Arc::new(AnthropicFactory))
@@ -99,6 +111,7 @@ impl AppHarness {
             harness,
             workspace: Arc::new(FsWorkspace::new(workspace_root)),
             mcp_servers,
+            skills,
         })
     }
 
@@ -217,6 +230,9 @@ impl AppHarness {
         for server in &self.mcp_servers {
             builder = builder.mcp_server(server.clone());
         }
+        if let Some(skills) = &self.skills {
+            builder = builder.skills(skills.clone());
+        }
 
         Ok(builder.start().await?)
     }
@@ -254,6 +270,9 @@ impl AppHarness {
         }
         for server in &self.mcp_servers {
             builder = builder.mcp_server(server.clone());
+        }
+        if let Some(skills) = &self.skills {
+            builder = builder.skills(skills.clone());
         }
 
         Ok(builder.start().await?)

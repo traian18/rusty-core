@@ -569,6 +569,7 @@ mod tests {
                     tools: HashMap::new(),
                 },
                 mcp_servers: Vec::new(),
+                skills: None,
             },
         };
         write_request(&mut client_in_write, &request).await;

@@ -21,9 +21,11 @@ use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
 use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 
+pub use harness_skills::SkillsConfig;
+use harness_skills::{SkillCatalog, SkillsContextProvider};
 use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
 use harness_tool_git::{GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
-pub use harness_tool_mcp::McpServerConfig;
+pub use harness_tool_mcp::{McpServerConfig, McpTransportConfig};
 use harness_tool_shell::ExecTool;
 use harness_tool_web::FetchTool;
 
@@ -111,6 +113,35 @@ struct PendingIntegration {
     config: serde_json::Value,
 }
 
+/// Projects a tool executor's descriptor into the protocol-level
+/// [`ToolCapability`] the root agent's toolset carries.
+///
+/// Shared by every path in [`SessionBuilder::start`] that turns registered
+/// executors into capabilities — MCP tools, skill tools, and the
+/// derive-from-registry fallback — so all three agree on the id, the
+/// `name`-is-the-tool-id convention, and the default policy.
+fn discovered_capability(
+    descriptor: harness_tools::ToolDescriptor,
+) -> (harness_protocol::ids::ToolId, ToolCapability) {
+    let id = harness_protocol::ids::ToolId::new();
+    (
+        id,
+        ToolCapability {
+            descriptor: harness_protocol::tools::ToolDescriptor {
+                id,
+                name: descriptor.id.to_string(),
+                description: descriptor.description,
+                input_schema: descriptor.input_schema,
+            },
+            policy: ToolPolicy {
+                permission: PermissionMode::Allow,
+                enabled: true,
+            },
+            delegatable: false,
+        },
+    )
+}
+
 /// Fluent builder for direct or registry-backed sessions.
 pub struct SessionBuilder {
     backend: Option<Arc<dyn ExecutionBackend>>,
@@ -135,6 +166,9 @@ pub struct SessionBuilder {
     /// MCP servers to connect at [`start`](Self::start) — see
     /// [`mcp_server`](Self::mcp_server).
     mcp_servers: Vec<McpServerConfig>,
+    /// Skill directories to scan at [`start`](Self::start) — see
+    /// [`skills`](Self::skills). `None` disables skills entirely.
+    skills: Option<SkillsConfig>,
 }
 
 impl SessionBuilder {
@@ -159,6 +193,7 @@ impl SessionBuilder {
             context_provider: None,
             execution_params: None,
             mcp_servers: Vec::new(),
+            skills: None,
         }
     }
 
@@ -183,6 +218,7 @@ impl SessionBuilder {
             context_provider: None,
             execution_params: None,
             mcp_servers: Vec::new(),
+            skills: None,
         }
     }
 
@@ -227,6 +263,29 @@ impl SessionBuilder {
     /// `mcp.<name>.<tool>` so servers (and built-in tools) never collide.
     pub fn mcp_server(mut self, config: McpServerConfig) -> Self {
         self.mcp_servers.push(config);
+        self
+    }
+
+    /// Discover filesystem skills at [`start`](Self::start), registering
+    /// `skill.load`/`skill.read` and adding the skill catalog to the system
+    /// prompt.
+    ///
+    /// Resolution is deferred to `start()` for the same reason
+    /// [`mcp_server`](Self::mcp_server) is: discovery walks directories,
+    /// which needs an async context the fluent builder doesn't have.
+    ///
+    /// Only each skill's **name and description** reach the system prompt;
+    /// instruction bodies stay on disk until the model calls `skill.load`.
+    /// A session with no discoverable skills pays nothing — no prompt text,
+    /// and the tools are still registered so the model can be told about
+    /// skills added later in the same workspace.
+    ///
+    /// Composes with [`context_provider`](Self::context_provider) rather
+    /// than replacing it: the skills provider runs first, so a compaction
+    /// provider set by the caller sizes its budget against the prompt that
+    /// actually ships.
+    pub fn skills(mut self, config: SkillsConfig) -> Self {
+        self.skills = Some(config);
         self
     }
 
@@ -364,7 +423,7 @@ impl SessionBuilder {
         // This needs to happen before `root_toolset` is derived below so
         // the no-explicit-toolset fallback (which reads straight from
         // `tool_registry.descriptors()`) picks the MCP tools up too.
-        let mut mcp_descriptors = Vec::new();
+        let mut discovered_descriptors = Vec::new();
         for config in &self.mcp_servers {
             let executors = harness_tool_mcp::connect_and_discover(config)
                 .await
@@ -372,25 +431,37 @@ impl SessionBuilder {
             for executor in executors {
                 let descriptor = executor.descriptor();
                 let _ = tool_registry.register(executor);
-                let id = harness_protocol::ids::ToolId::new();
-                mcp_descriptors.push((
-                    id,
-                    ToolCapability {
-                        descriptor: harness_protocol::tools::ToolDescriptor {
-                            id,
-                            name: descriptor.id.to_string(),
-                            description: descriptor.description,
-                            input_schema: descriptor.input_schema,
-                        },
-                        policy: ToolPolicy {
-                            permission: PermissionMode::Allow,
-                            enabled: true,
-                        },
-                        delegatable: false,
-                    },
-                ));
+                discovered_descriptors.push(discovered_capability(descriptor));
             }
         }
+
+        // Skills are discovered at the same point and for the same reason:
+        // `skill.load`/`skill.read` have to be in the registry and in the
+        // root toolset before either is frozen below.
+        //
+        // Unlike an MCP server, a broken skill is never fatal — one
+        // malformed `SKILL.md` costs its author that skill and nothing
+        // else, so `discover` hands back problems alongside the catalog and
+        // we log them rather than failing the session.
+        let skills_provider = match &self.skills {
+            Some(config) => {
+                let (catalog, errors) = SkillCatalog::discover(config).await;
+                for error in &errors {
+                    tracing::warn!(error = %error, "skills: skipping unreadable skill");
+                }
+                let catalog = Arc::new(catalog);
+                tracing::debug!(skills = catalog.len(), "skills: catalog ready");
+
+                for executor in harness_tool_skills::skill_tools(catalog.clone()) {
+                    let descriptor = executor.descriptor();
+                    let _ = tool_registry.register(executor);
+                    discovered_descriptors.push(discovered_capability(descriptor));
+                }
+                Some(Arc::new(SkillsContextProvider::new(catalog))
+                    as Arc<dyn harness_context::ContextProvider>)
+            }
+            None => None,
+        };
 
         // A high-level toolset carries explicit policy. For callers that
         // provide a registry directly, derive an enabled/allowed toolset so
@@ -398,35 +469,17 @@ impl SessionBuilder {
         let root_toolset = match self.root_toolset {
             Some(mut toolset) => {
                 // `.toolset()` already fixed its policy before MCP servers
-                // were connected — merge the newly discovered tools in
-                // rather than rebuilding from the registry, which would
-                // silently drop the caller's explicit choices.
-                toolset.tools.extend(mcp_descriptors);
+                // and skills were discovered — merge the newly discovered
+                // tools in rather than rebuilding from the registry, which
+                // would silently drop the caller's explicit choices.
+                toolset.tools.extend(discovered_descriptors);
                 toolset
             }
             None => {
                 let tools = tool_registry
                     .descriptors()
                     .into_iter()
-                    .map(|desc| {
-                        let id = harness_protocol::ids::ToolId::new();
-                        (
-                            id,
-                            ToolCapability {
-                                descriptor: harness_protocol::tools::ToolDescriptor {
-                                    id,
-                                    name: desc.id.to_string(),
-                                    description: desc.description,
-                                    input_schema: desc.input_schema,
-                                },
-                                policy: ToolPolicy {
-                                    permission: PermissionMode::Allow,
-                                    enabled: true,
-                                },
-                                delegatable: false,
-                            },
-                        )
-                    })
+                    .map(discovered_capability)
                     .collect();
                 AgentToolset { tools }
             }
@@ -446,7 +499,22 @@ impl SessionBuilder {
             .workspace
             .unwrap_or_else(|| Arc::new(FakeWorkspace::new()));
 
-        let backend: Arc<dyn ExecutionBackend> = match self.context_provider {
+        // The skills provider runs *before* whatever the caller installed,
+        // so that a compaction provider (which sizes a token budget) sees
+        // the prompt that will actually ship rather than one still missing
+        // the skill catalog.
+        let context_provider = match (skills_provider, self.context_provider) {
+            (Some(skills), Some(caller)) => {
+                Some(Arc::new(harness_context::ChainedContextProvider::new(vec![
+                    skills, caller,
+                ]))
+                    as Arc<dyn harness_context::ContextProvider>)
+            }
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        };
+
+        let backend: Arc<dyn ExecutionBackend> = match context_provider {
             Some(provider) => Arc::new(harness_context::ContextAssemblingBackend::new(
                 backend,
                 provider,

@@ -233,19 +233,25 @@ Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay t
 
 ### MCP servers
 
-Beyond the ten built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers over stdio — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
+Beyond the ten built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
 
-- **Handshake**: `initialize` → `notifications/initialized` → `tools/list` (with cursor pagination) → `tools/call`, hand-rolled JSON-RPC over stdio (no `rmcp` dependency — the workspace's own dependency-direction rule keeps that out of a `harness-tool-*` crate's transitive graph anyway).
-- **Scope, deliberately**: stdio transport and `tools/*` only. No resources, prompts, sampling, roots, or the HTTP/streamable-HTTP transport — a server that only exposes those contributes nothing today.
+- **Two transports**, behind one internal trait so everything above the client is written once:
+  - **stdio** — spawn a local process, newline-delimited JSON over its pipes.
+  - **streamable HTTP** — POST JSON-RPC to an endpoint; the reply comes back as either `application/json` or an SSE stream. The SSE branch is consumed incrementally and returns the moment the matching reply arrives, so a server that keeps the stream open after answering doesn't stall the call. `Mcp-Session-Id` is captured at `initialize` and echoed thereafter.
+- **Handshake**: `initialize` → `notifications/initialized` → `tools/list` (with cursor pagination) → `tools/call`, hand-rolled JSON-RPC (no `rmcp` dependency — the workspace's own dependency-direction rule keeps that out of a `harness-tool-*` crate's transitive graph anyway).
+- **Scope, deliberately**: `tools/*` only. No resources, prompts, sampling, or roots — a server that only exposes those contributes nothing today.
 - **Client only.** The harness can *consume* another MCP server's tools; it cannot *expose itself* as an MCP server for something like Claude Desktop or Cursor to connect into. That's unstarted, separate work.
-- **Failure handling**: a request timeout, a malformed response, or the server process dying mid-call all become the same thing every other tool's error already is here — a logical `ToolResult { is_error: true }` the model can see and react to — not an aborted run. Spawn failures (bad `command`) surface earlier, at session start.
+- **Failure handling**: a request timeout, a malformed response, an unexpected content type, a non-2xx status, or the server process dying mid-call all become the same thing every other tool's error already is here — a logical `ToolResult { is_error: true }` the model can see and react to — not an aborted run. Spawn failures (bad `command`) surface earlier, at session start.
 
 Reachable from all three entry points:
 
+Reachable from all three entry points. The `--mcp-server` flag takes `name=command[,args...]` for stdio or `name=<url>` for HTTP — a URL is never a plausible executable name, so no extra flag is needed to disambiguate:
+
 ```console
-# harnessctl (repeatable, name=command[,arg1,arg2,...]):
+# harnessctl, repeatable:
 harnessctl session create --workspace ./repo --integration anthropic \
   --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp' \
+  --mcp-server 'remote=https://example.com/mcp' \
   --tools fs.read
 
 # apps/harness (standalone TUI), same flag shape, applies to every session
@@ -263,12 +269,81 @@ let session = harness
         harness_engine::McpServerConfig::new("filesystem", "npx")
             .args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
     )
+    .mcp_server(
+        harness_engine::McpServerConfig::http("remote", "https://example.com/mcp")
+            .header("Authorization", "Bearer ..."),
+    )
     .toolset(my_toolset, workspace)
     .start()
     .await?;
 ```
 
-The `--mcp-server name=command[,args...]` CLI flag is a convenience for the common case; it can't express environment variables, a working directory, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/harness-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `harness-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
+The CLI flag is a convenience for the common case; it can't express environment variables, a working directory, request headers, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/harness-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `harness-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
+
+On the wire, `McpServerSpec` carries an optional tagged `transport` member (`{"kind":"stdio",...}` or `{"kind":"http",...}`). Its absence means the flat `command`/`args`/`env`/`cwd` fields describe a stdio server — the original shape — so an existing client keeps working unchanged and no `PROTOCOL_VERSION` bump was needed. Read it via `McpServerSpec::resolve_transport()` rather than either representation directly.
+
+### Skills
+
+A **skill** is a directory containing a `SKILL.md` — YAML frontmatter naming and describing it, then a markdown body of instructions — plus any files those instructions reference. Dropping one into `.harness/skills/` gives an agent a new capability **without recompiling anything**, which is the gap the compile-time `Plugin` trait leaves open. Implemented in `harness-skills` (discovery, parsing, the context provider) and `harness-tool-skills` (the two tools).
+
+```text
+.harness/skills/pdf-report/
+├── SKILL.md
+└── template.tex
+```
+
+```markdown
+---
+name: pdf-report
+description: Generate a formatted PDF report from CSV data.
+allowed-tools: [fs.read, shell.exec]
+---
+
+1. Read the CSV with `fs.read`.
+2. Fill `template.tex` — read it with `skill.read`.
+3. Render with `shell.exec`.
+```
+
+**Progressive disclosure is the whole design.** The system prompt carries only each skill's **name and description** — one line each. Instruction bodies and bundled files reach the model only when it calls a tool:
+
+| Tool ID | What it does |
+|---|---|
+| `skill.load` | One skill's full instructions plus a listing of the files it bundles |
+| `skill.read` | One of those bundled files, scoped to that skill's own directory |
+
+So thirty installed skills cost thirty lines per request, not thirty documents. That is the difference between skills being free to install and being something you ration. `crates/harness-engine/tests/skills_e2e.rs` asserts the negative directly: instruction bodies must *not* appear in the assembled `ExecutionRequest`.
+
+Discovery scans, in increasing precedence (later wins on a name collision):
+
+1. `$HOME/.harness/skills` — your personal skills
+2. `<workspace_root>/.harness/skills` — the project's own
+3. any explicitly named root (`--skills-dir`, or `SkillsConfig::root`)
+
+Frontmatter requires `name` (which must equal the directory name) and `description`; `version`, `license`, and `allowed-tools` are optional and unknown keys are ignored, so a skill written for a future field still loads today. The parser is a hand-rolled flat-YAML subset in `crates/harness-skills/src/frontmatter.rs` — deliberately not a YAML dependency, for the same supply-chain reason the MCP client is hand-rolled rather than pulling `rmcp`.
+
+A malformed `SKILL.md` is **never fatal**: it's logged at `warn` and skipped, and its siblings still load. `skill.read` refuses absolute paths, `..` traversal, and — via canonicalization — symlinks that escape the skill directory, which a component check alone would miss.
+
+```console
+# Standalone TUI: skills are ON by default (local, single-user, your own
+# directories). --skills-dir adds roots; --no-skills opts out entirely.
+cargo run -p harness -- --skills-dir ./team-skills
+
+# harnessctl: OFF by default, since over a socket the daemon's $HOME is not
+# the caller's. --skills-dir implies --skills.
+harnessctl session create --workspace ./repo --integration anthropic \
+  --tools fs.read,shell.exec --skills
+```
+```rust
+let session = harness
+    .session()
+    .integration("anthropic", serde_json::json!({}))?
+    .skills(harness_engine::SkillsConfig::new().workspace_root("./repo"))
+    .toolset(my_toolset, workspace)
+    .start()
+    .await?;
+```
+
+Architecturally, skills add **no new seams**. The catalog reaches the model through `harness_context::ContextProvider` — the same decorator seam compaction already uses, composed via `ChainedContextProvider` so a caller-supplied provider is never clobbered — and the two tools are ordinary `ToolExecutor`s in the session's normal registry. Nothing touches `harness-core`'s state machine.
 
 ---
 
@@ -278,9 +353,10 @@ The `--mcp-server name=command[,args...]` CLI flag is a convenience for the comm
 |---|---|---|
 | Core | `harness-protocol`, `harness-core`, `harness-runtime`, `harness-engine` | Wire types, the deterministic agent state machine, async orchestration, and the public `Harness`/`SessionBuilder` API |
 | Context | `harness-context` | Injects a system prompt / workspace summary and truncates the transcript when it grows too large |
+| Skills | `harness-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
 | Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
 | Subprocess backends | `crates/integrations/{claude-code,codex,github-copilot}` | Drive the `claude`/`codex`/`copilot` CLIs as subprocesses — the CLI manages its own tools and context, this just translates its output |
-| Tools | `crates/tools/{filesystem,shell,git,web,mcp}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
+| Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client, `skill.load`/`skill.read` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
 | Transports | `crates/transports/{ipc,websocket,stdio}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
 | SDKs | `sdk/rust`, `sdk/typescript` | Application-agnostic client facades — see [SDKs](#sdks) |

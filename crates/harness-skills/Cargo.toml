@@ -1,0 +1,22 @@
+[package]
+name = "harness-skills"
+version = "0.1.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+harness-context = { path = "../harness-context" }
+harness-protocol = { path = "../harness-protocol" }
+harness-workspace = { path = "../harness-workspace" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -911,10 +911,12 @@ dependencies = [
  "harness-protocol",
  "harness-runtime",
  "harness-session-store",
+ "harness-skills",
  "harness-tool-filesystem",
  "harness-tool-git",
  "harness-tool-mcp",
  "harness-tool-shell",
+ "harness-tool-skills",
  "harness-tool-web",
  "harness-tools",
  "harness-workspace",
@@ -1155,6 +1157,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-skills"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "harness-context",
+ "harness-protocol",
+ "harness-workspace",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harness-tool-filesystem"
 version = "0.1.1"
 dependencies = [
@@ -1190,7 +1206,9 @@ name = "harness-tool-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "harness-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1211,6 +1229,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "harness-tool-skills"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "harness-skills",
+ "harness-tools",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

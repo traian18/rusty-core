@@ -17,6 +17,7 @@ import type {
   AgentEventEnvelope,
   AgentToolset,
   McpServerSpec,
+  SkillsSpec,
   MutationCommand,
   MutationMetadata,
   PermissionDecision,
@@ -47,6 +48,13 @@ export interface CreateSessionOptions {
    * `#[serde(default)]` on `RpcRequestBody::CreateSession.mcp_servers`.
    */
   mcpServers?: McpServerSpec[];
+  /**
+   * Directories to scan for `SKILL.md` files at session start. Discovered
+   * skills add a one-line description each to the system prompt and merge
+   * `skill.load`/`skill.read` into `toolset`. Omitted entirely when unset,
+   * which disables skills — matching the Rust side's `Option<SkillsSpec>`.
+   */
+  skills?: SkillsSpec;
 }
 
 export interface RestoreSessionOptions {
@@ -148,6 +156,7 @@ export class HarnessClient {
         integration_config: options.integrationConfig ?? {},
         toolset: options.toolset ?? { tools: {} },
         ...(options.mcpServers ? { mcp_servers: options.mcpServers } : {}),
+        ...(options.skills ? { skills: options.skills } : {}),
       },
     });
     if (body.type !== "session_created") {

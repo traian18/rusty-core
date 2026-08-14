@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 harness-tools = { path = "../../harness-tools" }
 async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -24,4 +26,4 @@ test = false
 doc = false
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

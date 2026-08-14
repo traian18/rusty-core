@@ -23,7 +23,7 @@ use harness_protocol::commands::PermissionDecision;
 use harness_setup::{AppHarness, SessionOptions};
 use input::InputAction;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 
 #[derive(Parser, Debug)]
 #[command(name = "harness")]
@@ -37,25 +37,54 @@ struct Args {
     #[arg(long, default_value = "{}")]
     config_json: String,
 
-    /// MCP server(s) to connect over stdio, as `name=command[,arg1,arg2,...]`.
-    /// Repeatable. Discovered tools are registered as `mcp.<name>.<tool>`
-    /// alongside the built-in toolset, for every session this TUI starts
-    /// (including ones created later via the provider picker). Env vars,
-    /// a working directory, or a non-default timeout aren't expressible
-    /// through this flag — embed `harness-engine` directly and use
-    /// `SessionBuilder::mcp_server` for those.
+    /// MCP server(s) to connect, as `name=command[,arg1,arg2,...]` for a
+    /// stdio server or `name=https://host/mcp` for an HTTP one. Repeatable.
+    /// Discovered tools are registered as `mcp.<name>.<tool>` alongside the
+    /// built-in toolset, for every session this TUI starts (including ones
+    /// created later via the provider picker). Env vars, a working
+    /// directory, request headers, or a non-default timeout aren't
+    /// expressible through this flag — embed `harness-engine` directly and
+    /// use `SessionBuilder::mcp_server` for those.
     #[arg(long = "mcp-server")]
     mcp_servers: Vec<String>,
+
+    /// Extra directory to scan for `SKILL.md` files, on top of
+    /// `<cwd>/.harness/skills` and `$HOME/.harness/skills`. Repeatable;
+    /// later directories win on a name collision.
+    #[arg(long = "skills-dir")]
+    skills_dirs: Vec<PathBuf>,
+
+    /// Disable filesystem skills entirely.
+    ///
+    /// Skills are on by default here, unlike over the daemon's RPC: this is
+    /// a local, single-user TUI, the scanned directories belong to the
+    /// person running it, and a session with no skill directories costs
+    /// nothing — no prompt text and two unused tools.
+    #[arg(long)]
+    no_skills: bool,
 }
 
-/// Parses one `--mcp-server` value: `name=command[,arg1,arg2,...]`.
+/// Parses one `--mcp-server` value.
+///
+/// Two forms, told apart by whether the part after `=` looks like a URL:
+///
+/// - `name=command[,arg1,arg2,...]` — a stdio server
+/// - `name=http://host/mcp` or `name=https://host/mcp` — an HTTP server
+///
+/// A URL is never a plausible executable name, so the discrimination is
+/// unambiguous and needs no extra flag.
 fn parse_mcp_server(raw: &str) -> Result<harness_engine::McpServerConfig> {
     let (name, rest) = raw.split_once('=').ok_or_else(|| {
-        anyhow::anyhow!("--mcp-server value {raw:?} must be name=command[,arg,...]")
+        anyhow::anyhow!("--mcp-server value {raw:?} must be name=command[,arg,...] or name=URL")
     })?;
     if name.is_empty() {
         anyhow::bail!("--mcp-server value {raw:?} has an empty name before '='");
     }
+
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        return Ok(harness_engine::McpServerConfig::http(name, rest));
+    }
+
     let mut parts = rest.split(',');
     let command = parts
         .next()
@@ -123,7 +152,13 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let app_harness = AppHarness::new(workspace_root, mcp_servers).await?;
+    let skills = (!args.no_skills).then(|| {
+        let mut config = harness_engine::SkillsConfig::new().workspace_root(workspace_root.clone());
+        config.extra_roots = args.skills_dirs.clone();
+        config
+    });
+
+    let app_harness = AppHarness::new(workspace_root, mcp_servers, skills).await?;
     let mut controller = AppController::new(app_harness, options, initial_selection).await?;
     let mut needs_draw = true;
 

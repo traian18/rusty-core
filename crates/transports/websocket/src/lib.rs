@@ -579,6 +579,7 @@ mod tests {
                     tools: HashMap::new(),
                 },
                 mcp_servers: Vec::new(),
+                skills: None,
             },
         };
         ws.send(Message::Text(serde_json::to_string(&request).unwrap()))

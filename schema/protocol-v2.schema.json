@@ -21,15 +21,25 @@
       "additionalProperties": false
     },
     "McpServerSpec": {
-      "description": "Launch spec for one MCP server, connected over stdio when the session that requests it starts. See crates/harness-protocol/src/mcp.rs.",
+      "description": "Connection spec for one MCP server, connected when the session that requests it starts. See crates/harness-protocol/src/mcp.rs. The flat command/args/env/cwd fields are the original shape and describe a stdio server; when `transport` is present it wins and the flat fields are ignored.",
       "type": "object",
       "required": [
-        "name",
-        "command"
+        "name"
       ],
       "properties": {
         "name": {
           "type": "string"
+        },
+        "transport": {
+          "description": "How to reach the server. Absent or null means the flat legacy fields describe a stdio server.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/McpTransportSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "command": {
           "type": "string"
@@ -60,6 +70,89 @@
         }
       },
       "additionalProperties": false
+    },
+    "McpTransportSpec": {
+      "description": "How to reach an MCP server. Mirrors harness_tool_mcp::McpTransportConfig.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "command"
+          ],
+          "properties": {
+            "kind": {
+              "const": "stdio"
+            },
+            "command": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "url"
+          ],
+          "properties": {
+            "kind": {
+              "const": "http"
+            },
+            "url": {
+              "type": "string"
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SkillsSpec": {
+      "type": "object",
+      "properties": {
+        "include_user_dir": {
+          "type": "boolean",
+          "default": false,
+          "description": "Scan $HOME/.harness/skills. Defaults to false over the wire."
+        },
+        "include_workspace_dir": {
+          "type": "boolean",
+          "default": true,
+          "description": "Scan <workspace_root>/.harness/skills, using the workspace_root already given on CreateSession."
+        },
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional roots, scanned last so they win on a name collision."
+        }
+      }
     },
     "UserInput": {
       "type": "object",
@@ -346,6 +439,17 @@
                   "items": {
                     "$ref": "#/definitions/McpServerSpec"
                   }
+                },
+                "skills": {
+                  "description": "Directories to scan for SKILL.md at session start. Null or absent disables skills entirely.",
+                  "oneOf": [
+                    {
+                      "$ref": "#/definitions/SkillsSpec"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               }
             }
@@ -533,7 +637,6 @@
                 "event",
                 "event_gap",
                 "ack",
-      
                 "failure"
               ]
             },

@@ -11,7 +11,8 @@ pub use builder::HarnessBuilder;
 pub use harness::Harness;
 pub use providers::*;
 pub use session_builder::{
-    ContextInspection, HarnessError, McpServerConfig, SessionBuilder, SessionHandle,
+    ContextInspection, HarnessError, McpServerConfig, McpTransportConfig, SessionBuilder,
+    SessionHandle, SkillsConfig,
 };
 
 // Re-export workspace types for convenience.

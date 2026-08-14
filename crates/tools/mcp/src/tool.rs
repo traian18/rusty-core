@@ -7,8 +7,9 @@ use harness_tools::{
     CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult,
 };
 
-use crate::client::{McpClient, McpError};
+use crate::client::McpClient;
 use crate::config::McpServerConfig;
+use crate::error::McpError;
 use crate::protocol::{CallToolResult, McpToolInfo};
 
 /// Wraps one tool advertised by a connected MCP server as a `ToolExecutor`.
