@@ -20,6 +20,10 @@ serde.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Integration tests in `tests/` are separate crates, so `cfg(test)` does not
+# reach this crate's `testing` module for them — the self-dependency turns
+# the feature on for test builds only, keeping it off for consumers.
+harness-generic-backend = { path = ".", features = ["testing"] }
 serde_json.workspace = true
 
 [features]

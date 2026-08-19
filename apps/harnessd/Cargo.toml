@@ -20,7 +20,7 @@ async-trait = { workspace = true }
 harness-engine = { path = "../../crates/harness-engine" }
 harness-protocol = { path = "../../crates/harness-protocol" }
 harness-runtime = { path = "../../crates/harness-runtime" }
-harness-session-store = { path = "../../crates/harness-session-store" }
+harness-session-store = { path = "../../crates/harness-session-store", default-features = false }
 harness-transport-ipc = { path = "../../crates/transports/ipc" }
 harness-transport-websocket = { path = "../../crates/transports/websocket" }
 harness-transport-stdio = { path = "../../crates/transports/stdio" }
@@ -31,6 +31,7 @@ harness-integration-openai-compatible = { path = "../../crates/integrations/open
 harness-integration-gemini = { path = "../../crates/integrations/gemini" }
 harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
 harness-integration-codex = { path = "../../crates/integrations/codex" }
+harness-integration-github-copilot = { path = "../../crates/integrations/github-copilot" }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

@@ -71,6 +71,7 @@ impl ModelClient for FakeModelClient {
             tool_calls: true,
             parallel_tool_calls: true,
             images: true,
+            structured_output: true,
         })
     }
 

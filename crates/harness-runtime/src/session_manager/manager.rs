@@ -294,20 +294,11 @@ impl SessionRestorer for SessionManager {
             return Ok(existing);
         }
 
-        let restorer = SessionRestorerEngine::new(
-            store.clone(),
-            self.restore_policy,
-            self.scheduler.clone(),
-        );
+        let restorer =
+            SessionRestorerEngine::new(store.clone(), self.restore_policy, self.scheduler.clone());
 
         let (runtime, session_permit) = restorer
-            .restore(
-                id,
-                integrations,
-                tool_registry,
-                workspace,
-                event_sink,
-            )
+            .restore(id, integrations, tool_registry, workspace, event_sink)
             .await?;
 
         self.registry

@@ -450,6 +450,7 @@ async fn execution_params_are_forwarded_to_the_model_client_unchanged() {
         stop_sequences: vec!["STOP".to_string()],
         reasoning_effort: Some(harness_protocol::backend::ReasoningEffort::High),
         extended_thinking: Some(true),
+        response_format: None,
         provider_options: serde_json::json!({"anthropic": {"top_k": 40}}),
     };
 
@@ -490,6 +491,7 @@ async fn reasoning_request_against_a_non_reasoning_model_is_rejected_before_disp
             tool_calls: false,
             parallel_tool_calls: false,
             images: false,
+            structured_output: false,
         })
         .with_result(ModelResult::default());
     let probe = client.clone();
@@ -526,6 +528,7 @@ async fn tool_call_request_against_a_non_tool_model_is_rejected_before_dispatch(
             tool_calls: false,
             parallel_tool_calls: false,
             images: false,
+            structured_output: false,
         })
         .with_result(ModelResult::default());
     let probe = client.clone();
@@ -565,6 +568,7 @@ async fn plain_text_request_passes_capability_checks_against_a_minimal_model() {
             tool_calls: false,
             parallel_tool_calls: false,
             images: false,
+            structured_output: false,
         })
         .with_result(ModelResult::default());
 

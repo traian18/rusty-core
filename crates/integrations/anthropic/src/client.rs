@@ -74,6 +74,7 @@ impl ModelClient for AnthropicClient {
             tool_calls: true,
             parallel_tool_calls: true,
             images: true,
+            structured_output: true,
         }
     }
 
@@ -118,6 +119,13 @@ impl ModelClient for AnthropicClient {
         // ------------------------------------------------------------------
         let max_tokens = request.max_tokens.unwrap_or(self.config.default_max_tokens);
 
+        // Anthropic has no `response_format`; a non-text format is emulated
+        // with a forced single-purpose tool call. See `structured_output_tool`.
+        let structured_output = request
+            .response_format
+            .as_ref()
+            .and_then(crate::wire::structured_output_tool);
+
         let anthropic_request = AnthropicRequest {
             model: request
                 .model
@@ -131,17 +139,21 @@ impl ModelClient for AnthropicClient {
                 let tool_ids = self.tool_ids.lock().expect("provider tool-id map poisoned");
                 convert_messages_with_tool_ids(&request.messages, &tool_ids)
             },
-            tools: if request.tools.is_empty() {
-                None
-            } else {
-                Some(
-                    request
-                        .tools
-                        .iter()
-                        .map(tool_descriptor_to_anthropic)
-                        .collect(),
-                )
+            tools: {
+                let mut tools: Vec<_> = request
+                    .tools
+                    .iter()
+                    .map(tool_descriptor_to_anthropic)
+                    .collect();
+                // The synthetic structured-output tool rides alongside the
+                // host's real tools; `tool_choice` below forces the model
+                // onto it, so the others are unreachable for this request.
+                if let Some((tool, _)) = structured_output.as_ref() {
+                    tools.push(tool.clone());
+                }
+                (!tools.is_empty()).then_some(tools)
             },
+            tool_choice: structured_output.map(|(_, choice)| choice),
             max_tokens,
             temperature: request.temperature,
             stop_sequences: if request.stop_sequences.is_empty() {

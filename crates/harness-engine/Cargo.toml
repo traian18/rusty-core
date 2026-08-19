@@ -11,9 +11,9 @@ publish = false
 [dependencies]
 harness-core = { path = "../harness-core" }
 harness-protocol = { path = "../harness-protocol" }
-harness-runtime = { path = "../harness-runtime", features = ["testing"] }
+harness-runtime = { path = "../harness-runtime" }
 harness-context = { path = "../harness-context" }
-harness-session-store = { path = "../harness-session-store" }
+harness-session-store = { path = "../harness-session-store", default-features = false }
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
 harness-tool-filesystem = { path = "../tools/filesystem" }
@@ -34,5 +34,10 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# `testing` belongs here, not in [dependencies]: Cargo unifies features across
+# the graph, so enabling it for the library turned FakeBackend/FakeToolRegistry
+# on for every downstream consumer's release build. Only this crate's own
+# integration tests (tests/real_tools_e2e.rs) actually use them.
+harness-runtime = { path = "../harness-runtime", features = ["testing"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

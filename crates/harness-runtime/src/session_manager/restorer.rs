@@ -70,13 +70,15 @@ impl SessionRestorerEngine {
 
         let resolver = HostRestoreResolver::new(workspace.as_ref(), integrations.clone());
         let report = resolver.resolve(id, &snapshot.metadata).await;
-        harness_session_store::assess_restore(&report, self.restore_policy).inspect_err(|_error| {
-            tracing::error!(
-                %id,
-                missing = ?report.missing,
-                "restore refused: host dependencies could not be resolved"
-            );
-        })?;
+        harness_session_store::assess_restore(&report, self.restore_policy).inspect_err(
+            |_error| {
+                tracing::error!(
+                    %id,
+                    missing = ?report.missing,
+                    "restore refused: host dependencies could not be resolved"
+                );
+            },
+        )?;
 
         let mut backends: HashMap<String, Arc<dyn ExecutionBackend>> = HashMap::new();
         for agent in &snapshot.agents {

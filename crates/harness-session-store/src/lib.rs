@@ -24,8 +24,10 @@ pub mod projection;
 pub mod replay;
 pub mod resolver;
 pub mod retention;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod store;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod version;
 
@@ -45,12 +47,14 @@ pub use resolver::{
     MissingDependency, PermissiveResolver, RestoreError, RestorePolicy, RestoreReport,
 };
 pub use retention::{mark_compacted, plan_compaction, prune_plan, CompactionPlan, RetentionPolicy};
+#[cfg(feature = "sqlite")]
 pub use sqlite::SqliteSessionStore;
 pub use store::{
     is_durable, summarize_session, DurableSessionEvent, DurableSessionMetadata,
     DurableSessionSnapshot, RawRecord, SessionStore, SessionSummary, StoreError, StoredAgentState,
     StoredPendingToolCall, StoredSession,
 };
+#[cfg(any(test, feature = "testing"))]
 pub use testing::{FaultInjectingStore, MemoryStore};
 pub use version::{
     check_snapshot_version, migrate_snapshot, SnapshotVersionError, MIN_SUPPORTED_SNAPSHOT_VERSION,

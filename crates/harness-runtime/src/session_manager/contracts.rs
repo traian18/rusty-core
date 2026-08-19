@@ -115,7 +115,13 @@ pub trait SessionRestorer: Send + Sync {
 }
 
 /// Composite service trait combining registry, lifecycle, and restoration capabilities.
-pub trait SessionService: SessionRegistry + SessionLifecycle + SessionRestorer + Send + Sync {}
+pub trait SessionService:
+    SessionRegistry + SessionLifecycle + SessionRestorer + Send + Sync
+{
+}
 
 // Blanket implementation for any type implementing all constituent traits.
-impl<T> SessionService for T where T: SessionRegistry + SessionLifecycle + SessionRestorer + Send + Sync {}
+impl<T> SessionService for T where
+    T: SessionRegistry + SessionLifecycle + SessionRestorer + Send + Sync
+{
+}

@@ -109,6 +109,73 @@ pub struct GeminiGenerationConfig {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    /// `"application/json"` puts the model in JSON mode. Required for
+    /// `response_schema` to take effect — a schema alone is ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
+}
+
+impl GeminiGenerationConfig {
+    /// Apply the provider-neutral response format onto this config.
+    ///
+    /// Gemini has no `strict` distinction — a schema is always enforced — so
+    /// that flag is intentionally dropped rather than mapped onto something
+    /// that doesn't mean the same thing.
+    pub fn apply_response_format(
+        &mut self,
+        format: Option<&harness_protocol::backend::ResponseFormat>,
+    ) {
+        use harness_protocol::backend::ResponseFormat;
+        match format {
+            None | Some(ResponseFormat::Text) => {}
+            Some(ResponseFormat::JsonObject) => {
+                self.response_mime_type = Some("application/json".to_string());
+            }
+            Some(ResponseFormat::JsonSchema { schema, .. }) => {
+                self.response_mime_type = Some("application/json".to_string());
+                self.response_schema = Some(sanitize_schema(schema.clone()));
+            }
+        }
+    }
+}
+
+/// Strip JSON Schema keywords Gemini's `responseSchema` subset rejects.
+///
+/// Gemini accepts a restricted OpenAPI-flavored subset; sending a schema
+/// containing `$schema`, `additionalProperties`, or `$defs`/`definitions`
+/// (all of which `schemars`-generated schemas carry by default) fails the
+/// whole request with a 400. Dropping them is lossy but leaves the
+/// structural constraints — types, properties, required, enum — intact,
+/// which is what actually shapes the output.
+fn sanitize_schema(mut value: serde_json::Value) -> serde_json::Value {
+    const REJECTED: [&str; 5] = [
+        "$schema",
+        "$id",
+        "additionalProperties",
+        "$defs",
+        "definitions",
+    ];
+    match &mut value {
+        serde_json::Value::Object(map) => {
+            for key in REJECTED {
+                map.remove(key);
+            }
+            let sanitized: serde_json::Map<_, _> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sanitize_schema(v.clone())))
+                .collect();
+            serde_json::Value::Object(sanitized)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| sanitize_schema(item.clone()))
+                .collect(),
+        ),
+        _ => value,
+    }
 }
 
 pub fn tool_descriptor_to_gemini(tool: &ToolDescriptor) -> GeminiFunctionDeclaration {
@@ -477,6 +544,8 @@ mod tests {
             max_output_tokens: Some(2048),
             temperature: Some(0.7),
             stop_sequences: Some(vec!["STOP".to_string()]),
+            response_mime_type: None,
+            response_schema: None,
         };
         let json = serde_json::to_value(&config).expect("serialize GeminiGenerationConfig");
         assert_eq!(json["maxOutputTokens"], 2048);
@@ -487,11 +556,114 @@ mod tests {
             max_output_tokens: None,
             temperature: None,
             stop_sequences: None,
+            response_mime_type: None,
+            response_schema: None,
         };
         let bare_json = serde_json::to_value(&bare).expect("serialize bare GeminiGenerationConfig");
         assert!(bare_json.get("maxOutputTokens").is_none());
         assert!(bare_json.get("temperature").is_none());
         assert!(bare_json.get("stopSequences").is_none());
+    }
+
+    /// Gemini needs *both* the JSON mime type and the schema — a schema
+    /// alone is silently ignored by the API, which would look like the
+    /// feature simply not working.
+    #[test]
+    fn json_schema_sets_both_mime_type_and_schema() {
+        let mut config = GeminiGenerationConfig {
+            max_output_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+            response_mime_type: None,
+            response_schema: None,
+        };
+        config.apply_response_format(Some(
+            &harness_protocol::backend::ResponseFormat::JsonSchema {
+                name: "task_graph".into(),
+                schema: serde_json::json!({ "type": "object" }),
+                strict: true,
+            },
+        ));
+
+        let json = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(json["responseMimeType"], "application/json");
+        assert_eq!(
+            json["responseSchema"],
+            serde_json::json!({ "type": "object" })
+        );
+    }
+
+    #[test]
+    fn json_object_sets_the_mime_type_without_a_schema() {
+        let mut config = GeminiGenerationConfig {
+            max_output_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+            response_mime_type: None,
+            response_schema: None,
+        };
+        config.apply_response_format(Some(&harness_protocol::backend::ResponseFormat::JsonObject));
+
+        let json = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(json["responseMimeType"], "application/json");
+        assert!(json.get("responseSchema").is_none());
+    }
+
+    /// Gemini's `responseSchema` accepts a restricted subset; a schema
+    /// carrying `$schema`/`additionalProperties`/`$defs` (which every
+    /// `schemars`-generated schema does) fails the whole request with a 400.
+    #[test]
+    fn schema_keywords_gemini_rejects_are_stripped_recursively() {
+        let mut config = GeminiGenerationConfig {
+            max_output_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+            response_mime_type: None,
+            response_schema: None,
+        };
+        config.apply_response_format(Some(
+            &harness_protocol::backend::ResponseFormat::JsonSchema {
+                name: "n".into(),
+                schema: serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "nested": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": { "a": { "type": "string" } }
+                        }
+                    },
+                    "required": ["nested"]
+                }),
+                strict: false,
+            },
+        ));
+
+        let schema = config.response_schema.expect("a schema must be set");
+        assert!(
+            schema.get("$schema").is_none(),
+            "top-level $schema survived"
+        );
+        assert!(
+            schema.get("additionalProperties").is_none(),
+            "top-level additionalProperties survived"
+        );
+        assert!(
+            schema["properties"]["nested"]
+                .get("additionalProperties")
+                .is_none(),
+            "nested additionalProperties survived: {schema}"
+        );
+        // The structural constraints must survive — stripping is targeted,
+        // not a blanket flattening.
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["nested"]));
+        assert_eq!(
+            schema["properties"]["nested"]["properties"]["a"]["type"],
+            "string"
+        );
     }
 
     fn user_message(content: Vec<ContentBlock>) -> AgentMessage {

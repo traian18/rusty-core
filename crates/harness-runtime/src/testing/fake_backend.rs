@@ -110,6 +110,7 @@ impl ExecutionBackend for FakeBackend {
             model_switching: false,
             exact_usage: true,
             exact_cost: true,
+            structured_output: true,
         }
     }
 

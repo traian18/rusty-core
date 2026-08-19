@@ -18,7 +18,6 @@ use harness_runtime::session_client::{SessionClient, SessionSnapshot};
 use harness_runtime::session_manager::{SessionManager, SessionManagerError};
 use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
 use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
-use harness_runtime::workspace::FakeWorkspace;
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 
 pub use harness_skills::SkillsConfig;
@@ -495,9 +494,16 @@ impl SessionBuilder {
             tools: protocol_descriptors,
             selection: persisted_selection,
         });
+        // An unbound session used to fall back to `FakeWorkspace`, an
+        // in-memory store: `fs.read` reported "not found" for files that
+        // exist on disk and `fs.edit` wrote into a buffer that was dropped
+        // when the session ended — silently, with a successful tool result
+        // either way. `UnboundWorkspace` keeps the no-tools case working
+        // (nothing calls it) while turning the tools case into an
+        // actionable error at the first call.
         let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
-            .unwrap_or_else(|| Arc::new(FakeWorkspace::new()));
+            .unwrap_or_else(|| Arc::new(harness_workspace::UnboundWorkspace::new()));
 
         // The skills provider runs *before* whatever the caller installed,
         // so that a compaction provider (which sizes a token budget) sees
@@ -670,6 +676,29 @@ impl SessionHandle {
     /// future prompts.
     pub async fn cancel(&self) -> Result<(), HarnessError> {
         self.client.cancel_run().await?;
+        Ok(())
+    }
+
+    /// Pause the session's active run.
+    ///
+    /// Unlike [`cancel`](Self::cancel) this is recoverable: the agent stops
+    /// at its next transition point and holds its run state, so
+    /// [`resume`](Self::resume) continues the same run rather than starting a
+    /// new one. Pausing an already-paused, cancelled, or failed agent is a
+    /// no-op — the state machine rejects the transition and emits nothing.
+    ///
+    /// Note that this does not abort an in-flight backend request; a run
+    /// waiting on the model pauses once that request settles.
+    pub async fn pause(&self) -> Result<(), HarnessError> {
+        self.client.send(SessionCommand::Pause).await?;
+        Ok(())
+    }
+
+    /// Resume a paused session, continuing the run that was interrupted.
+    ///
+    /// A no-op unless the agent is actually paused.
+    pub async fn resume(&self) -> Result<(), HarnessError> {
+        self.client.send(SessionCommand::Resume).await?;
         Ok(())
     }
 

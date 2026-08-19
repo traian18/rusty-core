@@ -28,6 +28,61 @@ pub struct AnthropicRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+    /// Set only when emulating structured output — see
+    /// [`STRUCTURED_OUTPUT_TOOL`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<AnthropicToolChoice>,
+}
+
+/// Name of the synthetic tool used to emulate `response_format`.
+///
+/// The Messages API has no `response_format` field. The supported way to get
+/// schema-conforming JSON is to declare a tool whose `input_schema` *is* the
+/// desired schema and force `tool_choice` onto it: the model's tool-call
+/// input is then guaranteed to match. The harness surfaces that input as
+/// ordinary assistant text, so callers see the same thing they would from a
+/// provider with a native `response_format`.
+///
+/// Prefixed to make a collision with a real host tool implausible.
+pub const STRUCTURED_OUTPUT_TOOL: &str = "__harness_structured_response";
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
+}
+
+/// Build the synthetic tool and forced choice for a response format, or
+/// `None` when the format needs no emulation.
+pub fn structured_output_tool(
+    format: &harness_protocol::backend::ResponseFormat,
+) -> Option<(AnthropicTool, AnthropicToolChoice)> {
+    use harness_protocol::backend::ResponseFormat;
+    let (description, schema) = match format {
+        ResponseFormat::Text => return None,
+        ResponseFormat::JsonObject => (
+            "Return your entire response as a single JSON object.".to_string(),
+            // No constraint beyond "an object" — mirrors what OpenAI's
+            // `json_object` mode guarantees.
+            serde_json::json!({ "type": "object" }),
+        ),
+        ResponseFormat::JsonSchema { name, schema, .. } => (
+            format!("Return your entire response as JSON matching the `{name}` schema."),
+            schema.clone(),
+        ),
+    };
+    Some((
+        AnthropicTool {
+            name: STRUCTURED_OUTPUT_TOOL.to_string(),
+            description,
+            input_schema: schema,
+        },
+        AnthropicToolChoice::Tool {
+            name: STRUCTURED_OUTPUT_TOOL.to_string(),
+        },
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +266,12 @@ pub struct AnthropicSseParser {
     result: Option<ModelResult>,
     events: Vec<ModelEvent>,
     tool_ids: ProviderToolIds,
+    /// Indices of content blocks belonging to the synthetic structured-output
+    /// tool. Their `input_json_delta` fragments are re-emitted as
+    /// `TextDelta` and they produce no tool-call events, so a caller that
+    /// asked for JSON sees assistant text — not a tool call it never
+    /// registered and could not execute.
+    structured_output_blocks: std::collections::HashSet<usize>,
 }
 
 impl Default for AnthropicSseParser {
@@ -235,6 +296,7 @@ impl AnthropicSseParser {
             result: None,
             events: Vec::new(),
             tool_ids,
+            structured_output_blocks: std::collections::HashSet::new(),
         }
     }
 
@@ -363,6 +425,20 @@ impl AnthropicSseParser {
                 let index = value["index"].as_u64().unwrap_or_default() as usize;
                 let content = &value["content_block"];
                 if content["type"] == "tool_use" {
+                    // The structured-output tool is an implementation detail
+                    // of `response_format`; it is never registered with the
+                    // host and must not surface as a tool call.
+                    if content["name"] == STRUCTURED_OUTPUT_TOOL {
+                        self.structured_output_blocks.insert(index);
+                        let initial = content
+                            .get("input")
+                            .filter(|input| {
+                                !input.is_null()
+                                    && input.as_object().map_or(true, |object| !object.is_empty())
+                            })
+                            .map(ToString::to_string);
+                        return Ok(initial.map(|delta| ModelEvent::TextDelta { delta }));
+                    }
                     let id = ToolCallId::new();
                     if let Some(provider_id) = content["id"].as_str() {
                         self.tool_ids
@@ -400,6 +476,14 @@ impl AnthropicSseParser {
                     Some("thinking_delta") => Ok(Some(ModelEvent::ReasoningDelta {
                         delta: delta["thinking"].as_str().unwrap_or_default().to_string(),
                     })),
+                    Some("input_json_delta") if self.structured_output_blocks.contains(&index) => {
+                        Ok(Some(ModelEvent::TextDelta {
+                            delta: delta["partial_json"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string(),
+                        }))
+                    }
                     Some("input_json_delta") => {
                         if let Some(tool) = self.tools.get_mut(&index) {
                             let fragment = delta["partial_json"].as_str().unwrap_or_default();
@@ -417,6 +501,11 @@ impl AnthropicSseParser {
             }
             "content_block_stop" => {
                 let index = value["index"].as_u64().unwrap_or_default() as usize;
+                if self.structured_output_blocks.remove(&index) {
+                    // Already fully emitted as text deltas; there is no tool
+                    // call to complete.
+                    return Ok(None);
+                }
                 if let Some(tool) = self.tools.remove(&index) {
                     let input = if tool.json.is_empty() {
                         serde_json::json!({})
@@ -522,6 +611,7 @@ fn merge_usage(previous: &ModelUsage, raw: &RawUsage) -> ModelUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_protocol::backend::ResponseFormat;
     use harness_protocol::ids::{MessageId, Timestamp};
     use harness_protocol::messages::{ContentBlock, MessageRole};
 
@@ -603,5 +693,130 @@ data: {"type":"message_stop"}
             .push_chunk(b"event: ping\ndata: {}\n\n")
             .expect("ping parses");
         assert!(matches!(parser.finish(), Err(ModelError::Protocol { .. })));
+    }
+
+    // -----------------------------------------------------------------
+    // Structured output (emulated — Anthropic has no `response_format`)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn json_schema_becomes_a_forced_single_purpose_tool() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"],
+        });
+        let (tool, choice) = structured_output_tool(&ResponseFormat::JsonSchema {
+            name: "task_graph".into(),
+            schema: schema.clone(),
+            strict: true,
+        })
+        .expect("a schema format must produce a tool");
+
+        assert_eq!(tool.name, STRUCTURED_OUTPUT_TOOL);
+        // The caller's schema is the tool's input schema verbatim — that is
+        // the whole mechanism by which the response conforms.
+        assert_eq!(tool.input_schema, schema);
+        assert!(
+            tool.description.contains("task_graph"),
+            "the schema name should reach the model as a hint: {}",
+            tool.description
+        );
+        assert_eq!(
+            choice,
+            AnthropicToolChoice::Tool {
+                name: STRUCTURED_OUTPUT_TOOL.into()
+            },
+            "the tool must be forced, not merely offered"
+        );
+    }
+
+    #[test]
+    fn text_format_needs_no_emulation() {
+        assert!(structured_output_tool(&ResponseFormat::Text).is_none());
+    }
+
+    #[test]
+    fn json_object_constrains_only_to_an_object() {
+        let (tool, _) =
+            structured_output_tool(&ResponseFormat::JsonObject).expect("must produce a tool");
+        assert_eq!(tool.input_schema, serde_json::json!({ "type": "object" }));
+    }
+
+    /// The important one: the synthetic tool's input must reach the caller as
+    /// assistant **text**. If it leaked through as a tool call, the runtime
+    /// would try to execute a tool that was never registered, and a caller
+    /// that asked for JSON would receive empty text.
+    #[test]
+    fn structured_output_tool_input_streams_back_as_text_not_a_tool_call() {
+        let mut parser = AnthropicSseParser::new();
+        let mut events = Vec::new();
+
+        for chunk in [
+            format!(
+                "event: content_block_start\ndata: {{\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"{STRUCTURED_OUTPUT_TOOL}\",\"input\":{{}}}}}}\n\n"
+            ),
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"title\\\":\"}}\n\n".to_string(),
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"hi\\\"}\"}}\n\n".to_string(),
+            "event: content_block_stop\ndata: {\"index\":0}\n\n".to_string(),
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n".to_string(),
+            "event: message_stop\ndata: {}\n\n".to_string(),
+        ] {
+            events.extend(parser.push_chunk(chunk.as_bytes()).expect("chunk parses"));
+        }
+
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelEvent::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, r#"{"title":"hi"}"#,
+            "the tool input should reassemble as the response text"
+        );
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ModelEvent::ToolCallStarted { .. }
+                    | ModelEvent::ToolCallDelta { .. }
+                    | ModelEvent::ToolCallCompleted { .. }
+            )),
+            "the synthetic tool must not surface as a tool call: {events:?}"
+        );
+    }
+
+    /// A *real* tool call in the same stream must keep behaving normally —
+    /// the suppression is keyed on the synthetic tool's name, not on
+    /// "any tool call while a response format is set".
+    #[test]
+    fn a_real_tool_call_is_unaffected_by_the_structured_output_path() {
+        let mut parser = AnthropicSseParser::new();
+        let mut events = Vec::new();
+
+        for chunk in [
+            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"fs.read\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        ] {
+            events.extend(parser.push_chunk(chunk.as_bytes()).expect("chunk parses"));
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::ToolCallStarted { name, .. } if name == "fs.read")),
+            "a real tool call must still start: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ModelEvent::ToolCallCompleted { .. })),
+            "a real tool call must still complete: {events:?}"
+        );
     }
 }

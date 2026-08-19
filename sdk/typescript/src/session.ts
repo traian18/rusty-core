@@ -36,6 +36,14 @@ export class HarnessSession {
     return this.client.cancel(this.sessionId, options);
   }
 
+  pause(options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.pause(this.sessionId, options);
+  }
+
+  resume(options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.client.resume(this.sessionId, options);
+  }
+
   resolvePermission(
     id: PermissionId,
     decision: PermissionDecision,

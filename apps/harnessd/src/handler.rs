@@ -373,6 +373,8 @@ impl HarnessRpcHandler {
         let is_run_less_mutation = matches!(
             &command,
             MutationCommand::Cancel
+                | MutationCommand::Pause
+                | MutationCommand::Resume
                 | MutationCommand::ResolvePermission { .. }
                 | MutationCommand::CloseSession
         );
@@ -381,6 +383,8 @@ impl HarnessRpcHandler {
             MutationCommand::Steer(input) => handle.steer_input(input).await,
             MutationCommand::FollowUp(input) => handle.follow_up_input(input).await,
             MutationCommand::Cancel => handle.cancel().await,
+            MutationCommand::Pause => handle.pause().await,
+            MutationCommand::Resume => handle.resume().await,
             MutationCommand::ResolvePermission { id, decision } => {
                 handle.resolve_permission(id, decision).await
             }

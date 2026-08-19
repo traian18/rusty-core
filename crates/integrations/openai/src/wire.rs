@@ -29,6 +29,8 @@ pub struct OpenAiRequest {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<OpenAiResponseFormat>,
     pub stream: bool,
     pub stream_options: StreamOptions,
 }
@@ -36,6 +38,52 @@ pub struct OpenAiRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
+}
+
+/// Chat Completions' `response_format`.
+///
+/// `json_object` requires the word "JSON" to appear somewhere in the prompt
+/// or the API rejects the call; `json_schema` does not, and additionally
+/// enforces the schema when `strict` is set.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAiResponseFormat {
+    Text,
+    JsonObject,
+    JsonSchema { json_schema: OpenAiJsonSchema },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OpenAiJsonSchema {
+    pub name: String,
+    pub schema: serde_json::Value,
+    pub strict: bool,
+}
+
+impl OpenAiResponseFormat {
+    /// Translate the provider-neutral format. Returns `None` for
+    /// [`ResponseFormat::Text`] so the field is omitted entirely rather than
+    /// sent as an explicit `{"type":"text"}` — some OpenAI-compatible
+    /// servers reject fields they don't implement, and text is their default
+    /// anyway.
+    pub fn from_neutral(format: &harness_protocol::backend::ResponseFormat) -> Option<Self> {
+        use harness_protocol::backend::ResponseFormat;
+        match format {
+            ResponseFormat::Text => None,
+            ResponseFormat::JsonObject => Some(Self::JsonObject),
+            ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => Some(Self::JsonSchema {
+                json_schema: OpenAiJsonSchema {
+                    name: name.clone(),
+                    schema: schema.clone(),
+                    strict: *strict,
+                },
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -555,6 +603,7 @@ mod tests {
             max_tokens: Some(4096),
             temperature: Some(0.5),
             stop: Some(vec!["STOP".to_string()]),
+            response_format: None,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -576,6 +625,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             stop: None,
+            response_format: None,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -585,6 +635,51 @@ mod tests {
         assert!(bare_json.get("max_tokens").is_none());
         assert!(bare_json.get("temperature").is_none());
         assert!(bare_json.get("stop").is_none());
+    }
+
+    /// `response_format` must serialize exactly as the Chat Completions API
+    /// spells it — a wrong shape here is accepted by serde and rejected by
+    /// the provider at request time.
+    #[test]
+    fn json_schema_response_format_serializes_in_the_openai_shape() {
+        let schema = serde_json::json!({ "type": "object" });
+        let format = OpenAiResponseFormat::from_neutral(
+            &harness_protocol::backend::ResponseFormat::JsonSchema {
+                name: "task_graph".into(),
+                schema: schema.clone(),
+                strict: true,
+            },
+        )
+        .expect("a schema format must serialize");
+
+        let json = serde_json::to_value(&format).expect("serialize response_format");
+        assert_eq!(json["type"], "json_schema");
+        assert_eq!(json["json_schema"]["name"], "task_graph");
+        assert_eq!(json["json_schema"]["schema"], schema);
+        assert_eq!(json["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn json_object_response_format_serializes_as_a_bare_type_tag() {
+        let format = OpenAiResponseFormat::from_neutral(
+            &harness_protocol::backend::ResponseFormat::JsonObject,
+        )
+        .expect("json_object must serialize");
+        assert_eq!(
+            serde_json::to_value(&format).expect("serialize"),
+            serde_json::json!({ "type": "json_object" })
+        );
+    }
+
+    /// `Text` maps to `None` so the field is omitted rather than sent as an
+    /// explicit `{"type":"text"}` — OpenAI-compatible servers vary in what
+    /// they accept, and text is the default everywhere.
+    #[test]
+    fn text_response_format_is_omitted_from_the_request() {
+        assert!(OpenAiResponseFormat::from_neutral(
+            &harness_protocol::backend::ResponseFormat::Text
+        )
+        .is_none());
     }
 
     fn user_message(content: Vec<ContentBlock>) -> AgentMessage {

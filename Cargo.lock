@@ -949,6 +949,7 @@ name = "harness-generic-backend"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "harness-generic-backend",
  "harness-model",
  "harness-protocol",
  "harness-runtime",
@@ -1145,6 +1146,7 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
+ "harness-session-store",
  "metrics",
  "r2d2",
  "r2d2_sqlite",
@@ -1379,6 +1381,7 @@ dependencies = [
  "harness-integration-claude-code",
  "harness-integration-codex",
  "harness-integration-gemini",
+ "harness-integration-github-copilot",
  "harness-integration-openai",
  "harness-integration-openai-compatible",
  "harness-protocol",

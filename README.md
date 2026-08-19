@@ -136,9 +136,11 @@ Every `Hello` handshake response carries a `ProtocolCapabilities` struct so a cl
 | `session_restore` | `true` | `restore_session` from a persisted snapshot |
 | `event_gap_signals` | `true` | a client is told explicitly if it fell behind the broadcast buffer, rather than silently missing events |
 | `durable_idempotency` | **`false`** | admission history (which command IDs were already accepted) is **not** persisted — it resets on daemon restart |
-| `pause_resume` | **`false`** | no pause/resume run control yet, only cancel |
+| `pause_resume` | `true` | `Mutate { Pause }` stops the active run recoverably; `Resume` continues it |
 
-Treat the two `false` rows as real constraints, not roadmap trivia: a client that retries a mutation across a daemon restart using the same command ID cannot rely on the daemon recognizing it as a duplicate.
+Treat the `false` row as a real constraint, not roadmap trivia: a client that retries a mutation across a daemon restart using the same command ID cannot rely on the daemon recognizing it as a duplicate.
+
+On `pause_resume`: pause is *recoverable*, unlike cancel — the agent holds its run state and `Resume` continues the same run rather than starting a new one. It does not abort an in-flight backend request; `AgentRunner` receives one command, then awaits the effects it produced before receiving the next, so a pause issued while the model is streaming applies once that request settles.
 
 ### Provider resilience
 
@@ -170,9 +172,9 @@ Seven model backends ship today, sharing one of two shapes: a **direct HTTP clie
 | `openai-compatible` | `harness-integration-openai-compatible` | HTTP (OpenAI-shaped) | optional `api_key` (some local servers need none) | ✅ | not wired |
 | `claude-code` | `harness-integration-claude-code` | subprocess (`claude`) | CLI's own credential store (`claude` login) | ✅ | ✅ |
 | `codex` | `harness-integration-codex` | subprocess (`codex`) | CLI's own credential store (`codex login`) | ✅ | ✅ |
-| `github-copilot` | `harness-integration-github-copilot` | subprocess (`copilot`) | CLI's own credential store (`copilot login`) | ❌ **not yet** | ✅ |
+| `github-copilot` | `harness-integration-github-copilot` | subprocess (`copilot`) | CLI's own credential store (`copilot login`) | ✅ | ✅ |
 
-`github-copilot` is a complete, tested integration (it's exercised by its own conformance suite like every other backend) that the standalone TUI already registers — it just isn't in `harnessd`'s `Harness::builder()` chain yet (`apps/harnessd/src/main.rs`). If you need it over the daemon/`harnessctl` path, that's a one-line `.register_integration(Arc::new(GitHubCopilotFactory))` addition, not a missing feature.
+All seven integrations are registered in both `harnessd` and the standalone TUI, so every backend is reachable over the daemon/`harnessctl` path as well as in-process.
 
 ### Config shapes
 
@@ -198,6 +200,40 @@ Example — pointing `openai-compatible` at a local Ollama server:
 ```console
 --config-json '{"base_url":"http://localhost:11434/v1","model":"llama3"}'
 ```
+
+### Structured output
+
+`ExecutionParams::response_format` constrains the model's response shape,
+provider-neutrally. Three forms: `Text` (the default), `JsonObject` (valid
+JSON, no schema), and `JsonSchema { name, schema, strict }`.
+
+The three providers reach it three different ways, which is why it is a
+neutral field rather than something left to `provider_options`:
+
+| Integration | Mechanism |
+|---|---|
+| `openai`, `openai-compatible` | native `response_format` (`json_object` / `json_schema`) |
+| `gemini` | `generationConfig.responseMimeType` + `responseSchema` |
+| `anthropic` | **emulated** — no `response_format` exists in the Messages API, so the harness declares a single-purpose tool whose input schema *is* the requested schema, forces `tool_choice` onto it, and surfaces the resulting tool-call input as assistant text |
+| `claude-code`, `codex`, `github-copilot` | **unsupported** — these drive a CLI that owns its own output |
+
+The Anthropic emulation is invisible to callers: the synthetic tool never
+appears as a tool call, and its input streams back as ordinary text deltas.
+
+Two provider-specific caveats worth knowing:
+
+- **Gemini** accepts only a restricted schema subset. `$schema`, `$id`,
+  `additionalProperties`, `$defs`, and `definitions` are stripped
+  recursively before the request is sent — a `schemars`-generated schema
+  carries all of them and would otherwise fail the whole call with a 400.
+  Structural constraints (types, properties, required, enum) survive.
+- **OpenAI's `json_object`** mode requires the word "JSON" to appear in the
+  prompt or the API rejects the call. `json_schema` has no such requirement.
+
+A backend that cannot honor a non-`Text` format rejects the request with
+`UnsupportedCapability` **before any network call**, so an unsatisfiable
+request never produces a billed call returning prose you would then fail to
+parse. Advertised as `BackendCapabilities::structured_output`.
 
 ---
 
@@ -667,11 +703,10 @@ CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchai
 Versions across the workspace are `0.1.x` — nothing here is published to crates.io or npm yet, and no crate makes a semver promise except `harness-extension-api`. Known, current limitations worth knowing before depending on this:
 
 - **Unix-like platforms only (Linux, macOS) — no Windows support.** `harness-transport-ipc` and `harnessctl`'s client (its only way to reach a daemon) use `tokio::net::UnixListener`/`UnixStream` unconditionally, which don't exist on Windows; the workspace does not currently build there. CI's test matrix reflects this (`ubuntu-latest`/`macos-latest` only). The `stdio` and WebSocket transports have no such dependency — a Windows host embedding `harness-engine` directly, or driving `harnessd --stdio`/`--tcp` from a non-Rust client, isn't affected by this; only `harnessd --unix-socket` and `harnessctl` are.
-- MCP support is client-only (the harness can consume another MCP server's tools; it cannot expose itself as one — see [MCP servers](#mcp-servers)), and stdio/`tools`-only within that.
+- MCP support covers `tools/*` only — no resources, prompts, sampling, or roots, in either direction (see [MCP servers](#mcp-servers)).
 - The WebSocket transport is unauthenticated and loopback-only by deliberate scope decision (see `crates/transports/websocket/src/lib.rs`) — a remote/multi-tenant deployment needs an auth/TLS layer built on top, not just a different bind address.
-- `github-copilot` isn't yet registered in `harnessd` (see [Integrations](#integrations)).
 - Extension loading is compile-time only (see [Extending the harness](#extending-the-harness)) — no third-party plugin ecosystem without recompiling the host.
-- `durable_idempotency` and `pause_resume` are `false` in `ProtocolCapabilities` (see [Protocol capabilities](#protocol-capabilities)).
+- `durable_idempotency` is `false` in `ProtocolCapabilities` — admission history resets on daemon restart (see [Protocol capabilities](#protocol-capabilities)).
 - No independent external security review has been done on this codebase.
 
 None of these are silently papered over — each is called out at the point in this README (or in the source doc comment it links to) where it actually matters, rather than only here.

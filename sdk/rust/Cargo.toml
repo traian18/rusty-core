@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 harness-engine = { path = "../../crates/harness-engine" }
 harness-protocol = { path = "../../crates/harness-protocol" }
-harness-runtime = { path = "../../crates/harness-runtime", features = ["testing"] }
+harness-runtime = { path = "../../crates/harness-runtime" }
 harness-session-store = { path = "../../crates/harness-session-store" }
 harness-workspace = { path = "../../crates/harness-workspace" }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

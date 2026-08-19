@@ -62,6 +62,15 @@ pub struct BackendCapabilities {
     pub exact_usage: bool,
     /// Whether the backend reports exact cost information.
     pub exact_cost: bool,
+    /// Whether the backend can honor
+    /// [`ExecutionParams::response_format`](ExecutionParams::response_format).
+    ///
+    /// `false` means a request carrying one is rejected before any network
+    /// call, rather than silently returning unconstrained prose that a
+    /// caller would then try to parse as JSON. The three subprocess
+    /// integrations (`claude-code`, `codex`, `github-copilot`) are `false`:
+    /// they drive a CLI that owns its own output format.
+    pub structured_output: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +149,50 @@ pub enum ReasoningEffort {
     High,
 }
 
+/// Provider-neutral constraint on the shape of the model's response.
+///
+/// Providers reach this three different ways, which is exactly why it is
+/// expressed neutrally here rather than left to `provider_options`:
+///
+/// - **OpenAI / OpenAI-compatible** — native `response_format`.
+/// - **Gemini** — `generationConfig.responseMimeType` plus `responseSchema`.
+/// - **Anthropic** — no `response_format` field exists. [`JsonSchema`] is
+///   emulated by declaring a single-purpose tool whose input schema *is* the
+///   requested schema and forcing `tool_choice` onto it, then surfacing the
+///   resulting tool-call input as the response text.
+///
+/// A backend that cannot honor the request rejects it up front with
+/// `ExecutionError::UnsupportedCapability` rather than silently returning
+/// unconstrained prose — see `BackendCapabilities::structured_output`.
+///
+/// [`JsonSchema`]: ResponseFormat::JsonSchema
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Free-form text. Equivalent to leaving `response_format` unset; present
+    /// so a caller can explicitly override an inherited session-level format.
+    Text,
+    /// Any syntactically valid JSON value, with no schema constraint.
+    ///
+    /// Cheaper than [`JsonSchema`](ResponseFormat::JsonSchema) and supported
+    /// more widely, but it guarantees only that the output parses — not that
+    /// it has the fields you expect.
+    JsonObject,
+    /// JSON conforming to `schema` (a JSON Schema document).
+    JsonSchema {
+        /// Schema name. Some providers require it and surface it to the
+        /// model as a hint, so make it descriptive (`"task_graph"`, not `"s"`).
+        name: String,
+        /// The JSON Schema the response must satisfy.
+        schema: serde_json::Value,
+        /// Ask the provider to guarantee conformance rather than merely
+        /// encourage it, where it offers that distinction (OpenAI's
+        /// `strict: true`). Providers without the distinction ignore it.
+        #[serde(default)]
+        strict: bool,
+    },
+}
+
 /// Model selection and sampling/output parameters for one execution request.
 ///
 /// Every field is optional/empty by default, meaning "use the provider's own
@@ -167,6 +220,9 @@ pub struct ExecutionParams {
     /// `None` means "not specified" (falls back to `false` at request time),
     /// distinct from an explicit `Some(false)`.
     pub extended_thinking: Option<bool>,
+    /// Constrain the response's shape (JSON object / JSON schema). `None`
+    /// means free-form text, the provider default.
+    pub response_format: Option<ResponseFormat>,
     /// Provider-specific options that don't have a provider-neutral
     /// equivalent, namespaced by provider id (e.g.
     /// `{"anthropic": {"top_k": 40}}`). Providers that don't recognize their
@@ -191,6 +247,13 @@ impl ExecutionParams {
             },
             reasoning_effort: update.reasoning_effort.or(self.reasoning_effort),
             extended_thinking: update.extended_thinking.or(self.extended_thinking),
+            // `ResponseFormat::Text` is how a caller clears an inherited
+            // format — it survives this merge as an explicit value rather
+            // than reading as "unset", which `None` would.
+            response_format: update
+                .response_format
+                .clone()
+                .or_else(|| self.response_format.clone()),
             provider_options: if update.provider_options.is_null() {
                 self.provider_options.clone()
             } else {
@@ -371,6 +434,7 @@ mod tests {
             stop_sequences: vec!["STOP".to_string()],
             reasoning_effort: None,
             extended_thinking: None,
+            response_format: None,
             provider_options: serde_json::Value::Null,
         };
         let update = ExecutionParams {

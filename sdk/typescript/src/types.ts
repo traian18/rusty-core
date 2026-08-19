@@ -225,6 +225,8 @@ export type MutationCommand =
   | { type: "steer"; payload: UserInput }
   | { type: "follow_up"; payload: UserInput }
   | { type: "cancel" }
+  | { type: "pause" }
+  | { type: "resume" }
   | {
       type: "resolve_permission";
       payload: { id: PermissionId; decision: PermissionDecision };

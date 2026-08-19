@@ -1,13 +1,13 @@
 # MCP server mode, MCP HTTP transport, and filesystem skills
 
 Status doc for the three gaps the comparative assessment flagged as blocking
-open-source launch. Two are now closed; one remains.
+open-source launch. All three are now closed.
 
 | Phase | Scope | Status |
 |:--|:--|:--|
 | 1 | Filesystem skills (`SKILL.md`), runtime-extensible | **Done** |
 | 2 | MCP client over HTTP, alongside stdio | **Done** |
-| 3 | MCP server mode — expose the engine *as* an MCP server | **Not started** |
+| 3 | MCP server mode — expose the engine *as* an MCP server | **Done** |
 
 Verification at the time of writing: `cargo test --workspace --all-targets`
 passes 688 tests across 62 suites, with `cargo fmt --check`,
@@ -147,10 +147,13 @@ name, so no extra flag is needed to disambiguate.
 
 ---
 
-## Phase 3 — MCP server mode (not started)
+## Phase 3 — MCP server mode (done)
 
 Expose the engine *as* an MCP server so Claude Desktop / Cursor / VS Code can
-drive it without a custom SDK. This is the P0 item.
+drive it without a custom SDK. Landed in `233cb88` as
+`crates/transports/mcp`, wired into `harnessd` behind `--mcp-stdio`; see the
+MCP server mode section of the README for the shipped surface. The plan
+below is what was built, kept for the rationale.
 
 ### Approach
 

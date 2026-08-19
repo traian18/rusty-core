@@ -110,6 +110,7 @@ impl GenericModelBackend {
             tool_calls: model.tool_calls,
             parallel_tool_calls: model.parallel_tool_calls,
             images: model.images,
+            structured_output: model.structured_output,
             host_managed_tools: true,
             ..Default::default()
         };
@@ -174,6 +175,24 @@ impl GenericModelBackend {
             return Some(ModelError::UnsupportedCapability {
                 capability: "tool_calls".to_string(),
                 detail: format!("{} does not support tool calls", self.descriptor.name),
+            });
+        }
+
+        // A caller asking for JSON and silently receiving prose is the worst
+        // outcome here — it fails later, at a parse site far from the cause.
+        // `ResponseFormat::Text` is the provider default, so it needs no
+        // capability.
+        let wants_structured_output = !matches!(
+            request.params.response_format,
+            None | Some(harness_protocol::backend::ResponseFormat::Text)
+        );
+        if wants_structured_output && !self.capabilities.structured_output {
+            return Some(ModelError::UnsupportedCapability {
+                capability: "structured_output".to_string(),
+                detail: format!(
+                    "{} cannot constrain its response format",
+                    self.descriptor.name
+                ),
             });
         }
 
@@ -425,6 +444,7 @@ impl ExecutionBackend for GenericModelBackend {
             stop_sequences: request.params.stop_sequences,
             extended_thinking: request.extended_thinking,
             reasoning_effort: request.params.reasoning_effort,
+            response_format: request.params.response_format,
             provider_options: request.params.provider_options,
         };
         if let Err(error) = self.circuit_allows_request() {
@@ -515,6 +535,137 @@ impl ExecutionBackend for GenericModelBackend {
 mod tests {
     use super::*;
     use crate::testing::FakeModelClient;
+
+    /// A client that advertises `structured_output` must have that reach
+    /// `BackendCapabilities`. This was wrong once already: the four HTTP
+    /// integrations set `structured_output: true` on their *factory
+    /// descriptor* while `GenericModelBackend::new` derived capabilities
+    /// from `ModelCapabilities`, where the field defaulted to `false` — so
+    /// every structured-output request would have been rejected by the very
+    /// backend advertising support for it.
+    #[test]
+    fn structured_output_capability_propagates_from_the_client() {
+        let backend = GenericModelBackend::new(Arc::new(FakeModelClient::default()));
+        assert_eq!(
+            backend.capabilities().structured_output,
+            FakeModelClient::default().capabilities().structured_output,
+            "the backend must mirror its client's structured-output support"
+        );
+    }
+
+    /// A constrained request against a backend that cannot honor it must be
+    /// rejected *before* any network call, rather than silently returning
+    /// prose the caller will fail to parse much later.
+    #[tokio::test]
+    async fn a_response_format_is_rejected_when_the_backend_cannot_honor_it() {
+        use harness_protocol::backend::{ExecutionParams, ResponseFormat};
+
+        struct NoStructuredOutput;
+
+        #[async_trait]
+        impl ModelClient for NoStructuredOutput {
+            fn capabilities(&self) -> harness_model::request::ModelCapabilities {
+                harness_model::request::ModelCapabilities {
+                    streaming: true,
+                    reasoning: false,
+                    tool_calls: false,
+                    parallel_tool_calls: false,
+                    images: false,
+                    structured_output: false,
+                }
+            }
+
+            async fn stream(
+                &self,
+                _request: ModelRequest,
+                _sink: broadcast::Sender<ModelEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<ModelResult, ModelError> {
+                panic!("must be rejected before the client is ever reached");
+            }
+        }
+
+        let backend = GenericModelBackend::new(Arc::new(NoStructuredOutput));
+        let (sink, _rx) = broadcast::channel(16);
+        let result = backend
+            .execute(
+                harness_protocol::backend::ExecutionRequest {
+                    request_id: RequestId::new(),
+                    run_id: harness_protocol::ids::RunId::new(),
+                    system_prompt: String::new(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    extended_thinking: false,
+                    params: ExecutionParams {
+                        response_format: Some(ResponseFormat::JsonObject),
+                        ..Default::default()
+                    },
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let error = result.expect_err("a constrained request must be rejected");
+        assert!(
+            matches!(
+                &error,
+                harness_protocol::backend::ExecutionError::UnsupportedCapability { capability, .. }
+                    if capability == "structured_output"
+            ),
+            "expected an UnsupportedCapability(structured_output) error, got: {error:?}"
+        );
+    }
+
+    /// `Text` is every provider's default, so it must not require the
+    /// capability — otherwise a backend without structured output could not
+    /// serve an ordinary prose request that happened to set the field.
+    #[tokio::test]
+    async fn an_explicit_text_format_needs_no_capability() {
+        use harness_protocol::backend::{ExecutionParams, ResponseFormat};
+
+        let backend = GenericModelBackend::new(Arc::new(
+            FakeModelClient::default()
+                .with_capabilities(harness_model::request::ModelCapabilities {
+                    streaming: true,
+                    reasoning: false,
+                    tool_calls: false,
+                    parallel_tool_calls: false,
+                    images: false,
+                    // Explicitly unable to do structured output — the point
+                    // is that `Text` sails through anyway.
+                    structured_output: false,
+                })
+                .with_result(ModelResult {
+                    stop_reason: "end_turn".to_string(),
+                    usage: Default::default(),
+                    cost: Default::default(),
+                }),
+        ));
+        let (sink, _rx) = broadcast::channel(16);
+        let result = backend
+            .execute(
+                harness_protocol::backend::ExecutionRequest {
+                    request_id: RequestId::new(),
+                    run_id: harness_protocol::ids::RunId::new(),
+                    system_prompt: String::new(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    extended_thinking: false,
+                    params: ExecutionParams {
+                        response_format: Some(ResponseFormat::Text),
+                        ..Default::default()
+                    },
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "ResponseFormat::Text must not be gated: {result:?}"
+        );
+    }
 
     #[test]
     fn recovery_policy_default_matches_prior_hardcoded_values() {
@@ -818,6 +969,7 @@ mod tests {
                     tool_calls: false,
                     parallel_tool_calls: false,
                     images: false,
+                    structured_output: false,
                 }
             }
 
@@ -865,6 +1017,7 @@ mod tests {
                     tool_calls: false,
                     parallel_tool_calls: false,
                     images: false,
+                    structured_output: false,
                 }
             }
 

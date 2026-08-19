@@ -147,7 +147,17 @@ pub enum AgentOperation {
 /// Each variant corresponds to an external event or user action that the
 /// agent's transition function (`Agent::apply`) processes, returning a
 /// list of [`AgentEffect`](crate::effects::AgentEffect)s.
+// `SpawnChild`'s `SpawnAgentSpec` makes this enum ~464 bytes, so every
+// command — including one-byte ones like `Cancel` and `Pause` — costs that
+// much in a channel buffer. `SessionCommand`, which carries the same spec,
+// already carries this same allow for the same reason. Boxing
+// `SpawnAgentSpec` is the real fix (it is wire-compatible: `Box<T>`
+// serializes identically to `T`), but it ripples into
+// `AgentEffect::SpawnAgent` and the deterministic core's transition
+// function, so it is tracked as its own change rather than folded into an
+// unrelated one. See PRODUCTION_READINESS.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentCommand {
     /// Start a new run with the given user input.
     StartRun { input: UserInput },

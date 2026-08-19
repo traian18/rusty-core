@@ -431,14 +431,16 @@ async fn a_lagging_subscriber_recovers_the_full_durable_backlog_via_events_since
             delta: format!("chunk {i} "),
         });
     }
-    let backend = Arc::new(FakeBackend::new().with_events(events).with_result(
-        ExecutionResult {
-            request_id,
-            usage: ModelUsage::default(),
-            cost: Cost::default(),
-            finish_reason: "end_turn".into(),
-        },
-    ));
+    let backend = Arc::new(
+        FakeBackend::new()
+            .with_events(events)
+            .with_result(ExecutionResult {
+                request_id,
+                usage: ModelUsage::default(),
+                cost: Cost::default(),
+                finish_reason: "end_turn".into(),
+            }),
+    );
 
     let runtime = manager
         .create_session(
@@ -697,8 +699,7 @@ async fn a_restored_session_replays_no_side_effects_and_is_immediately_usable() 
     const BACKEND_NAME: &str = "crash-restart-fake-backend";
 
     let backing_store = Arc::new(MemoryStore::new());
-    let store: Arc<dyn SessionStore> =
-        Arc::new(FaultInjectingStore::new(backing_store.clone()));
+    let store: Arc<dyn SessionStore> = Arc::new(FaultInjectingStore::new(backing_store.clone()));
 
     let original_calls = Arc::new(AtomicUsize::new(0));
     let original_backend = Arc::new(CountingBackend {
@@ -897,7 +898,10 @@ async fn session_manager_implements_traits_and_contract_polymorphism() {
         .expect("create_session through SessionLifecycle contract");
 
     assert_eq!(registry.active_session_count().await, 1);
-    assert_eq!(registry.active_session_ids().await, vec![runtime.session_id]);
+    assert_eq!(
+        registry.active_session_ids().await,
+        vec![runtime.session_id]
+    );
     assert!(registry.session_handle(runtime.session_id).await.is_some());
 
     // Verify polymorphic usage as dyn SessionRestorer
@@ -921,9 +925,7 @@ async fn active_session_registry_operations() {
     assert!(registry.ids().await.is_empty());
 
     let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
-    let permit = scheduler
-        .acquire_session_permit()
-        .await;
+    let permit = scheduler.acquire_session_permit().await;
     let session_id = SessionId::new();
     let runtime = Arc::new(crate::session_runtime::SessionRuntime::new_with_scheduler(
         session_id,

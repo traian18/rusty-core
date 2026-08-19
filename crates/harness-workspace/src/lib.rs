@@ -9,6 +9,6 @@ pub mod worktree;
 pub use filesystem::FsWorkspace;
 pub use workspace::{
     FileInfo, ProgressPhase, ReadOnlyWorkspace, SearchMatch, SearchResult, SnapshotWorkspace,
-    ToolProgress, ToolResult, Workspace, WorkspaceError, WorkspaceMode,
+    ToolProgress, ToolResult, UnboundWorkspace, Workspace, WorkspaceError, WorkspaceMode,
 };
 pub use worktree::WorktreeWorkspace;

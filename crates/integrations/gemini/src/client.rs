@@ -49,6 +49,7 @@ impl ModelClient for GeminiClient {
             tool_calls: true,
             parallel_tool_calls: true,
             images: true,
+            structured_output: true,
         }
     }
 
@@ -64,6 +65,16 @@ impl ModelClient for GeminiClient {
             .clone()
             .unwrap_or_else(|| self.config.default_model.clone());
 
+        let mut generation_config = GeminiGenerationConfig {
+            max_output_tokens: Some(request.max_tokens.unwrap_or(self.config.default_max_tokens)),
+            temperature: request.temperature,
+            stop_sequences: (!request.stop_sequences.is_empty())
+                .then(|| request.stop_sequences.clone()),
+            response_mime_type: None,
+            response_schema: None,
+        };
+        generation_config.apply_response_format(request.response_format.as_ref());
+
         let gemini_request = GeminiRequest {
             contents: convert_messages(&request.messages),
             system_instruction: build_system_instruction(&request.system_prompt, &request.messages),
@@ -78,14 +89,7 @@ impl ModelClient for GeminiClient {
                         .collect(),
                 }])
             },
-            generation_config: GeminiGenerationConfig {
-                max_output_tokens: Some(
-                    request.max_tokens.unwrap_or(self.config.default_max_tokens),
-                ),
-                temperature: request.temperature,
-                stop_sequences: (!request.stop_sequences.is_empty())
-                    .then_some(request.stop_sequences),
-            },
+            generation_config,
         };
 
         let url = format!(

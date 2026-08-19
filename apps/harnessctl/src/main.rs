@@ -170,6 +170,10 @@ enum SessionCommand {
     Snapshot { session_id: String },
     /// Cancel a session's active run.
     Cancel { session_id: String },
+    /// Pause a session's active run, keeping it resumable.
+    Pause { session_id: String },
+    /// Resume a paused session.
+    Resume { session_id: String },
     /// Close a session.
     Close { session_id: String },
 }
@@ -518,6 +522,28 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
                 .request(
                     Some(session_id),
                     mutation(session_id, MutationCommand::Cancel),
+                )
+                .await?;
+            print_ack_or_error(response)
+        }
+
+        SessionCommand::Pause { session_id } => {
+            let session_id = parse_session_id(&session_id)?;
+            let response = client
+                .request(
+                    Some(session_id),
+                    mutation(session_id, MutationCommand::Pause),
+                )
+                .await?;
+            print_ack_or_error(response)
+        }
+
+        SessionCommand::Resume { session_id } => {
+            let session_id = parse_session_id(&session_id)?;
+            let response = client
+                .request(
+                    Some(session_id),
+                    mutation(session_id, MutationCommand::Resume),
                 )
                 .await?;
             print_ack_or_error(response)

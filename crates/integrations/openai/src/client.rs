@@ -52,6 +52,7 @@ impl ModelClient for OpenAiClient {
             tool_calls: true,
             parallel_tool_calls: true,
             images: true,
+            structured_output: true,
         }
     }
 
@@ -90,6 +91,10 @@ impl ModelClient for OpenAiClient {
             max_tokens: Some(request.max_tokens.unwrap_or(self.config.default_max_tokens)),
             temperature: request.temperature,
             stop: (!request.stop_sequences.is_empty()).then_some(request.stop_sequences),
+            response_format: request
+                .response_format
+                .as_ref()
+                .and_then(crate::wire::OpenAiResponseFormat::from_neutral),
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,

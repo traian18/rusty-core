@@ -38,6 +38,15 @@ pub enum MutationCommand {
     Steer(UserInput),
     FollowUp(UserInput),
     Cancel,
+    /// Pause the active run, holding its state so it can be continued.
+    ///
+    /// Recoverable, unlike [`Cancel`](Self::Cancel). Gated by the
+    /// `pause_resume` protocol capability — a client must check it before
+    /// offering pause in its UI, since an older daemon rejects this variant
+    /// as an unknown command.
+    Pause,
+    /// Continue a run stopped by [`Pause`](Self::Pause).
+    Resume,
     ResolvePermission {
         id: PermissionId,
         decision: PermissionDecision,
@@ -257,6 +266,8 @@ pub struct ProtocolCapabilities {
     pub event_gap_signals: bool,
     /// False until command admissions are stored durably across daemon restarts.
     pub durable_idempotency: bool,
+    /// `MutationCommand::Pause`/`Resume` are accepted and drive a real,
+    /// recoverable pause of the active run.
     pub pause_resume: bool,
 }
 
@@ -270,7 +281,7 @@ impl Default for ProtocolCapabilities {
             session_restore: true,
             event_gap_signals: true,
             durable_idempotency: false,
-            pause_resume: false,
+            pause_resume: true,
         }
     }
 }
@@ -376,6 +387,24 @@ mod tests {
         assert!(capabilities.session_restore);
         assert!(capabilities.event_gap_signals);
         assert!(!capabilities.durable_idempotency);
-        assert!(!capabilities.pause_resume);
+        assert!(capabilities.pause_resume);
+    }
+
+    #[test]
+    fn pause_and_resume_round_trip_on_the_wire() {
+        for command in [MutationCommand::Pause, MutationCommand::Resume] {
+            let encoded = serde_json::to_value(&command).expect("serialize");
+            let decoded: MutationCommand =
+                serde_json::from_value(encoded.clone()).expect("deserialize");
+            assert_eq!(
+                std::mem::discriminant(&command),
+                std::mem::discriminant(&decoded),
+                "round-trip changed the variant for {encoded}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(MutationCommand::Pause).expect("serialize"),
+            serde_json::json!({ "type": "pause" }),
+        );
     }
 }

@@ -235,6 +235,22 @@ export class HarnessClient {
     return this.mutate(sessionId, { type: "cancel" }, options);
   }
 
+  /**
+   * Pause the active run, holding its state so `resume` can continue it.
+   *
+   * Requires the `pause_resume` capability; check
+   * `client.capabilities.pause_resume` before offering this in a UI, since
+   * an older daemon rejects the command as unknown.
+   */
+  pause(sessionId: SessionId, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.mutate(sessionId, { type: "pause" }, options);
+  }
+
+  /** Continue a run stopped by {@link pause}. */
+  resume(sessionId: SessionId, options?: MutationOptions): Promise<AdmissionReceipt> {
+    return this.mutate(sessionId, { type: "resume" }, options);
+  }
+
   resolvePermission(
     sessionId: SessionId,
     id: PermissionId,

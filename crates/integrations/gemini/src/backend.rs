@@ -42,6 +42,7 @@ impl IntegrationFactory for GeminiFactory {
                 tool_calls: true,
                 parallel_tool_calls: true,
                 host_managed_tools: true,
+                structured_output: true,
                 ..Default::default()
             },
         }

@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harness_protocol::backend::ReasoningEffort;
+use harness_protocol::backend::{ReasoningEffort, ResponseFormat};
 use harness_protocol::messages::AgentMessage;
 use harness_protocol::tools::ToolDescriptor;
 
@@ -22,6 +22,14 @@ pub struct ModelCapabilities {
     pub parallel_tool_calls: bool,
     /// Whether the provider accepts image content blocks in messages.
     pub images: bool,
+    /// Whether this client can honor [`ModelRequest::response_format`] —
+    /// natively, or by emulation it performs itself (Anthropic forces a
+    /// single-purpose tool call).
+    ///
+    /// `GenericModelBackend` surfaces this as
+    /// `BackendCapabilities::structured_output` and rejects a constrained
+    /// request before any network call when it is `false`.
+    pub structured_output: bool,
 }
 
 /// A request to be sent to a model provider.
@@ -44,6 +52,12 @@ pub struct ModelRequest {
     /// rejected by `GenericModelBackend`'s capability check before a
     /// `ModelClient` ever sees this — see `ModelError::UnsupportedCapability`.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Requested response shape. `None` (or `Text`) means free-form prose.
+    /// `GenericModelBackend` rejects a non-`Text` value before a client ever
+    /// sees it unless the backend advertises
+    /// `BackendCapabilities::structured_output`, so a client that reaches
+    /// this with `Some(JsonSchema { .. })` is expected to honor it.
+    pub response_format: Option<ResponseFormat>,
     /// Provider-specific options namespaced by provider id. See
     /// `harness_protocol::backend::ExecutionParams::provider_options`.
     pub provider_options: serde_json::Value,
