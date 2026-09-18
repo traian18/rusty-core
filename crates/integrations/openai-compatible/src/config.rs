@@ -44,6 +44,15 @@ pub struct OpenAiCompatibleConfig {
     /// Some providers require a custom header beyond `Authorization`.
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Whether this endpoint accepts the `reasoning_effort` request param
+    /// and streams reasoning text back. Defaults to `false` -- most
+    /// OpenAI-compatible endpoints (local Ollama/vLLM, plain chat models)
+    /// reject an unrecognized param rather than ignoring it, so this is an
+    /// explicit per-provider opt-in, not a blanket capability. See
+    /// `harness-integration-openai::OpenAiConfig::supports_reasoning`'s own
+    /// doc comment -- this field maps straight into that one.
+    #[serde(default)]
+    pub supports_reasoning: bool,
 }
 
 fn default_max_tokens() -> u64 {
@@ -111,6 +120,7 @@ impl OpenAiCompatibleConfig {
             request_timeout: default_timeout(),
             recovery: RecoveryPolicy::default(),
             extra_headers: HashMap::new(),
+            supports_reasoning: false,
         }
     }
 
@@ -126,6 +136,7 @@ impl OpenAiCompatibleConfig {
             request_timeout: self.request_timeout,
             recovery: self.recovery,
             extra_headers: self.extra_headers,
+            supports_reasoning: self.supports_reasoning,
         }
     }
 }
@@ -207,6 +218,18 @@ mod tests {
         config.recovery.max_attempts = 6;
         let openai_config = config.into_openai_config();
         assert_eq!(openai_config.recovery.max_attempts, 6);
+    }
+
+    #[test]
+    fn supports_reasoning_defaults_to_false_and_threads_through_into_openai_config() {
+        let config = OpenAiCompatibleConfig::new("http://localhost:11434/v1", "llama3");
+        assert!(!config.supports_reasoning);
+        assert!(!config.into_openai_config().supports_reasoning);
+
+        let mut with_reasoning =
+            OpenAiCompatibleConfig::new("https://opencode.ai/zen/v1", "big-pickle");
+        with_reasoning.supports_reasoning = true;
+        assert!(with_reasoning.into_openai_config().supports_reasoning);
     }
 
     #[test]

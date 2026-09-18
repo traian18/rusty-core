@@ -6,18 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use harness_generic_backend::RecoveryPolicy;
 
-/// Configuration for the OpenAI Chat Completions API client.
+/// Configuration for the OpenAI Responses API client.
 ///
-/// Formatting is explicitly redacted so the API key cannot leak through
-/// logs. `base_url` includes the version path segment (`/v1`), matching the
-/// convention most OpenAI-compatible providers (OpenRouter, Together, Groq)
-/// document their own base URLs with — this is what lets
-/// `harness-integration-openai-compatible` reuse this client directly by
-/// swapping only `base_url`/`api_key`/`default_model` (see that crate's
-/// `PLAN.md`).
+/// `base_url` includes the version path segment (`/v1`), matching
+/// `harness-integration-openai`'s own convention -- the client posts to
+/// `{base_url}/responses`. This is what lets a gateway-style provider (e.g.
+/// OpenCode Zen's GPT/Grok/Muse-Spark family) reuse this client directly by
+/// pointing `base_url` at its own `/v1`-suffixed root.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OpenAiConfig {
+pub struct OpenAiResponsesConfig {
     pub api_key: String,
     pub base_url: String,
     pub default_model: String,
@@ -31,21 +29,8 @@ pub struct OpenAiConfig {
     /// Retry, deadline, and circuit-breaker settings for provider calls.
     pub recovery: RecoveryPolicy,
     /// Extra headers sent with every request, beyond `Authorization` and
-    /// `Content-Type`. Empty for plain OpenAI; some OpenAI-compatible
-    /// providers require a provider-specific header (see
-    /// `harness-integration-openai-compatible`).
+    /// `Content-Type`.
     pub extra_headers: HashMap<String, String>,
-    /// Whether this endpoint accepts the `reasoning_effort` request param
-    /// and streams `delta.reasoning_content`/`delta.reasoning` back.
-    /// Defaults to `false` -- this client also backs plain `gpt-4o`-style
-    /// OpenAI calls and arbitrary Ollama/vLLM/local endpoints, most of which
-    /// reject an unrecognized param outright rather than ignoring it, so
-    /// this has to be an explicit opt-in per configured endpoint rather than
-    /// a blanket capability. See `harness-integration-openai-compatible`'s
-    /// own `supports_reasoning` field, which sets this for gateway-style
-    /// providers (e.g. OpenCode Zen's chat-completions model family) known
-    /// to support it.
-    pub supports_reasoning: bool,
 }
 
 fn serialize_duration_secs<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
@@ -62,22 +47,21 @@ where
     Ok(Duration::from_secs(u64::deserialize(deserializer)?))
 }
 
-impl Default for OpenAiConfig {
+impl Default for OpenAiResponsesConfig {
     fn default() -> Self {
         Self {
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             base_url: "https://api.openai.com/v1".into(),
-            default_model: "gpt-4o".into(),
+            default_model: "gpt-5".into(),
             default_max_tokens: 4096,
             request_timeout: Duration::from_secs(120),
             recovery: RecoveryPolicy::default(),
             extra_headers: HashMap::new(),
-            supports_reasoning: false,
         }
     }
 }
 
-impl fmt::Display for OpenAiConfig {
+impl fmt::Display for OpenAiResponsesConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let redacted = if self.api_key.len() >= 4 {
             format!("{}***", &self.api_key[..4])
@@ -86,19 +70,19 @@ impl fmt::Display for OpenAiConfig {
         };
         write!(
             f,
-            "OpenAiConfig {{ api_key: {}, base_url: {}, default_model: {}, default_max_tokens: {}, request_timeout: {:?}, recovery: {:?}, supports_reasoning: {} }}",
-            redacted, self.base_url, self.default_model, self.default_max_tokens, self.request_timeout, self.recovery, self.supports_reasoning,
+            "OpenAiResponsesConfig {{ api_key: {}, base_url: {}, default_model: {}, default_max_tokens: {}, request_timeout: {:?}, recovery: {:?} }}",
+            redacted, self.base_url, self.default_model, self.default_max_tokens, self.request_timeout, self.recovery,
         )
     }
 }
 
-impl fmt::Debug for OpenAiConfig {
+impl fmt::Debug for OpenAiResponsesConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
 }
 
-impl OpenAiConfig {
+impl OpenAiResponsesConfig {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -113,7 +97,7 @@ mod tests {
 
     #[test]
     fn serde_uses_seconds_and_defaults() {
-        let config: OpenAiConfig = serde_json::from_value(serde_json::json!({
+        let config: OpenAiResponsesConfig = serde_json::from_value(serde_json::json!({
             "api_key": "test-key",
             "request_timeout_secs": 30
         }))
@@ -125,24 +109,11 @@ mod tests {
 
         let value = serde_json::to_value(config).expect("serializable config");
         assert_eq!(value["request_timeout_secs"], 30);
-        assert_eq!(value["recovery"]["max_attempts"], 2);
-    }
-
-    #[test]
-    fn custom_recovery_policy_deserializes() {
-        let config: OpenAiConfig = serde_json::from_value(serde_json::json!({
-            "api_key": "test-key",
-            "recovery": { "max_attempts": 4, "total_deadline_secs": 45 }
-        }))
-        .expect("valid config");
-        assert_eq!(config.recovery.max_attempts, 4);
-        assert_eq!(config.recovery.total_deadline, Duration::from_secs(45));
-        assert_eq!(config.recovery.circuit_failure_threshold, 3);
     }
 
     #[test]
     fn formatting_redacts_api_key() {
-        let config = OpenAiConfig::new("sk-my-secret-key");
+        let config = OpenAiResponsesConfig::new("sk-my-secret-key");
         assert!(!format!("{config}").contains("my-secret-key"));
         assert!(!format!("{config:?}").contains("my-secret-key"));
     }

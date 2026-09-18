@@ -373,7 +373,7 @@ impl SessionBuilder {
             "git.diff" => Arc::new(GitDiffTool::new(workspace.root().to_path_buf())),
             "git.log" => Arc::new(GitLogTool::new(workspace.root().to_path_buf())),
             "git.show" => Arc::new(GitShowTool::new(workspace.root().to_path_buf())),
-            "web.fetch" => Arc::new(FetchTool::new()),
+            "web_fetch" => Arc::new(FetchTool::new()),
             _ => {
                 // Create a fallback that always fails
                 // Convert protocol descriptor to harness-tools descriptor

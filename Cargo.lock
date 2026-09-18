@@ -1089,6 +1089,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-integration-openai-responses"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "harness-engine",
+ "harness-generic-backend",
+ "harness-model",
+ "harness-protocol",
+ "harness-runtime",
+ "harness-tools",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "harness-model"
 version = "0.1.1"
 dependencies = [

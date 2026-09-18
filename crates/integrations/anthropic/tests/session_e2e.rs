@@ -262,6 +262,11 @@ async fn provider_options_reach_the_outgoing_anthropic_request_body() {
         Some(&serde_json::json!(17)),
         "provider_options[\"anthropic\"] must merge into the outgoing request body: {body}"
     );
+    assert_eq!(
+        body.get("stream"),
+        Some(&serde_json::json!(true)),
+        "Anthropic client must explicitly request streaming via stream: true"
+    );
 }
 
 #[tokio::test]
@@ -438,4 +443,74 @@ async fn anthropic_session_completes_a_tool_round_trip() {
         Some(33)
     );
     assert_eq!(snapshot.usage.cumulative.total_requests, 2);
+}
+
+#[tokio::test]
+async fn anthropic_backend_handles_non_streaming_json_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind json server");
+    let address = listener.local_addr().expect("json server address");
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept json request");
+        let _ = read_http_request(&mut socket).await;
+        let json_body = serde_json::json!({
+            "id": "msg_non_streaming",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "text", "text": "Non-streaming fallback response" }
+            ],
+            "model": "claude-3-5-haiku-20241022",
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 8,
+                "output_tokens": 4
+            }
+        });
+        let body = json_body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        use tokio::io::AsyncWriteExt;
+        socket.write_all(response.as_bytes()).await.expect("write json response");
+        socket.shutdown().await.expect("shutdown json response");
+    });
+
+    let mut config = AnthropicConfig::new("fixture-key");
+    config.base_url = format!("http://{address}");
+    config.request_timeout = std::time::Duration::from_secs(5);
+
+    let session = Harness::new()
+        .session()
+        .backend(Arc::new(AnthropicBackend::new(config)))
+        .tools(Arc::new(NoTools))
+        .start()
+        .await
+        .expect("start Anthropic json session");
+
+    let mut events = session.subscribe();
+    session.send("Say hello").await.expect("send prompt");
+
+    let mut text = String::new();
+    let mut completed = false;
+
+    while let Ok(envelope) = events.recv().await {
+        match envelope.event {
+            AgentEvent::AssistantTextDelta { delta, .. } => text.push_str(&delta),
+            AgentEvent::Completed { outcome } => {
+                assert_eq!(outcome, AgentOutcome::Success);
+                completed = true;
+                break;
+            }
+            AgentEvent::Failed { error } => panic!("json session failed: {error:?}"),
+            _ => {}
+        }
+    }
+
+    assert!(completed, "json session did not complete");
+    assert_eq!(text, "Non-streaming fallback response");
 }

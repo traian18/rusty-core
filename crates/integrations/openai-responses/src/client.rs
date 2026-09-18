@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions API client implementing [`ModelClient`].
+//! OpenAI Responses API client implementing [`ModelClient`].
 //!
 //! [`ModelClient`]: harness_model::client::ModelClient
 
@@ -12,25 +12,27 @@ use harness_model::client::ModelClient;
 use harness_model::events::{ModelError, ModelEvent, ModelResult};
 use harness_model::request::{ModelCapabilities, ModelRequest};
 
-use crate::config::OpenAiConfig;
+use crate::config::OpenAiResponsesConfig;
 use crate::wire::{
-    build_system_message, convert_messages_with_tool_ids, tool_descriptor_to_openai, OpenAiRequest,
-    OpenAiSseParser, ProviderToolIds, StreamOptions,
+    build_system_message, convert_messages_with_tool_ids, reasoning_effort_to_responses,
+    tool_descriptor_to_responses, OpenAiResponsesRequest, OpenAiResponsesSseParser,
+    ProviderToolIds, RESPONSES_MIN_OUTPUT_TOKENS,
 };
 
-/// Client for the OpenAI Chat Completions API.
+/// Client for the OpenAI Responses API.
 ///
-/// Implements [`ModelClient`] by converting [`ModelRequest`] into the OpenAI
-/// wire format, sending HTTP POST requests to `{base_url}/chat/completions`,
-/// and parsing the SSE response stream into [`ModelEvent`]s.
-pub struct OpenAiClient {
-    config: OpenAiConfig,
+/// Implements [`ModelClient`] by converting [`ModelRequest`] into the
+/// Responses wire format, sending HTTP POST requests to
+/// `{base_url}/responses`, and parsing the SSE response stream into
+/// [`ModelEvent`]s.
+pub struct OpenAiResponsesClient {
+    config: OpenAiResponsesConfig,
     http_client: reqwest::Client,
     tool_ids: ProviderToolIds,
 }
 
-impl OpenAiClient {
-    pub fn new(config: OpenAiConfig) -> Self {
+impl OpenAiResponsesClient {
+    pub fn new(config: OpenAiResponsesConfig) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
@@ -44,20 +46,23 @@ impl OpenAiClient {
 }
 
 #[async_trait]
-impl ModelClient for OpenAiClient {
+impl ModelClient for OpenAiResponsesClient {
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
             streaming: true,
-            // Opt-in per configured endpoint -- see `OpenAiConfig::
-            // supports_reasoning`'s own doc comment for why this can't be a
-            // blanket `true`: this same client also backs plain OpenAI and
-            // arbitrary local/self-hosted endpoints, most of which reject an
-            // unrecognized `reasoning_effort` param outright.
-            reasoning: self.config.supports_reasoning,
+            // `reasoning_effort` maps onto the Responses API's own
+            // `reasoning.effort` param (see `wire.rs`'s
+            // `reasoning_effort_to_responses`); the response side already
+            // parsed `response.reasoning_text.delta` events since this
+            // crate's first version, so this was the one missing half.
+            reasoning: true,
             tool_calls: true,
             parallel_tool_calls: true,
             images: true,
-            structured_output: true,
+            // `response_format`/structured-output isn't mapped in this v1
+            // either (Responses API's `text.format` param) -- same reasoning
+            // as `reasoning` above.
+            structured_output: false,
         }
     }
 
@@ -68,20 +73,25 @@ impl ModelClient for OpenAiClient {
         events: tokio::sync::broadcast::Sender<ModelEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
-        let mut messages = Vec::new();
+        let mut input = Vec::new();
         if let Some(system) = build_system_message(&request.system_prompt, &request.messages) {
-            messages.push(system);
+            input.push(system);
         }
         {
             let tool_ids = self.tool_ids.lock().expect("provider tool-id map poisoned");
-            messages.extend(convert_messages_with_tool_ids(&request.messages, &tool_ids));
+            input.extend(convert_messages_with_tool_ids(&request.messages, &tool_ids));
         }
 
-        let openai_request = OpenAiRequest {
+        let max_output_tokens = request
+            .max_tokens
+            .unwrap_or(self.config.default_max_tokens)
+            .max(RESPONSES_MIN_OUTPUT_TOKENS);
+
+        let responses_request = OpenAiResponsesRequest {
             model: request
                 .model
                 .unwrap_or_else(|| self.config.default_model.clone()),
-            messages,
+            input,
             tools: if request.tools.is_empty() {
                 None
             } else {
@@ -89,28 +99,18 @@ impl ModelClient for OpenAiClient {
                     request
                         .tools
                         .iter()
-                        .map(tool_descriptor_to_openai)
+                        .map(tool_descriptor_to_responses)
                         .collect(),
                 )
             },
-            max_tokens: Some(request.max_tokens.unwrap_or(self.config.default_max_tokens)),
+            max_output_tokens: Some(max_output_tokens),
             temperature: request.temperature,
-            stop: (!request.stop_sequences.is_empty()).then_some(request.stop_sequences),
-            response_format: request
-                .response_format
-                .as_ref()
-                .and_then(crate::wire::OpenAiResponseFormat::from_neutral),
-            reasoning_effort: request
-                .reasoning_effort
-                .filter(|_| self.config.supports_reasoning)
-                .map(crate::wire::reasoning_effort_to_openai),
+            reasoning: request.reasoning_effort.map(reasoning_effort_to_responses),
             stream: true,
-            stream_options: StreamOptions {
-                include_usage: true,
-            },
+            store: false,
         };
 
-        let url = format!("{}/chat/completions", self.config.base_url);
+        let url = format!("{}/responses", self.config.base_url);
 
         let mut request_builder = self
             .http_client
@@ -121,17 +121,12 @@ impl ModelClient for OpenAiClient {
             request_builder = request_builder.header(key, value);
         }
 
-        // M4: merge caller-supplied `provider_options["openai"]` knobs
-        // (e.g. `top_p`, `frequency_penalty`) that have no typed field on
-        // `OpenAiRequest` — see `harness_model::merge_provider_options`'s
-        // doc comment for the precedence rule (typed fields above always
-        // win).
         let body = harness_model::merge_provider_options(
-            serde_json::to_value(&openai_request).map_err(|error| ModelError::InvalidRequest {
+            serde_json::to_value(&responses_request).map_err(|error| ModelError::InvalidRequest {
                 message: format!("failed to serialize request: {error}"),
             })?,
             &request.provider_options,
-            "openai",
+            "openai-responses",
         );
 
         let response = request_builder.json(&body).send().await.map_err(|e| {
@@ -156,14 +151,14 @@ impl ModelClient for OpenAiClient {
     }
 }
 
-impl OpenAiClient {
+impl OpenAiResponsesClient {
     async fn handle_success_response(
         mut response: reqwest::Response,
         events: &tokio::sync::broadcast::Sender<ModelEvent>,
         cancel: &tokio_util::sync::CancellationToken,
         tool_ids: ProviderToolIds,
     ) -> Result<ModelResult, ModelError> {
-        let mut parser = OpenAiSseParser::with_tool_ids(tool_ids);
+        let mut parser = OpenAiResponsesSseParser::with_tool_ids(tool_ids);
 
         loop {
             let chunk = tokio::select! {
@@ -173,7 +168,7 @@ impl OpenAiClient {
                         ModelError::Timeout
                     } else {
                         ModelError::Protocol {
-                            message: format!("failed to read OpenAI SSE stream: {error}"),
+                            message: format!("failed to read Responses SSE stream: {error}"),
                         }
                     }
                 })?,
@@ -215,8 +210,6 @@ impl OpenAiClient {
     }
 }
 
-/// Normalize OpenAI's standard `Retry-After` header (whole seconds) using the
-/// shared, provider-neutral parser.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     harness_model::retry::parse_retry_after(|name| {
         headers.get(name).and_then(|value| value.to_str().ok())

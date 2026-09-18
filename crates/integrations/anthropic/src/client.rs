@@ -15,8 +15,8 @@ use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::AnthropicConfig;
 use crate::wire::{
-    build_system, convert_messages_with_tool_ids, tool_descriptor_to_anthropic, AnthropicRequest,
-    AnthropicSseParser, AnthropicThinking, ProviderToolIds,
+    build_system, convert_messages_with_tool_ids, resolve_thinking, tool_descriptor_to_anthropic,
+    AnthropicRequest, AnthropicSseParser, ProviderToolIds,
 };
 
 /// Client for the Anthropic Messages API.
@@ -114,6 +114,17 @@ impl ModelClient for AnthropicClient {
         events: tokio::sync::broadcast::Sender<ModelEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
+        let invalid_names = crate::wire::find_invalid_tool_names(&request.tools);
+        if !invalid_names.is_empty() {
+            return Err(ModelError::InvalidRequest {
+                message: format!(
+                    "tool name(s) incompatible with the Anthropic Messages API \
+                     (must match ^[a-zA-Z0-9_-]{{1,128}}$): {}",
+                    invalid_names.join(", ")
+                ),
+            });
+        }
+
         // ------------------------------------------------------------------
         // Step 1: Convert ModelRequest to AnthropicRequest
         // ------------------------------------------------------------------
@@ -161,19 +172,8 @@ impl ModelClient for AnthropicClient {
             } else {
                 Some(request.stop_sequences)
             },
-            thinking: if request.extended_thinking {
-                if max_tokens < 2048 {
-                    return Err(ModelError::InvalidRequest {
-                        message: "extended thinking requires max_tokens >= 2048".to_string(),
-                    });
-                }
-                Some(AnthropicThinking {
-                    kind: "enabled".to_string(),
-                    budget_tokens: max_tokens - 1024,
-                })
-            } else {
-                None
-            },
+            thinking: resolve_thinking(request.extended_thinking, request.reasoning_effort, max_tokens)?,
+            stream: true,
         };
 
         // ------------------------------------------------------------------
@@ -195,12 +195,18 @@ impl ModelClient for AnthropicClient {
             "anthropic",
         );
 
-        let response = self
+        let mut request_builder = self
             .http_client
             .post(&url)
             .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if !self.config.api_key.is_empty() {
+            request_builder = request_builder.header("authorization", format!("Bearer {}", self.config.api_key));
+        }
+
+        let response = request_builder
             .json(&body)
             .send()
             .await
@@ -242,6 +248,25 @@ impl AnthropicClient {
         cancel: &tokio_util::sync::CancellationToken,
         tool_ids: ProviderToolIds,
     ) -> Result<ModelResult, ModelError> {
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map_or(false, |ct| ct.contains("application/json"));
+
+        if is_json {
+            let body = response.text().await.map_err(|error| ModelError::Protocol {
+                message: format!("failed to read Anthropic JSON response: {error}"),
+            })?;
+            let mut parser = AnthropicSseParser::with_tool_ids(tool_ids);
+            let _ = parser.push_chunk(body.as_bytes())?;
+            let (terminal_events, result) = parser.finish()?;
+            for event in terminal_events {
+                let _ = events.send(event);
+            }
+            return Ok(result);
+        }
+
         let mut parser = AnthropicSseParser::with_tool_ids(tool_ids);
 
         loop {

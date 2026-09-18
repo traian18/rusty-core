@@ -15,6 +15,7 @@ members = [
     "crates/harness-extension-api",
     "crates/integrations/anthropic",
     "crates/integrations/openai",
+    "crates/integrations/openai-responses",
     "crates/integrations/gemini",
     "crates/integrations/openai-compatible",
     "crates/integrations/claude-code",

@@ -98,6 +98,19 @@ pub enum ModelError {
         /// Description of the protocol error.
         message: String,
     },
+    /// The response stream closed before its provider-specific terminal
+    /// marker arrived (Anthropic's `message_stop`, OpenAI's `[DONE]`, the
+    /// Responses API's `response.completed`/`.incomplete`/`.failed`) --
+    /// distinct from [`Protocol`](Self::Protocol), which means the bytes
+    /// that *did* arrive were malformed. Here nothing was malformed; the
+    /// connection simply ended early (a flaky proxy, a dropped connection),
+    /// which retrying can plausibly recover from -- unlike a genuine parse
+    /// failure, which retrying the identical request would only reproduce.
+    #[error("stream interrupted: {message}")]
+    StreamInterrupted {
+        /// Description of what was expected but never arrived.
+        message: String,
+    },
     /// The request asked for a capability (reasoning, images, a specific
     /// param) the target model/provider does not support. Raised *before*
     /// any network call is made, so it never causes a billed request.
@@ -115,7 +128,7 @@ impl ModelError {
     /// Whether retrying the unchanged request may recover from this error.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } | Self::Timeout => true,
+            Self::RateLimited { .. } | Self::Timeout | Self::StreamInterrupted { .. } => true,
             Self::BackendError { code, .. } => {
                 code == "request_failed"
                     || code == "408"
@@ -162,6 +175,14 @@ mod tests {
             message: String::new()
         }
         .is_retryable());
+        assert!(
+            ModelError::StreamInterrupted {
+                message: String::new()
+            }
+            .is_retryable(),
+            "a stream that closed before its terminal marker is a dropped-connection case, \
+             not malformed data -- retrying can plausibly recover from it, unlike Protocol"
+        );
         assert!(!ModelError::CircuitOpen {
             retry_after: Duration::from_secs(1)
         }

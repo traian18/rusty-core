@@ -382,6 +382,10 @@ fn to_execution_error(error: ModelError) -> ExecutionError {
             message,
             code: "PROTOCOL_ERROR".to_string(),
         },
+        ModelError::StreamInterrupted { message } => ExecutionError::BackendError {
+            message,
+            code: "STREAM_INTERRUPTED".to_string(),
+        },
         ModelError::UnsupportedCapability { capability, detail } => {
             ExecutionError::UnsupportedCapability { capability, detail }
         }

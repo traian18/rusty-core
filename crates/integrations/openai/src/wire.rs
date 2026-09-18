@@ -31,8 +31,30 @@ pub struct OpenAiRequest {
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
+    /// OpenAI's own Chat Completions param for o-series/gpt-5 reasoning
+    /// models (`"low"`/`"medium"`/`"high"`), also accepted verbatim by
+    /// several OpenAI-compatible gateways. Only ever `Some` when the
+    /// configured endpoint opted in via `OpenAiConfig::supports_reasoning`
+    /// -- see that field's own doc comment for why this isn't unconditional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub stream: bool,
     pub stream_options: StreamOptions,
+}
+
+/// Maps rusty-core's 3-level `ReasoningEffort` onto the Chat Completions
+/// `reasoning_effort` string values -- same 1:1 mapping as
+/// `harness-integration-openai-responses`'s own `reasoning_effort_to_responses`.
+pub fn reasoning_effort_to_openai(
+    effort: harness_protocol::backend::ReasoningEffort,
+) -> String {
+    use harness_protocol::backend::ReasoningEffort;
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -411,7 +433,7 @@ impl OpenAiSseParser {
             let _ = self.parse_block(&trailing)?;
         }
         if !self.saw_done {
-            return Err(ModelError::Protocol {
+            return Err(ModelError::StreamInterrupted {
                 message: "SSE stream ended without [DONE]".to_string(),
             });
         }
@@ -513,6 +535,26 @@ impl OpenAiSseParser {
 
         let delta = &choice["delta"];
 
+        // Reasoning/thinking text, checked before plain content: DeepSeek's
+        // own convention is `delta.reasoning_content`; some other
+        // OpenAI-compatible gateways spell it `delta.reasoning`. Neither
+        // field exists on plain OpenAI's own responses, so this is a no-op
+        // there. Only reachable once `check_capabilities` has already
+        // confirmed `supports_reasoning` was on for this endpoint (a
+        // `reasoning_effort` was actually requested), so a stray field here
+        // for a non-reasoning endpoint would be unexpected but harmless.
+        let reasoning_text = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(|r| r.as_str());
+        if let Some(text) = reasoning_text {
+            if !text.is_empty() {
+                return Ok(Some(ModelEvent::ReasoningDelta {
+                    delta: text.to_string(),
+                }));
+            }
+        }
+
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
                 return Ok(Some(ModelEvent::TextDelta {
@@ -604,6 +646,7 @@ mod tests {
             temperature: Some(0.5),
             stop: Some(vec!["STOP".to_string()]),
             response_format: None,
+            reasoning_effort: None,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -626,6 +669,7 @@ mod tests {
             temperature: None,
             stop: None,
             response_format: None,
+            reasoning_effort: None,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -775,7 +819,9 @@ data: [DONE]\n\n";
         parser
             .push_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
             .expect("chunk parses");
-        assert!(matches!(parser.finish(), Err(ModelError::Protocol { .. })));
+        let error = parser.finish().expect_err("must reject a stream missing [DONE]");
+        assert!(matches!(error, ModelError::StreamInterrupted { .. }));
+        assert!(error.is_retryable(), "a dropped connection, not malformed data, should be retried");
     }
 
     #[test]
@@ -806,5 +852,57 @@ data: [DONE]\n\n";
             .expect("a ToolCallCompleted event");
         assert_eq!(completed.0, "get_weather");
         assert_eq!(completed.1, serde_json::json!({ "city": "paris" }));
+    }
+
+    #[test]
+    fn reasoning_effort_maps_onto_the_expected_strings() {
+        use harness_protocol::backend::ReasoningEffort;
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Low), "low");
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Medium), "medium");
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::High), "high");
+    }
+
+    #[test]
+    fn a_requested_reasoning_effort_serializes_into_the_request_body() {
+        let request = OpenAiRequest {
+            model: "big-pickle".to_string(),
+            messages: vec![],
+            tools: None,
+            max_tokens: None,
+            temperature: None,
+            stop: None,
+            response_format: None,
+            reasoning_effort: Some("medium".to_string()),
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(json["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn reasoning_content_delta_produces_a_reasoning_event_not_a_text_event() {
+        let mut parser = OpenAiSseParser::new();
+        let events = parser
+            .push_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking...\"}}]}\n\n")
+            .expect("valid chunk");
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ReasoningDelta { delta }] if delta == "thinking..."
+        ));
+    }
+
+    #[test]
+    fn reasoning_field_spelling_is_also_accepted() {
+        let mut parser = OpenAiSseParser::new();
+        let events = parser
+            .push_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"pondering\"}}]}\n\n")
+            .expect("valid chunk");
+        assert!(matches!(
+            events.as_slice(),
+            [ModelEvent::ReasoningDelta { delta }] if delta == "pondering"
+        ));
     }
 }

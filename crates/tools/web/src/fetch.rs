@@ -20,7 +20,7 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Width used for `html2text`'s HTML→text line wrapping.
 const HTML_TEXT_WIDTH: usize = 120;
 
-/// Input for the `web.fetch` tool.
+/// Input for the `web_fetch` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FetchInput {
     pub url: String,
@@ -59,8 +59,23 @@ impl ToolExecutor for FetchTool {
     fn descriptor(&self) -> ToolDescriptor {
         let schema = schemars::schema_for!(FetchInput);
         ToolDescriptor {
-            id: ToolId::new("web.fetch"),
-            name: "Fetch URL".to_string(),
+            // `SessionBuilder`'s own `discovered_capability` (harness-engine/
+            // src/session_builder.rs) projects every registered tool's
+            // model-facing `name` from THIS `id` field, not from `.name`
+            // below (an established, workspace-wide "name-is-the-tool-id"
+            // convention -- see that function's own doc comment) -- so `id`,
+            // not `.name`, is what every provider's tool-name pattern
+            // actually constrains. Was `"web.fetch"` until a live Anthropic
+            // 400 (`tools.N.custom.name` pattern violation) surfaced that a
+            // `.` fails `^[a-zA-Z0-9_-]{1,128}$`; changing `.name` alone (an
+            // earlier, incomplete fix) did nothing, since `.name` is never
+            // what reaches the model through this path. Must also match
+            // what callers are told to call it (`agent_chat.ts`/
+            // `execute_node.ts`/`global_explore.ts`'s own system-prompt tool
+            // descriptions) and `harness-runtime::spawn_tool`'s
+            // `DEFAULT_DELEGATED_TOOL_NAMES` (kept in sync there too).
+            id: ToolId::new("web_fetch"),
+            name: "web_fetch".to_string(),
             description: "Fetch a URL over HTTP(S) and return its text content".to_string(),
             input_schema: serde_json::to_value(schema).unwrap_or(json!({})),
         }
@@ -240,6 +255,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for a real live 400: `SessionBuilder`'s own
+    /// `discovered_capability` (harness-engine/src/session_builder.rs)
+    /// projects a registered tool's model-facing `name` from its `id`, not
+    /// its `.name` field (an established, workspace-wide convention) -- so
+    /// `id` is what every provider's tool-name pattern actually constrains.
+    /// `id` must equal `.name` here (both `"web_fetch"`) so the two
+    /// conventions ("id is the real wire identifier" and "descriptor.name
+    /// documents what it's called") never diverge again the way they did
+    /// when `id` was `"web.fetch"` (a `.`, invalid for Anthropic/OpenAI) and
+    /// `.name` alone was fixed to `"web_fetch"` without the `id` also
+    /// changing.
+    #[test]
+    fn descriptor_id_and_name_are_both_a_valid_provider_tool_name() {
+        let descriptor = FetchTool::new().descriptor();
+        assert_eq!(descriptor.id.as_str(), "web_fetch");
+        assert_eq!(descriptor.name, "web_fetch");
+        assert_eq!(
+            descriptor.id.as_str(),
+            descriptor.name,
+            "id and name must match -- discovered_capability sends id as the model-facing name"
+        );
+    }
 
     #[tokio::test]
     async fn rejects_a_loopback_url_before_connecting() {

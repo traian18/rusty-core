@@ -68,10 +68,22 @@ mod tests {
         assert!(capabilities.streaming);
         assert!(capabilities.tool_calls);
         assert!(capabilities.host_managed_tools);
+        assert!(
+            !capabilities.reasoning_stream,
+            "reasoning must default to off -- plain OpenAI/local endpoints reject an unrecognized reasoning_effort param"
+        );
         assert_eq!(
             backend.recovery_policy(),
             &harness_generic_backend::RecoveryPolicy::default()
         );
+    }
+
+    #[test]
+    fn supports_reasoning_config_flag_turns_the_capability_on() {
+        let mut config = OpenAiConfig::new("test-key");
+        config.supports_reasoning = true;
+        let backend = OpenAiBackend::new(config);
+        assert!(backend.capabilities().reasoning_stream);
     }
 
     #[test]

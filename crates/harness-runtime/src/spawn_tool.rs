@@ -20,7 +20,14 @@ use serde::Deserialize;
 
 /// Stable name a model calls this tool by, and the name a host registers it
 /// under in an `AgentToolset` (see the module doc for wiring instructions).
-pub const AGENT_SPAWN_TOOL_NAME: &str = "agent.spawn";
+///
+/// Must satisfy every provider's tool-name pattern -- Anthropic's Messages
+/// API (and OpenAI's own) reject anything outside `^[a-zA-Z0-9_-]{1,128}$`,
+/// so no `.` (was `"agent.spawn"` until this was caught by a live 400 from a
+/// real Anthropic-shaped endpoint -- the bug had been masked until then
+/// because no embedder had ever actually round-tripped this tool name
+/// through a real Anthropic/OpenAI request).
+pub const AGENT_SPAWN_TOOL_NAME: &str = "agent_spawn";
 
 /// Tool names granted to a spawned child by default when the calling model
 /// doesn't specify `tools` explicitly — a conservative, read-only subset of
@@ -38,7 +45,7 @@ const DEFAULT_DELEGATED_TOOL_NAMES: &[&str] = &[
     "git.diff",
     "git.log",
     "git.show",
-    "web.fetch",
+    "web_fetch",
 ];
 
 /// JSON-schema-shaped tool-call arguments for `agent.spawn`. Deserialized
