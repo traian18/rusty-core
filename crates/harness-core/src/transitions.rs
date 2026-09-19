@@ -9,7 +9,7 @@ use harness_protocol::ids::{
 };
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 use harness_protocol::tools::{PermissionMode, ToolCall, ToolError, ToolResult, ToolResultSummary};
-use harness_protocol::usage::{AgentUsageSummary, UsageRecord};
+use harness_protocol::usage::{AgentUsageMetrics, AgentUsageSnapshot, AgentUsageSummary, UsageRecord};
 
 use crate::agent::Agent;
 use crate::agent_state::PendingToolCall;
@@ -295,7 +295,77 @@ impl Agent {
                 }]
             }
             ExecutionEvent::ToolCallRequested { call, .. } => self.tool_requested(call),
-            ExecutionEvent::UsageUpdate { .. } => Vec::new(),
+            ExecutionEvent::ToolCallStarted { call, .. } => {
+                let from = self.state.status;
+                self.state.status = AgentStatus::Executing;
+                let call_id = call.id;
+                let message_id = self.next_message_id();
+                let created_at = self.next_timestamp();
+                self.state.messages.push(AgentMessage {
+                    id: message_id,
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse { call: call.clone() }],
+                    created_at,
+                });
+                let mut effects = Vec::new();
+                if from != AgentStatus::Executing {
+                    effects.push(Self::state_changed(from, AgentStatus::Executing));
+                }
+                effects.push(AgentEffect::Emit {
+                    event: AgentEvent::ToolCallRequested { call },
+                });
+                effects.push(AgentEffect::Emit {
+                    event: AgentEvent::ToolCallStarted { call_id },
+                });
+                effects
+            }
+            ExecutionEvent::ToolCallCompleted { call_id, result, .. } => {
+                let from = self.state.status;
+                self.state.status = AgentStatus::Streaming;
+                self.usage.tool_calls = self.usage.tool_calls.saturating_add(1);
+                let message_id = self.next_message_id();
+                let created_at = self.next_timestamp();
+                self.state.messages.push(AgentMessage {
+                    id: message_id,
+                    role: MessageRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        call_id,
+                        result: result.clone(),
+                    }],
+                    created_at,
+                });
+                let mut effects = Vec::new();
+                if from != AgentStatus::Streaming {
+                    effects.push(Self::state_changed(from, AgentStatus::Streaming));
+                }
+                effects.push(AgentEffect::Emit {
+                    event: AgentEvent::ToolCallCompleted { call_id, result },
+                });
+                effects
+            }
+            ExecutionEvent::UsageUpdate { usage, .. } => {
+                let timestamp = self.next_timestamp().to_rfc3339();
+                vec![AgentEffect::Emit {
+                    event: AgentEvent::UsageUpdated {
+                        usage: AgentUsageSnapshot {
+                            agent_id: self.id.to_string(),
+                            metrics: AgentUsageMetrics {
+                                total_runs: self.usage.runs,
+                                total_requests: self.usage.records.len() as u64,
+                                total_tool_calls: self.usage.tool_calls,
+                                total_tokens: usage.total_tokens,
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens,
+                                cache_write_tokens: usage.cache_write_tokens,
+                                reasoning_tokens: usage.reasoning_tokens,
+                                total_cost: None,
+                            },
+                            timestamp,
+                        },
+                    },
+                }]
+            }
             ExecutionEvent::Completed { result, .. } => {
                 let is_tool_turn = result.finish_reason == "tool_use";
                 self.usage.records.push(UsageRecord {

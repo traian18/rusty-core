@@ -69,9 +69,123 @@ pub fn extract_assistant_text(value: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolResult {
+    pub tool_use_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// Extracts tool use calls from an assistant message line.
+pub fn extract_tool_uses(value: &serde_json::Value) -> Vec<ParsedToolUse> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .filter_map(|block| {
+            let id = block.get("id")?.as_str()?.to_string();
+            let name = block.get("name")?.as_str()?.to_string();
+            let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            Some(ParsedToolUse { id, name, input })
+        })
+        .collect()
+}
+
+/// Extracts tool results from a user message line.
+pub fn extract_tool_results(value: &serde_json::Value) -> Vec<ParsedToolResult> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return Vec::new();
+    }
+    let Some(content) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        .filter_map(|block| {
+            let tool_use_id = block.get("tool_use_id")?.as_str()?.to_string();
+            let is_error = block.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+            let content_val = block.get("content");
+            let content_str = match content_val {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                None => String::new(),
+            };
+            Some(ParsedToolResult {
+                tool_use_id,
+                content: content_str,
+                is_error,
+            })
+        })
+        .collect()
+}
+
+/// Extracts thinking/reasoning text from an assistant message line.
+pub fn extract_thinking(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = value.get("message")?.get("content")?.as_array()?;
+    let thinking: String = content
+        .iter()
+        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+        .filter_map(|block| block.get("thinking").and_then(|t| t.as_str()))
+        .collect();
+    (!thinking.is_empty()).then_some(thinking)
+}
+
+/// Extracts intermediate usage from an assistant message line.
+pub fn extract_intermediate_usage(value: &serde_json::Value) -> Option<ModelUsage> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let usage_value = value.get("message")?.get("usage")?;
+    let input_tokens = usage_value.get("input_tokens").and_then(|v| v.as_u64());
+    let output_tokens = usage_value.get("output_tokens").and_then(|v| v.as_u64());
+    let cache_read_tokens = usage_value.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+    let cache_write_tokens = usage_value.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+    let total_tokens = match (input_tokens, output_tokens) {
+        (Some(i), Some(o)) => Some(i + o),
+        _ => None,
+    };
+    if input_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+    Some(ModelUsage {
+        input_tokens: UsageValue::new(input_tokens),
+        output_tokens: UsageValue::new(output_tokens),
+        cache_read_tokens: UsageValue::new(cache_read_tokens),
+        cache_write_tokens: UsageValue::new(cache_write_tokens),
+        reasoning_tokens: UsageValue::new(None),
+        total_tokens: UsageValue::new(total_tokens),
+    })
+}
+
 /// The parsed content of a terminal `{"type":"result",...}` line.
 pub struct ResultLine {
     pub finish_reason: String,
+    pub is_error: bool,
+    pub error_message: Option<String>,
     pub usage: ModelUsage,
     pub cost_usd: Option<f64>,
 }
@@ -86,6 +200,18 @@ pub fn extract_result(value: &serde_json::Value) -> Option<ResultLine> {
         .and_then(|s| s.as_str())
         .unwrap_or("end_turn")
         .to_string();
+    let is_error = value
+        .get("is_error")
+        .and_then(|flag| flag.as_bool())
+        .unwrap_or(false);
+    let error_message = is_error
+        .then(|| {
+            value
+                .get("result")
+                .and_then(|message| message.as_str())
+                .map(str::to_string)
+        })
+        .flatten();
     let cost_usd = value.get("total_cost_usd").and_then(|c| c.as_f64());
     let usage_value = value.get("usage");
     let input_tokens = usage_value
@@ -107,6 +233,8 @@ pub fn extract_result(value: &serde_json::Value) -> Option<ResultLine> {
 
     Some(ResultLine {
         finish_reason,
+        is_error,
+        error_message,
         usage: ModelUsage {
             input_tokens: UsageValue::new(input_tokens),
             output_tokens: UsageValue::new(output_tokens),
@@ -204,9 +332,100 @@ mod tests {
         });
         let result = extract_result(&value).expect("a result line");
         assert_eq!(result.finish_reason, "success");
+        assert!(!result.is_error);
         assert_eq!(result.cost_usd, Some(0.0149959));
         assert_eq!(result.usage.input_tokens.value(), Some(10));
         assert_eq!(result.usage.output_tokens.value(), Some(44));
         assert_eq!(result.usage.total_tokens.value(), Some(54));
+    }
+
+    #[test]
+    fn preserves_error_shaped_success_results_from_the_cli() {
+        let value = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "result": "Not logged in · Please run /login",
+            "terminal_reason": "api_error",
+            "usage": {}
+        });
+        let result = extract_result(&value).expect("a result line");
+        assert!(result.is_error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("Not logged in · Please run /login")
+        );
+    }
+
+    #[test]
+    fn extracts_tool_uses_from_assistant_message() {
+        let value = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01LQH5yRHZkHS9EcF96EP5rY",
+                        "name": "Bash",
+                        "input": { "command": "echo 'hello'" }
+                    }
+                ]
+            }
+        });
+        let calls = extract_tool_uses(&value);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_01LQH5yRHZkHS9EcF96EP5rY");
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].input["command"], "echo 'hello'");
+    }
+
+    #[test]
+    fn extracts_tool_results_from_user_message() {
+        let value = serde_json::json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_01LQH5yRHZkHS9EcF96EP5rY",
+                        "content": "hello",
+                        "is_error": false
+                    }
+                ]
+            }
+        });
+        let results = extract_tool_results(&value);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_use_id, "toolu_01LQH5yRHZkHS9EcF96EP5rY");
+        assert_eq!(results[0].content, "hello");
+        assert!(!results[0].is_error);
+    }
+
+    #[test]
+    fn extracts_thinking_from_assistant_message() {
+        let value = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "thinking", "thinking": "Let me calculate..." }
+                ]
+            }
+        });
+        assert_eq!(extract_thinking(&value), Some("Let me calculate...".to_string()));
+    }
+
+    #[test]
+    fn extracts_intermediate_usage_from_assistant_message() {
+        let value = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{ "type": "text", "text": "ok" }],
+                "usage": { "input_tokens": 15, "output_tokens": 8 }
+            }
+        });
+        let usage = extract_intermediate_usage(&value).expect("usage present");
+        assert_eq!(usage.input_tokens.value(), Some(15));
+        assert_eq!(usage.output_tokens.value(), Some(8));
+        assert_eq!(usage.total_tokens.value(), Some(23));
     }
 }

@@ -99,6 +99,11 @@ fn metrics_from_live(live: &AgentLiveState) -> AgentUsageMetrics {
         total_requests: live.total_requests,
         total_tool_calls: live.usage.inclusive_usage.total_tool_calls,
         total_tokens: live.usage.inclusive_usage.total_tokens,
+        input_tokens: live.usage.inclusive_usage.input_tokens,
+        output_tokens: live.usage.inclusive_usage.output_tokens,
+        cache_read_tokens: live.usage.inclusive_usage.cache_read_tokens,
+        cache_write_tokens: live.usage.inclusive_usage.cache_write_tokens,
+        reasoning_tokens: live.usage.inclusive_usage.reasoning_tokens,
         total_cost: live.total_cost_usd,
     }
 }

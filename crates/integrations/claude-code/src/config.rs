@@ -24,6 +24,10 @@ pub struct ClaudeCodeConfig {
     /// Optional timeout in seconds for the CLI subprocess.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+
+    /// Working directory for the spawned process.
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
 }
 
 fn default_binary_path() -> PathBuf {
@@ -41,6 +45,7 @@ impl Default for ClaudeCodeConfig {
             extra_args: Vec::new(),
             permission_mode: default_permission_mode(),
             timeout_secs: None,
+            working_dir: None,
         }
     }
 }
@@ -72,6 +77,12 @@ impl ClaudeCodeConfig {
     /// Set a timeout in seconds.
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the working directory for the spawned process.
+    pub fn with_working_dir(mut self, dir: PathBuf) -> Self {
+        self.working_dir = Some(dir);
         self
     }
 }

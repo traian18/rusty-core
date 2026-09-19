@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// A reported counter. `None` means unknown and is distinct from `Some(0)`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct UsageValue(Option<u64>);
 
 impl UsageValue {
@@ -102,6 +103,16 @@ pub struct AgentUsageMetrics {
     pub total_requests: u64,
     pub total_tool_calls: u64,
     pub total_tokens: UsageValue,
+    #[serde(default, skip_serializing_if = "UsageValue::is_unknown")]
+    pub input_tokens: UsageValue,
+    #[serde(default, skip_serializing_if = "UsageValue::is_unknown")]
+    pub output_tokens: UsageValue,
+    #[serde(default, skip_serializing_if = "UsageValue::is_unknown")]
+    pub cache_read_tokens: UsageValue,
+    #[serde(default, skip_serializing_if = "UsageValue::is_unknown")]
+    pub cache_write_tokens: UsageValue,
+    #[serde(default, skip_serializing_if = "UsageValue::is_unknown")]
+    pub reasoning_tokens: UsageValue,
     pub total_cost: Option<Decimal>,
 }
 

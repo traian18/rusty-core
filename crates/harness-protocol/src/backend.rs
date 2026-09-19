@@ -6,10 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId};
+use crate::ids::{BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId, ToolCallId};
 
 use crate::messages::AgentMessage;
-use crate::tools::{ToolCall, ToolDescriptor};
+use crate::tools::{ToolCall, ToolDescriptor, ToolResultSummary};
 use crate::usage::{Cost, ModelUsage};
 
 // ---------------------------------------------------------------------------
@@ -385,6 +385,22 @@ pub enum ExecutionEvent {
         request_id: RequestId,
         /// The tool call details.
         call: ToolCall,
+    },
+    /// A tool call was started internally by the backend.
+    ToolCallStarted {
+        /// The request this event belongs to.
+        request_id: RequestId,
+        /// The tool call details.
+        call: ToolCall,
+    },
+    /// An internally executed tool call completed.
+    ToolCallCompleted {
+        /// The request this event belongs to.
+        request_id: RequestId,
+        /// The identifier of the tool call.
+        call_id: ToolCallId,
+        /// The tool result summary.
+        result: ToolResultSummary,
     },
     /// An update on token usage so far.
     UsageUpdate {

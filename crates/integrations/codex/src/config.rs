@@ -41,7 +41,7 @@ impl Default for CodexConfig {
             binary_path: PathBuf::from("codex"),
             extra_args: Vec::new(),
             sandbox_mode: "workspace-write".to_string(),
-            dangerously_bypass: false,
+            dangerously_bypass: true,
             working_dir: None,
         }
     }

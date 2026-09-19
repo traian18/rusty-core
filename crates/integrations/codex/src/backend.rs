@@ -7,6 +7,7 @@
 //! `crates/integrations/codex/PLAN.md` and `wire.rs`'s module docs for how
 //! the wire schema differs from Claude Code's.
 
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,15 +21,17 @@ use harness_protocol::backend::{
     BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent, ExecutionRequest,
     ExecutionResult,
 };
-use harness_protocol::ids::BackendId;
+use harness_protocol::ids::{BackendId, ToolCallId};
 use harness_protocol::messages::{ContentBlock, MessageRole};
+use harness_protocol::tools::{ToolCall, ToolResultSummary};
 use harness_protocol::usage::Cost;
 use harness_runtime::traits::ExecutionBackend;
 use harness_runtime::IntegrationFactory;
 
 use crate::config::CodexConfig;
 use crate::wire::{
-    extract_agent_message_text, extract_error, extract_thread_id, extract_turn_completed,
+    extract_agent_message_text, extract_codex_item, extract_error, extract_thread_id,
+    extract_turn_completed, ParsedCodexItem,
 };
 
 /// Finds the most recent `User`-role message's concatenated `Text` content —
@@ -85,12 +88,13 @@ impl ExecutionBackend for CodexBackend {
         BackendCapabilities {
             streaming: true,
             reasoning_stream: true,
-            // As with Claude Code: tool calls (shell commands, file edits)
-            // happen entirely inside the CLI subprocess's own sandbox and
-            // are never relayed back to the harness.
             tool_calls: false,
             parallel_tool_calls: false,
             host_managed_tools: false,
+            backend_managed_tools: true,
+            resumable_sessions: true,
+            exact_usage: true,
+            exact_cost: false,
             ..Default::default()
         }
     }
@@ -136,6 +140,14 @@ impl ExecutionBackend for CodexBackend {
                 if let Some(dir) = &self.config.working_dir {
                     command.arg("-C").arg(dir);
                 }
+                if let Some(model) = request
+                    .params
+                    .model
+                    .as_deref()
+                    .filter(|model| !model.is_empty())
+                {
+                    command.arg("-m").arg(model);
+                }
             }
         }
         // `-C` alone isn't enough — the native codex binary also needs the
@@ -144,6 +156,12 @@ impl ExecutionBackend for CodexBackend {
         // with an ENOENT-style error before emitting any JSON at all).
         if let Some(dir) = &self.config.working_dir {
             command.current_dir(dir);
+        }
+        if let Some(parent) = self.config.binary_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                command.env("PATH", format!("{}:{current_path}", parent.display()));
+            }
         }
         command.args(&self.config.extra_args);
         command.arg(&prompt);
@@ -172,6 +190,8 @@ impl ExecutionBackend for CodexBackend {
         let mut lines = BufReader::new(stdout).lines();
 
         let mut new_thread_id: Option<String> = None;
+        let mut tool_calls: HashMap<String, ToolCallId> = HashMap::new();
+        let mut started_tools: HashSet<ToolCallId> = HashSet::new();
         let mut final_result: Option<ExecutionResult> = None;
 
         loop {
@@ -211,6 +231,91 @@ impl ExecutionBackend for CodexBackend {
                 });
             }
 
+            if let Some(item) = extract_codex_item(&value) {
+                match item {
+                    ParsedCodexItem::Reasoning(delta) => {
+                        let _ = sink.send(ExecutionEvent::ReasoningDelta {
+                            request_id: request.request_id,
+                            delta,
+                        });
+                    }
+                    ParsedCodexItem::CommandStarted { id, command } => {
+                        let call_id = *tool_calls.entry(id).or_insert_with(ToolCallId::new);
+                        if started_tools.insert(call_id) {
+                            let _ = sink.send(ExecutionEvent::ToolCallStarted {
+                                request_id: request.request_id,
+                                call: ToolCall {
+                                    id: call_id,
+                                    name: "bash.exec".to_string(),
+                                    arguments: serde_json::json!({ "command": command }),
+                                },
+                            });
+                        }
+                    }
+                    ParsedCodexItem::CommandCompleted {
+                        id,
+                        command,
+                        exit_code,
+                        output,
+                    } => {
+                        let call_id = *tool_calls.entry(id).or_insert_with(ToolCallId::new);
+                        if started_tools.insert(call_id) {
+                            let _ = sink.send(ExecutionEvent::ToolCallStarted {
+                                request_id: request.request_id,
+                                call: ToolCall {
+                                    id: call_id,
+                                    name: "bash.exec".to_string(),
+                                    arguments: serde_json::json!({ "command": command }),
+                                },
+                            });
+                        }
+                        let _ = sink.send(ExecutionEvent::ToolCallCompleted {
+                            request_id: request.request_id,
+                            call_id,
+                            result: ToolResultSummary {
+                                has_error: exit_code.unwrap_or(0) != 0,
+                                output_preview: output,
+                            },
+                        });
+                    }
+                    ParsedCodexItem::FileChangeStarted { id, detail } => {
+                        let call_id = *tool_calls.entry(id).or_insert_with(ToolCallId::new);
+                        if started_tools.insert(call_id) {
+                            let _ = sink.send(ExecutionEvent::ToolCallStarted {
+                                request_id: request.request_id,
+                                call: ToolCall {
+                                    id: call_id,
+                                    name: "file_change".to_string(),
+                                    arguments: detail,
+                                },
+                            });
+                        }
+                    }
+                    ParsedCodexItem::FileChangeCompleted { id, detail } => {
+                        let call_id = *tool_calls.entry(id).or_insert_with(ToolCallId::new);
+                        if started_tools.insert(call_id) {
+                            let _ = sink.send(ExecutionEvent::ToolCallStarted {
+                                request_id: request.request_id,
+                                call: ToolCall {
+                                    id: call_id,
+                                    name: "file_change".to_string(),
+                                    arguments: detail.clone(),
+                                },
+                            });
+                        }
+                        let _ = sink.send(ExecutionEvent::ToolCallCompleted {
+                            request_id: request.request_id,
+                            call_id,
+                            result: ToolResultSummary {
+                                has_error: false,
+                                output_preview: detail.to_string(),
+                            },
+                        });
+                    }
+                }
+                continue;
+            }
+
             if let Some(text) = extract_agent_message_text(&value) {
                 // Each completed item is whole on arrival (unlike Claude
                 // Code's ever-growing accumulation) — forward it directly.
@@ -224,6 +329,10 @@ impl ExecutionBackend for CodexBackend {
             }
 
             if let Some(turn) = extract_turn_completed(&value) {
+                let _ = sink.send(ExecutionEvent::UsageUpdate {
+                    request_id: request.request_id,
+                    usage: turn.usage.clone(),
+                });
                 final_result = Some(ExecutionResult {
                     request_id: request.request_id,
                     usage: turn.usage,
@@ -250,6 +359,10 @@ impl ExecutionBackend for CodexBackend {
 
         match final_result {
             Some(result) => {
+                let _ = sink.send(ExecutionEvent::UsageUpdate {
+                    request_id: request.request_id,
+                    usage: result.usage.clone(),
+                });
                 let _ = sink.send(ExecutionEvent::Completed {
                     request_id: request.request_id,
                     result: result.clone(),
@@ -428,6 +541,71 @@ mod tests {
             *backend.thread_id.lock().unwrap(),
             Some("019fc8bb-b347-7550-87fa-e57e0c0f52df".to_string())
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stub_cli_forwards_commands_and_reasoning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("fake_codex_tools.sh");
+        write_stub_script(
+            &script_path,
+            r#"{"type":"thread.started","thread_id":"019fc8bb-b347-7550-87fa-e57e0c0f52df"}
+{"type":"item.started","item":{"id":"r1","type":"reasoning","text":"Thinking about running command..."}}
+{"type":"item.started","item":{"id":"cmd1","type":"command_execution","command":"ls -la"}}
+{"type":"item.completed","item":{"id":"cmd1","type":"command_execution","command":"ls -la","exit_code":0,"stdout":"total 0","stderr":""}}
+{"type":"item.completed","item":{"id":"msg1","type":"agent_message","text":"All done"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":20}}"#,
+        );
+
+        let backend = CodexBackend::new(CodexConfig {
+            binary_path: script_path,
+            ..CodexConfig::default()
+        });
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let result = backend
+            .execute(
+                request_with(vec![user_message("hi")]),
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute should succeed");
+
+        assert_eq!(result.finish_reason, "completed");
+
+        let mut saw_reasoning = false;
+        let mut saw_tool_started = false;
+        let mut saw_tool_completed = false;
+        let mut text = String::new();
+
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ExecutionEvent::ReasoningDelta { delta, .. } => {
+                    if delta.contains("Thinking") {
+                        saw_reasoning = true;
+                    }
+                }
+                ExecutionEvent::ToolCallStarted { call, .. } => {
+                    if call.name == "bash.exec" && call.arguments["command"] == "ls -la" {
+                        saw_tool_started = true;
+                    }
+                }
+                ExecutionEvent::ToolCallCompleted { result, .. } => {
+                    if result.output_preview.contains("total 0") && !result.has_error {
+                        saw_tool_completed = true;
+                    }
+                }
+                ExecutionEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                _ => {}
+            }
+        }
+
+        assert!(saw_reasoning);
+        assert!(saw_tool_started);
+        assert!(saw_tool_completed);
+        assert_eq!(text, "All done");
     }
 
     #[cfg(unix)]

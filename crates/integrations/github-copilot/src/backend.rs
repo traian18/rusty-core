@@ -75,6 +75,16 @@ impl ExecutionBackend for GitHubCopilotBackend {
         let prompt = latest_user_text(&request).ok_or_else(|| ExecutionError::InvalidRequest {
             message: "no user message to send to Copilot".into(),
         })?;
+        let raw_model = request
+            .params
+            .model
+            .as_deref()
+            .unwrap_or(&self.config.model);
+        let model = raw_model
+            .strip_prefix("github-copilot/")
+            .unwrap_or(raw_model);
+        let model = if model.is_empty() { "auto" } else { model };
+
         let mut command = tokio::process::Command::new(&self.config.binary_path);
         command
             .arg("--prompt")
@@ -82,7 +92,7 @@ impl ExecutionBackend for GitHubCopilotBackend {
             .arg("--output-format=json")
             .arg("--allow-all-tools")
             .arg("--model")
-            .arg(&self.config.model);
+            .arg(model);
         if let Some(directory) = &self.config.working_dir {
             command.current_dir(directory);
         }

@@ -54,6 +54,88 @@ pub fn extract_agent_message_text(value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedCodexItem {
+    Reasoning(String),
+    CommandStarted {
+        id: String,
+        command: String,
+    },
+    CommandCompleted {
+        id: String,
+        command: String,
+        exit_code: Option<i64>,
+        output: String,
+    },
+    FileChangeStarted {
+        id: String,
+        detail: serde_json::Value,
+    },
+    FileChangeCompleted {
+        id: String,
+        detail: serde_json::Value,
+    },
+}
+
+pub fn extract_codex_item(value: &serde_json::Value) -> Option<ParsedCodexItem> {
+    let event_type = value.get("type").and_then(|t| t.as_str())?;
+    let item = value.get("item")?;
+    let item_type = item.get("type").and_then(|t| t.as_str())?;
+    let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+
+    match item_type {
+        "reasoning" => {
+            let text = item.get("text").and_then(|t| t.as_str())?;
+            Some(ParsedCodexItem::Reasoning(text.to_string()))
+        }
+        "command_execution" => {
+            let command = item
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            if event_type == "item.started" {
+                Some(ParsedCodexItem::CommandStarted { id, command })
+            } else if event_type == "item.completed" {
+                let exit_code = item.get("exit_code").and_then(|c| c.as_i64());
+                let stdout = item.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
+                let stderr = item.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
+                let output = if !stderr.is_empty() && !stdout.is_empty() {
+                    format!("{stdout}\n{stderr}")
+                } else if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    stdout.to_string()
+                };
+                Some(ParsedCodexItem::CommandCompleted {
+                    id,
+                    command,
+                    exit_code,
+                    output,
+                })
+            } else {
+                None
+            }
+        }
+        "file_change" => {
+            if event_type == "item.started" {
+                Some(ParsedCodexItem::FileChangeStarted {
+                    id,
+                    detail: item.clone(),
+                })
+            } else if event_type == "item.completed" {
+                Some(ParsedCodexItem::FileChangeCompleted {
+                    id,
+                    detail: item.clone(),
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub struct TurnCompleted {
     pub usage: ModelUsage,
 }
