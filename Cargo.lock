@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "harness-context"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "harness-protocol",
  "rust_decimal",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "harness-engine"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-context",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "harness-extension-api"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-generic-backend",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "harness-generic-backend"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-generic-backend",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-anthropic"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-claude-code"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-codex"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-gemini"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-github-copilot"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-openai"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-openai-compatible"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-engine",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "harness-integration-openai-responses"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "harness-model"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "harness-protocol"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "base64",
  "chrono",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "harness-runtime"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "harness-session-store"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "harness-skills"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-context",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-filesystem"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-tools",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-git"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "git2",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-shell"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-tools",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-skills"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-skills",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tool-web"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "schemars",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "harness-transport-ipc"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "harness-transport-mcp"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "harness-transport-stdio"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "harness-protocol",
@@ -1347,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "harness-transport-websocket"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "harness-workspace"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "harnessctl"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "harnessd"
-version = "0.1.1"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2741,7 +2741,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty-harness-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
