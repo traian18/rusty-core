@@ -1125,3 +1125,176 @@ fn multiple_runs_accumulate_the_counter() {
     });
     assert_eq!(agent.usage.runs, 2);
 }
+
+fn text_delta(run_id: harness_protocol::ids::RunId, delta: &str) -> AgentCommand {
+    AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::TextDelta {
+            request_id: RequestId::new(),
+            delta: delta.into(),
+        },
+    }
+}
+
+fn reasoning_delta(run_id: harness_protocol::ids::RunId, delta: &str) -> AgentCommand {
+    AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ReasoningDelta {
+            request_id: RequestId::new(),
+            delta: delta.into(),
+        },
+    }
+}
+
+fn complete(agent: &mut Agent, run_id: harness_protocol::ids::RunId) {
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: completed_result(),
+        },
+    });
+}
+
+fn roles(agent: &Agent) -> Vec<MessageRole> {
+    agent.state.messages.iter().map(|m| m.role).collect()
+}
+
+fn text_of(agent: &Agent, index: usize) -> String {
+    agent.state.messages[index]
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A follow-up run's answer must land *after* its user message, in a new
+/// assistant message -- never be spliced onto the previous run's answer.
+#[test]
+fn a_second_runs_text_starts_a_new_assistant_message_after_the_new_user_turn() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let first = start(&mut agent);
+    agent.apply(text_delta(first, "first answer"));
+    complete(&mut agent, first);
+
+    let second = start(&mut agent);
+    agent.apply(text_delta(second, "second "));
+    agent.apply(text_delta(second, "answer"));
+    complete(&mut agent, second);
+
+    assert_eq!(
+        roles(&agent),
+        vec![
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::User,
+            MessageRole::Assistant
+        ]
+    );
+    assert_eq!(text_of(&agent, 1), "first answer");
+    assert_eq!(text_of(&agent, 3), "second answer");
+}
+
+/// Reasoning arrives before the first text delta on thinking models. The
+/// message opened for the reasoning must be the one the text fills, not a
+/// content-less sibling left ahead of it.
+#[test]
+fn reasoning_followed_by_text_produces_one_assistant_message() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    agent.apply(reasoning_delta(run_id, "thinking"));
+    agent.apply(text_delta(run_id, "answer"));
+    complete(&mut agent, run_id);
+
+    assert_eq!(
+        roles(&agent),
+        vec![MessageRole::User, MessageRole::Assistant]
+    );
+    assert_eq!(text_of(&agent, 1), "answer");
+    assert!(agent.state.messages.iter().all(|m| !m.content.is_empty()));
+}
+
+/// Reasoning followed directly by a tool call: the tool use goes into the
+/// message the reasoning opened. Previously this left `assistant: []` in
+/// the transcript, which Cohere rejects on the next request with "must have
+/// non-empty content or tool calls".
+#[test]
+fn reasoning_followed_by_a_tool_call_leaves_no_empty_assistant_message() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    agent.apply(reasoning_delta(run_id, "thinking"));
+    let call_id = ToolCallId::new();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+
+    assert_eq!(
+        roles(&agent),
+        vec![MessageRole::User, MessageRole::Assistant]
+    );
+    assert!(matches!(
+        agent.state.messages[1].content.as_slice(),
+        [ContentBlock::ToolUse { call }] if call.id == call_id
+    ));
+}
+
+/// A turn that produced nothing but reasoning ends with the empty message
+/// removed, so the next request never carries it.
+#[test]
+fn a_reasoning_only_turn_does_not_persist_an_empty_assistant_message() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    agent.apply(reasoning_delta(run_id, "thinking"));
+    assert_eq!(agent.state.messages.len(), 2, "reasoning opens a message");
+    complete(&mut agent, run_id);
+    assert_eq!(roles(&agent), vec![MessageRole::User]);
+
+    // Same for a turn that fails mid-way.
+    let run_id = start(&mut agent);
+    agent.apply(reasoning_delta(run_id, "thinking"));
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Error {
+            request_id: RequestId::new(),
+            error: harness_protocol::backend::ExecutionError::Timeout,
+        },
+    });
+    assert_eq!(roles(&agent), vec![MessageRole::User, MessageRole::User]);
+}
+
+/// Text that announces a tool call and the tool call itself keep their
+/// separate messages: the tool-use message is never merged into text.
+#[test]
+fn text_then_tool_call_keeps_the_tool_use_in_its_own_message() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    agent.apply(text_delta(run_id, "Let me check."));
+    let call_id = ToolCallId::new();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+    assert_eq!(
+        roles(&agent),
+        vec![
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::Assistant
+        ]
+    );
+    assert_eq!(text_of(&agent, 1), "Let me check.");
+    assert!(matches!(
+        agent.state.messages[2].content.as_slice(),
+        [ContentBlock::ToolUse { .. }]
+    ));
+}

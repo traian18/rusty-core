@@ -4,10 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use harness_model::client::ModelClient;
+use harness_model::client::{send_event, ModelClient, ModelEventSender};
 use harness_model::events::{ModelError, ModelEvent, ModelResult};
 use harness_model::request::{ModelCapabilities, ModelRequest};
 
@@ -78,7 +77,7 @@ impl ModelClient for FakeModelClient {
     async fn stream(
         &self,
         _request: ModelRequest,
-        events: broadcast::Sender<ModelEvent>,
+        events: ModelEventSender,
         cancel: CancellationToken,
     ) -> Result<ModelResult, ModelError> {
         *self
@@ -90,7 +89,7 @@ impl ModelClient for FakeModelClient {
             return Err(ModelError::Cancelled);
         }
         for event in &self.events {
-            let _ = events.send(event.clone());
+            send_event(&events, event.clone(), &cancel).await?;
             tokio::select! {
                 _ = tokio::time::sleep(STEP_DELAY) => {},
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
@@ -101,15 +100,25 @@ impl ModelClient for FakeModelClient {
             _ = cancel.cancelled() => return Err(ModelError::Cancelled),
         }
         if let Some(error) = self.error.clone() {
-            let _ = events.send(ModelEvent::Error {
-                error: error.clone(),
-            });
+            send_event(
+                &events,
+                ModelEvent::Error {
+                    error: error.clone(),
+                },
+                &cancel,
+            )
+            .await?;
             return Err(error);
         }
         if let Some(result) = self.result.clone() {
-            let _ = events.send(ModelEvent::Completed {
-                result: result.clone(),
-            });
+            send_event(
+                &events,
+                ModelEvent::Completed {
+                    result: result.clone(),
+                },
+                &cancel,
+            )
+            .await?;
             return Ok(result);
         }
         Err(ModelError::BackendError {

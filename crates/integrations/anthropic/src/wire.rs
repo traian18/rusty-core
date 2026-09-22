@@ -190,24 +190,29 @@ pub fn agent_message_to_anthropic(message: &AgentMessage) -> AnthropicMessage {
     let content = message
         .content
         .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
-            ContentBlock::ToolUse { call } => AnthropicContentBlock::ToolUse {
+        .filter_map(|block| match block {
+            // The Messages API rejects a text block with no text ("text
+            // content blocks must be non-empty"); it carries nothing anyway.
+            ContentBlock::Text { text } if text.is_empty() => None,
+            ContentBlock::Text { text } => Some(AnthropicContentBlock::Text { text: text.clone() }),
+            ContentBlock::ToolUse { call } => Some(AnthropicContentBlock::ToolUse {
                 id: call.id.to_string(),
                 name: call.name.clone(),
                 input: call.arguments.clone(),
-            },
-            ContentBlock::ToolResult { call_id, result } => AnthropicContentBlock::ToolResult {
-                tool_use_id: call_id.to_string(),
-                content: result.output_preview.clone(),
-            },
-            ContentBlock::Image { mime_type, data } => AnthropicContentBlock::Image {
+            }),
+            ContentBlock::ToolResult { call_id, result } => {
+                Some(AnthropicContentBlock::ToolResult {
+                    tool_use_id: call_id.to_string(),
+                    content: result.output_preview.clone(),
+                })
+            }
+            ContentBlock::Image { mime_type, data } => Some(AnthropicContentBlock::Image {
                 source: AnthropicImageSource {
                     kind: "base64",
                     media_type: mime_type.clone(),
                     data: base64::engine::general_purpose::STANDARD.encode(data),
                 },
-            },
+            }),
         })
         .collect();
     AnthropicMessage { role, content }
@@ -270,6 +275,14 @@ pub fn convert_messages(messages: &[AgentMessage]) -> Vec<AnthropicMessage> {
         .iter()
         .filter(|message| message.role != MessageRole::System)
         .map(agent_message_to_anthropic)
+        // An assistant message left with no content blocks (a turn that
+        // only produced reasoning, recorded by an older core) says nothing,
+        // and the Messages API rejects empty `content` on the next request.
+        // The core no longer produces such messages; persisted transcripts
+        // can still carry one.
+        .filter(|message| {
+            !matches!(message.role, AnthropicRole::Assistant) || !message.content.is_empty()
+        })
         .collect()
 }
 
@@ -879,6 +892,43 @@ mod tests {
             resolve_thinking(false, Some(ReasoningEffort::Low), 1024),
             Err(ModelError::InvalidRequest { .. })
         ));
+    }
+
+    /// An assistant message with no content blocks (a reasoning-only turn
+    /// recorded by an older core) must be omitted: the Messages API rejects
+    /// empty `content`, and there is nothing in it to send.
+    #[test]
+    fn a_content_less_assistant_message_is_omitted_from_the_wire() {
+        let message = |role: MessageRole, content: Vec<ContentBlock>| AgentMessage {
+            id: MessageId::new(),
+            role,
+            content,
+            created_at: Timestamp::now(),
+        };
+        let messages = [
+            message(
+                MessageRole::User,
+                vec![ContentBlock::Text { text: "hi".into() }],
+            ),
+            message(MessageRole::Assistant, Vec::new()),
+            message(
+                MessageRole::Assistant,
+                vec![ContentBlock::Text {
+                    text: String::new(),
+                }],
+            ),
+            message(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "again".into(),
+                }],
+            ),
+        ];
+        let converted = convert_messages(&messages);
+        assert_eq!(converted.len(), 2);
+        assert!(converted
+            .iter()
+            .all(|message| matches!(message.role, AnthropicRole::User)));
     }
 
     /// M4: an image content block must reach the wire as a real base64

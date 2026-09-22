@@ -203,6 +203,7 @@ impl Agent {
     }
 
     fn fail(&mut self, code: &str, message: String) -> Vec<AgentEffect> {
+        self.discard_trailing_empty_assistant_message();
         let from = self.state.status;
         let error = AgentError {
             message,
@@ -303,14 +304,7 @@ impl Agent {
                 let from = self.state.status;
                 self.state.status = AgentStatus::Executing;
                 let call_id = call.id;
-                let message_id = self.next_message_id();
-                let created_at = self.next_timestamp();
-                self.state.messages.push(AgentMessage {
-                    id: message_id,
-                    role: MessageRole::Assistant,
-                    content: vec![ContentBlock::ToolUse { call: call.clone() }],
-                    created_at,
-                });
+                self.push_tool_use(call.clone());
                 let mut effects = Vec::new();
                 if from != AgentStatus::Executing {
                     effects.push(Self::state_changed(from, AgentStatus::Executing));
@@ -374,6 +368,7 @@ impl Agent {
             }
             ExecutionEvent::Completed { result, .. } => {
                 self.state.backend_in_flight = false;
+                self.discard_trailing_empty_assistant_message();
                 let is_tool_turn = result.finish_reason == "tool_use";
                 self.usage.records.push(UsageRecord {
                     model_usage: result.usage,
@@ -424,14 +419,7 @@ impl Agent {
     fn tool_requested(&mut self, call: ToolCall) -> Vec<AgentEffect> {
         let from = self.state.status;
         let call_id = call.id;
-        let message_id = self.next_message_id();
-        let created_at = self.next_timestamp();
-        self.state.messages.push(AgentMessage {
-            id: message_id,
-            role: MessageRole::Assistant,
-            content: vec![ContentBlock::ToolUse { call: call.clone() }],
-            created_at,
-        });
+        self.push_tool_use(call.clone());
         let started_at = self.next_timestamp();
         self.state.pending_tools.insert(
             call_id,
@@ -764,19 +752,31 @@ impl Agent {
     }
 
     fn append_assistant_text(&mut self, delta: &str) -> MessageId {
-        if let Some(message) = self
-            .state
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|message| message.role == MessageRole::Assistant)
-        {
+        // Only the transcript's *last* message may absorb the delta. An
+        // earlier assistant message -- one before the user turn that started
+        // this run, or before a tool result -- belongs to a different turn,
+        // and appending to it would splice the new answer into the old one
+        // and leave the current user message with no reply after it.
+        if let Some(message) = self.trailing_assistant_message() {
             if let Some(ContentBlock::Text { text }) = message
                 .content
                 .iter_mut()
                 .find(|block| matches!(block, ContentBlock::Text { .. }))
             {
                 push_bounded(text, delta);
+                return message.id;
+            }
+            // Opened by a reasoning delta and still empty: give it the text
+            // rather than leaving a content-less assistant message behind,
+            // which providers reject on the next request.
+            if !message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            {
+                let mut text = String::new();
+                push_bounded(&mut text, delta);
+                message.content.push(ContentBlock::Text { text });
                 return message.id;
             }
         }
@@ -794,16 +794,14 @@ impl Agent {
         id
     }
 
+    /// The message a reasoning delta belongs to: the assistant message the
+    /// current turn is building, or a fresh one if the turn has produced
+    /// nothing else yet. The fresh message starts empty; the text or tool
+    /// call that follows fills it, and [`Self::discard_trailing_empty_assistant_message`]
+    /// removes it if nothing ever does.
     fn assistant_message_id(&mut self) -> MessageId {
-        if let Some(id) = self
-            .state
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == MessageRole::Assistant)
-            .map(|message| message.id)
-        {
-            return id;
+        if let Some(message) = self.trailing_assistant_message() {
+            return message.id;
         }
 
         let id = self.next_message_id();
@@ -815,5 +813,48 @@ impl Agent {
             created_at,
         });
         id
+    }
+
+    /// Records a tool call the model just requested. Reuses the turn's
+    /// assistant message when it has no content yet (opened by a reasoning
+    /// delta), so a reasoning-then-tool-call turn does not leave an empty
+    /// assistant message ahead of the tool call.
+    fn push_tool_use(&mut self, call: ToolCall) -> MessageId {
+        if let Some(message) = self.trailing_assistant_message() {
+            if message.content.is_empty() {
+                message.content.push(ContentBlock::ToolUse { call });
+                return message.id;
+            }
+        }
+        let message_id = self.next_message_id();
+        let created_at = self.next_timestamp();
+        self.state.messages.push(AgentMessage {
+            id: message_id,
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse { call }],
+            created_at,
+        });
+        message_id
+    }
+
+    fn trailing_assistant_message(&mut self) -> Option<&mut AgentMessage> {
+        self.state
+            .messages
+            .last_mut()
+            .filter(|message| message.role == MessageRole::Assistant)
+    }
+
+    /// Drops a trailing assistant message that never received content -- a
+    /// turn that produced only reasoning, or nothing at all. Every provider
+    /// rejects a content-less assistant message on the next request
+    /// (Cohere: "must have non-empty content or tool calls"), and it carries
+    /// nothing worth keeping.
+    fn discard_trailing_empty_assistant_message(&mut self) {
+        if self
+            .trailing_assistant_message()
+            .is_some_and(|message| message.content.is_empty())
+        {
+            self.state.messages.pop();
+        }
     }
 }

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tracing::instrument;
 
-use harness_model::client::ModelClient;
-use harness_model::events::{ModelError, ModelEvent, ModelResult};
+use harness_model::client::{send_event, ModelClient, ModelEventSender};
+use harness_model::events::{ModelError, ModelResult};
 use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::OpenAiResponsesConfig;
@@ -24,7 +24,7 @@ use crate::wire::{
 /// Implements [`ModelClient`] by converting [`ModelRequest`] into the
 /// Responses wire format, sending HTTP POST requests to
 /// `{base_url}/responses`, and parsing the SSE response stream into
-/// [`ModelEvent`]s.
+/// [`ModelEvent`](harness_model::events::ModelEvent)s.
 pub struct OpenAiResponsesClient {
     config: OpenAiResponsesConfig,
     http_client: reqwest::Client,
@@ -70,7 +70,7 @@ impl ModelClient for OpenAiResponsesClient {
     async fn stream(
         &self,
         request: ModelRequest,
-        events: tokio::sync::broadcast::Sender<ModelEvent>,
+        events: ModelEventSender,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
         let mut input = Vec::new();
@@ -154,7 +154,7 @@ impl ModelClient for OpenAiResponsesClient {
 impl OpenAiResponsesClient {
     async fn handle_success_response(
         mut response: reqwest::Response,
-        events: &tokio::sync::broadcast::Sender<ModelEvent>,
+        events: &ModelEventSender,
         cancel: &tokio_util::sync::CancellationToken,
         tool_ids: ProviderToolIds,
     ) -> Result<ModelResult, ModelError> {
@@ -176,10 +176,7 @@ impl OpenAiResponsesClient {
             let Some(chunk) = chunk else { break };
 
             for event in parser.push_chunk(&chunk)? {
-                if cancel.is_cancelled() {
-                    return Err(ModelError::Cancelled);
-                }
-                let _ = events.send(event);
+                send_event(events, event, cancel).await?;
             }
         }
 
@@ -188,7 +185,7 @@ impl OpenAiResponsesClient {
         }
         let (terminal_events, result) = parser.finish()?;
         for event in terminal_events {
-            let _ = events.send(event);
+            send_event(events, event, cancel).await?;
         }
         Ok(result)
     }

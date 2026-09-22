@@ -289,6 +289,16 @@ fn agent_message_to_openai(
                     _ => None,
                 })
                 .collect();
+            // An assistant message with neither text nor tool calls says
+            // nothing, and the wire form it would take -- `{"role":
+            // "assistant"}` -- is rejected outright by several
+            // Chat-Completions-compatible providers (Cohere via OpenRouter:
+            // "must have non-empty content or tool calls"). The core no
+            // longer produces such messages, but transcripts persisted
+            // before it stopped can still carry one.
+            if text.is_empty() && tool_calls.is_empty() {
+                return Vec::new();
+            }
             vec![OpenAiMessage {
                 role: "assistant".to_string(),
                 content: if text.is_empty() {
@@ -781,6 +791,53 @@ mod tests {
             "unexpected image_url shape: {url}"
         );
         assert!(url.ends_with(&base64::engine::general_purpose::STANDARD.encode([1, 2, 3])));
+    }
+
+    fn assistant_message(content: Vec<ContentBlock>) -> AgentMessage {
+        AgentMessage {
+            role: MessageRole::Assistant,
+            ..user_message(content)
+        }
+    }
+
+    /// A transcript can carry an assistant message with no text and no tool
+    /// calls (a turn that only produced reasoning, recorded by an older
+    /// core). Its wire form, `{"role":"assistant"}`, is rejected by Cohere
+    /// behind OpenRouter with "must have non-empty content or tool calls",
+    /// so it must be omitted rather than sent.
+    #[test]
+    fn a_content_less_assistant_message_is_omitted_from_the_wire() {
+        let messages = [
+            user_message(vec![ContentBlock::Text { text: "hi".into() }]),
+            assistant_message(Vec::new()),
+            assistant_message(vec![ContentBlock::Text {
+                text: String::new(),
+            }]),
+            user_message(vec![ContentBlock::Text {
+                text: "again".into(),
+            }]),
+        ];
+        let openai = convert_messages_with_tool_ids(&messages, &HashMap::new());
+        let roles: Vec<&str> = openai.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "user"]);
+    }
+
+    /// The guard must not touch assistant messages that do say something:
+    /// tool-call-only turns keep their (content-less) message, since the
+    /// tool calls are what the following `tool` messages answer.
+    #[test]
+    fn a_tool_call_only_assistant_message_is_still_sent() {
+        let call = harness_protocol::tools::ToolCall {
+            id: harness_protocol::ids::ToolCallId::new(),
+            name: "search".into(),
+            arguments: serde_json::json!({"q": "x"}),
+        };
+        let message = assistant_message(vec![ContentBlock::ToolUse { call }]);
+        let openai = agent_message_to_openai(&message, &HashMap::new());
+        assert_eq!(openai.len(), 1);
+        let json = serde_json::to_value(&openai[0]).expect("serialize OpenAiMessage");
+        assert!(json.get("content").is_none());
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "search");
     }
 
     const FIXTURE: &str = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n\

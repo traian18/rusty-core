@@ -8,7 +8,7 @@ pub mod provider_options;
 pub mod request;
 pub mod retry;
 
-pub use client::ModelClient;
+pub use client::{send_event, ModelClient, ModelEventSender};
 pub use events::{ModelError, ModelEvent, ModelResult};
 pub use provider_options::merge_provider_options;
 pub use request::{ModelCapabilities, ModelRequest};

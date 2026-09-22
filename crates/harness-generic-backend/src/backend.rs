@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -102,6 +102,22 @@ struct AttemptProgress {
 struct AttemptOutcome {
     result: Result<ModelResult, ModelError>,
     emitted_output: bool,
+}
+
+/// How far a model client may run ahead of `run_attempt` before its next
+/// `send` waits. Sized for a large SSE chunk's worth of deltas; anything
+/// beyond it is backpressure, never loss.
+const MODEL_EVENT_BUFFER: usize = 256;
+
+/// Why `run_attempt`'s receive loop stopped, decided before the client task
+/// is joined so every exit path closes the channel first.
+enum AttemptExit {
+    Completed(ModelResult),
+    Error(ModelError),
+    /// The client dropped its sender without a terminal event.
+    Closed,
+    Cancelled,
+    TimedOut,
 }
 
 impl GenericModelBackend {
@@ -252,7 +268,10 @@ impl GenericModelBackend {
         cancel: &CancellationToken,
         progress: &mut AttemptProgress,
     ) -> AttemptOutcome {
-        let (model_tx, mut model_rx) = broadcast::channel(256);
+        // Bounded and lossless: see `harness_model::client::ModelEventSender`
+        // for why this is not a `broadcast` channel. The capacity only sets
+        // how far the client may run ahead before `send` makes it wait.
+        let (model_tx, mut model_rx) = mpsc::channel(MODEL_EVENT_BUFFER);
         let client = self.model_client.clone();
         let attempt_cancel = cancel.child_token();
         let task_cancel = attempt_cancel.clone();
@@ -263,23 +282,19 @@ impl GenericModelBackend {
         let mut requested_tools = false;
         let mut deadline = tokio::time::Instant::now() + self.recovery.idle_timeout;
 
-        loop {
+        let exit = loop {
             tokio::select! {
                 message = model_rx.recv() => match message {
-                    Ok(event) => {
+                    Some(event) => {
                         deadline = tokio::time::Instant::now() + self.recovery.idle_timeout;
                         match event {
                             ModelEvent::Completed { mut result } => {
-                                let _ = stream.await;
                                 if requested_tools {
                                     result.stop_reason = "tool_use".into();
                                 }
-                                return AttemptOutcome { result: Ok(result), emitted_output };
+                                break AttemptExit::Completed(result);
                             }
-                            ModelEvent::Error { error } => {
-                                let _ = stream.await;
-                                return AttemptOutcome { result: Err(error), emitted_output };
-                            }
+                            ModelEvent::Error { error } => break AttemptExit::Error(error),
                             event => {
                                 requested_tools |= matches!(event, ModelEvent::ToolCallCompleted { .. });
                                 progress.requested_tools = requested_tools;
@@ -291,38 +306,59 @@ impl GenericModelBackend {
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        attempt_cancel.cancel();
-                        let _ = stream.await;
-                        return AttemptOutcome { result: Err(ModelError::BackendError { message: format!("lost {count} model events"), code: "EVENT_LAG".to_string() }), emitted_output };
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        let mut result = match stream.await {
-                            Ok(result) => result,
-                            Err(error) => Err(ModelError::BackendError { message: format!("model client task failed: {error}"), code: "TASK_PANIC".to_string() }),
-                        };
-                        // Some clients return their result without emitting a
-                        // Completed event. Tools still require a follow-up turn
-                        // even when the provider labels the completion STOP.
-                        if requested_tools {
-                            if let Ok(result) = &mut result {
-                                result.stop_reason = "tool_use".into();
-                            }
-                        }
-                        return AttemptOutcome { result, emitted_output };
-                    }
+                    None => break AttemptExit::Closed,
                 },
-                _ = cancel.cancelled() => {
-                    attempt_cancel.cancel();
-                    let _ = stream.await;
-                    return AttemptOutcome { result: Err(ModelError::Cancelled), emitted_output };
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    attempt_cancel.cancel();
-                    let _ = stream.await;
-                    return AttemptOutcome { result: Err(ModelError::Timeout), emitted_output };
-                }
+                _ = cancel.cancelled() => break AttemptExit::Cancelled,
+                _ = tokio::time::sleep_until(deadline) => break AttemptExit::TimedOut,
             }
+        };
+
+        // Nothing past this point reads the channel, so close it before
+        // joining the client task: a client still holding events for a
+        // consumer that has left would otherwise block on a full buffer and
+        // this join would never return.
+        drop(model_rx);
+        let result = match exit {
+            AttemptExit::Completed(result) => {
+                let _ = stream.await;
+                Ok(result)
+            }
+            AttemptExit::Error(error) => {
+                let _ = stream.await;
+                Err(error)
+            }
+            AttemptExit::Closed => {
+                let mut result = match stream.await {
+                    Ok(result) => result,
+                    Err(error) => Err(ModelError::BackendError {
+                        message: format!("model client task failed: {error}"),
+                        code: "TASK_PANIC".to_string(),
+                    }),
+                };
+                // Some clients return their result without emitting a
+                // Completed event. Tools still require a follow-up turn
+                // even when the provider labels the completion STOP.
+                if requested_tools {
+                    if let Ok(result) = &mut result {
+                        result.stop_reason = "tool_use".into();
+                    }
+                }
+                result
+            }
+            AttemptExit::Cancelled => {
+                attempt_cancel.cancel();
+                let _ = stream.await;
+                Err(ModelError::Cancelled)
+            }
+            AttemptExit::TimedOut => {
+                attempt_cancel.cancel();
+                let _ = stream.await;
+                Err(ModelError::Timeout)
+            }
+        };
+        AttemptOutcome {
+            result,
+            emitted_output,
         }
     }
 
@@ -595,6 +631,7 @@ impl ExecutionBackend for GenericModelBackend {
 mod tests {
     use super::*;
     use crate::testing::FakeModelClient;
+    use harness_model::client::ModelEventSender;
 
     /// A client that advertises `structured_output` must have that reach
     /// `BackendCapabilities`. This was wrong once already: the four HTTP
@@ -638,7 +675,7 @@ mod tests {
             async fn stream(
                 &self,
                 _request: ModelRequest,
-                _sink: broadcast::Sender<ModelEvent>,
+                _sink: ModelEventSender,
                 _cancel: CancellationToken,
             ) -> Result<ModelResult, ModelError> {
                 panic!("must be rejected before the client is ever reached");
@@ -1018,7 +1055,7 @@ mod tests {
             async fn stream(
                 &self,
                 request: ModelRequest,
-                sink: broadcast::Sender<ModelEvent>,
+                sink: ModelEventSender,
                 _cancel: CancellationToken,
             ) -> Result<ModelResult, ModelError> {
                 let first = {
@@ -1027,23 +1064,29 @@ mod tests {
                     requests.len() == 1
                 };
                 if first {
-                    let _ = sink.send(ModelEvent::TextDelta {
-                        delta: "Research says: ".into(),
-                    });
+                    let _ = sink
+                        .send(ModelEvent::TextDelta {
+                            delta: "Research says: ".into(),
+                        })
+                        .await;
                     if self.emit_tool {
-                        let _ = sink.send(ModelEvent::ToolCallCompleted {
-                            id: harness_protocol::ids::ToolCallId::new(),
-                            name: "search".into(),
-                            input: serde_json::json!({}),
-                        });
+                        let _ = sink
+                            .send(ModelEvent::ToolCallCompleted {
+                                id: harness_protocol::ids::ToolCallId::new(),
+                                name: "search".into(),
+                                input: serde_json::json!({}),
+                            })
+                            .await;
                     }
                     // Exercise the closed-stream return path as real clients
                     // need not emit a separate terminal model event.
                     return Err(self.error.clone());
                 }
-                let _ = sink.send(ModelEvent::TextDelta {
-                    delta: "the answer.".into(),
-                });
+                let _ = sink
+                    .send(ModelEvent::TextDelta {
+                        delta: "the answer.".into(),
+                    })
+                    .await;
                 Ok(ModelResult {
                     stop_reason: "stop".into(),
                     usage: Default::default(),
@@ -1121,6 +1164,94 @@ mod tests {
         }
     }
 
+    /// One HTTP chunk can carry hundreds of SSE frames -- a proxy flushing
+    /// a buffered upstream all at once -- and a client parses and emits them
+    /// with no await in between. Over the previous `broadcast` channel the
+    /// receiver then saw `Lagged(n)` and the attempt failed with
+    /// `EVENT_LAG` ("lost 76 model events"). The bounded channel makes the
+    /// client wait instead, so every delta reaches the sink.
+    #[tokio::test]
+    async fn a_synchronous_burst_of_model_events_is_delivered_in_full() {
+        struct Burst {
+            count: usize,
+        }
+        #[async_trait]
+        impl ModelClient for Burst {
+            fn capabilities(&self) -> harness_model::request::ModelCapabilities {
+                FakeModelClient::new().capabilities()
+            }
+            async fn stream(
+                &self,
+                _request: ModelRequest,
+                sink: ModelEventSender,
+                cancel: CancellationToken,
+            ) -> Result<ModelResult, ModelError> {
+                for index in 0..self.count {
+                    harness_model::send_event(
+                        &sink,
+                        ModelEvent::TextDelta {
+                            delta: format!("{index} "),
+                        },
+                        &cancel,
+                    )
+                    .await?;
+                }
+                let result = ModelResult {
+                    stop_reason: "stop".into(),
+                    usage: Default::default(),
+                    cost: Default::default(),
+                };
+                harness_model::send_event(
+                    &sink,
+                    ModelEvent::Completed {
+                        result: result.clone(),
+                    },
+                    &cancel,
+                )
+                .await?;
+                Ok(result)
+            }
+        }
+
+        let count = MODEL_EVENT_BUFFER * 8;
+        let backend = GenericModelBackend::new(Arc::new(Burst { count }));
+        let (sink, mut rx) = broadcast::channel(count + 16);
+        let result = backend
+            .execute(
+                harness_protocol::backend::ExecutionRequest {
+                    request_id: RequestId::new(),
+                    run_id: harness_protocol::ids::RunId::new(),
+                    system_prompt: String::new(),
+                    messages: vec![],
+                    tools: vec![],
+                    extended_thinking: false,
+                    params: Default::default(),
+                },
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "burst must not fail the attempt: {result:?}"
+        );
+
+        let mut deltas = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::TextDelta { delta, .. } = event {
+                deltas.push(delta);
+            }
+        }
+        assert_eq!(deltas.len(), count, "every delta must be forwarded");
+        assert!(
+            deltas
+                .iter()
+                .enumerate()
+                .all(|(index, delta)| delta == &format!("{index} ")),
+            "deltas must keep their order"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_tracks_inactivity_instead_of_stream_duration() {
         struct SlowStream {
@@ -1134,14 +1265,16 @@ mod tests {
             async fn stream(
                 &self,
                 _request: ModelRequest,
-                sink: broadcast::Sender<ModelEvent>,
+                sink: ModelEventSender,
                 cancel: CancellationToken,
             ) -> Result<ModelResult, ModelError> {
                 for _ in 0..4 {
                     tokio::time::sleep(Duration::from_secs(6)).await;
-                    let _ = sink.send(ModelEvent::TextDelta {
-                        delta: "text ".into(),
-                    });
+                    let _ = sink
+                        .send(ModelEvent::TextDelta {
+                            delta: "text ".into(),
+                        })
+                        .await;
                 }
                 if self.stall {
                     cancel.cancelled().await;
@@ -1199,11 +1332,10 @@ mod tests {
         use std::time::Duration;
 
         use async_trait::async_trait;
-        use tokio::sync::broadcast;
         use tokio_util::sync::CancellationToken;
 
-        use harness_model::client::ModelClient;
-        use harness_model::events::{ModelError, ModelEvent, ModelResult};
+        use harness_model::client::{ModelClient, ModelEventSender};
+        use harness_model::events::{ModelError, ModelResult};
         use harness_model::request::{ModelCapabilities, ModelRequest};
 
         /// Minimal `ModelClient` used only to construct a `GenericModelBackend`
@@ -1226,7 +1358,7 @@ mod tests {
             async fn stream(
                 &self,
                 _request: ModelRequest,
-                _sink: broadcast::Sender<ModelEvent>,
+                _sink: ModelEventSender,
                 _cancel: CancellationToken,
             ) -> Result<harness_model::events::ModelResult, harness_model::events::ModelError>
             {
@@ -1274,7 +1406,7 @@ mod tests {
             async fn stream(
                 &self,
                 _request: ModelRequest,
-                _sink: broadcast::Sender<ModelEvent>,
+                _sink: ModelEventSender,
                 _cancel: CancellationToken,
             ) -> Result<ModelResult, ModelError> {
                 let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;

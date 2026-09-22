@@ -1,6 +1,6 @@
 //! Async runtime loop for a single deterministic agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +58,68 @@ impl AgentTask {
         };
         (task, commands_tx)
     }
+}
+
+/// Capacity of the broadcast sink a backend streams one request's events
+/// into. A `broadcast` channel overwrites its oldest entry once the producer
+/// gets this far ahead of the receiver, so this must cover the largest burst
+/// [`forward_backend_events`] can be left unpolled for. Each scheduler slice
+/// of the producer is capped by tokio's cooperative budget (128 channel
+/// operations), so this leaves several slices of headroom.
+const BACKEND_EVENT_BUFFER: usize = 1024;
+
+/// Relays one request's backend events from its broadcast sink into the
+/// agent mailbox. Returns whether a terminal (`Completed`/`Error`) event was
+/// among them, so the driver knows whether to synthesize one.
+///
+/// Receiving never waits on the mailbox: events the mailbox has not accepted
+/// yet are parked in a local queue. The sink drops its oldest entries once a
+/// producer gets `BACKEND_EVENT_BUFFER` events ahead of this receiver, so the
+/// receiver must keep draining even while the mailbox is full -- it would
+/// stop for the whole duration of a mailbox stall if it awaited
+/// `commands.send` directly. A stall now costs memory proportional to the
+/// burst rather than dropped text deltas.
+async fn forward_backend_events(
+    mut event_rx: broadcast::Receiver<ExecutionEvent>,
+    commands: mpsc::Sender<AgentCommand>,
+    run_id: RunId,
+    cancel: CancellationToken,
+) -> bool {
+    let mut terminal_forwarded = false;
+    let mut queued: VecDeque<ExecutionEvent> = VecDeque::new();
+    let mut source_open = true;
+    loop {
+        if !source_open && queued.is_empty() {
+            break;
+        }
+        tokio::select! {
+            // Draining the sink takes priority over feeding the mailbox: the
+            // sink is the lossy side, the local queue is not.
+            biased;
+            _ = cancel.cancelled() => break,
+            event = event_rx.recv(), if source_open => match event {
+                Ok(event) => queued.push_back(event),
+                Err(broadcast::error::RecvError::Closed) => source_open = false,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(run_id = ?run_id, skipped = n, "backend event receiver lagged");
+                }
+            },
+            permit = commands.reserve(), if !queued.is_empty() => match permit {
+                Ok(permit) => {
+                    let event = queued
+                        .pop_front()
+                        .expect("branch is guarded by !queued.is_empty()");
+                    terminal_forwarded |= matches!(
+                        &event,
+                        ExecutionEvent::Completed { .. } | ExecutionEvent::Error { .. }
+                    );
+                    permit.send(AgentCommand::BackendEvent { run_id, event });
+                }
+                Err(_) => break,
+            },
+        }
+    }
+    terminal_forwarded
 }
 
 /// Drives an agent's state machine and dispatches its effects asynchronously.
@@ -745,36 +807,16 @@ impl AgentRunner {
         let backend_id = self.backend.descriptor().id;
         let run_id = request.run_id;
         let request_id = request.request_id;
-        let (event_tx, mut event_rx) = broadcast::channel(256);
+        let (event_tx, event_rx) = broadcast::channel(BACKEND_EVENT_BUFFER);
         let token = self.cancel.child_token();
         self.backend_tokens.insert(run_id, token.clone());
 
-        let commands = self.task.commands_tx.clone();
-        let forward_cancel = self.cancel.clone();
-        let forward_handle = tokio::spawn(async move {
-            let mut terminal_forwarded = false;
-            loop {
-                tokio::select! {
-                    event = event_rx.recv() => match event {
-                        Ok(event) => {
-                            terminal_forwarded |= matches!(
-                                &event,
-                                ExecutionEvent::Completed { .. } | ExecutionEvent::Error { .. }
-                            );
-                            if commands.send(AgentCommand::BackendEvent { run_id, event }).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(run_id = ?run_id, skipped = n, "backend event receiver lagged");
-                        }
-                    },
-                    _ = forward_cancel.cancelled() => break,
-                }
-            }
-            terminal_forwarded
-        });
+        let forward_handle = tokio::spawn(forward_backend_events(
+            event_rx,
+            self.task.commands_tx.clone(),
+            run_id,
+            self.cancel.clone(),
+        ));
 
         let backend = self.backend.clone();
         let scheduler = self.scheduler.clone();
@@ -1027,10 +1069,10 @@ mod tests {
 
     use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
     use harness_protocol::backend::{
-        BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference,
+        BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference, ExecutionResult,
     };
     use harness_protocol::commands::UserInput;
-    use harness_protocol::ids::{BackendId, ConfigurationId, IntegrationId, SessionId};
+    use harness_protocol::ids::{BackendId, ConfigurationId, IntegrationId, RequestId, SessionId};
     use harness_protocol::tools::AgentToolset;
     use harness_protocol::usage::AgentBudget;
 
@@ -1056,6 +1098,69 @@ mod tests {
     struct NoopSink;
     impl EventSink for NoopSink {
         fn send(&self, _envelope: AgentEventEnvelope) {}
+    }
+    /// The mailbox is bounded (64) and the backend sink is a lossy
+    /// broadcast: a forwarder that awaits `commands.send` while the mailbox
+    /// is full stops receiving, and every event the backend streams past the
+    /// sink's capacity in the meantime is silently overwritten. Here nobody
+    /// reads the mailbox until the whole burst has been sent, so the old
+    /// forwarder lost all but the last `BACKEND_EVENT_BUFFER` deltas.
+    #[tokio::test]
+    async fn forwarder_keeps_draining_the_sink_while_the_mailbox_is_full() {
+        let run_id = RunId::new();
+        let request_id = RequestId::new();
+        let total = BACKEND_EVENT_BUFFER * 4;
+        let (event_tx, event_rx) = broadcast::channel(BACKEND_EVENT_BUFFER);
+        let (commands_tx, mut commands_rx) = mpsc::channel(4);
+        let forwarder = tokio::spawn(forward_backend_events(
+            event_rx,
+            commands_tx,
+            run_id,
+            CancellationToken::new(),
+        ));
+
+        for index in 0..total {
+            let _ = event_tx.send(ExecutionEvent::TextDelta {
+                request_id,
+                delta: index.to_string(),
+            });
+            // Give the forwarder a turn the way a real backend's I/O awaits
+            // do, without ever draining the mailbox.
+            if index % 100 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let _ = event_tx.send(ExecutionEvent::Completed {
+            request_id,
+            result: ExecutionResult {
+                request_id,
+                usage: Default::default(),
+                cost: Default::default(),
+                finish_reason: "stop".into(),
+            },
+        });
+        drop(event_tx);
+
+        let mut received = Vec::new();
+        while let Some(AgentCommand::BackendEvent { event, .. }) = commands_rx.recv().await {
+            match event {
+                ExecutionEvent::TextDelta { delta, .. } => received.push(delta),
+                ExecutionEvent::Completed { .. } => break,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(
+            forwarder.await.expect("forwarder join"),
+            "terminal event was forwarded"
+        );
+        assert_eq!(received.len(), total, "every delta must reach the mailbox");
+        assert!(
+            received
+                .iter()
+                .enumerate()
+                .all(|(index, delta)| delta == &index.to_string()),
+            "deltas must arrive in order"
+        );
     }
 
     fn test_agent(agent_id: AgentId, session_id: SessionId) -> Agent {

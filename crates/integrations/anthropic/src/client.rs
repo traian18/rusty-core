@@ -9,8 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::instrument;
 
-use harness_model::client::ModelClient;
-use harness_model::events::{ModelError, ModelEvent, ModelResult};
+use harness_model::client::{send_event, ModelClient, ModelEventSender};
+use harness_model::events::{ModelError, ModelResult};
 use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::AnthropicConfig;
@@ -23,7 +23,7 @@ use crate::wire::{
 ///
 /// Implements [`ModelClient`] by converting [`ModelRequest`] to the Anthropic
 /// wire format, sending HTTP POST requests to the Anthropic API, and parsing
-/// the Server-Sent Events (SSE) response stream into [`ModelEvent`]s.
+/// the Server-Sent Events (SSE) response stream into [`ModelEvent`](harness_model::events::ModelEvent)s.
 ///
 /// The client is constructed with an [`AnthropicConfig`] that controls the
 /// API key, base URL, default model, timeout, and other settings.
@@ -87,8 +87,8 @@ impl ModelClient for AnthropicClient {
     ///    required Anthropic headers (`x-api-key`, `anthropic-version`,
     ///    `content-type`).
     /// 3. On success (HTTP 2xx), parses the SSE response body using
-    ///    [`AnthropicSseParser`] and forwards each parsed [`ModelEvent`]
-    ///    through the `events` broadcast channel.
+    ///    [`AnthropicSseParser`] and forwards each parsed [`ModelEvent`](harness_model::events::ModelEvent)
+    ///    through the bounded `events` channel.
     /// 4. On HTTP 429, reads the `retry-after-ms` header and returns
     ///    [`ModelError::RateLimited`].
     /// 5. On other HTTP errors, returns [`ModelError::BackendError`] with
@@ -111,7 +111,7 @@ impl ModelClient for AnthropicClient {
     async fn stream(
         &self,
         request: ModelRequest,
-        events: tokio::sync::broadcast::Sender<ModelEvent>,
+        events: ModelEventSender,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
         let invalid_names = crate::wire::find_invalid_tool_names(&request.tools);
@@ -244,7 +244,7 @@ impl AnthropicClient {
     /// Incrementally parse a successful SSE response and forward events.
     async fn handle_success_response(
         mut response: reqwest::Response,
-        events: &tokio::sync::broadcast::Sender<ModelEvent>,
+        events: &ModelEventSender,
         cancel: &tokio_util::sync::CancellationToken,
         tool_ids: ProviderToolIds,
     ) -> Result<ModelResult, ModelError> {
@@ -262,7 +262,7 @@ impl AnthropicClient {
             let _ = parser.push_chunk(body.as_bytes())?;
             let (terminal_events, result) = parser.finish()?;
             for event in terminal_events {
-                let _ = events.send(event);
+                send_event(events, event, cancel).await?;
             }
             return Ok(result);
         }
@@ -287,10 +287,7 @@ impl AnthropicClient {
             };
 
             for event in parser.push_chunk(&chunk)? {
-                if cancel.is_cancelled() {
-                    return Err(ModelError::Cancelled);
-                }
-                let _ = events.send(event);
+                send_event(events, event, cancel).await?;
             }
         }
 
@@ -299,7 +296,7 @@ impl AnthropicClient {
         }
         let (terminal_events, result) = parser.finish()?;
         for event in terminal_events {
-            let _ = events.send(event);
+            send_event(events, event, cancel).await?;
         }
         Ok(result)
     }
