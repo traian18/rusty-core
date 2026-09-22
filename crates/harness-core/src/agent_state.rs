@@ -30,6 +30,9 @@ pub struct AgentState {
     /// Per-agent inference-context checkpoint and pressure bookkeeping.
     pub context: AgentContextState,
     pub active_run: Option<RunId>,
+    /// Tools may finish while the backend is still emitting the current batch.
+    /// Do not dispatch another inference until that backend turn has ended.
+    pub backend_in_flight: bool,
     /// User inputs admitted while a run is active. Inputs are consumed in FIFO
     /// order once the active run reaches a terminal command boundary.
     pub queued_inputs: VecDeque<UserInput>,

@@ -34,7 +34,7 @@ pub struct OpenAiResponsesClient {
 impl OpenAiResponsesClient {
     pub fn new(config: OpenAiResponsesConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .read_timeout(config.request_timeout)
             .build()
             .expect("reqwest::ClientBuilder::build should not fail with default settings");
         Self {
@@ -167,7 +167,7 @@ impl OpenAiResponsesClient {
                     if error.is_timeout() {
                         ModelError::Timeout
                     } else {
-                        ModelError::Protocol {
+                        ModelError::StreamInterrupted {
                             message: format!("failed to read Responses SSE stream: {error}"),
                         }
                     }

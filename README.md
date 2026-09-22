@@ -147,14 +147,16 @@ On `pause_resume`: pause is *recoverable*, unlike cancel — the agent holds its
 Every HTTP model request runs through `GenericModelBackend::execute`, which provides:
 
 1. **Retry** — transient failures (`RateLimited`, retryable `BackendError`, `Timeout`) are retried with exponential backoff (250 ms doubling) plus jitter, up to `max_attempts`.
-2. **Shared deadline** — one `total_deadline` bounds all attempts and backoff delays combined; no unbounded retry loops.
+2. **Inactivity timeout** — `idle_timeout` resets on every model event. Active streams have no total duration limit. HTTP clients also use read inactivity timeouts, defaulting to 600 seconds. Retries remain bounded by `max_attempts`. Interrupted text answers can continue with the partial answer in context and tools disabled; turns that already dispatched tools and constrained structured responses are not replayed.
 3. **Circuit breaker** — `circuit_failure_threshold` consecutive transient failures open the circuit; while open, requests fail fast with a `CircuitOpen` error until `circuit_open_duration` elapses, then a single half-open probe is allowed.
 
-The policy is a serializable struct embedded in every HTTP provider config as `recovery` (JSON keys: `max_attempts`, `total_deadline_secs`, `circuit_failure_threshold`, `circuit_open_duration_secs`). Defaults: `max_attempts: 2`, `total_deadline_secs: 15`, `circuit_failure_threshold: 3`, `circuit_open_duration_secs: 30`.
+The policy is a serializable struct embedded in every HTTP provider config as `recovery` (JSON keys: `max_attempts`, `idle_timeout_secs`, `circuit_failure_threshold`, `circuit_open_duration_secs`). Defaults: `max_attempts: 2`, `idle_timeout_secs: 600`, `circuit_failure_threshold: 3`, `circuit_open_duration_secs: 30`.
 
 ```console
---config-json '{"api_key":"sk-...","recovery":{"max_attempts":5,"total_deadline_secs":45}}'
+--config-json '{"api_key":"sk-...","recovery":{"max_attempts":5,"idle_timeout_secs":600}}'
 ```
+
+The legacy JSON key `total_deadline_secs` is accepted as an alias for `idle_timeout_secs`; it now measures inactivity.
 
 The `claude-code`/`codex`/`github-copilot` subprocess backends bypass this layer entirely (the CLI manages its own network retries); only the four HTTP backends go through it.
 

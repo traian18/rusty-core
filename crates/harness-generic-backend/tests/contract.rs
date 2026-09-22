@@ -222,6 +222,63 @@ async fn test_completion() {
     assert_eq!(completed_count, 1, "expected exactly one Completed event");
 }
 
+#[tokio::test]
+async fn tool_finish_reasons_keep_execution_in_the_tool_loop() {
+    for stop_reason in [
+        "tool_calls",
+        "function_call",
+        "tool_use",
+        "STOP",
+        "stop",
+        "end_turn",
+    ] {
+        let call_id = ToolCallId::new();
+        let client = FakeModelClient::new()
+            .with_events(vec![ModelEvent::ToolCallCompleted {
+                id: call_id,
+                name: "web_search".into(),
+                input: serde_json::json!({"query": "rust"}),
+            }])
+            .with_result(ModelResult {
+                stop_reason: stop_reason.into(),
+                usage: Default::default(),
+                cost: Default::default(),
+            });
+        let (result, events) = run_execution(GenericModelBackend::new(Arc::new(client))).await;
+
+        assert_eq!(result.unwrap().finish_reason, "tool_use", "{stop_reason}");
+        let tool_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event, ExecutionEvent::ToolCallRequested { call, .. } if call.id == call_id
+                )
+            })
+            .expect("tool request must be delivered");
+        let completion_index = events.iter().position(|event| matches!(
+            event, ExecutionEvent::Completed { result, .. } if result.finish_reason == "tool_use"
+        )).expect("stream completion must also use the normalized reason");
+        assert!(tool_index < completion_index);
+    }
+}
+
+#[tokio::test]
+async fn text_only_completions_preserve_the_provider_finish_reason() {
+    for stop_reason in ["STOP", "stop", "end_turn", "length"] {
+        let client = FakeModelClient::new()
+            .with_events(vec![ModelEvent::TextDelta {
+                delta: "done".into(),
+            }])
+            .with_result(ModelResult {
+                stop_reason: stop_reason.into(),
+                usage: Default::default(),
+                cost: Default::default(),
+            });
+        let (result, _) = run_execution(GenericModelBackend::new(Arc::new(client))).await;
+        assert_eq!(result.unwrap().finish_reason, stop_reason);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 4. Usage propagation — UsageUpdate forwarded
 // ---------------------------------------------------------------------------
@@ -346,7 +403,7 @@ async fn test_error_normalization_backend_error() {
     assert!(has_error_event, "expected an Error execution event");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_error_normalization_rate_limited() {
     let client = FakeModelClient::new().with_error(ModelError::RateLimited {
         retry_after: Some(Duration::from_secs(42)),

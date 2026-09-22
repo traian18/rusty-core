@@ -106,6 +106,31 @@ fn start(agent: &mut Agent) -> harness_protocol::ids::RunId {
     agent.state.active_run.expect("active run")
 }
 
+#[test]
+fn output_limited_response_is_incomplete_and_can_be_continued() {
+    for reason in ["max_tokens", "length", "max_output_tokens"] {
+        let mut agent = create_agent(PermissionMode::Allow);
+        let run_id = start(&mut agent);
+        let mut result = completed_result();
+        result.finish_reason = reason.into();
+        let effects = agent.apply(AgentCommand::BackendEvent {
+            run_id,
+            event: ExecutionEvent::Completed { request_id: result.request_id, result },
+        });
+        assert!(effects.iter().any(|effect| matches!(effect,
+            AgentEffect::Emit { event: AgentEvent::Failed { error } }
+                if error.code == "OUTPUT_LIMIT_REACHED"
+        )));
+        assert!(!effects.iter().any(|effect| matches!(effect,
+            AgentEffect::Emit { event: AgentEvent::Completed { .. } }
+        )));
+        assert!(agent.state.active_run.is_none());
+        // Continuation is a new run in the same conversation, not a replay.
+        start(&mut agent);
+        assert_eq!(agent.state.messages.len(), 2);
+    }
+}
+
 fn tool_call(call_id: ToolCallId) -> ToolCall {
     ToolCall {
         id: call_id,
@@ -219,10 +244,22 @@ fn scripted_vertical_slice() {
     });
     assert!(matches!(
         completed.as_slice(),
+        [AgentEffect::Emit {
+            event: AgentEvent::ToolCallCompleted { .. }
+        }]
+    ));
+    let mut tool_turn = completed_result();
+    tool_turn.finish_reason = "tool_use".into();
+    let continuation = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result: tool_turn,
+        },
+    });
+    assert!(matches!(
+        continuation.as_slice(),
         [
-            AgentEffect::Emit {
-                event: AgentEvent::ToolCallCompleted { .. }
-            },
             AgentEffect::Emit {
                 event: AgentEvent::StateChanged {
                     from: AgentStatus::Executing,
@@ -421,6 +458,15 @@ fn tool_failure_records_result_and_continues() {
             call: tool_call(call_id),
         },
     });
+    let mut result = completed_result();
+    result.finish_reason = "tool_use".into();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result,
+        },
+    });
     let effects = agent.apply(AgentCommand::ToolFailed {
         call_id,
         error: ToolError::Timeout,
@@ -440,6 +486,73 @@ fn tool_failure_records_result_and_continues() {
             AgentEffect::ExecuteBackend { .. }
         ]
     ));
+}
+
+#[test]
+fn fast_tool_results_cannot_fan_out_concurrent_model_requests() {
+    for permission in [PermissionMode::Allow, PermissionMode::Deny] {
+        let mut agent = create_agent(permission.clone());
+        let run_id = start(&mut agent);
+        // Reproduces host-bridge delivery: each tool is fully answered before
+        // the next ToolCallRequested from the same model turn arrives.
+        for _ in 0..3 {
+            let call_id = ToolCallId::new();
+            let requested = agent.apply(AgentCommand::BackendEvent {
+                run_id,
+                event: ExecutionEvent::ToolCallRequested {
+                    request_id: RequestId::new(),
+                    call: tool_call(call_id),
+                },
+            });
+            assert!(!requested
+                .iter()
+                .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
+            if matches!(permission, PermissionMode::Allow) {
+                let completed = agent.apply(AgentCommand::ToolCompleted {
+                    call_id,
+                    result: ToolResult {
+                        call_id,
+                        output: serde_json::json!("done"),
+                        is_error: false,
+                    },
+                });
+                assert!(!completed
+                    .iter()
+                    .any(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. })));
+            }
+        }
+        let mut result = completed_result();
+        result.finish_reason = "tool_use".into();
+        let effects = agent.apply(AgentCommand::BackendEvent {
+            run_id,
+            event: ExecutionEvent::Completed {
+                request_id: RequestId::new(),
+                result,
+            },
+        });
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, AgentEffect::ExecuteBackend { .. }))
+                .count(),
+            1
+        );
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                AgentEffect::ExecuteBackend { request } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Tool)
+                .count(),
+            3
+        );
+    }
 }
 
 #[test]

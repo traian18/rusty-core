@@ -30,7 +30,7 @@ pub struct GeminiClient {
 impl GeminiClient {
     pub fn new(config: GeminiConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .read_timeout(config.request_timeout)
             .build()
             .expect("reqwest::ClientBuilder::build should not fail with default settings");
         Self {
@@ -162,7 +162,7 @@ impl GeminiClient {
                     if error.is_timeout() {
                         ModelError::Timeout
                     } else {
-                        ModelError::Protocol {
+                        ModelError::StreamInterrupted {
                             message: format!("failed to read Gemini SSE stream: {error}"),
                         }
                     }

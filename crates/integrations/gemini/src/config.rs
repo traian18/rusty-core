@@ -22,8 +22,9 @@ pub struct GeminiConfig {
         serialize_with = "serialize_duration_secs",
         deserialize_with = "deserialize_duration_secs"
     )]
+    /// Maximum gap between HTTP reads, not a total streaming deadline.
     pub request_timeout: Duration,
-    /// Retry, deadline, and circuit-breaker settings for provider calls.
+    /// Retry, inactivity timeout, and circuit-breaker settings for provider calls.
     pub recovery: RecoveryPolicy,
 }
 
@@ -48,7 +49,7 @@ impl Default for GeminiConfig {
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
             default_model: "gemini-1.5-pro".into(),
             default_max_tokens: 8192,
-            request_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_secs(600),
             recovery: RecoveryPolicy::default(),
         }
     }
@@ -112,7 +113,7 @@ mod tests {
         }))
         .expect("valid config");
         assert_eq!(config.recovery.max_attempts, 4);
-        assert_eq!(config.recovery.total_deadline, Duration::from_secs(45));
+        assert_eq!(config.recovery.idle_timeout, Duration::from_secs(45));
         assert_eq!(config.recovery.circuit_failure_threshold, 3);
     }
 

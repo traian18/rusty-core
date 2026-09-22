@@ -37,8 +37,9 @@ pub struct OpenAiCompatibleConfig {
         serialize_with = "serialize_duration_secs",
         deserialize_with = "deserialize_duration_secs"
     )]
+    /// Maximum gap between HTTP reads, not a total streaming deadline.
     pub request_timeout: Duration,
-    /// Retry, deadline, and circuit-breaker settings for provider calls.
+    /// Retry, inactivity timeout, and circuit-breaker settings for provider calls.
     #[serde(default)]
     pub recovery: RecoveryPolicy,
     /// Some providers require a custom header beyond `Authorization`.
@@ -60,7 +61,7 @@ fn default_max_tokens() -> u64 {
 }
 
 fn default_timeout() -> Duration {
-    Duration::from_secs(120)
+    Duration::from_secs(600)
 }
 
 fn serialize_duration_secs<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
@@ -128,8 +129,20 @@ impl OpenAiCompatibleConfig {
     /// — this is the whole reuse mechanism: no forked client, no duplicated
     /// wire/SSE logic, just a different set of field values.
     pub fn into_openai_config(self) -> OpenAiConfig {
+        let api_key = self
+            .api_key
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                if self.base_url.contains("openrouter.ai") {
+                    std::env::var("OPENROUTER_API_KEY").ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
         OpenAiConfig {
-            api_key: self.api_key.unwrap_or_default(),
+            api_key,
             base_url: self.base_url,
             default_model: self.model,
             default_max_tokens: self.default_max_tokens,
@@ -242,5 +255,23 @@ mod tests {
         assert_eq!(config.default_max_tokens, 4096);
         assert!(config.api_key.is_none());
         assert_eq!(config.recovery, RecoveryPolicy::default());
+    }
+
+    #[test]
+    fn falls_back_to_openrouter_api_key_from_env_for_openrouter_url() {
+        let key_var = "OPENROUTER_API_KEY";
+        let prev = std::env::var(key_var).ok();
+        std::env::set_var(key_var, "test-openrouter-key");
+
+        let config =
+            OpenAiCompatibleConfig::new("https://openrouter.ai/api/v1", "meta-llama/llama-3");
+        let openai_config = config.into_openai_config();
+        assert_eq!(openai_config.api_key, "test-openrouter-key");
+
+        if let Some(val) = prev {
+            std::env::set_var(key_var, val);
+        } else {
+            std::env::remove_var(key_var);
+        }
     }
 }

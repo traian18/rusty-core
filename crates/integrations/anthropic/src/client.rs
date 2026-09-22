@@ -44,13 +44,13 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     /// Create a new [`AnthropicClient`] from the given configuration.
     ///
-    /// The underlying `reqwest::Client` is built with the request timeout
+    /// The underlying `reqwest::Client` is built with the HTTP read inactivity timeout
     /// specified in `config.request_timeout`. Construction panics only if
     /// `reqwest::Client::builder()` fails, which should never happen with
     /// the default builder settings used here.
     pub fn new(config: AnthropicConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .read_timeout(config.request_timeout)
             .build()
             .expect("reqwest::ClientBuilder::build should not fail with default settings");
         Self {
@@ -276,7 +276,7 @@ impl AnthropicClient {
                     if error.is_timeout() {
                         ModelError::Timeout
                     } else {
-                        ModelError::Protocol {
+                        ModelError::StreamInterrupted {
                             message: format!("failed to read Anthropic SSE stream: {error}"),
                         }
                     }

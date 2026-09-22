@@ -25,8 +25,9 @@ pub struct OpenAiResponsesConfig {
         serialize_with = "serialize_duration_secs",
         deserialize_with = "deserialize_duration_secs"
     )]
+    /// Maximum gap between HTTP reads, not a total streaming deadline.
     pub request_timeout: Duration,
-    /// Retry, deadline, and circuit-breaker settings for provider calls.
+    /// Retry, inactivity timeout, and circuit-breaker settings for provider calls.
     pub recovery: RecoveryPolicy,
     /// Extra headers sent with every request, beyond `Authorization` and
     /// `Content-Type`.
@@ -54,7 +55,7 @@ impl Default for OpenAiResponsesConfig {
             base_url: "https://api.openai.com/v1".into(),
             default_model: "gpt-5".into(),
             default_max_tokens: 4096,
-            request_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_secs(600),
             recovery: RecoveryPolicy::default(),
             extra_headers: HashMap::new(),
         }

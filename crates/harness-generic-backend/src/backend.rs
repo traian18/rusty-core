@@ -41,13 +41,15 @@ pub struct GenericModelBackend {
 pub struct RecoveryPolicy {
     /// Total calls allowed for a request, including its initial attempt.
     pub max_attempts: usize,
-    /// Deadline shared by all attempts and backoff delays.
+    /// Maximum inactivity per attempt; reset on every model stream event.
+    /// Active streams have no wall-clock deadline.
     #[serde(
-        rename = "total_deadline_secs",
+        rename = "idle_timeout_secs",
+        alias = "total_deadline_secs",
         serialize_with = "serialize_duration_secs",
         deserialize_with = "deserialize_duration_secs"
     )]
-    pub total_deadline: Duration,
+    pub idle_timeout: Duration,
     /// Consecutive transient request failures that open the circuit.
     pub circuit_failure_threshold: u32,
     /// How long an open circuit fails fast before one probe is allowed.
@@ -77,7 +79,7 @@ impl Default for RecoveryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 2,
-            total_deadline: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(600),
             circuit_failure_threshold: 3,
             circuit_open_duration: Duration::from_secs(30),
         }
@@ -89,6 +91,12 @@ struct CircuitState {
     consecutive_failures: u32,
     open_until: Option<tokio::time::Instant>,
     half_open_probe_in_flight: bool,
+}
+
+#[derive(Default)]
+struct AttemptProgress {
+    text: String,
+    requested_tools: bool,
 }
 
 struct AttemptOutcome {
@@ -242,7 +250,7 @@ impl GenericModelBackend {
         request_id: RequestId,
         sink: &broadcast::Sender<ExecutionEvent>,
         cancel: &CancellationToken,
-        deadline: tokio::time::Instant,
+        progress: &mut AttemptProgress,
     ) -> AttemptOutcome {
         let (model_tx, mut model_rx) = broadcast::channel(256);
         let client = self.model_client.clone();
@@ -252,14 +260,20 @@ impl GenericModelBackend {
         let mut stream =
             tokio::spawn(async move { client.stream(model_request, model_tx, task_cancel).await });
         let mut emitted_output = false;
+        let mut requested_tools = false;
+        let mut deadline = tokio::time::Instant::now() + self.recovery.idle_timeout;
 
         loop {
             tokio::select! {
                 message = model_rx.recv() => match message {
                     Ok(event) => {
+                        deadline = tokio::time::Instant::now() + self.recovery.idle_timeout;
                         match event {
-                            ModelEvent::Completed { result } => {
+                            ModelEvent::Completed { mut result } => {
                                 let _ = stream.await;
+                                if requested_tools {
+                                    result.stop_reason = "tool_use".into();
+                                }
                                 return AttemptOutcome { result: Ok(result), emitted_output };
                             }
                             ModelEvent::Error { error } => {
@@ -267,6 +281,11 @@ impl GenericModelBackend {
                                 return AttemptOutcome { result: Err(error), emitted_output };
                             }
                             event => {
+                                requested_tools |= matches!(event, ModelEvent::ToolCallCompleted { .. });
+                                progress.requested_tools = requested_tools;
+                                if let ModelEvent::TextDelta { delta } = &event {
+                                    progress.text.push_str(delta);
+                                }
                                 emitted_output |= matches!(event, ModelEvent::TextDelta { .. } | ModelEvent::ReasoningDelta { .. } | ModelEvent::ToolCallCompleted { .. } | ModelEvent::UsageUpdate { .. });
                                 let _ = Self::translate_event(event, request_id, sink);
                             }
@@ -278,10 +297,18 @@ impl GenericModelBackend {
                         return AttemptOutcome { result: Err(ModelError::BackendError { message: format!("lost {count} model events"), code: "EVENT_LAG".to_string() }), emitted_output };
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        let result = match stream.await {
+                        let mut result = match stream.await {
                             Ok(result) => result,
                             Err(error) => Err(ModelError::BackendError { message: format!("model client task failed: {error}"), code: "TASK_PANIC".to_string() }),
                         };
+                        // Some clients return their result without emitting a
+                        // Completed event. Tools still require a follow-up turn
+                        // even when the provider labels the completion STOP.
+                        if requested_tools {
+                            if let Ok(result) = &mut result {
+                                result.stop_reason = "tool_use".into();
+                            }
+                        }
                         return AttemptOutcome { result, emitted_output };
                     }
                 },
@@ -353,7 +380,13 @@ fn to_execution_result(request_id: RequestId, result: ModelResult) -> ExecutionR
         request_id,
         usage: result.usage,
         cost: result.cost,
-        finish_reason: result.stop_reason,
+        // The agent loop uses `tool_use` to keep the run alive until tool
+        // results arrive. Chat Completions uses `tool_calls` instead; passing
+        // it through would finish the run while its tools are still running.
+        finish_reason: match result.stop_reason.as_str() {
+            "tool_calls" | "function_call" => "tool_use".to_string(),
+            _ => result.stop_reason,
+        },
     }
 }
 
@@ -438,7 +471,7 @@ impl ExecutionBackend for GenericModelBackend {
             emit_terminal(&sink, request_id, &final_result);
             return final_result;
         }
-        let model_request = ModelRequest {
+        let mut model_request = ModelRequest {
             system_prompt: request.system_prompt,
             messages: request.messages,
             tools: request.tools,
@@ -458,15 +491,17 @@ impl ExecutionBackend for GenericModelBackend {
             return final_result;
         }
 
-        let deadline = tokio::time::Instant::now() + self.recovery.total_deadline;
         let mut attempt = 1;
         let final_result = loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break Err(ExecutionError::Timeout);
-            }
+            let mut progress = AttemptProgress::default();
             let outcome = self
-                .run_attempt(model_request.clone(), request_id, &sink, &cancel, deadline)
+                .run_attempt(
+                    model_request.clone(),
+                    request_id,
+                    &sink,
+                    &cancel,
+                    &mut progress,
+                )
                 .await;
 
             match outcome.result {
@@ -478,16 +513,37 @@ impl ExecutionBackend for GenericModelBackend {
                     break Err(ExecutionError::Cancelled);
                 }
                 Err(error)
-                    if !outcome.emitted_output
+                    if (!outcome.emitted_output
+                        || (!progress.text.is_empty()
+                            && !progress.requested_tools
+                            && matches!(
+                                model_request.response_format,
+                                None | Some(harness_protocol::backend::ResponseFormat::Text)
+                            )))
                         && error.is_retryable()
-                        && attempt < self.recovery.max_attempts
-                        && tokio::time::Instant::now() < deadline =>
+                        && attempt < self.recovery.max_attempts =>
                 {
                     let delay = self.retry_delay(attempt, &error);
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if delay >= remaining {
+                    if delay >= self.recovery.idle_timeout {
                         self.record_failure(&error);
                         break Err(to_execution_error(error));
+                    }
+                    if !progress.text.is_empty() {
+                        use harness_protocol::ids::{MessageId, Timestamp};
+                        use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
+                        // Continue the answer in context, never replay the original
+                        // request after visible output or repeat side effects.
+                        for (role, text) in [
+                            (MessageRole::Assistant, progress.text),
+                            (MessageRole::User, "The response stream was interrupted. Continue exactly where your previous answer stopped. Output only the remaining text, without repeating earlier content or adding an introduction. Use the research and tool results already in this conversation; do not perform further tool calls.".into()),
+                        ] {
+                            model_request.messages.push(AgentMessage {
+                                id: MessageId::new(), role,
+                                content: vec![ContentBlock::Text { text }],
+                                created_at: Timestamp::now(),
+                            });
+                        }
+                        model_request.tools.clear();
                     }
                     warn!(attempt, ?delay, error = %error, "retrying transient model provider failure");
                     tokio::select! {
@@ -672,10 +728,10 @@ mod tests {
     }
 
     #[test]
-    fn recovery_policy_default_matches_prior_hardcoded_values() {
+    fn recovery_policy_default_allows_long_streamed_answers() {
         let policy = RecoveryPolicy::default();
         assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.total_deadline, Duration::from_secs(15));
+        assert_eq!(policy.idle_timeout, Duration::from_secs(600));
         assert_eq!(policy.circuit_failure_threshold, 3);
         assert_eq!(policy.circuit_open_duration, Duration::from_secs(30));
     }
@@ -684,17 +740,17 @@ mod tests {
     fn recovery_policy_serde_uses_seconds_and_defaults() {
         let policy: RecoveryPolicy = serde_json::from_value(serde_json::json!({
             "max_attempts": 5,
-            "total_deadline_secs": 45
+            "idle_timeout_secs": 45
         }))
         .expect("valid recovery policy");
         assert_eq!(policy.max_attempts, 5);
-        assert_eq!(policy.total_deadline, Duration::from_secs(45));
+        assert_eq!(policy.idle_timeout, Duration::from_secs(45));
         // Fields omitted from the JSON fall back to RecoveryPolicy::default().
         assert_eq!(policy.circuit_failure_threshold, 3);
         assert_eq!(policy.circuit_open_duration, Duration::from_secs(30));
 
         let value = serde_json::to_value(&policy).expect("serializable policy");
-        assert_eq!(value["total_deadline_secs"], 45);
+        assert_eq!(value["idle_timeout_secs"], 45);
         assert_eq!(value["max_attempts"], 5);
     }
 
@@ -702,7 +758,7 @@ mod tests {
     fn recovery_policy_round_trips_through_json() {
         let policy = RecoveryPolicy {
             max_attempts: 4,
-            total_deadline: Duration::from_secs(20),
+            idle_timeout: Duration::from_secs(20),
             circuit_failure_threshold: 7,
             circuit_open_duration: Duration::from_secs(60),
         };
@@ -717,7 +773,7 @@ mod tests {
 
         let custom = RecoveryPolicy {
             max_attempts: 9,
-            total_deadline: Duration::from_secs(3),
+            idle_timeout: Duration::from_secs(3),
             circuit_failure_threshold: 1,
             circuit_open_duration: Duration::from_secs(2),
         };
@@ -744,7 +800,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 3,
-                total_deadline: Duration::from_secs(2),
+                idle_timeout: Duration::from_secs(2),
                 ..RecoveryPolicy::default()
             },
         );
@@ -779,7 +835,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 2,
-                total_deadline: Duration::from_secs(2),
+                idle_timeout: Duration::from_secs(2),
                 ..RecoveryPolicy::default()
             },
         );
@@ -825,7 +881,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 5,
-                total_deadline: Duration::from_secs(30),
+                idle_timeout: Duration::from_secs(30),
                 ..RecoveryPolicy::default()
             },
         );
@@ -877,15 +933,9 @@ mod tests {
         );
     }
 
-    /// M2: provider partial-stream failure — an error arriving *after* some
-    /// deltas were already streamed, not just before any output at all.
-    /// This matters because `GenericModelBackend`'s retry logic explicitly
-    /// only retries when `!outcome.emitted_output` (see `execute`) — a
-    /// failure after partial output must NOT be silently retried (that
-    /// would replay/duplicate the already-emitted deltas to the caller); it
-    /// must propagate as a terminal error on the first such failure.
+    /// Structured output must not be resumed by appending a second document.
     #[tokio::test]
-    async fn partial_stream_failure_after_some_deltas_is_not_retried() {
+    async fn partial_structured_stream_failure_is_not_retried() {
         let client = FakeModelClient::new()
             .with_events(vec![
                 ModelEvent::TextDelta {
@@ -916,7 +966,12 @@ mod tests {
                     messages: Vec::new(),
                     tools: Vec::new(),
                     extended_thinking: false,
-                    params: Default::default(),
+                    params: harness_protocol::backend::ExecutionParams {
+                        response_format: Some(
+                            harness_protocol::backend::ResponseFormat::JsonObject,
+                        ),
+                        ..Default::default()
+                    },
                 },
                 sink,
                 CancellationToken::new(),
@@ -945,6 +1000,197 @@ mod tests {
             "both deltas emitted before the failure must have reached the sink exactly once"
         );
         assert!(saw_error, "the terminal error must also reach the sink");
+    }
+
+    #[tokio::test]
+    async fn interrupted_answers_continue_with_context_without_replaying_tools() {
+        use harness_protocol::messages::{ContentBlock, MessageRole};
+        struct InterruptedAnswer {
+            requests: Mutex<Vec<ModelRequest>>,
+            error: ModelError,
+            emit_tool: bool,
+        }
+        #[async_trait]
+        impl ModelClient for InterruptedAnswer {
+            fn capabilities(&self) -> harness_model::request::ModelCapabilities {
+                FakeModelClient::new().capabilities()
+            }
+            async fn stream(
+                &self,
+                request: ModelRequest,
+                sink: broadcast::Sender<ModelEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<ModelResult, ModelError> {
+                let first = {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(request);
+                    requests.len() == 1
+                };
+                if first {
+                    let _ = sink.send(ModelEvent::TextDelta {
+                        delta: "Research says: ".into(),
+                    });
+                    if self.emit_tool {
+                        let _ = sink.send(ModelEvent::ToolCallCompleted {
+                            id: harness_protocol::ids::ToolCallId::new(),
+                            name: "search".into(),
+                            input: serde_json::json!({}),
+                        });
+                    }
+                    // Exercise the closed-stream return path as real clients
+                    // need not emit a separate terminal model event.
+                    return Err(self.error.clone());
+                }
+                let _ = sink.send(ModelEvent::TextDelta {
+                    delta: "the answer.".into(),
+                });
+                Ok(ModelResult {
+                    stop_reason: "stop".into(),
+                    usage: Default::default(),
+                    cost: Default::default(),
+                })
+            }
+        }
+        for error in [
+            ModelError::Timeout,
+            ModelError::StreamInterrupted {
+                message: "disconnected".into(),
+            },
+        ] {
+            for emit_tool in [false, true] {
+                let client = Arc::new(InterruptedAnswer {
+                    requests: Mutex::new(Vec::new()),
+                    error: error.clone(),
+                    emit_tool,
+                });
+                let backend = GenericModelBackend::new(client.clone());
+                let (sink, mut rx) = broadcast::channel(32);
+                let result = backend
+                    .execute(
+                        harness_protocol::backend::ExecutionRequest {
+                            request_id: RequestId::new(),
+                            run_id: harness_protocol::ids::RunId::new(),
+                            system_prompt: "Use the research already provided".into(),
+                            messages: vec![],
+                            tools: vec![harness_protocol::tools::ToolDescriptor {
+                                id: harness_protocol::ids::ToolId::new(),
+                                name: "search".into(),
+                                description: "Search".into(),
+                                input_schema: serde_json::json!({}),
+                            }],
+                            extended_thinking: false,
+                            params: Default::default(),
+                        },
+                        sink,
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let requests = client.requests.lock().unwrap();
+                if emit_tool {
+                    assert!(result.is_err());
+                    assert_eq!(
+                        requests.len(),
+                        1,
+                        "never replay a turn that dispatched tools"
+                    );
+                    continue;
+                }
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].tools.is_empty());
+                assert_eq!(requests[1].system_prompt, requests[0].system_prompt);
+                assert_eq!(requests[1].messages[0].role, MessageRole::Assistant);
+                assert!(
+                    matches!(&requests[1].messages[0].content[0], ContentBlock::Text { text } if text == "Research says: ")
+                );
+                let mut text = String::new();
+                let mut completed = 0;
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        ExecutionEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        ExecutionEvent::Error { error, .. } => {
+                            panic!("recovered error leaked: {error:?}")
+                        }
+                        ExecutionEvent::Completed { .. } => completed += 1,
+                        _ => {}
+                    }
+                }
+                assert_eq!(text, "Research says: the answer.");
+                assert_eq!(completed, 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_tracks_inactivity_instead_of_stream_duration() {
+        struct SlowStream {
+            stall: bool,
+        }
+        #[async_trait]
+        impl ModelClient for SlowStream {
+            fn capabilities(&self) -> harness_model::request::ModelCapabilities {
+                FakeModelClient::new().capabilities()
+            }
+            async fn stream(
+                &self,
+                _request: ModelRequest,
+                sink: broadcast::Sender<ModelEvent>,
+                cancel: CancellationToken,
+            ) -> Result<ModelResult, ModelError> {
+                for _ in 0..4 {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    let _ = sink.send(ModelEvent::TextDelta {
+                        delta: "text ".into(),
+                    });
+                }
+                if self.stall {
+                    cancel.cancelled().await;
+                    return Err(ModelError::Cancelled);
+                }
+                Ok(ModelResult {
+                    stop_reason: "stop".into(),
+                    usage: Default::default(),
+                    cost: Default::default(),
+                })
+            }
+        }
+        for stall in [false, true] {
+            let backend = GenericModelBackend::new_with_recovery(
+                Arc::new(SlowStream { stall }),
+                RecoveryPolicy {
+                    idle_timeout: Duration::from_secs(10),
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            );
+            let start = tokio::time::Instant::now();
+            let (sink, _rx) = broadcast::channel(32);
+            let result = backend
+                .execute(
+                    harness_protocol::backend::ExecutionRequest {
+                        request_id: RequestId::new(),
+                        run_id: harness_protocol::ids::RunId::new(),
+                        system_prompt: String::new(),
+                        messages: vec![],
+                        tools: vec![],
+                        extended_thinking: false,
+                        params: Default::default(),
+                    },
+                    sink,
+                    CancellationToken::new(),
+                )
+                .await;
+            if stall {
+                assert!(matches!(result, Err(ExecutionError::Timeout)));
+                assert_eq!(start.elapsed(), Duration::from_secs(34));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "active stream must outlive the idle limit: {result:?}"
+                );
+                assert_eq!(start.elapsed(), Duration::from_secs(24));
+            }
+        }
     }
 
     mod harness_generic_backend_test_support {

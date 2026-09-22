@@ -9,7 +9,9 @@ use harness_protocol::ids::{
 };
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 use harness_protocol::tools::{PermissionMode, ToolCall, ToolError, ToolResult, ToolResultSummary};
-use harness_protocol::usage::{AgentUsageMetrics, AgentUsageSnapshot, AgentUsageSummary, UsageRecord};
+use harness_protocol::usage::{
+    AgentUsageMetrics, AgentUsageSnapshot, AgentUsageSummary, UsageRecord,
+};
 
 use crate::agent::Agent;
 use crate::agent_state::PendingToolCall;
@@ -173,6 +175,7 @@ impl Agent {
     }
 
     fn execution_request(&mut self, run_id: RunId) -> ExecutionRequest {
+        self.state.backend_in_flight = true;
         let tools = self
             .capabilities
             .tools
@@ -208,6 +211,7 @@ impl Agent {
         };
         self.state.status = AgentStatus::Failed;
         self.state.active_run = None;
+        self.state.backend_in_flight = false;
         self.state.last_error = Some(error.clone());
         self.usage.runs = self.usage.runs.saturating_add(1);
         vec![
@@ -319,7 +323,9 @@ impl Agent {
                 });
                 effects
             }
-            ExecutionEvent::ToolCallCompleted { call_id, result, .. } => {
+            ExecutionEvent::ToolCallCompleted {
+                call_id, result, ..
+            } => {
                 let from = self.state.status;
                 self.state.status = AgentStatus::Streaming;
                 self.usage.tool_calls = self.usage.tool_calls.saturating_add(1);
@@ -367,14 +373,21 @@ impl Agent {
                 }]
             }
             ExecutionEvent::Completed { result, .. } => {
+                self.state.backend_in_flight = false;
                 let is_tool_turn = result.finish_reason == "tool_use";
                 self.usage.records.push(UsageRecord {
                     model_usage: result.usage,
                     cost: result.cost,
                     tool_usage: None,
                 });
+                if matches!(result.finish_reason.as_str(), "max_tokens" | "length" | "max_output_tokens") {
+                    return self.fail(
+                        "OUTPUT_LIMIT_REACHED",
+                        format!("The model stopped at its output token limit ({}); the response is incomplete.", result.finish_reason),
+                    );
+                }
                 if is_tool_turn {
-                    return Vec::new();
+                    return self.continue_after_tools();
                 }
                 let from = self.state.status;
                 self.state.status = AgentStatus::Idle;
@@ -528,7 +541,13 @@ impl Agent {
                 },
             },
         }];
-        if self.state.pending_tools.is_empty() {
+        effects.extend(self.continue_after_tools());
+        effects
+    }
+
+    fn continue_after_tools(&mut self) -> Vec<AgentEffect> {
+        let mut effects = Vec::new();
+        if self.state.pending_tools.is_empty() && !self.state.backend_in_flight {
             if let Some(run_id) = self.state.active_run {
                 let from = self.state.status;
                 self.state.status = AgentStatus::WaitingForBackend;
@@ -688,6 +707,7 @@ impl Agent {
 
         self.state.status = AgentStatus::Cancelled;
         self.state.active_run = None;
+        self.state.backend_in_flight = false;
         self.state.pending_tools.clear();
         self.state.pending_permissions.clear();
         self.state.children.clear();

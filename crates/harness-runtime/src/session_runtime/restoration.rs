@@ -83,6 +83,8 @@ impl SessionRuntime {
                     messages: stored.messages,
                     context: Default::default(),
                     active_run: stored.active_run,
+                    // A restored session has no surviving backend task.
+                    backend_in_flight: false,
                     queued_inputs: Default::default(),
                     pending_tools: stored
                         .pending_tools

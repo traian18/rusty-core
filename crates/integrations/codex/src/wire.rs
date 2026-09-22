@@ -81,7 +81,11 @@ pub fn extract_codex_item(value: &serde_json::Value) -> Option<ParsedCodexItem> 
     let event_type = value.get("type").and_then(|t| t.as_str())?;
     let item = value.get("item")?;
     let item_type = item.get("type").and_then(|t| t.as_str())?;
-    let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+    let id = item
+        .get("id")
+        .and_then(|i| i.as_str())
+        .unwrap_or("")
+        .to_string();
 
     match item_type {
         "reasoning" => {
@@ -100,13 +104,16 @@ pub fn extract_codex_item(value: &serde_json::Value) -> Option<ParsedCodexItem> 
                 let exit_code = item.get("exit_code").and_then(|c| c.as_i64());
                 let stdout = item.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
                 let stderr = item.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
-                let output = if !stderr.is_empty() && !stdout.is_empty() {
-                    format!("{stdout}\n{stderr}")
-                } else if !stderr.is_empty() {
-                    stderr.to_string()
-                } else {
-                    stdout.to_string()
-                };
+                let output =
+                    if let Some(output) = item.get("aggregated_output").and_then(|s| s.as_str()) {
+                        output.to_string()
+                    } else if !stderr.is_empty() && !stdout.is_empty() {
+                        format!("{stdout}\n{stderr}")
+                    } else if !stderr.is_empty() {
+                        stderr.to_string()
+                    } else {
+                        stdout.to_string()
+                    };
                 Some(ParsedCodexItem::CommandCompleted {
                     id,
                     command,
@@ -196,6 +203,19 @@ pub fn extract_error(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_output_uses_aggregated_output() {
+        let item = serde_json::json!({"type": "item.completed", "item": {
+            "id": "cmd", "type": "command_execution", "command": "git status",
+            "exit_code": 128, "aggregated_output": "fatal: not a git repository"
+        }});
+        assert!(
+            matches!(extract_codex_item(&item), Some(ParsedCodexItem::CommandCompleted {
+            exit_code: Some(128), output, ..
+        }) if output == "fatal: not a git repository")
+        );
+    }
 
     #[test]
     fn extracts_thread_id_from_thread_started() {

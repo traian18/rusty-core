@@ -82,6 +82,7 @@ impl Agent {
                 messages: Vec::new(),
                 context: AgentContextState::default(),
                 active_run: None,
+                backend_in_flight: false,
                 queued_inputs: Default::default(),
                 pending_tools: Default::default(),
                 pending_permissions: Default::default(),
