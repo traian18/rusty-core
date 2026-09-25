@@ -27,6 +27,7 @@ pub struct OpenAiClient {
     config: OpenAiConfig,
     http_client: reqwest::Client,
     tool_ids: ProviderToolIds,
+    auth: Option<Arc<dyn harness_model::auth::InferenceAuth>>,
 }
 
 impl OpenAiClient {
@@ -39,7 +40,12 @@ impl OpenAiClient {
             config,
             http_client,
             tool_ids: Arc::new(Mutex::new(HashMap::new())),
+            auth: None,
         }
+    }
+    pub fn with_auth(mut self, auth: Arc<dyn harness_model::auth::InferenceAuth>) -> Self {
+        self.auth = Some(auth);
+        self
     }
 }
 
@@ -134,7 +140,18 @@ impl ModelClient for OpenAiClient {
             "openai",
         );
 
-        let response = request_builder.json(&body).send().await.map_err(|e| {
+        if let Some(auth) = &self.auth {
+            let headers = tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                result = auth.headers(&body) => result?,
+            };
+            request_builder = request_builder.headers(headers);
+        }
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            result = request_builder.json(&body).send() => result,
+        }
+        .map_err(|e| {
             if e.is_timeout() {
                 ModelError::Timeout
             } else {

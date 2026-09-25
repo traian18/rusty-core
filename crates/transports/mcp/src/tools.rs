@@ -110,6 +110,7 @@ async fn create_session(handler: &Arc<dyn RpcHandler>, config: &McpServeConfig) 
         .handle(
             None,
             RpcRequestBody::CreateSession {
+                execution_policy: None,
                 workspace_root: config.workspace_root.clone(),
                 integration: config.integration.clone(),
                 integration_config: config.integration_config.clone(),

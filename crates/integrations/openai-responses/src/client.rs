@@ -19,6 +19,8 @@ use crate::wire::{
     ProviderToolIds, RESPONSES_MIN_OUTPUT_TOKENS,
 };
 
+pub use harness_model::auth::InferenceAuth as ResponsesAuth;
+
 /// Client for the OpenAI Responses API.
 ///
 /// Implements [`ModelClient`] by converting [`ModelRequest`] into the
@@ -29,6 +31,8 @@ pub struct OpenAiResponsesClient {
     config: OpenAiResponsesConfig,
     http_client: reqwest::Client,
     tool_ids: ProviderToolIds,
+    auth: Option<Arc<dyn ResponsesAuth>>,
+    chatgpt_subscription: bool,
 }
 
 impl OpenAiResponsesClient {
@@ -41,7 +45,20 @@ impl OpenAiResponsesClient {
             config,
             http_client,
             tool_ids: Arc::new(Mutex::new(HashMap::new())),
+            auth: None,
+            chatgpt_subscription: false,
         }
+    }
+
+    pub fn with_auth(mut self, auth: Arc<dyn ResponsesAuth>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_chatgpt_auth(mut self, auth: Arc<dyn ResponsesAuth>) -> Self {
+        self.auth = Some(auth);
+        self.chatgpt_subscription = true;
+        self
     }
 }
 
@@ -74,7 +91,8 @@ impl ModelClient for OpenAiResponsesClient {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ModelResult, ModelError> {
         let mut input = Vec::new();
-        if let Some(system) = build_system_message(&request.system_prompt, &request.messages) {
+        let system = build_system_message(&request.system_prompt, &request.messages);
+        if let Some(system) = system.clone().filter(|_| !self.chatgpt_subscription) {
             input.push(system);
         }
         {
@@ -92,17 +110,15 @@ impl ModelClient for OpenAiResponsesClient {
                 .model
                 .unwrap_or_else(|| self.config.default_model.clone()),
             input,
-            tools: if request.tools.is_empty() {
-                None
-            } else {
-                Some(
-                    request
-                        .tools
-                        .iter()
-                        .map(tool_descriptor_to_responses)
-                        .collect(),
-                )
-            },
+            // An explicit empty array prevents provider_options from introducing
+            // provider-native tools when the harness grants no tools.
+            tools: Some(
+                request
+                    .tools
+                    .iter()
+                    .map(tool_descriptor_to_responses)
+                    .collect(),
+            ),
             max_output_tokens: Some(max_output_tokens),
             temperature: request.temperature,
             reasoning: request.reasoning_effort.map(reasoning_effort_to_responses),
@@ -120,16 +136,32 @@ impl ModelClient for OpenAiResponsesClient {
         for (key, value) in &self.config.extra_headers {
             request_builder = request_builder.header(key, value);
         }
-
-        let body = harness_model::merge_provider_options(
-            serde_json::to_value(&responses_request).map_err(|error| ModelError::InvalidRequest {
-                message: format!("failed to serialize request: {error}"),
+        let mut body = harness_model::merge_provider_options(
+            serde_json::to_value(&responses_request).map_err(|error| {
+                ModelError::InvalidRequest {
+                    message: format!("failed to serialize request: {error}"),
+                }
             })?,
             &request.provider_options,
             "openai-responses",
         );
+        if self.chatgpt_subscription {
+            prepare_chatgpt_body(&mut body, system);
+        }
 
-        let response = request_builder.json(&body).send().await.map_err(|e| {
+        if let Some(auth) = &self.auth {
+            let headers = tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                result = auth.headers(&body) => result?,
+            };
+            request_builder = request_builder.headers(headers);
+        }
+
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            result = request_builder.json(&body).send() => result,
+        }
+        .map_err(|e| {
             if e.is_timeout() {
                 ModelError::Timeout
             } else {
@@ -142,7 +174,14 @@ impl ModelClient for OpenAiResponsesClient {
 
         let status = response.status();
         if status.is_success() {
-            Self::handle_success_response(response, &events, &cancel, self.tool_ids.clone()).await
+            Self::handle_success_response(
+                response,
+                &events,
+                &cancel,
+                self.tool_ids.clone(),
+                self.chatgpt_subscription,
+            )
+            .await
         } else if status.as_u16() == 429 {
             Self::handle_rate_limit(response)
         } else {
@@ -151,12 +190,40 @@ impl ModelClient for OpenAiResponsesClient {
     }
 }
 
+fn prepare_chatgpt_body(
+    body: &mut serde_json::Value,
+    system: Option<crate::wire::ResponsesInputItem>,
+) {
+    use crate::wire::{ResponsesInputContentPart, ResponsesInputItem};
+    let instructions = match system {
+        Some(ResponsesInputItem::InputMessage { content, .. }) => content
+            .into_iter()
+            .filter_map(|part| match part {
+                ResponsesInputContentPart::InputText { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let object = body
+        .as_object_mut()
+        .expect("Responses request is an object");
+    object.insert("instructions".into(), instructions.into());
+    // The subscription endpoint owns the output budget and rejects these API knobs.
+    object.remove("max_output_tokens");
+    object.remove("temperature");
+    object.insert("store".into(), false.into());
+    object.insert("stream".into(), true.into());
+}
+
 impl OpenAiResponsesClient {
     async fn handle_success_response(
         mut response: reqwest::Response,
         events: &ModelEventSender,
         cancel: &tokio_util::sync::CancellationToken,
         tool_ids: ProviderToolIds,
+        subscription: bool,
     ) -> Result<ModelResult, ModelError> {
         let mut parser = OpenAiResponsesSseParser::with_tool_ids(tool_ids);
 
@@ -175,7 +242,12 @@ impl OpenAiResponsesClient {
             };
             let Some(chunk) = chunk else { break };
 
-            for event in parser.push_chunk(&chunk)? {
+            for mut event in parser.push_chunk(&chunk)? {
+                if subscription {
+                    if let harness_model::ModelEvent::Completed { result } = &mut event {
+                        result.cost = Default::default();
+                    }
+                }
                 send_event(events, event, cancel).await?;
             }
         }
@@ -183,7 +255,10 @@ impl OpenAiResponsesClient {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
-        let (terminal_events, result) = parser.finish()?;
+        let (terminal_events, mut result) = parser.finish()?;
+        if subscription {
+            result.cost = Default::default();
+        }
         for event in terminal_events {
             send_event(events, event, cancel).await?;
         }

@@ -782,6 +782,19 @@ impl AgentRunner {
     /// to drain before synthesizing a terminal event, so streamed events are
     /// never overtaken.
     async fn execute_backend(&mut self, request: ExecutionRequest) {
+        // Covers direct runtime construction, restore and child backends too.
+        if self.backend.capabilities().backend_managed_tools {
+            let _ = self.task.commands_tx.send(AgentCommand::BackendEvent {
+                run_id: request.run_id,
+                event: ExecutionEvent::Error {
+                    request_id: request.request_id,
+                    error: ExecutionError::InvalidRequest {
+                        message: "Integration must return tool calls to the harness; backend-managed execution is disabled".into(),
+                    },
+                },
+            }).await;
+            return;
+        }
         if let Err(error) = validate_transcript(&self.agent.state.messages) {
             tracing::error!(
                 ?error,
@@ -853,6 +866,40 @@ impl AgentRunner {
         let call_id = request.call.id;
         let name = request.call.name.clone();
         let arguments = request.call.arguments.clone();
+
+        // Recheck the actual capability before every route, including spawn.
+        // `request.permission` is an effect field, not an authorization grant.
+        let permitted =
+            match crate::permissions::PermissionPolicy.evaluate(&self.agent.capabilities, &name) {
+                crate::permissions::PermissionOutcome::Allow => true,
+                crate::permissions::PermissionOutcome::Denied(_) => false,
+                crate::permissions::PermissionOutcome::RequiresApproval(_) => {
+                    self.agent
+                        .state
+                        .pending_tools
+                        .get(&call_id)
+                        .is_some_and(|pending| {
+                            pending.call.name == name && pending.call.arguments == arguments
+                        })
+                        && !self
+                            .agent
+                            .state
+                            .pending_permissions
+                            .values()
+                            .any(|id| *id == call_id)
+                }
+            };
+        if !permitted {
+            let _ = self
+                .task
+                .commands_tx
+                .send(AgentCommand::ToolFailed {
+                    call_id,
+                    error: harness_protocol::tools::ToolError::PermissionDenied,
+                })
+                .await;
+            return;
+        }
 
         // M5: `agent.spawn` is not a registered `ToolExecutor` — its
         // implementation needs `&mut self` (to call `spawn_agent`, which
@@ -1850,6 +1897,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dispatch_rejects_a_forged_allow_for_an_unapproved_or_denied_tool() {
+        for mode in [
+            harness_protocol::tools::PermissionMode::Ask,
+            harness_protocol::tools::PermissionMode::Deny,
+        ] {
+            let agent_id = AgentId::new();
+            let mut agent =
+                test_agent_with_ask_permission_tool(agent_id, SessionId::new(), "write_file");
+            for capability in agent.capabilities.tools.tools.values_mut() {
+                capability.policy.permission = mode.clone();
+            }
+            let (task, _sender) = AgentTask::new(agent_id);
+            let mut registry = FakeToolRegistry::new();
+            registry.add_executor(Arc::new(FakeToolExecutor::new(
+                harness_tools::ToolDescriptor {
+                    id: harness_tools::ToolId::new("write_file"),
+                    name: "write_file".into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                },
+            )));
+            let mut runner = AgentRunner::new(
+                agent,
+                task,
+                Arc::new(FakeBackend::new()),
+                Arc::new(registry),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+                CancellationToken::new(),
+                Arc::new(Mutex::new(StdHashMap::new())),
+                Arc::new(Scheduler::new(SchedulerConfig::default())),
+            );
+            let call_id = ToolCallId::new();
+            runner
+                .execute_tool(ToolRequest {
+                    call: harness_protocol::tools::ToolCall {
+                        id: call_id,
+                        name: "write_file".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    permission: harness_protocol::tools::PermissionMode::Allow,
+                })
+                .await;
+            assert!(matches!(
+                runner.task.commands.recv().await,
+                Some(AgentCommand::ToolFailed {
+                    error: harness_protocol::tools::ToolError::PermissionDenied,
+                    ..
+                })
+            ));
+        }
+    }
+
     /// M3: `shell.exec` calls must be bounded separately from generic tool
     /// concurrency via `SchedulerConfig::max_concurrent_processes` — a real
     /// OS process is heavier than "a tool call" in general. This proves the
@@ -1871,7 +1972,10 @@ mod tests {
     async fn shell_exec_calls_are_bounded_by_max_concurrent_processes() {
         let agent_id = AgentId::new();
         let session_id = SessionId::new();
-        let agent = test_agent(agent_id, session_id);
+        let mut agent = test_agent_with_ask_permission_tool(agent_id, session_id, "shell.exec");
+        for capability in agent.capabilities.tools.tools.values_mut() {
+            capability.policy.permission = harness_protocol::tools::PermissionMode::Allow;
+        }
         let (task, _sender) = AgentTask::new(agent_id);
 
         let mut registry = FakeToolRegistry::new();

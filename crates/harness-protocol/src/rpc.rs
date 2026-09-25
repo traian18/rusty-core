@@ -61,6 +61,8 @@ pub enum RpcRequestBody {
         protocol_version: u32,
     },
     CreateSession {
+        #[serde(default)]
+        execution_policy: Option<crate::tools::ExecutionPolicy>,
         workspace_root: PathBuf,
         integration: String,
         integration_config: serde_json::Value,
@@ -258,6 +260,8 @@ pub struct DiagnosticsSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolCapabilities {
+    #[serde(default)]
+    pub execution_policy: bool,
     pub resumable_subscribe: bool,
     pub lifecycle_commands: bool,
     pub typed_errors: bool,
@@ -274,6 +278,7 @@ pub struct ProtocolCapabilities {
 impl Default for ProtocolCapabilities {
     fn default() -> Self {
         Self {
+            execution_policy: true,
             resumable_subscribe: true,
             lifecycle_commands: true,
             typed_errors: true,

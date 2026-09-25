@@ -37,6 +37,12 @@ pub fn merge_provider_options(
         return body;
     };
     for (key, value) in overrides {
+        // Tool declarations come exclusively from the harness registry. An
+        // empty toolset must not enable hosted web/shell/MCP execution through
+        // untyped provider options.
+        if matches!(key.as_str(), "tools" | "functions" | "mcp_servers") {
+            continue;
+        }
         existing.entry(key.clone()).or_insert_with(|| value.clone());
     }
     body
@@ -88,5 +94,20 @@ mod tests {
         let provider_options = json!({"openai": "not an object"});
         let merged = merge_provider_options(body.clone(), &provider_options, "openai");
         assert_eq!(merged, body);
+    }
+    #[test]
+    fn provider_options_cannot_add_hosted_or_legacy_tools_to_an_empty_toolset() {
+        let body = json!({"model": "gpt-5.5"});
+        let options = json!({"openai-responses": {
+            "tools": [{"type": "web_search"}],
+            "functions": [{"name": "shell"}],
+            "mcp_servers": [{"url": "https://example.com"}],
+            "top_p": 0.8
+        }});
+        let merged = merge_provider_options(body, &options, "openai-responses");
+        for key in ["tools", "functions", "mcp_servers"] {
+            assert!(merged.get(key).is_none());
+        }
+        assert_eq!(merged["top_p"], 0.8);
     }
 }

@@ -80,7 +80,28 @@ impl AgentCapabilities {
                         return Err(CapabilityError::NotDelegatable(*id));
                     }
                 }
-                toolset.tools.clone()
+                toolset
+                    .tools
+                    .iter()
+                    .map(|(id, requested)| {
+                        let parent = &self.tools.tools[id];
+                        let mut child = parent.clone();
+                        child.policy.enabled &= requested.policy.enabled;
+                        child.delegatable &= requested.delegatable;
+                        use harness_protocol::tools::PermissionMode;
+                        child.policy.permission =
+                            match (&parent.policy.permission, &requested.policy.permission) {
+                                (PermissionMode::Deny, _) | (_, PermissionMode::Deny) => {
+                                    PermissionMode::Deny
+                                }
+                                (PermissionMode::Ask, _) | (_, PermissionMode::Ask) => {
+                                    PermissionMode::Ask
+                                }
+                                _ => PermissionMode::Allow,
+                            };
+                        (*id, child)
+                    })
+                    .collect()
             }
         };
 
@@ -123,6 +144,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn replacement_cannot_change_tool_identity_or_remove_parent_approval() {
+        let mut parent = parent_with_one_delegatable_tool();
+        let id = *parent.tools.tools.keys().next().unwrap();
+        parent.tools.tools.get_mut(&id).unwrap().policy.permission = PermissionMode::Ask;
+        let mut replacement = parent.tools.clone();
+        let tool = replacement.tools.get_mut(&id).unwrap();
+        tool.descriptor.name = "shell.exec".into();
+        tool.policy.permission = PermissionMode::Allow;
+        let child = parent
+            .derive_child_capabilities(&ToolInheritance::Replace(replacement))
+            .unwrap();
+        assert_eq!(child.tools[&id].descriptor.name, "fs.read");
+        assert!(matches!(
+            child.tools[&id].policy.permission,
+            PermissionMode::Ask
+        ));
+    }
 
     fn parent_with_one_delegatable_tool() -> AgentCapabilities {
         let tool_id = ToolId::new();

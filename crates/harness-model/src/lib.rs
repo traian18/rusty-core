@@ -2,6 +2,7 @@
 
 //! Provider-neutral model requests, responses, streams, tool calls, and usage types.
 
+pub mod auth;
 pub mod client;
 pub mod events;
 pub mod provider_options;

@@ -202,6 +202,7 @@ export interface AgentEventEnvelope {
 }
 
 export interface ProtocolCapabilities {
+  execution_policy?: boolean;
   resumable_subscribe: boolean;
   lifecycle_commands: boolean;
   typed_errors: boolean;
@@ -285,6 +286,7 @@ export type RpcRequestBody =
   | {
       type: "create_session";
       payload: {
+        execution_policy?: ExecutionPolicy;
         workspace_root: string;
         integration: string;
         integration_config: unknown;
@@ -370,4 +372,11 @@ export function isKnownRpcResponseBody(body: RpcResponseBody): body is RpcRespon
 
     "failure",
   ].includes(body.type);
+}
+
+/** Skill grants intersected with harness mode restrictions. Empty lists grant nothing. */
+export interface ExecutionPolicy {
+  mode: "execute" | "plan" | "virtual";
+  enabled_tools: string[];
+  allowed_mcp_servers: string[];
 }

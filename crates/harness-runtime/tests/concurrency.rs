@@ -549,12 +549,8 @@ async fn scheduler_serializes_backend_calls_under_low_permit_count() {
 /// evaluations for different agents with different permission modes produce
 /// correct, non-interfering outcomes.
 ///
-/// NOTE: `PermissionPolicy::evaluate` is not currently invoked inside
-/// [`AgentRunner::execute_tool`]; wiring that check in is a behaviour
-/// change to `agent_runner.rs` beyond pure test-writing.  This test only
-/// validates the policy function itself under concurrency, not the runtime
-/// integration.  If the wiring were added, this test (re-purposed or
-/// extended) would exercise the end-to-end path.
+/// This verifies policy evaluation in isolation. Dispatch enforcement is covered
+/// by agent_runner's permission tests and the engine's skill_permissions_e2e tests.
 #[tokio::test]
 async fn concurrent_ask_permission_requests_do_not_leak_across_agents() {
     use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};

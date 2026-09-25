@@ -95,6 +95,7 @@ async fn full_stack_create_session_snapshot_close() {
         id: RequestCorrelationId(1),
         session_id: None,
         body: RpcRequestBody::CreateSession {
+            execution_policy: None,
             workspace_root: workspace_dir.path().to_path_buf(),
             integration: "anthropic".to_string(),
             integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),
@@ -214,6 +215,7 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
         id: RequestCorrelationId(1),
         session_id: None,
         body: RpcRequestBody::CreateSession {
+            execution_policy: None,
             workspace_root: workspace_dir.path().to_path_buf(),
             integration: "anthropic".to_string(),
             integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),
@@ -402,6 +404,7 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
         id: RequestCorrelationId(1),
         session_id: None,
         body: RpcRequestBody::CreateSession {
+            execution_policy: None,
             workspace_root: workspace_dir.path().to_path_buf(),
             integration: "anthropic".to_string(),
             integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),

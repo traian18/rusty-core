@@ -581,6 +581,7 @@ mod tests {
             id: harness_protocol::rpc::RequestCorrelationId(2),
             session_id: None,
             body: RpcRequestBody::CreateSession {
+                execution_policy: None,
                 workspace_root: std::path::PathBuf::from("/tmp/ws"),
                 integration: "anthropic".to_string(),
                 integration_config: serde_json::json!({}),

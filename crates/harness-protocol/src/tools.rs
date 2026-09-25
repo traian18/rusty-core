@@ -6,6 +6,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ToolCallId, ToolId};
 
+/// Permissions supplied by the application, separately from model instructions.
+/// An empty allowlist grants no tools. Missing fields fail deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    pub mode: ExecutionMode,
+    pub enabled_tools: Vec<String>,
+    pub allowed_mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Execute,
+    Plan,
+    Virtual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub id: ToolId,

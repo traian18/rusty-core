@@ -174,6 +174,7 @@ impl HarnessRpcHandler {
 
     async fn create_session(
         &self,
+        execution_policy: Option<harness_protocol::tools::ExecutionPolicy>,
         workspace_root: std::path::PathBuf,
         integration: String,
         integration_config: serde_json::Value,
@@ -198,6 +199,9 @@ impl HarnessRpcHandler {
         };
         for spec in mcp_servers {
             builder = builder.mcp_server(mcp_config_from_spec(spec));
+        }
+        if let Some(policy) = execution_policy {
+            builder = builder.execution_policy(policy);
         }
         if let Some(spec) = skills {
             builder = builder.skills(skills_config_from_spec(spec, &workspace_root));
@@ -514,6 +518,7 @@ impl RpcHandler for HarnessRpcHandler {
                 "Hello must be handled by the transport",
             ),
             RpcRequestBody::CreateSession {
+                execution_policy,
                 workspace_root,
                 integration,
                 integration_config,
@@ -522,6 +527,7 @@ impl RpcHandler for HarnessRpcHandler {
                 skills,
             } => {
                 self.create_session(
+                    execution_policy,
                     workspace_root,
                     integration,
                     integration_config,

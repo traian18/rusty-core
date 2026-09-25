@@ -72,6 +72,7 @@ pub async fn run(
         .request(
             None,
             RpcRequestBody::CreateSession {
+                execution_policy: None,
                 workspace_root: workspace,
                 integration,
                 integration_config,

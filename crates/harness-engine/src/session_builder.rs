@@ -83,6 +83,10 @@ impl EventSink for BroadcastEventSink {
 /// Errors raised while configuring or operating a session.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
+    #[error(
+        "This integration executes tools outside the harness. Use a model API integration so skill permissions can be enforced."
+    )]
+    BackendManagedTools,
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
     #[error("provider catalog error: {0}")]
@@ -143,6 +147,7 @@ fn discovered_capability(
 
 /// Fluent builder for direct or registry-backed sessions.
 pub struct SessionBuilder {
+    execution_policy: Option<harness_protocol::tools::ExecutionPolicy>,
     backend: Option<Arc<dyn ExecutionBackend>>,
     integration: Option<PendingIntegration>,
     integrations: Arc<IntegrationRegistry>,
@@ -165,6 +170,7 @@ pub struct SessionBuilder {
     /// MCP servers to connect at [`start`](Self::start) — see
     /// [`mcp_server`](Self::mcp_server).
     mcp_servers: Vec<McpServerConfig>,
+    optional_mcp_servers: std::collections::HashSet<String>,
     /// Skill directories to scan at [`start`](Self::start) — see
     /// [`skills`](Self::skills). `None` disables skills entirely.
     skills: Option<SkillsConfig>,
@@ -182,6 +188,7 @@ impl SessionBuilder {
     /// A fresh [`SessionManager`] is created internally.
     pub fn with_integrations(integrations: Arc<IntegrationRegistry>) -> Self {
         Self {
+            execution_policy: None,
             backend: None,
             integration: None,
             integrations,
@@ -192,6 +199,7 @@ impl SessionBuilder {
             context_provider: None,
             execution_params: None,
             mcp_servers: Vec::new(),
+            optional_mcp_servers: Default::default(),
             skills: None,
         }
     }
@@ -207,6 +215,7 @@ impl SessionBuilder {
         session_manager: Arc<SessionManager>,
     ) -> Self {
         Self {
+            execution_policy: None,
             backend: None,
             integration: None,
             integrations,
@@ -217,6 +226,7 @@ impl SessionBuilder {
             context_provider: None,
             execution_params: None,
             mcp_servers: Vec::new(),
+            optional_mcp_servers: Default::default(),
             skills: None,
         }
     }
@@ -251,6 +261,12 @@ impl SessionBuilder {
         self
     }
 
+    /// Enforce application mode and skill permissions after all tool discovery.
+    pub fn execution_policy(mut self, policy: harness_protocol::tools::ExecutionPolicy) -> Self {
+        self.execution_policy = Some(policy);
+        self
+    }
+
     /// Connect an MCP server at [`start`](Self::start) and register every
     /// tool it advertises alongside the session's other tools.
     ///
@@ -261,6 +277,14 @@ impl SessionBuilder {
     /// server; each gets its own process and its tools are namespaced
     /// `mcp.<name>.<tool>` so servers (and built-in tools) never collide.
     pub fn mcp_server(mut self, config: McpServerConfig) -> Self {
+        self.mcp_servers.push(config);
+        self
+    }
+
+    /// Like `mcp_server`, but an unavailable server does not abort the session.
+    /// Permission checks still run before attempting connection.
+    pub fn optional_mcp_server(mut self, config: McpServerConfig) -> Self {
+        self.optional_mcp_servers.insert(config.name.clone());
         self.mcp_servers.push(config);
         self
     }
@@ -416,6 +440,10 @@ impl SessionBuilder {
             .tool_registry
             .ok_or(HarnessError::MissingToolRegistry)?;
 
+        if backend.capabilities().backend_managed_tools {
+            return Err(HarnessError::BackendManagedTools);
+        }
+
         // Connect any configured MCP servers and register their tools into
         // the same registry as the built-in ones — from here on an MCP
         // tool and `fs.read` look identical to the rest of the builder.
@@ -423,12 +451,24 @@ impl SessionBuilder {
         // the no-explicit-toolset fallback (which reads straight from
         // `tool_registry.descriptors()`) picks the MCP tools up too.
         let mut discovered_descriptors = Vec::new();
+        let mut allowed_mcp_tools = Vec::new();
         for config in &self.mcp_servers {
-            let executors = harness_tool_mcp::connect_and_discover(config)
-                .await
-                .map_err(|error| HarnessError::Mcp(config.name.clone(), error))?;
+            if self.execution_policy.as_ref().is_some_and(|policy| {
+                !harness_core::execution_policy::allows_mcp_server(policy, &config.name)
+            }) {
+                continue;
+            }
+            let executors = match harness_tool_mcp::connect_and_discover(config).await {
+                Ok(executors) => executors,
+                Err(error) if self.optional_mcp_servers.contains(&config.name) => {
+                    tracing::warn!(server = %config.name, %error, "skipping unavailable MCP server");
+                    continue;
+                }
+                Err(error) => return Err(HarnessError::Mcp(config.name.clone(), error)),
+            };
             for executor in executors {
                 let descriptor = executor.descriptor();
+                allowed_mcp_tools.push(descriptor.id.to_string());
                 let _ = tool_registry.register(executor);
                 discovered_descriptors.push(discovered_capability(descriptor));
             }
@@ -465,13 +505,21 @@ impl SessionBuilder {
         // A high-level toolset carries explicit policy. For callers that
         // provide a registry directly, derive an enabled/allowed toolset so
         // registered tools are also executable by the root agent.
-        let root_toolset = match self.root_toolset {
+        let mut root_toolset = match self.root_toolset {
             Some(mut toolset) => {
                 // `.toolset()` already fixed its policy before MCP servers
                 // and skills were discovered — merge the newly discovered
                 // tools in rather than rebuilding from the registry, which
                 // would silently drop the caller's explicit choices.
-                toolset.tools.extend(discovered_descriptors);
+                for (id, capability) in discovered_descriptors {
+                    if !toolset
+                        .tools
+                        .values()
+                        .any(|existing| existing.descriptor.name == capability.descriptor.name)
+                    {
+                        toolset.tools.insert(id, capability);
+                    }
+                }
                 toolset
             }
             None => {
@@ -483,6 +531,13 @@ impl SessionBuilder {
                 AgentToolset { tools }
             }
         };
+        if let Some(policy) = &self.execution_policy {
+            harness_core::execution_policy::restrict_toolset(
+                policy,
+                &mut root_toolset,
+                &allowed_mcp_tools,
+            );
+        }
         let protocol_descriptors = root_toolset
             .enabled_descriptors()
             .into_iter()

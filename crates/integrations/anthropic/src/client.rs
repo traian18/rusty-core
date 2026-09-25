@@ -39,6 +39,7 @@ pub struct AnthropicClient {
     http_client: reqwest::Client,
     /// Provider-issued tool IDs retained across model turns.
     tool_ids: ProviderToolIds,
+    auth: Option<Arc<dyn harness_model::auth::InferenceAuth>>,
 }
 
 impl AnthropicClient {
@@ -57,7 +58,12 @@ impl AnthropicClient {
             config,
             http_client,
             tool_ids: Arc::new(Mutex::new(HashMap::new())),
+            auth: None,
         }
+    }
+    pub fn with_auth(mut self, auth: Arc<dyn harness_model::auth::InferenceAuth>) -> Self {
+        self.auth = Some(auth);
+        self
     }
 }
 
@@ -128,11 +134,10 @@ impl ModelClient for AnthropicClient {
         let requested_max_tokens = request.max_tokens.unwrap_or(self.config.default_max_tokens);
         let url = format!("{}/v1/messages", self.config.base_url);
         let body = self.build_body(&request, requested_max_tokens)?;
-        let response = self
-            .post_messages(&url, &body)
-            .send()
-            .await
-            .map_err(Self::map_send_error)?;
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            result = self.send_messages(&url, &body) => result?,
+        };
         let status = response.status();
 
         if status.is_success() {
@@ -177,11 +182,10 @@ impl ModelClient for AnthropicClient {
             "provider rejected max_tokens above the model's real output ceiling; retrying once with the corrected value"
         );
         let corrected_body = self.build_body(&request, allowed)?;
-        let retry_response = self
-            .post_messages(&url, &corrected_body)
-            .send()
-            .await
-            .map_err(Self::map_send_error)?;
+        let retry_response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            result = self.send_messages(&url, &corrected_body) => result?,
+        };
         let retry_status = retry_response.status();
 
         if retry_status.is_success() {
@@ -280,16 +284,28 @@ impl AnthropicClient {
         let mut request_builder = self
             .http_client
             .post(url)
-            .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
-        if !self.config.api_key.is_empty() {
+        if self.auth.is_none() && !self.config.api_key.is_empty() {
+            request_builder = request_builder.header("x-api-key", &self.config.api_key);
             request_builder =
                 request_builder.header("authorization", format!("Bearer {}", self.config.api_key));
         }
 
         request_builder.json(body)
+    }
+
+    async fn send_messages(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ModelError> {
+        let mut builder = self.post_messages(url, body);
+        if let Some(auth) = &self.auth {
+            builder = builder.headers(auth.headers(body).await?);
+        }
+        builder.send().await.map_err(Self::map_send_error)
     }
 
     fn map_send_error(error: reqwest::Error) -> ModelError {

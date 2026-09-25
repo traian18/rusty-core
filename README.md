@@ -30,7 +30,7 @@ This README covers what the engine does, how it works, every integration and too
 - **Multi-session, multi-agent runtime** — `harness-runtime` runs any number of sessions concurrently (each with a root agent that can spawn child agents), with a shared scheduler, resource manager, and per-backend rate limiting.
 - **Streaming event model** — every observable occurrence is an `AgentEventEnvelope` carrying routing metadata (`session_id`, `agent_id`, `parent_agent_id`, `run_id`) and two monotonic sequence numbers for exact ordering. Subscribers get a live push stream; reconnecting clients can **resume from a sequence number without gaps or duplicates**.
 - **Durable session persistence** — every durable event is written to a `SessionStore` (JSONL or WAL-mode SQLite) as it happens, plus periodic state snapshots. Sessions survive daemon restarts and can be restored via `Harness::restore_session`. Raw streaming deltas stay ephemeral by design (see [Durability](#durability-and-resume)).
-- **Seven pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and the `claude`/`codex`/`copilot` CLIs driven as subprocesses. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is currently wired up.
+- **Seven pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and Claude, Codex, and Copilot subscription inference APIs. All tools execute through the harness. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is currently wired up.
 - **Built-in resilience** — every HTTP model call goes through retry with exponential backoff + jitter, a shared deadline across attempts, and a circuit breaker. Settings are configurable per provider (see [Provider resilience](#provider-resilience)).
 - **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), and model-initiated subagent delegation (`agent.spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
 - **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire).
@@ -158,13 +158,13 @@ The policy is a serializable struct embedded in every HTTP provider config as `r
 
 The legacy JSON key `total_deadline_secs` is accepted as an alias for `idle_timeout_secs`; it now measures inactivity.
 
-The `claude-code`/`codex`/`github-copilot` subprocess backends bypass this layer entirely (the CLI manages its own network retries); only the four HTTP backends go through it.
+The `claude-code`, `codex`, and `github-copilot` subscription integrations also use HTTP model clients and the generic backend recovery layer. No provider runs its own tool loop.
 
 ---
 
 ## Integrations
 
-Seven model backends ship today, sharing one of two shapes: a **direct HTTP client** against the provider's own API, or a **subprocess driver** that shells out to a CLI the provider already publishes and translates its output into the same event stream.
+Model integrations use direct inference APIs. They return proposed function calls; the harness authorizes and executes tools. Backends that declare provider-owned tool execution are rejected.
 
 | Integration | Crate | Kind | Credential source | Registered in `harnessd` | Registered in `apps/harness` (standalone TUI) |
 |---|---|---|---|:---:|:---:|
@@ -172,9 +172,9 @@ Seven model backends ship today, sharing one of two shapes: a **direct HTTP clie
 | `openai` | `harness-integration-openai` | HTTP (Chat Completions) | `OPENAI_API_KEY` or `api_key` in config | ✅ | ✅ |
 | `gemini` | `harness-integration-gemini` | HTTP | `GEMINI_API_KEY` or `api_key` in config | ✅ | not wired |
 | `openai-compatible` | `harness-integration-openai-compatible` | HTTP (OpenAI-shaped) | optional `api_key` (some local servers need none) | ✅ | not wired |
-| `claude-code` | `harness-integration-claude-code` | subprocess (`claude`) | CLI's own credential store (`claude` login) | ✅ | ✅ |
-| `codex` | `harness-integration-codex` | subprocess (`codex`) | CLI's own credential store (`codex login`) | ✅ | ✅ |
-| `github-copilot` | `harness-integration-github-copilot` | subprocess (`copilot`) | CLI's own credential store (`copilot login`) | ✅ | ✅ |
+| `claude-code` | `harness-integration-claude-code` | HTTP (Messages API) | Claude OAuth credential store | ✅ | ✅ |
+| `codex` | `harness-integration-codex` | HTTP (ChatGPT Responses) | Codex OAuth credential store | ✅ | ✅ |
+| `github-copilot` | `harness-integration-github-copilot` | HTTP (Copilot model APIs) | Copilot token environment/configuration/Keychain | ✅ | ✅ |
 
 All seven integrations are registered in both `harnessd` and the standalone TUI, so every backend is reachable over the daemon/`harnessctl` path as well as in-process.
 
@@ -189,13 +189,15 @@ Every HTTP integration's config is a flat JSON object passed via `--config-json`
 | `gemini` | none (reads `GEMINI_API_KEY`) | `api_key`, `base_url` |
 | `openai-compatible` | `base_url`, `model` — no defaults, both required | `api_key` (omit for an unauthenticated local server), `extra_headers` |
 
-The three subprocess integrations don't take API keys at all — they drive an already-authenticated CLI:
+The subscription integrations reuse sign-in credentials without launching an agent CLI:
 
-| Integration | Fields | Notes |
+| Integration | Optional fields | Details |
 |---|---|---|
-| `claude-code` | `binary_path` (default: resolve `claude` on `PATH`), `extra_args`, `permission_mode` (default `bypassPermissions` — the harness is the single permission layer), `timeout_secs` | See [subprocess troubleshooting](#troubleshooting-claude-codecodex-subprocess-spawn-failures) below |
-| `codex` | `binary_path` (default `codex`), `extra_args`, `sandbox_mode` (`read-only` \| `workspace-write` \| `danger-full-access`, default `workspace-write`), `dangerously_bypass`, `working_dir` | `sandbox_mode`/`working_dir` only apply on a fresh session — `codex exec resume` doesn't accept `--sandbox`/`-C` and inherits the original session's policy |
-| `github-copilot` | `binary_path` (default `copilot`), `model` (default `"auto"`), `working_dir` | |
+| `claude-code` | `credentials_path`, `default_model` | [Claude subscription authentication](crates/integrations/claude-code/README.md) |
+| `codex` | `auth_path`, `default_model` | [ChatGPT subscription authentication](crates/integrations/codex/README.md) |
+| `github-copilot` | `credentials_path`, `default_model`, `github_host` | [Copilot subscription authentication](crates/integrations/github-copilot/README.md) |
+
+Legacy CLI fields (`binary_path`, `permission_mode`, `dangerously_bypass`, etc.) are rejected. Skill tool grants and mode restrictions are passed separately as the session's `execution_policy`; they cannot be overridden by provider configuration or model output.
 
 Example — pointing `openai-compatible` at a local Ollama server:
 
@@ -439,7 +441,7 @@ Architecturally, skills add **no new seams**. The catalog reaches the model thro
 | Context | `harness-context` | Injects a system prompt / workspace summary and truncates the transcript when it grows too large |
 | Skills | `harness-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
 | Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
-| Subprocess backends | `crates/integrations/{claude-code,codex,github-copilot}` | Drive the `claude`/`codex`/`copilot` CLIs as subprocesses — the CLI manages its own tools and context, this just translates its output |
+| Subscription inference | `crates/integrations/{claude-code,codex,github-copilot}` | Authenticate model API requests; the harness owns tools and context |
 | Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client, `skill.load`/`skill.read` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
 | Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
@@ -457,7 +459,7 @@ Build everything first:
 cargo build --release
 ```
 
-### Option A — no API key needed (if you have the Claude Code CLI installed and logged in)
+### Option A — existing Claude subscription sign-in
 
 ```console
 mkdir -p /tmp/demo-workspace
@@ -468,7 +470,7 @@ mkdir -p /tmp/demo-workspace
 # Terminal 2: drive it
 SID=$(./target/release/harnessctl --socket /tmp/demo.sock session create \
   --workspace /tmp/demo-workspace --integration claude-code \
-  --config-json '{"sandbox_mode":"read-only","permission_mode":"bypassPermissions"}')
+  --config-json '{}')
 
 ./target/release/harnessctl --socket /tmp/demo.sock session send "$SID" \
   "In one short sentence, what is a Rust trait?"
@@ -502,25 +504,9 @@ Pass `--json` for raw envelope JSON. If the connection drops mid-run (sleep/wake
 
 Every durable event with `session_sequence > 12` is replayed first, then live events continue — no gaps, no duplicates. See [Durability and resume](#durability-and-resume) for what's replayable.
 
-### Troubleshooting `claude-code`/`codex`/`github-copilot` subprocess spawn failures
+### Subscription authentication troubleshooting
 
-These three backends spawn a real CLI as a child process, which means `harnessd` needs that CLI to actually be reachable from *its own* process environment — not just from whatever terminal you happen to be typing in. Two failure modes come up in practice:
-
-**`Error: BackendError { message: "failed to spawn claude CLI: No such file or directory (os error 2)" ... }`**
-`harnessd` inherits its `PATH` from whatever shell launched it. If `claude` isn't on `PATH` in *that* shell (e.g. `harnessd` was started before `nvm`/`asdf`/etc. initialized, or from a non-interactive shell), the plain-name lookup fails — even though `which claude` works fine when you check it in a normal interactive terminal afterward. Fix: skip `PATH` lookup entirely by pointing `binary_path` at the absolute path, found by running `which claude` in the *same terminal* you use to start `harnessd`:
-
-```console
-which claude   # run this in the terminal where harnessd is (or will be) started
-
---config-json '{"sandbox_mode":"read-only","permission_mode":"bypassPermissions","binary_path":"/absolute/path/from/which/claude"}'
-```
-
-If `which claude` prints nothing at all in that terminal, that's a real "not installed / not on PATH anywhere" problem to fix at the shell level first — no `binary_path` value will paper over that. The same applies verbatim to `codex`/`which codex` and `github-copilot`/`which copilot`.
-
-**`Please update your Node.js version or visit https://nodejs.org/ for additional instructions.`**
-This comes from the `claude` CLI's own launcher script (it's a Node.js shim, `#!/usr/bin/env node`), not from the harness. It means the `node` binary that resolves on `PATH` in `harnessd`'s environment is too old — commonly caused by a `conda`/`pyenv`/etc. environment putting its own bundled `node` ahead of `nvm`'s in `PATH` (a `(base)` conda prompt is a strong hint). `binary_path` doesn't help here since the problem is one level down, inside the shebang's own `PATH` lookup for `node` — fix it by deactivating conda before starting `harnessd`, or reordering `PATH` so the right `node` wins.
-
-All three subprocess backends are the only ones that spawn a subprocess at all — `anthropic`/`openai`/`gemini`/`openai-compatible` just make an HTTP call and never hit either issue.
+These integrations do not launch the provider CLIs for inference. Check the signed-in account and the credential source documented for the integration. On macOS, allow the harness application access to the matching Keychain item when prompted. Authentication/entitlement failures are returned explicitly; they do not trigger CLI execution or API-key billing fallback.
 
 ### Option B — with a real model API key
 
@@ -549,7 +535,7 @@ Composing `session create`/`send`/`events` by hand gets old fast. `harnessctl ch
 ```console
 ./target/release/harnessctl --socket /tmp/demo.sock chat \
   --workspace /tmp/demo-workspace --integration claude-code \
-  --config-json '{"sandbox_mode":"read-only","permission_mode":"bypassPermissions"}' \
+  --config-json '{}' \
   --all-tools
 ```
 

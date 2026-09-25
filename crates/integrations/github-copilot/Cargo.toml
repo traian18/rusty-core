@@ -14,8 +14,17 @@ harness-runtime = { path = "../../harness-runtime" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "macros"] }
 tokio-util = { workspace = true }
+
+harness-model = { path = "../../harness-model" }
+harness-generic-backend = { path = "../../harness-generic-backend" }
+harness-integration-openai = { path = "../openai" }
+harness-integration-openai-responses = { path = "../openai-responses" }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

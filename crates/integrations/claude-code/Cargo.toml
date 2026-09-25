@@ -12,7 +12,7 @@ publish = false
 harness-protocol = { path = "../../harness-protocol" }
 harness-runtime = { path = "../../harness-runtime" }
 async-trait.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +20,19 @@ rust_decimal.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util"] }
+harness-model = { path = "../../harness-model" }
+harness-generic-backend = { path = "../../harness-generic-backend" }
+harness-integration-anthropic = { path = "../anthropic" }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tempfile = "3"
+
+harness-engine = { path = "../../harness-engine" }
+harness-tools = { path = "../../harness-tools" }
+harness-context = { path = "../../harness-context" }

@@ -169,6 +169,7 @@ async fn run_scenario(client: &mut dyn WireClient, workspace_root: PathBuf) -> V
             id: RequestCorrelationId(1),
             session_id: None,
             body: RpcRequestBody::CreateSession {
+                execution_policy: None,
                 workspace_root,
                 integration: "anthropic".to_string(),
                 integration_config: serde_json::to_value(AnthropicConfig::new("test-key")).unwrap(),

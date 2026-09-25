@@ -8,6 +8,7 @@ import type { Transport } from "../transport.js";
 const SESSION_ID = "00000000-0000-0000-0000-000000000001";
 
 class MockTransport implements Transport {
+  executionPolicy = true;
   readonly requests: RpcRequest[] = [];
   private messageListener: ((response: RpcResponse) => void) | undefined;
   private closeListener: ((reason?: Error) => void) | undefined;
@@ -21,6 +22,7 @@ class MockTransport implements Transport {
         payload: {
           protocol_version: 2,
           capabilities: {
+            execution_policy: this.executionPolicy,
             resumable_subscribe: true,
             lifecycle_commands: true,
             typed_errors: true,
@@ -155,4 +157,19 @@ test("attachment bytes use serde Vec<u8> JSON arrays", () => {
     attachments: [{ mime_type: "text/plain", data: [104, 105] }],
   } satisfies UserInput;
   assert.deepEqual(JSON.parse(JSON.stringify(input)), input);
+});
+
+test("createSession forwards skill permissions and refuses an older harness", async () => {
+  const executionPolicy = { mode: "plan" as const, enabled_tools: ["write_file"], allowed_mcp_servers: [] };
+  const transport = new MockTransport();
+  const client = await HarnessClient.connect(transport);
+  await client.createSession({ workspaceRoot: "/workspace", integration: "test", executionPolicy });
+  const body = transport.requests[1]?.body;
+  assert.equal(body?.type, "create_session");
+  assert.deepEqual(body?.type === "create_session" && body.payload.execution_policy, executionPolicy);
+  const oldTransport = new MockTransport();
+  oldTransport.executionPolicy = false;
+  const oldClient = await HarnessClient.connect(oldTransport);
+  await assert.rejects(oldClient.createSession({ workspaceRoot: "/workspace", integration: "test", executionPolicy }), /refusing to discard/);
+  assert.equal(oldTransport.requests.length, 1);
 });

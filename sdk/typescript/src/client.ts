@@ -16,6 +16,7 @@ import type {
   AdmissionResult,
   AgentEventEnvelope,
   AgentToolset,
+  ExecutionPolicy,
   McpServerSpec,
   SkillsSpec,
   MutationCommand,
@@ -37,6 +38,7 @@ export interface ConnectOptions {
 }
 
 export interface CreateSessionOptions {
+  executionPolicy?: ExecutionPolicy;
   workspaceRoot: string;
   integration: string;
   integrationConfig?: unknown;
@@ -148,10 +150,14 @@ export class HarnessClient {
   }
 
   async createSession(options: CreateSessionOptions): Promise<HarnessSession> {
+    if (options.executionPolicy && !this.capabilities.execution_policy) {
+      throw new HarnessRpcError("This harness does not support execution policies; refusing to discard skill permissions");
+    }
     const body = await this.request({
       type: "create_session",
       payload: {
         workspace_root: options.workspaceRoot,
+        ...(options.executionPolicy ? { execution_policy: options.executionPolicy } : {}),
         integration: options.integration,
         integration_config: options.integrationConfig ?? {},
         toolset: options.toolset ?? { tools: {} },
