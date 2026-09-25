@@ -23,10 +23,43 @@ pub struct McpToolExecutor {
     descriptor: ToolDescriptor,
 }
 
+/// The registry ID of a server's tool, which is also the name the model sees
+/// and calls it by. Model APIs only accept `^[a-zA-Z0-9_-]+$` (Anthropic caps
+/// names at 128 characters, OpenAI at 64), so a dotted `mcp.server.tool`
+/// would be rejected before the first turn.
+pub fn mcp_tool_id(server: &str, tool: &str) -> String {
+    const MAX_LEN: usize = 64;
+    let raw = format!("mcp__{server}__{tool}");
+    let safe: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe == raw && safe.len() <= MAX_LEN {
+        return safe;
+    }
+    // Replacing or truncating characters could make two tools collide, so
+    // an altered name carries a hash of the original.
+    let suffix = format!("_{:08x}", fnv1a(raw.as_bytes()));
+    let keep = (MAX_LEN - suffix.len()).min(safe.len());
+    format!("{}{suffix}", &safe[..keep])
+}
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 impl McpToolExecutor {
     pub fn new(client: Arc<McpClient>, server_name: &str, info: McpToolInfo) -> Self {
         let descriptor = ToolDescriptor {
-            id: ToolId::new(format!("mcp.{server_name}.{}", info.name)),
+            id: ToolId::new(mcp_tool_id(server_name, &info.name)),
             name: info.name.clone(),
             description: info
                 .description
@@ -108,10 +141,27 @@ fn call_result_to_output(result: &CallToolResult) -> Value {
 pub async fn connect_and_discover(
     config: &McpServerConfig,
 ) -> Result<Vec<Arc<dyn ToolExecutor>>, McpError> {
+    discover(config, |_| true).await
+}
+
+/// Like [`connect_and_discover`], but keeps only tools the server marks
+/// read-only (see [`McpToolInfo::is_read_only`]) -- for sessions that may
+/// read through an MCP server but must not change anything with it.
+pub async fn connect_and_discover_read_only(
+    config: &McpServerConfig,
+) -> Result<Vec<Arc<dyn ToolExecutor>>, McpError> {
+    discover(config, McpToolInfo::is_read_only).await
+}
+
+async fn discover(
+    config: &McpServerConfig,
+    keep: impl Fn(&McpToolInfo) -> bool,
+) -> Result<Vec<Arc<dyn ToolExecutor>>, McpError> {
     let client = McpClient::connect(config).await?;
     let tools = client.list_tools().await?;
     Ok(tools
         .into_iter()
+        .filter(|info| keep(info))
         .map(|info| {
             Arc::new(McpToolExecutor::new(client.clone(), &config.name, info))
                 as Arc<dyn ToolExecutor>
@@ -122,6 +172,47 @@ pub async fn connect_and_discover(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_model_safe(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn tool_ids_are_readable_and_accepted_by_model_apis() {
+        assert_eq!(
+            mcp_tool_id("atlassian", "getJiraIssue"),
+            "mcp__atlassian__getJiraIssue"
+        );
+        assert_eq!(
+            mcp_tool_id("weather", "get-forecast"),
+            "mcp__weather__get-forecast"
+        );
+    }
+
+    #[test]
+    fn unsafe_or_overlong_names_are_rewritten_without_colliding() {
+        let dotted = mcp_tool_id("docs", "pages.get");
+        let underscored = mcp_tool_id("docs", "pages_get");
+        assert!(is_model_safe(&dotted), "{dotted}");
+        assert_ne!(dotted, underscored);
+
+        let long_a = mcp_tool_id("atlassian", &"a".repeat(80));
+        let long_b = mcp_tool_id("atlassian", &format!("{}b", "a".repeat(79)));
+        assert!(
+            is_model_safe(&long_a) && is_model_safe(&long_b),
+            "{long_a} {long_b}"
+        );
+        assert_ne!(long_a, long_b);
+        assert_eq!(
+            mcp_tool_id("atlassian", &"a".repeat(80)),
+            long_a,
+            "stable across calls"
+        );
+    }
 
     #[test]
     fn flattens_multiple_text_blocks_joined_by_newline() {

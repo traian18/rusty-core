@@ -81,6 +81,26 @@ pub struct McpToolInfo {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    #[serde(default)]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+impl McpToolInfo {
+    /// True only when the server explicitly marks the tool `readOnlyHint:
+    /// true`; an unmarked tool may write. The hint is the server's own claim,
+    /// so it only protects against accidental writes by a server the user
+    /// chose to connect, not against a malicious one.
+    pub fn is_read_only(&self) -> bool {
+        self.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+    }
+}
+
+/// Behavioral hints a server may attach to a tool (MCP 2025-03-26+). Only the
+/// hint the harness acts on is kept.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpToolAnnotations {
+    #[serde(default, rename = "readOnlyHint")]
+    pub read_only_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +114,25 @@ pub(crate) struct ListToolsResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_explicit_read_only_hint_marks_a_tool_read_only() {
+        let tool = |annotations: Value| -> McpToolInfo {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "inputSchema": { "type": "object" },
+                "annotations": annotations,
+            }))
+            .unwrap()
+        };
+        assert!(tool(serde_json::json!({ "readOnlyHint": true })).is_read_only());
+        assert!(!tool(serde_json::json!({ "readOnlyHint": false })).is_read_only());
+        assert!(!tool(serde_json::json!({ "destructiveHint": false })).is_read_only());
+        assert!(!tool(Value::Null).is_read_only());
+        let unannotated: McpToolInfo =
+            serde_json::from_value(serde_json::json!({ "name": "t", "inputSchema": {} })).unwrap();
+        assert!(!unannotated.is_read_only());
+    }
 
     #[test]
     fn request_omits_params_when_none_and_uses_protocol_field_names() {

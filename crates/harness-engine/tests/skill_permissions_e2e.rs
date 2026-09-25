@@ -119,7 +119,7 @@ async fn custom_refactor_skill_allows_writes_but_never_dispatches_network_or_unl
         "web_fetch",
         "run_command",
         "shell.exec",
-        "mcp.other.search",
+        "mcp__other__search",
         "agent_spawn",
         "unknown",
     ] {

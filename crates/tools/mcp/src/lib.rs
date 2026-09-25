@@ -51,5 +51,7 @@ mod transport;
 pub use client::McpClient;
 pub use config::{McpServerConfig, McpTransportConfig};
 pub use error::McpError;
-pub use protocol::{CallToolResult, McpToolInfo, ServerInfo};
-pub use tool::{connect_and_discover, McpToolExecutor};
+pub use protocol::{CallToolResult, McpToolAnnotations, McpToolInfo, ServerInfo};
+pub use tool::{
+    connect_and_discover, connect_and_discover_read_only, mcp_tool_id, McpToolExecutor,
+};
