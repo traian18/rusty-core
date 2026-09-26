@@ -875,7 +875,6 @@ dependencies = [
  "crossterm",
  "harness-engine",
  "harness-integration-anthropic",
- "harness-integration-claude-code",
  "harness-integration-codex",
  "harness-integration-github-copilot",
  "harness-integration-openai",
@@ -987,31 +986,6 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-integration-claude-code"
-version = "0.2.2"
-dependencies = [
- "async-trait",
- "harness-context",
- "harness-engine",
- "harness-generic-backend",
- "harness-integration-anthropic",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "rust_decimal",
- "security-framework",
- "serde",
- "serde_json",
- "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -1437,7 +1411,6 @@ dependencies = [
  "futures",
  "harness-engine",
  "harness-integration-anthropic",
- "harness-integration-claude-code",
  "harness-integration-codex",
  "harness-integration-gemini",
  "harness-integration-github-copilot",

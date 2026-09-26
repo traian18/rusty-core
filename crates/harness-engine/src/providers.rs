@@ -332,13 +332,6 @@ pub(crate) fn descriptor_for(
             AuthMethod::Environment,
             "ANTHROPIC_API_KEY",
         ),
-        "claude-code" => (
-            "claude-code",
-            "Claude Code",
-            AdapterKind::Cli,
-            AuthMethod::CliManaged,
-            "Claude CLI login",
-        ),
         "openai" => (
             "openai-api",
             "OpenAI API",
@@ -481,11 +474,6 @@ pub(crate) fn default_models(provider: &ProviderKey) -> Vec<ModelDescriptor> {
         "anthropic-api" => &[
             ("claude-sonnet-4-20250514", "Claude Sonnet 4", true),
             ("claude-opus-4-20250514", "Claude Opus 4", false),
-        ],
-        "claude-code" => &[
-            ("sonnet", "Sonnet", true),
-            ("opus", "Opus", false),
-            ("haiku", "Haiku", false),
         ],
         "openai-api" => &[
             ("gpt-4o", "GPT-4o", true),

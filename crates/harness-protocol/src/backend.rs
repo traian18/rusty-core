@@ -68,7 +68,7 @@ pub struct BackendCapabilities {
     /// `false` means a request carrying one is rejected before any network
     /// call, rather than silently returning unconstrained prose that a
     /// caller would then try to parse as JSON. The three subprocess
-    /// integrations (`claude-code`, `codex`, `github-copilot`) are `false`:
+    /// integrations (`codex`, `github-copilot`) are `false`:
     /// they drive a CLI that owns its own output format.
     pub structured_output: bool,
 }

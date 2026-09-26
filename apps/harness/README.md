@@ -42,7 +42,6 @@ Supported integration values are:
 
 - `anthropic`
 - `openai`
-- `claude-code`
 - `codex`
 - `github-copilot`
 
@@ -54,7 +53,6 @@ The directory from which the TUI is launched becomes its workspace. Start it fro
 |---|---|---|
 | Anthropic API | `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY=... cargo run -p harness -- --integration anthropic` |
 | OpenAI API | `OPENAI_API_KEY` | `OPENAI_API_KEY=... cargo run -p harness -- --integration openai` |
-| Claude Code | `claude` on `PATH`, authenticated | Run `claude` once to authenticate |
 | OpenAI Codex | `codex` on `PATH`, authenticated | Run `codex login` |
 | GitHub Copilot | `copilot` on `PATH`, authenticated | Run `copilot login` |
 

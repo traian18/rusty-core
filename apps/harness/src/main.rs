@@ -29,7 +29,7 @@ use std::{io, path::PathBuf, time::Duration};
 #[command(name = "harness")]
 #[command(about = "Interactive TUI for testing the Rusty harness agent", long_about = None)]
 struct Args {
-    /// Integration backend to use (anthropic, claude-code, openai, codex, or github-copilot)
+    /// Integration backend to use (anthropic, openai, codex, or github-copilot)
     #[arg(long, default_value = "anthropic")]
     integration: String,
 

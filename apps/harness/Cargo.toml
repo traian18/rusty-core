@@ -14,7 +14,6 @@ clap = { workspace = true, features = ["derive"] }
 crossterm = "0.28"
 harness-engine = { path = "../../crates/harness-engine" }
 harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
-harness-integration-claude-code = { path = "../../crates/integrations/claude-code" }
 harness-integration-codex = { path = "../../crates/integrations/codex" }
 harness-integration-github-copilot = { path = "../../crates/integrations/github-copilot" }
 harness-integration-openai = { path = "../../crates/integrations/openai" }

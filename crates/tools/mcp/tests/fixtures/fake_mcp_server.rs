@@ -54,6 +54,7 @@ fn main() {
                         "name": "echo",
                         "description": "Echoes its `message` argument back.",
                         "inputSchema": { "type": "object", "properties": { "message": { "type": "string" } } },
+                        "annotations": { "readOnlyHint": true },
                     }],
                 }),
             ),

@@ -995,7 +995,6 @@ mod tests {
         let screen = screen_text(&terminal);
         for provider in [
             "Anthropic API",
-            "Claude Code",
             "OpenAI API",
             "OpenAI Codex",
             "GitHub Copilot",

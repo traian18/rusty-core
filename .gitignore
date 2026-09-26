@@ -14,7 +14,6 @@ Thumbs.db
 /apps/harnessd/PLAN.md
 /crates/harness-context/PLAN.md
 /crates/harness-extension-api/PLAN.md
-/crates/integrations/claude-code/PLAN.md
 /crates/integrations/codex/PLAN.md
 /crates/integrations/gemini/PLAN.md
 /crates/integrations/openai/PLAN.md

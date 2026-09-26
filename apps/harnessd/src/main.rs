@@ -19,7 +19,6 @@ use clap::Parser;
 
 use harness_engine::Harness;
 use harness_integration_anthropic::AnthropicFactory;
-use harness_integration_claude_code::ClaudeCodeFactory;
 use harness_integration_codex::CodexFactory;
 use harness_integration_gemini::GeminiFactory;
 use harness_integration_github_copilot::GitHubCopilotFactory;
@@ -158,7 +157,6 @@ async fn main() -> Result<()> {
         .register_integration(Arc::new(OpenAiFactory))
         .register_integration(Arc::new(OpenAiCompatibleFactory))
         .register_integration(Arc::new(GeminiFactory))
-        .register_integration(Arc::new(ClaudeCodeFactory))
         .register_integration(Arc::new(CodexFactory))
         .register_integration(Arc::new(GitHubCopilotFactory))
         .session_store(Arc::new(JsonlSessionStore::new(sessions_dir)))

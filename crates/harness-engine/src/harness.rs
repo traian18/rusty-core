@@ -99,7 +99,6 @@ impl Harness {
                 let (program, args) = match provider.as_str() {
                     "github-copilot" => ("copilot", vec!["login"]),
                     "codex" => ("codex", vec!["login"]),
-                    "claude-code" => ("claude", vec![]),
                     _ => return Err(HarnessError::UnknownProvider(provider.to_string())),
                 };
                 AuthFlowState::WaitingForExternalCommand {
@@ -203,7 +202,6 @@ impl Harness {
     pub fn provider_health(&self, provider: &ProviderKey) -> Result<ProviderHealth, HarnessError> {
         let profile = self.list_credential_profiles(provider)?.remove(0);
         let program = match provider.as_str() {
-            "claude-code" => Some("claude"),
             "codex" => Some("codex"),
             "github-copilot" => Some("copilot"),
             _ => None,
@@ -243,12 +241,12 @@ impl Harness {
             "anthropic" | "openai" => {
                 serde_json::json!({"default_model": selection.provider_model_id.clone()})
             }
-            "claude-code" | "codex" | "github-copilot"
+            "codex" | "github-copilot"
                 if selection.provider_model_id == "default" =>
             {
                 serde_json::json!({})
             }
-            "claude-code" | "codex" => {
+            "codex" => {
                 serde_json::json!({"extra_args": ["--model", selection.provider_model_id.clone()]})
             }
             "github-copilot" => serde_json::json!({"model": selection.provider_model_id.clone()}),

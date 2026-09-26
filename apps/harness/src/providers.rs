@@ -67,13 +67,6 @@ pub fn fallback_options() -> Vec<ProviderOption> {
             &["claude-sonnet-4-20250514", "claude-opus-4-20250514"][..],
         ),
         (
-            "claude-code",
-            "claude-code",
-            "Claude Code",
-            "Claude CLI login",
-            &["sonnet", "opus", "haiku"][..],
-        ),
-        (
             "openai-api",
             "openai",
             "OpenAI API",
@@ -162,8 +155,7 @@ pub fn selection_for_backend(backend_name: Option<&str>, config: &Value) -> Sess
         .to_ascii_lowercase()
         .as_str()
     {
-        name if name.contains("anthropic") => "anthropic",
-        name if name.contains("claude") => "claude-code",
+        name if name.contains("anthropic") || name.contains("claude") => "anthropic",
         name if name.contains("copilot") => "github-copilot",
         name if name.contains("codex") => "codex",
         name if name.contains("openai") => "openai",

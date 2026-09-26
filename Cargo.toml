@@ -18,7 +18,6 @@ members = [
     "crates/integrations/openai-responses",
     "crates/integrations/gemini",
     "crates/integrations/openai-compatible",
-    "crates/integrations/claude-code",
     "crates/integrations/codex",
     "crates/integrations/github-copilot",
     "crates/tools/filesystem",

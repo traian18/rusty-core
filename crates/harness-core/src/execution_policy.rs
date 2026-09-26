@@ -2,14 +2,30 @@
 
 use harness_protocol::tools::{AgentToolset, ExecutionMode, ExecutionPolicy, PermissionMode};
 
-pub fn allows_mcp_server(policy: &ExecutionPolicy, server: &str) -> bool {
-    // MCP servers may execute arbitrary processes, writes and network requests.
-    // Until executors can enforce narrower effects, do not admit them into a
-    // read-only, virtual, or offline skill session.
-    policy.mode == ExecutionMode::Execute
-        && enabled(policy, "write_file")
-        && enabled(policy, "web_search")
-        && policy.allowed_mcp_servers.iter().any(|name| name == server)
+/// How much of an MCP server a session may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerAccess {
+    Denied,
+    /// Only the tools the server marks `readOnlyHint: true`.
+    ReadOnly,
+    Full,
+}
+
+pub fn mcp_server_access(policy: &ExecutionPolicy, server: &str) -> McpServerAccess {
+    // MCP servers reach the network (and stdio ones spawn processes), so they
+    // need an explicit per-server grant plus network permission.
+    if !policy.allowed_mcp_servers.iter().any(|name| name == server)
+        || !enabled(policy, "web_search")
+    {
+        return McpServerAccess::Denied;
+    }
+    // Tools that may write only run where the session may really write;
+    // plan, virtual, and write-less sessions get the read-only ones.
+    if policy.mode == ExecutionMode::Execute && enabled(policy, "write_file") {
+        McpServerAccess::Full
+    } else {
+        McpServerAccess::ReadOnly
+    }
 }
 
 fn enabled(policy: &ExecutionPolicy, name: &str) -> bool {
@@ -64,23 +80,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mcp_requires_exact_server_grants_and_a_mode_that_can_execute_it() {
+    fn mcp_requires_exact_server_grants_and_network_and_limits_non_writing_sessions_to_read_only() {
         let mut policy = ExecutionPolicy {
             mode: ExecutionMode::Execute,
             enabled_tools: vec!["write_file".into(), "web_search".into()],
             allowed_mcp_servers: vec!["docs".into()],
         };
-        assert!(allows_mcp_server(&policy, "docs"));
+        assert_eq!(mcp_server_access(&policy, "docs"), McpServerAccess::Full);
         for name in ["docs-other", "docs.child", "other"] {
-            assert!(!allows_mcp_server(&policy, name));
+            assert_eq!(mcp_server_access(&policy, name), McpServerAccess::Denied);
         }
         policy.mode = ExecutionMode::Plan;
-        assert!(!allows_mcp_server(&policy, "docs"));
+        assert_eq!(
+            mcp_server_access(&policy, "docs"),
+            McpServerAccess::ReadOnly
+        );
         policy.mode = ExecutionMode::Virtual;
-        assert!(!allows_mcp_server(&policy, "docs"));
+        assert_eq!(
+            mcp_server_access(&policy, "docs"),
+            McpServerAccess::ReadOnly
+        );
         policy.mode = ExecutionMode::Execute;
+        policy.enabled_tools.retain(|name| name != "write_file");
+        assert_eq!(
+            mcp_server_access(&policy, "docs"),
+            McpServerAccess::ReadOnly
+        );
         policy.enabled_tools.retain(|name| name != "web_search");
-        assert!(!allows_mcp_server(&policy, "docs"));
+        assert_eq!(mcp_server_access(&policy, "docs"), McpServerAccess::Denied);
     }
 
     #[test]

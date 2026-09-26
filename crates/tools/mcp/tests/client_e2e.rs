@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
-use harness_tool_mcp::{connect_and_discover, McpClient, McpError, McpServerConfig};
+use harness_tool_mcp::{
+    connect_and_discover, connect_and_discover_read_only, McpClient, McpError, McpServerConfig,
+};
 use harness_tools::{CancellationToken, ToolExecutor, ToolInput};
 
 fn fake_server_config(name: &str) -> McpServerConfig {
@@ -21,9 +23,23 @@ async fn connect_and_discover_returns_one_namespaced_executor_per_tool() {
 
     assert_eq!(executors.len(), 1);
     let descriptor = executors[0].descriptor();
-    assert_eq!(descriptor.id.as_str(), "mcp.fake.echo");
+    assert_eq!(descriptor.id.as_str(), "mcp__fake__echo");
     assert_eq!(descriptor.name, "echo");
     assert!(descriptor.description.contains("Echoes"));
+}
+
+#[tokio::test]
+async fn read_only_discovery_keeps_tools_the_server_marks_read_only() {
+    let executors = connect_and_discover_read_only(&fake_server_config("fake"))
+        .await
+        .expect("connect and discover");
+
+    let names: Vec<String> = executors.iter().map(|e| e.descriptor().name).collect();
+    assert_eq!(
+        names,
+        ["echo"],
+        "echo is annotated readOnlyHint: true in the fixture"
+    );
 }
 
 #[tokio::test]
@@ -79,6 +95,7 @@ async fn tool_executor_reports_the_servers_rpc_error_as_a_tool_result_error() {
             name: "does-not-exist".to_owned(),
             description: None,
             input_schema: serde_json::json!({}),
+            annotations: None,
         },
     );
 

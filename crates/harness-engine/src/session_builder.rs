@@ -453,12 +453,21 @@ impl SessionBuilder {
         let mut discovered_descriptors = Vec::new();
         let mut allowed_mcp_tools = Vec::new();
         for config in &self.mcp_servers {
-            if self.execution_policy.as_ref().is_some_and(|policy| {
-                !harness_core::execution_policy::allows_mcp_server(policy, &config.name)
-            }) {
-                continue;
-            }
-            let executors = match harness_tool_mcp::connect_and_discover(config).await {
+            use harness_core::execution_policy::{mcp_server_access, McpServerAccess};
+            let access = self
+                .execution_policy
+                .as_ref()
+                .map_or(McpServerAccess::Full, |policy| {
+                    mcp_server_access(policy, &config.name)
+                });
+            let discovered = match access {
+                McpServerAccess::Denied => continue,
+                McpServerAccess::ReadOnly => {
+                    harness_tool_mcp::connect_and_discover_read_only(config).await
+                }
+                McpServerAccess::Full => harness_tool_mcp::connect_and_discover(config).await,
+            };
+            let executors = match discovered {
                 Ok(executors) => executors,
                 Err(error) if self.optional_mcp_servers.contains(&config.name) => {
                     tracing::warn!(server = %config.name, %error, "skipping unavailable MCP server");

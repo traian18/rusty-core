@@ -5,7 +5,6 @@ use harness_engine::{
     BackendSelection, FsWorkspace, Harness, McpServerConfig, SessionHandle, SkillsConfig,
 };
 use harness_integration_anthropic::AnthropicFactory;
-use harness_integration_claude_code::ClaudeCodeFactory;
 use harness_integration_codex::CodexFactory;
 use harness_integration_github_copilot::GitHubCopilotFactory;
 use harness_integration_openai::OpenAiFactory;
@@ -24,7 +23,7 @@ use crate::providers::{option_from_descriptor, ProviderOption, SessionSelection}
 /// Today that's `"anthropic"` only: it's the sole integration whose wire
 /// layer translates a `thinking_delta` SSE event into
 /// `ModelEvent::ReasoningDelta` (see `crates/integrations/anthropic/src/wire.rs`).
-/// `claude-code`/`codex`/`openai`/`gemini`/`openai-compatible`/`github-copilot`
+/// `codex`/`openai`/`gemini`/`openai-compatible`/`github-copilot`
 /// all declare `extended_thinking: false` in their capabilities or simply
 /// never emit the event — this is a real backend gap, not a display bug,
 /// and setting `extended_thinking: true` unconditionally for every
@@ -99,7 +98,6 @@ impl AppHarness {
         let store_root = workspace_root.join(".harness").join("sessions");
         let harness = Harness::builder()
             .register_integration(Arc::new(AnthropicFactory))
-            .register_integration(Arc::new(ClaudeCodeFactory))
             .register_integration(Arc::new(OpenAiFactory))
             .register_integration(Arc::new(CodexFactory))
             .register_integration(Arc::new(GitHubCopilotFactory))
@@ -135,11 +133,10 @@ impl AppHarness {
         }
         options.sort_by_key(|provider| match provider.integration.as_str() {
             "anthropic" => 0,
-            "claude-code" => 1,
-            "openai" => 2,
-            "codex" => 3,
-            "github-copilot" => 4,
-            _ => 5,
+            "openai" => 1,
+            "codex" => 2,
+            "github-copilot" => 3,
+            _ => 4,
         });
         Ok(options)
     }

@@ -57,7 +57,7 @@ The workspace is split into five layers, each depending only on the ones below i
 │               (one RPC contract: harness_protocol::rpc)        │
 ├────────────────────────────────────────────────────────────────┤
 │ Integrations  anthropic · openai · openai-compatible · gemini  │
-│               · claude-code · codex · github-copilot           │
+│               · codex · github-copilot                         │
 │ Tools         filesystem · shell · git · web · mcp · skills    │
 │               · agent.spawn                                     │
 ├────────────────────────────────────────────────────────────────┤
@@ -158,7 +158,7 @@ The policy is a serializable struct embedded in every HTTP provider config as `r
 
 The legacy JSON key `total_deadline_secs` is accepted as an alias for `idle_timeout_secs`; it now measures inactivity.
 
-The `claude-code`, `codex`, and `github-copilot` subscription integrations also use HTTP model clients and the generic backend recovery layer. No provider runs its own tool loop.
+The `codex` and `github-copilot` subscription integrations also use HTTP model clients and the generic backend recovery layer. No provider runs its own tool loop.
 
 ---
 
@@ -172,11 +172,10 @@ Model integrations use direct inference APIs. They return proposed function call
 | `openai` | `harness-integration-openai` | HTTP (Chat Completions) | `OPENAI_API_KEY` or `api_key` in config | ✅ | ✅ |
 | `gemini` | `harness-integration-gemini` | HTTP | `GEMINI_API_KEY` or `api_key` in config | ✅ | not wired |
 | `openai-compatible` | `harness-integration-openai-compatible` | HTTP (OpenAI-shaped) | optional `api_key` (some local servers need none) | ✅ | not wired |
-| `claude-code` | `harness-integration-claude-code` | HTTP (Messages API) | Claude OAuth credential store | ✅ | ✅ |
 | `codex` | `harness-integration-codex` | HTTP (ChatGPT Responses) | Codex OAuth credential store | ✅ | ✅ |
 | `github-copilot` | `harness-integration-github-copilot` | HTTP (Copilot model APIs) | Copilot token environment/configuration/Keychain | ✅ | ✅ |
 
-All seven integrations are registered in both `harnessd` and the standalone TUI, so every backend is reachable over the daemon/`harnessctl` path as well as in-process.
+All six integrations are registered in both `harnessd` and the standalone TUI, so every backend is reachable over the daemon/`harnessctl` path as well as in-process.
 
 ### Config shapes
 
@@ -193,7 +192,6 @@ The subscription integrations reuse sign-in credentials without launching an age
 
 | Integration | Optional fields | Details |
 |---|---|---|
-| `claude-code` | `credentials_path`, `default_model` | [Claude subscription authentication](crates/integrations/claude-code/README.md) |
 | `codex` | `auth_path`, `default_model` | [ChatGPT subscription authentication](crates/integrations/codex/README.md) |
 | `github-copilot` | `credentials_path`, `default_model`, `github_host` | [Copilot subscription authentication](crates/integrations/github-copilot/README.md) |
 
@@ -219,7 +217,7 @@ neutral field rather than something left to `provider_options`:
 | `openai`, `openai-compatible` | native `response_format` (`json_object` / `json_schema`) |
 | `gemini` | `generationConfig.responseMimeType` + `responseSchema` |
 | `anthropic` | **emulated** — no `response_format` exists in the Messages API, so the harness declares a single-purpose tool whose input schema *is* the requested schema, forces `tool_choice` onto it, and surfaces the resulting tool-call input as assistant text |
-| `claude-code`, `codex`, `github-copilot` | **unsupported** — these drive a CLI that owns its own output |
+| `codex`, `github-copilot` | **unsupported** — these drive a CLI that owns its own output |
 
 The Anthropic emulation is invisible to callers: the synthetic tool never
 appears as a tool call, and its input streams back as ordinary text deltas.
@@ -258,7 +256,7 @@ An agent's toolset is assembled explicitly per session (`--tools ...` on the CLI
 | `web.fetch` | `harness-tool-web` | Fetch a URL, with a built-in SSRF guard (blocks loopback, link-local, cloud-metadata, and RFC1918 targets by default — see `crates/tools/web/src/ssrf.rs`) | no |
 | `agent.spawn` | `harness-runtime` (not a separate crate) | Model-facing subagent delegation (see below) | spawns a child agent |
 
-Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay tool calls through this registry — `claude-code`/`codex`/`github-copilot` manage tools internally via their own CLI, so `--tools` has no observable effect on those three.
+Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay tool calls through this registry — `codex`/`github-copilot` manage tools internally via their own CLI, so `--tools` has no observable effect on those two.
 
 ### `agent.spawn` — model-initiated subagent delegation
 
@@ -441,7 +439,7 @@ Architecturally, skills add **no new seams**. The catalog reaches the model thro
 | Context | `harness-context` | Injects a system prompt / workspace summary and truncates the transcript when it grows too large |
 | Skills | `harness-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
 | Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
-| Subscription inference | `crates/integrations/{claude-code,codex,github-copilot}` | Authenticate model API requests; the harness owns tools and context |
+| Subscription inference | `crates/integrations/{codex,github-copilot}` | Authenticate model API requests; the harness owns tools and context |
 | Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client, `skill.load`/`skill.read` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
 | Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
@@ -459,7 +457,7 @@ Build everything first:
 cargo build --release
 ```
 
-### Option A — existing Claude subscription sign-in
+### Option A — existing ChatGPT (Codex) subscription sign-in
 
 ```console
 mkdir -p /tmp/demo-workspace
@@ -469,7 +467,7 @@ mkdir -p /tmp/demo-workspace
 
 # Terminal 2: drive it
 SID=$(./target/release/harnessctl --socket /tmp/demo.sock session create \
-  --workspace /tmp/demo-workspace --integration claude-code \
+  --workspace /tmp/demo-workspace --integration codex \
   --config-json '{}')
 
 ./target/release/harnessctl --socket /tmp/demo.sock session send "$SID" \
@@ -526,7 +524,7 @@ By default a created session has no tools — useful for testing raw model plumb
 --tools fs.read,fs.edit,workspace.search,shell.exec,git.status,git.diff,git.log,git.show,web.fetch,agent.spawn
 ```
 
-or just `--all-tools` for the full set. Run `harnessctl session create --help` for the exact list — it's kept in sync with what the harness can actually build. Note: the `claude-code`/`codex`/`github-copilot` backends manage tools internally via their own CLI and never relay tool calls to the harness's registry, so `--tools` only does something observable with `anthropic`/`openai`/`gemini`/`openai-compatible`.
+or just `--all-tools` for the full set. Run `harnessctl session create --help` for the exact list — it's kept in sync with what the harness can actually build. Note: the `codex`/`github-copilot` backends manage tools internally via their own CLI and never relay tool calls to the harness's registry, so `--tools` only does something observable with `anthropic`/`openai`/`gemini`/`openai-compatible`.
 
 ### `harnessctl chat` — an interactive TUI for manual testing
 
@@ -534,7 +532,7 @@ Composing `session create`/`send`/`events` by hand gets old fast. `harnessctl ch
 
 ```console
 ./target/release/harnessctl --socket /tmp/demo.sock chat \
-  --workspace /tmp/demo-workspace --integration claude-code \
+  --workspace /tmp/demo-workspace --integration codex \
   --config-json '{}' \
   --all-tools
 ```
