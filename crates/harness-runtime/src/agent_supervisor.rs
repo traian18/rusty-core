@@ -132,6 +132,7 @@ impl AgentSupervisor {
         parent_commands_tx: mpsc::Sender<AgentCommand>,
         spec: SpawnAgentSpec,
     ) -> Result<AgentId, SupervisorError> {
+        let origin_tool_call_id = spec.origin_tool_call_id;
         // 1. Gate before creating a child task. The parent's real nesting depth
         //    is used so `max_depth` is enforced across the whole tree.
         let parent_depth = parent.state.depth;
@@ -343,7 +344,10 @@ impl AgentSupervisor {
             session_sequence: None,
             timestamp: Timestamp::now(),
             visibility: EventVisibility::User,
-            event: AgentEvent::ChildAgentSpawned { agent_id: child_id },
+            event: AgentEvent::ChildAgentSpawned {
+                agent_id: child_id,
+                tool_call_id: origin_tool_call_id,
+            },
         });
 
         let _ = start_tx.send(());
@@ -784,6 +788,7 @@ mod tests {
         let (parent_commands_tx, _parent_commands_rx) = mpsc::channel(64);
 
         let spec = SpawnAgentSpec {
+            origin_tool_call_id: None,
             role: Some("child".into()),
             backend: BackendPolicy::Inherit,
             tools: ToolInheritance::Subset(vec![fs_read_id]),
@@ -875,6 +880,7 @@ mod tests {
                     scheduler,
                     parent_commands_tx,
                     SpawnAgentSpec {
+                        origin_tool_call_id: None,
                         role: Some("child".into()),
                         backend: BackendPolicy::Inherit,
                         tools: ToolInheritance::InheritAll,
@@ -961,6 +967,7 @@ mod tests {
         let (parent_commands_tx, _parent_commands_rx) = mpsc::channel(64);
 
         let spec = SpawnAgentSpec {
+            origin_tool_call_id: None,
             role: Some("child".into()),
             backend: BackendPolicy::Inherit,
             tools: ToolInheritance::InheritAll,
@@ -1043,6 +1050,7 @@ mod tests {
         let (parent_commands_tx, _parent_commands_rx) = mpsc::channel(64);
 
         let spec = SpawnAgentSpec {
+            origin_tool_call_id: None,
             role: Some("A1".into()),
             backend: BackendPolicy::Inherit,
             tools: ToolInheritance::InheritAll,
@@ -1072,7 +1080,7 @@ mod tests {
         assert!(
             events.iter().any(|env| matches!(
                 &env.event,
-                AgentEvent::ChildAgentSpawned { agent_id } if *agent_id == child_id
+                AgentEvent::ChildAgentSpawned { agent_id, .. } if *agent_id == child_id
             )),
             "ChildAgentSpawned should be emitted for the new child"
         );
@@ -1103,6 +1111,7 @@ mod tests {
         let (parent_commands_tx, _parent_commands_rx) = mpsc::channel(64);
 
         let spec = || SpawnAgentSpec {
+            origin_tool_call_id: None,
             role: Some("A1".into()),
             backend: BackendPolicy::Inherit,
             tools: ToolInheritance::InheritAll,
@@ -1205,6 +1214,7 @@ mod tests {
         let (parent_commands_tx, mut parent_commands_rx) = mpsc::channel::<AgentCommand>(64);
 
         let spec = SpawnAgentSpec {
+            origin_tool_call_id: None,
             role: Some("A1".into()),
             backend: BackendPolicy::Inherit,
             tools: ToolInheritance::InheritAll,

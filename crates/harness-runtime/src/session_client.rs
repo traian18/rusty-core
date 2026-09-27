@@ -178,6 +178,7 @@ impl SessionClient {
 
         let root_agent_status = AgentUsageSnapshot {
             agent_id: runtime_snapshot.root_agent_id.to_string(),
+            model: None,
             metrics: metrics.clone(),
             timestamp: now.to_string(),
         };

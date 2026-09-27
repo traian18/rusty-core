@@ -9,10 +9,12 @@
 
 mod diff;
 mod log;
+mod patch;
 mod show;
 mod status;
 
 pub use diff::{GitDiffInput, GitDiffTool};
 pub use log::{GitLogInput, GitLogTool};
+pub use patch::DiffFilters;
 pub use show::{GitShowInput, GitShowTool};
 pub use status::{GitStatusInput, GitStatusTool};

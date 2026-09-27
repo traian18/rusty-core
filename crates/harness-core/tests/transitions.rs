@@ -115,14 +115,20 @@ fn output_limited_response_is_incomplete_and_can_be_continued() {
         result.finish_reason = reason.into();
         let effects = agent.apply(AgentCommand::BackendEvent {
             run_id,
-            event: ExecutionEvent::Completed { request_id: result.request_id, result },
+            event: ExecutionEvent::Completed {
+                request_id: result.request_id,
+                result,
+            },
         });
         assert!(effects.iter().any(|effect| matches!(effect,
             AgentEffect::Emit { event: AgentEvent::Failed { error } }
                 if error.code == "OUTPUT_LIMIT_REACHED"
         )));
-        assert!(!effects.iter().any(|effect| matches!(effect,
-            AgentEffect::Emit { event: AgentEvent::Completed { .. } }
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            AgentEffect::Emit {
+                event: AgentEvent::Completed { .. }
+            }
         )));
         assert!(agent.state.active_run.is_none());
         // Continuation is a new run in the same conversation, not a replay.
@@ -1297,4 +1303,30 @@ fn text_then_tool_call_keeps_the_tool_use_in_its_own_message() {
         agent.state.messages[2].content.as_slice(),
         [ContentBlock::ToolUse { .. }]
     ));
+}
+
+#[test]
+fn usage_snapshots_name_the_model_the_agent_runs_on() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            model: Some("claude-haiku-4-5".to_string()),
+            ..Default::default()
+        },
+    });
+    let run_id = start(&mut agent);
+    let effects = agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::UsageUpdate {
+            request_id: RequestId::new(),
+            usage: ModelUsage::default(),
+        },
+    });
+    let model = effects.iter().find_map(|effect| match effect {
+        AgentEffect::Emit {
+            event: AgentEvent::UsageUpdated { usage },
+        } => Some(usage.model.clone()),
+        _ => None,
+    });
+    assert_eq!(model, Some(Some("claude-haiku-4-5".to_string())));
 }

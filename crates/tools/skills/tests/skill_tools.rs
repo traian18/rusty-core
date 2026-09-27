@@ -151,3 +151,52 @@ async fn descriptors_carry_stable_tool_ids() {
         "skill.read"
     );
 }
+
+#[tokio::test]
+async fn read_can_page_through_a_large_file_by_line_range_and_byte_limit() {
+    let temp = TempDir::new().expect("tempdir");
+    write_skill(temp.path(), "pdf-report", "Body.\n").await;
+    let file: String = (1..=100).map(|n| format!("rule {n}\n")).collect();
+    tokio::fs::write(temp.path().join("pdf-report").join("rules.md"), &file)
+        .await
+        .expect("write");
+    let tool = SkillReadTool::new(catalog_from(temp.path()).await);
+    let read = |args: serde_json::Value| {
+        let tool = &tool;
+        async move {
+            tool.execute(input(args), CancellationToken::new())
+                .await
+                .expect("execute")
+        }
+    };
+
+    // No limits: the exact, complete file with the original output shape.
+    let whole = read(json!({ "skill": "pdf-report", "path": "rules.md" })).await;
+    assert_eq!(whole.output, json!({ "content": file }));
+
+    let range = read(
+        json!({ "skill": "pdf-report", "path": "rules.md", "start_line": 10, "end_line": 12 }),
+    )
+    .await;
+    assert_eq!(range.output["content"], "rule 10\nrule 11\nrule 12\n");
+    assert_eq!(range.output["total_lines"], 100);
+    assert!(range.output.get("truncated").is_none());
+
+    // Paging with max_bytes reassembles the file exactly.
+    let mut rebuilt = String::new();
+    let mut start = 1;
+    loop {
+        let page = read(json!({ "skill": "pdf-report", "path": "rules.md", "start_line": start, "max_bytes": 100 })).await;
+        assert!(!page.is_error, "{}", page.output);
+        rebuilt.push_str(page.output["content"].as_str().unwrap());
+        match page.output["next_start_line"].as_u64() {
+            Some(next) => start = next,
+            None => break,
+        }
+    }
+    assert_eq!(rebuilt, file);
+
+    let past_end =
+        read(json!({ "skill": "pdf-report", "path": "rules.md", "start_line": 101 })).await;
+    assert!(past_end.is_error);
+}

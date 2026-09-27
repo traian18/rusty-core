@@ -498,7 +498,14 @@ async fn cancelling_the_parent_cancels_a_concurrently_spawned_child() {
         sink.events_for(root_id)
             .into_iter()
             .find_map(|e| match e {
-                AgentEvent::ChildAgentSpawned { agent_id } => Some(agent_id),
+                AgentEvent::ChildAgentSpawned {
+                    agent_id,
+                    tool_call_id,
+                } => {
+                    // Hosts attribute the child's work to the spawning call.
+                    assert_eq!(tool_call_id, Some(call_id));
+                    Some(agent_id)
+                }
                 _ => None,
             })
             .expect("child id")

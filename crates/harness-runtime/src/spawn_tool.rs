@@ -163,6 +163,7 @@ pub fn build_spawn_spec(
     };
 
     let spec = SpawnAgentSpec {
+        origin_tool_call_id: None,
         role: args.role,
         backend: BackendPolicy::Inherit,
         tools,

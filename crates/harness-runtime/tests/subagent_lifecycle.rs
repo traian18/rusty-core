@@ -77,6 +77,7 @@ fn root_agent(session_id: SessionId, agent_id: AgentId, backend: &dyn ExecutionB
 
 fn child_spec(role: &str) -> SpawnAgentSpec {
     SpawnAgentSpec {
+        origin_tool_call_id: None,
         role: Some(role.into()),
         backend: BackendPolicy::Inherit,
         tools: ToolInheritance::InheritAll,
@@ -101,7 +102,7 @@ async fn wait_for_spawned(sink: &RecordingSink, count: usize) -> Vec<AgentId> {
             .expect("event lock poisoned")
             .iter()
             .filter_map(|envelope| match envelope.event {
-                AgentEvent::ChildAgentSpawned { agent_id } => Some(agent_id),
+                AgentEvent::ChildAgentSpawned { agent_id, .. } => Some(agent_id),
                 _ => None,
             })
             .collect::<Vec<_>>();

@@ -76,7 +76,9 @@ pub fn replay_snapshot(
                     .pending_permissions
                     .retain(|_, pending_call| *pending_call != *call_id);
             }
-            AgentEvent::ChildAgentSpawned { agent_id: child_id } => {
+            AgentEvent::ChildAgentSpawned {
+                agent_id: child_id, ..
+            } => {
                 if !agent.children.contains(child_id) {
                     agent.children.push(*child_id);
                 }

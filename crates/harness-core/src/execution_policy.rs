@@ -45,7 +45,8 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         }
         "list_files" => "list_files",
         "search_codebase" | "workspace.search" => "search_codebase",
-        "web_search" | "web_fetch" => "web_search",
+        // web_extract fetches a page like web_fetch, so it needs the same network grant.
+        "web_search" | "web_fetch" | "web_extract" => "web_search",
         "run_command" | "shell.exec" => {
             // The current command executor has host filesystem/network access.
             if policy.mode != ExecutionMode::Execute
@@ -124,5 +125,18 @@ mod tests {
         assert!(allows_tool(&policy, "run_command"));
         policy.mode = ExecutionMode::Plan;
         assert!(!allows_tool(&policy, "run_command"));
+    }
+
+    #[test]
+    fn web_extract_needs_the_same_network_grant_as_web_fetch() {
+        let mut policy = ExecutionPolicy {
+            mode: ExecutionMode::Plan,
+            enabled_tools: vec!["web_search".into()],
+            allowed_mcp_servers: vec![],
+        };
+        assert!(allows_tool(&policy, "web_extract"));
+        policy.enabled_tools.clear();
+        assert!(!allows_tool(&policy, "web_extract"));
+        assert!(!allows_tool(&policy, "web_fetch"));
     }
 }

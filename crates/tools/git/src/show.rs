@@ -9,14 +9,22 @@ use harness_tools::{
     CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult,
 };
 
-/// Same cap as `git.diff` — a single commit's diff can be arbitrarily large.
-const MAX_DIFF_BYTES: usize = 50_000;
+use crate::patch::{apply_pathspecs, render, DiffFilters};
+
+fn default_include_diff() -> bool {
+    true
+}
 
 /// Input for the `git.show` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GitShowInput {
     /// A commit-ish revision (SHA, branch name, `HEAD~2`, etc.).
     pub rev: String,
+    /// `false`: return commit metadata and per-file change counts only.
+    #[serde(default = "default_include_diff")]
+    pub include_diff: bool,
+    #[serde(flatten)]
+    pub filters: DiffFilters,
 }
 
 /// Shows a single commit's metadata and diff by ref/SHA. Read-only.
@@ -37,7 +45,10 @@ impl ToolExecutor for GitShowTool {
         ToolDescriptor {
             id: ToolId::new("git.show"),
             name: "Git show".to_string(),
-            description: "Show a single commit's metadata and diff by ref/SHA".to_string(),
+            description: "Show a single commit's metadata, per-file change counts, and diff by ref/SHA. \
+                          The diff is limited by file count and size; narrow with paths, hunk_contains, \
+                          max_hunks_per_file, or set include_diff to false."
+                .to_string(),
             input_schema: serde_json::to_value(schema).unwrap_or(json!({})),
         }
     }
@@ -53,7 +64,7 @@ impl ToolExecutor for GitShowTool {
         }
 
         let repo_root = self.repo_root.clone();
-        let result = tokio::task::spawn_blocking(move || run_show(&repo_root, &input.rev))
+        let result = tokio::task::spawn_blocking(move || run_show(&repo_root, &input))
             .await
             .map_err(|_| ToolError::Internal)?;
 
@@ -72,47 +83,31 @@ impl ToolExecutor for GitShowTool {
     }
 }
 
-fn render_patch(diff: &git2::Diff) -> Result<String, String> {
-    let mut buffer = String::new();
-    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        match line.origin() {
-            '+' | '-' | ' ' => {
-                buffer.push(line.origin());
-                buffer.push_str(content);
-            }
-            _ => buffer.push_str(content),
-        }
-        true
-    })
-    .map_err(|e| e.to_string())?;
-
-    if buffer.len() > MAX_DIFF_BYTES {
-        buffer.truncate(MAX_DIFF_BYTES);
-        buffer.push_str("\n... (diff truncated)");
-    }
-    Ok(buffer)
-}
-
-fn run_show(repo_root: &Path, rev: &str) -> Result<serde_json::Value, String> {
+fn run_show(repo_root: &Path, input: &GitShowInput) -> Result<serde_json::Value, String> {
     let repo = git2::Repository::discover(repo_root).map_err(|e| e.to_string())?;
-    let object = repo.revparse_single(rev).map_err(|e| e.to_string())?;
+    let object = repo
+        .revparse_single(&input.rev)
+        .map_err(|e| e.to_string())?;
     let commit = object.peel_to_commit().map_err(|e| e.to_string())?;
     let tree = commit.tree().map_err(|e| e.to_string())?;
     let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
 
+    let mut options = git2::DiffOptions::new();
+    apply_pathspecs(&mut options, input.filters.paths.iter().map(String::as_str));
     let diff = repo
-        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options))
         .map_err(|e| e.to_string())?;
-    let patch = render_patch(&diff)?;
 
-    Ok(json!({
-        "sha": commit.id().to_string(),
-        "summary": commit.summary().ok().flatten().unwrap_or("").to_string(),
-        "author": commit.author().name().unwrap_or("").to_string(),
-        "time": commit.time().seconds(),
-        "diff": patch,
-    }))
+    let mut output = serde_json::Map::new();
+    output.insert("sha".into(), json!(commit.id().to_string()));
+    output.insert(
+        "summary".into(),
+        json!(commit.summary().ok().flatten().unwrap_or("")),
+    );
+    output.insert("author".into(), json!(commit.author().name().unwrap_or("")));
+    output.insert("time".into(), json!(commit.time().seconds()));
+    output.extend(render(&diff, &input.filters, input.include_diff)?);
+    Ok(serde_json::Value::Object(output))
 }
 
 #[cfg(test)]
@@ -173,5 +168,65 @@ mod tests {
             .await
             .expect("execute should not hard-fail");
         assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn include_diff_false_returns_metadata_and_file_counts_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_commit(dir.path());
+
+        let result = GitShowTool::new(dir.path().to_path_buf())
+            .execute(
+                ToolInput {
+                    arguments: json!({ "rev": "HEAD", "include_diff": false }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute should succeed");
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["summary"], "initial commit");
+        assert_eq!(result.output["diff"], "");
+        assert_eq!(result.output["files"][0]["path"], "a.txt");
+        assert_eq!(result.output["files"][0]["status"], "added");
+        assert_eq!(result.output["files"][0]["additions"], 1);
+        assert_eq!(result.output["files"][0]["patch"], "summary");
+    }
+
+    #[tokio::test]
+    async fn filters_a_commit_to_the_requested_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init repo");
+        std::fs::write(dir.path().join("keep.rs"), "fn keep() {}\n").expect("write");
+        std::fs::write(dir.path().join("skip.txt"), "skip\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("add all");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("tree");
+        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "two files", &tree, &[])
+            .expect("commit");
+
+        let result = GitShowTool::new(dir.path().to_path_buf())
+            .execute(
+                ToolInput {
+                    arguments: json!({ "rev": "HEAD", "paths": ["*.rs"] }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute should succeed");
+
+        assert_eq!(result.output["total_files"], 1);
+        assert_eq!(result.output["files"][0]["path"], "keep.rs");
+        let diff = result.output["diff"].as_str().unwrap();
+        assert!(diff.contains("+fn keep() {}"));
+        assert!(diff.contains("--- /dev/null"));
+        assert!(!diff.contains("skip.txt"));
     }
 }

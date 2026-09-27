@@ -9,9 +9,7 @@ use harness_tools::{
     CancellationToken, ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolResult,
 };
 
-/// Caps returned diff size so an agent asking for a diff on a huge file
-/// can't blow the context window with one tool result.
-const MAX_DIFF_BYTES: usize = 50_000;
+use crate::patch::{apply_pathspecs, render, DiffFilters};
 
 /// Input for the `git.diff` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -22,6 +20,8 @@ pub struct GitDiffInput {
     /// `false` (default): working tree vs index. `true`: index vs HEAD.
     #[serde(default)]
     pub staged: bool,
+    #[serde(flatten)]
+    pub filters: DiffFilters,
 }
 
 /// Shows a diff for a path or the whole tree. Read-only.
@@ -42,7 +42,9 @@ impl ToolExecutor for GitDiffTool {
         ToolDescriptor {
             id: ToolId::new("git.diff"),
             name: "Git diff".to_string(),
-            description: "Show a diff for a path or the whole tree (working tree or staged)"
+            description: "Show a diff for a path or the whole tree (working tree or staged). \
+                          Returns per-file change counts plus the patch, limited by file count and size; \
+                          narrow with paths, hunk_contains, max_hunks_per_file, or use summary_only."
                 .to_string(),
             input_schema: serde_json::to_value(schema).unwrap_or(json!({})),
         }
@@ -59,16 +61,14 @@ impl ToolExecutor for GitDiffTool {
         }
 
         let repo_root = self.repo_root.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            run_diff(&repo_root, input.path.as_deref(), input.staged)
-        })
-        .await
-        .map_err(|_| ToolError::Internal)?;
+        let result = tokio::task::spawn_blocking(move || run_diff(&repo_root, &input))
+            .await
+            .map_err(|_| ToolError::Internal)?;
 
         match result {
-            Ok(patch) => Ok(ToolResult {
+            Ok(fields) => Ok(ToolResult {
                 call_id: "git.diff".to_string(),
-                output: json!({ "diff": patch }),
+                output: serde_json::Value::Object(fields),
                 is_error: false,
             }),
             Err(message) => Ok(ToolResult {
@@ -80,37 +80,23 @@ impl ToolExecutor for GitDiffTool {
     }
 }
 
-fn render_patch(diff: &git2::Diff) -> Result<String, String> {
-    let mut buffer = String::new();
-    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        match line.origin() {
-            '+' | '-' | ' ' => {
-                buffer.push(line.origin());
-                buffer.push_str(content);
-            }
-            _ => buffer.push_str(content),
-        }
-        true
-    })
-    .map_err(|e| e.to_string())?;
-
-    if buffer.len() > MAX_DIFF_BYTES {
-        buffer.truncate(MAX_DIFF_BYTES);
-        buffer.push_str("\n... (diff truncated)");
-    }
-    Ok(buffer)
-}
-
-fn run_diff(repo_root: &Path, path: Option<&str>, staged: bool) -> Result<String, String> {
+fn run_diff(
+    repo_root: &Path,
+    input: &GitDiffInput,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let repo = git2::Repository::discover(repo_root).map_err(|e| e.to_string())?;
 
     let mut options = git2::DiffOptions::new();
-    if let Some(path) = path {
-        options.pathspec(path);
-    }
+    apply_pathspecs(
+        &mut options,
+        input
+            .path
+            .iter()
+            .chain(&input.filters.paths)
+            .map(String::as_str),
+    );
 
-    let diff = if staged {
+    let diff = if input.staged {
         let head_tree = repo
             .head()
             .and_then(|head| head.peel_to_tree())
@@ -122,7 +108,7 @@ fn run_diff(repo_root: &Path, path: Option<&str>, staged: bool) -> Result<String
             .map_err(|e| e.to_string())?
     };
 
-    render_patch(&diff)
+    render(&diff, &input.filters, true)
 }
 
 #[cfg(test)]
@@ -190,5 +176,211 @@ mod tests {
         assert!(!result.is_error);
         let diff = result.output["diff"].as_str().expect("diff string");
         assert!(diff.contains("staged change"));
+    }
+
+    fn commit_all(repo: &git2::Repository, message: &str) {
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("add all");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("find tree");
+        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            message,
+            &tree,
+            &parent.iter().collect::<Vec<_>>(),
+        )
+        .expect("commit");
+    }
+
+    fn numbered(lines: usize) -> String {
+        (1..=lines).map(|n| format!("line {n}\n")).collect()
+    }
+
+    /// a.txt, b.rs, c.rs each with 60 lines; the working tree then changes
+    /// lines 2 and 50 of every file (two separate hunks per file), and
+    /// line 50 of b.rs mentions `needle`.
+    fn repo_with_two_hunks_per_file(dir: &Path) {
+        let repo = git2::Repository::init(dir).expect("init repo");
+        for name in ["a.txt", "b.rs", "c.rs"] {
+            std::fs::write(dir.join(name), numbered(60)).expect("write file");
+        }
+        commit_all(&repo, "initial");
+        for name in ["a.txt", "b.rs", "c.rs"] {
+            let tail = if name == "b.rs" {
+                "needle here"
+            } else {
+                "changed"
+            };
+            let content = numbered(60)
+                .replace("line 2\n", "line two\n")
+                .replace("line 50\n", &format!("line 50 {tail}\n"));
+            std::fs::write(dir.join(name), content).expect("modify file");
+        }
+    }
+
+    async fn diff_with(dir: &Path, arguments: serde_json::Value) -> serde_json::Value {
+        let result = GitDiffTool::new(dir.to_path_buf())
+            .execute(ToolInput { arguments }, CancellationToken::new())
+            .await
+            .expect("execute should succeed");
+        assert!(!result.is_error, "unexpected error: {}", result.output);
+        result.output
+    }
+
+    fn file_paths(output: &serde_json::Value) -> Vec<String> {
+        output["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn filters_by_pathspecs_and_summarizes_every_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        repo_with_two_hunks_per_file(dir.path());
+
+        let output = diff_with(dir.path(), json!({ "paths": ["*.rs"] })).await;
+
+        assert_eq!(file_paths(&output), vec!["b.rs", "c.rs"]);
+        assert_eq!(output["total_files"], 2);
+        assert_eq!(output["files"][0]["additions"], 2);
+        assert_eq!(output["files"][0]["deletions"], 2);
+        assert_eq!(output["files"][0]["status"], "modified");
+        assert_eq!(output["files"][0]["patch"], "full");
+        assert!(!output["diff"].as_str().unwrap().contains("a.txt"));
+        assert!(output.get("limits").is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_only_returns_counts_without_patch_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        repo_with_two_hunks_per_file(dir.path());
+
+        let output = diff_with(dir.path(), json!({ "summary_only": true })).await;
+
+        assert_eq!(output["diff"], "");
+        assert_eq!(file_paths(&output), vec!["a.txt", "b.rs", "c.rs"]);
+        assert!(output["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["patch"] == "summary"));
+    }
+
+    #[tokio::test]
+    async fn max_files_omits_later_patches_but_still_lists_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        repo_with_two_hunks_per_file(dir.path());
+
+        let output = diff_with(dir.path(), json!({ "max_files": 1 })).await;
+
+        let states: Vec<_> = output["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["patch"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, vec!["full", "omitted", "omitted"]);
+        assert_eq!(output["limits"]["omitted_files"], 2);
+        assert!(output["diff"]
+            .as_str()
+            .unwrap()
+            .contains("diff --git a/a.txt b/a.txt"));
+        assert!(!output["diff"].as_str().unwrap().contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn hunk_contains_keeps_only_matching_hunks_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        repo_with_two_hunks_per_file(dir.path());
+
+        let output = diff_with(dir.path(), json!({ "hunk_contains": "needle" })).await;
+        let diff = output["diff"].as_str().unwrap();
+
+        assert!(diff.contains("+line 50 needle here"));
+        assert!(
+            !diff.contains("line two"),
+            "the non-matching hunk must be dropped"
+        );
+        let states: Vec<_> = output["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["patch"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, vec!["filtered_out", "full", "filtered_out"]);
+        assert_eq!(output["files"][1]["hunks"], 2);
+        assert_eq!(output["files"][1]["hunks_shown"], 1);
+    }
+
+    #[tokio::test]
+    async fn max_hunks_per_file_reports_what_it_left_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        repo_with_two_hunks_per_file(dir.path());
+
+        let output = diff_with(
+            dir.path(),
+            json!({ "paths": ["a.txt"], "max_hunks_per_file": 1 }),
+        )
+        .await;
+        let diff = output["diff"].as_str().unwrap();
+
+        assert!(diff.contains("+line two"));
+        assert!(!diff.contains("line 50 changed"));
+        assert!(diff.contains("... (1 more matching hunk(s) omitted)"));
+        assert_eq!(output["limits"]["omitted_hunks"], 1);
+    }
+
+    #[tokio::test]
+    async fn max_bytes_truncates_on_a_character_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init repo");
+        std::fs::write(dir.path().join("euro.txt"), "start\n").expect("write");
+        commit_all(&repo, "initial");
+        // Multi-byte characters everywhere, so almost any byte cut lands mid-character.
+        std::fs::write(
+            dir.path().join("euro.txt"),
+            "€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€\n".repeat(500),
+        )
+        .expect("modify");
+
+        for max_bytes in [997, 998, 999, 1_000] {
+            let output = diff_with(dir.path(), json!({ "max_bytes": max_bytes })).await;
+            let diff = output["diff"].as_str().unwrap();
+            assert!(diff.len() <= max_bytes, "{} > {max_bytes}", diff.len());
+            assert!(diff.ends_with("... (diff truncated)"));
+            assert_eq!(output["files"][0]["patch"], "partial");
+            assert_eq!(output["limits"]["max_bytes"], max_bytes);
+        }
+    }
+
+    #[test]
+    fn schema_exposes_the_filters_alongside_the_original_fields() {
+        let schema = GitDiffTool::new(PathBuf::from("."))
+            .descriptor()
+            .input_schema;
+        let properties = schema["properties"].as_object().expect("properties");
+        for field in [
+            "path",
+            "staged",
+            "paths",
+            "hunk_contains",
+            "max_hunks_per_file",
+            "max_files",
+            "max_bytes",
+            "summary_only",
+        ] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
     }
 }

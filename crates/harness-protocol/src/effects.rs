@@ -110,6 +110,11 @@ pub struct SpawnAgentSpec {
     /// existed.
     #[serde(default)]
     pub execution_params: ExecutionParams,
+    /// The `agent.spawn` tool call that requested this child, when it came
+    /// from one; echoed on `ChildAgentSpawned` so hosts can attribute the
+    /// child's work (and model) to that call.
+    #[serde(default)]
+    pub origin_tool_call_id: Option<crate::ids::ToolCallId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

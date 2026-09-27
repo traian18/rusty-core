@@ -196,6 +196,9 @@ pub enum AgentEvent {
     ChildAgentSpawned {
         /// The identifier of the child agent.
         agent_id: AgentId,
+        /// The parent's `agent.spawn` tool call that created this child, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<ToolCallId>,
     },
 
     /// A child agent completed its run.
@@ -643,13 +646,21 @@ mod tests {
     #[test]
     fn event_child_agent_spawned_roundtrip() {
         let agent_id = crate::ids::AgentId::new();
-        let event = AgentEvent::ChildAgentSpawned { agent_id };
+        let tool_call_id = Some(ToolCallId::new());
+        let event = AgentEvent::ChildAgentSpawned {
+            agent_id,
+            tool_call_id,
+        };
         let env = envelope_for(event);
         let json = serde_json::to_string(&env).expect("serialize");
         let deserialized: AgentEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         match deserialized.event {
-            AgentEvent::ChildAgentSpawned { agent_id: aid } => {
+            AgentEvent::ChildAgentSpawned {
+                agent_id: aid,
+                tool_call_id: call,
+            } => {
                 assert_eq!(aid, agent_id);
+                assert_eq!(call, tool_call_id);
             }
             other => panic!("expected ChildAgentSpawned, got {other:?}"),
         }
@@ -784,6 +795,7 @@ mod tests {
             },
             AgentEvent::ChildAgentSpawned {
                 agent_id: crate::ids::AgentId::new(),
+                tool_call_id: None,
             },
             AgentEvent::ChildAgentCompleted {
                 agent_id: crate::ids::AgentId::new(),

@@ -959,7 +959,11 @@ impl AgentRunner {
 
             let input = harness_tools::ToolInput { arguments };
             let tool_call_start = std::time::Instant::now();
-            let outcome = executor.execute(input, token).await;
+            let outcome = harness_tools::with_tool_call_id(
+                call_id.to_string(),
+                executor.execute(input, token),
+            )
+            .await;
             metrics::histogram!("harness_tool_call_duration_seconds", "tool" => tool_name_for_metrics.clone())
                 .record(tool_call_start.elapsed().as_secs_f64());
             metrics::counter!(
@@ -1003,7 +1007,8 @@ impl AgentRunner {
     /// reports its own domain errors as `ToolResult { is_error: true,
     /// output: <message> }` rather than `ToolFailed`.
     async fn execute_spawn_tool(&mut self, call_id: ToolCallId, arguments: &serde_json::Value) {
-        let (spec, warnings) = match crate::spawn_tool::build_spawn_spec(arguments, &self.agent) {
+        let (mut spec, warnings) = match crate::spawn_tool::build_spawn_spec(arguments, &self.agent)
+        {
             Ok(parsed) => parsed,
             Err(message) => {
                 let effects = self.apply_and_publish(AgentCommand::ToolCompleted {
@@ -1019,6 +1024,7 @@ impl AgentRunner {
             }
         };
 
+        spec.origin_tool_call_id = Some(call_id);
         match self.spawn_agent(spec).await {
             Ok(outcome) => {
                 let (is_error, mut output) = match &outcome.awaited {

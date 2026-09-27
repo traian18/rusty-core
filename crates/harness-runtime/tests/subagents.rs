@@ -180,6 +180,7 @@ fn concurrent_spec(
     workspace: WorkspacePolicy,
 ) -> SpawnAgentSpec {
     SpawnAgentSpec {
+        origin_tool_call_id: None,
         role: Some(role.into()),
         backend,
         tools,

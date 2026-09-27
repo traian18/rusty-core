@@ -349,6 +349,7 @@ impl Agent {
                     event: AgentEvent::UsageUpdated {
                         usage: AgentUsageSnapshot {
                             agent_id: self.id.to_string(),
+                            model: self.state.execution_params.model.clone(),
                             metrics: AgentUsageMetrics {
                                 total_runs: self.usage.runs,
                                 total_requests: self.usage.records.len() as u64,
@@ -375,7 +376,10 @@ impl Agent {
                     cost: result.cost,
                     tool_usage: None,
                 });
-                if matches!(result.finish_reason.as_str(), "max_tokens" | "length" | "max_output_tokens") {
+                if matches!(
+                    result.finish_reason.as_str(),
+                    "max_tokens" | "length" | "max_output_tokens"
+                ) {
                     return self.fail(
                         "OUTPUT_LIMIT_REACHED",
                         format!("The model stopped at its output token limit ({}); the response is incomplete.", result.finish_reason),

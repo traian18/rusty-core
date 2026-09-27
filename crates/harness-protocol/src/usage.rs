@@ -127,6 +127,11 @@ pub struct AgentUsageSummary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentUsageSnapshot {
     pub agent_id: String,
+    /// The model this agent's requests run on, when one is set explicitly
+    /// (the session's model, or a spawned child's `model` override). Lets a
+    /// host attribute usage to the model that actually produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub metrics: AgentUsageMetrics,
     pub timestamp: String,
 }
