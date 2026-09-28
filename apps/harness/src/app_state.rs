@@ -68,9 +68,13 @@ fn log_summary(event: &AgentEvent) -> Option<String> {
             request.tool_call.name, request.id
         )),
         AgentEvent::UsageUpdated { usage } => Some(format!("usage updated: {usage:?}")),
-        AgentEvent::ChildAgentSpawned { agent_id } => {
-            Some(format!("child agent spawned {agent_id:?}"))
-        }
+        AgentEvent::ChildAgentSpawned {
+            agent_id,
+            tool_call_id,
+        } => Some(match tool_call_id {
+            Some(call) => format!("child agent spawned {agent_id:?} by tool call {call:?}"),
+            None => format!("child agent spawned {agent_id:?}"),
+        }),
         AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
             Some(format!("child agent {agent_id:?} completed: {outcome:?}"))
         }
@@ -545,7 +549,7 @@ impl AppState {
                 }
             }
             AgentEvent::UsageUpdated { usage } => self.usage = Some(usage),
-            AgentEvent::ChildAgentSpawned { agent_id } => {
+            AgentEvent::ChildAgentSpawned { agent_id, .. } => {
                 self.ensure_child(agent_id);
             }
             AgentEvent::ChildAgentCompleted { agent_id, outcome } => {

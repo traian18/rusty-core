@@ -45,9 +45,7 @@ pub struct OpenAiRequest {
 /// Maps rusty-core's 3-level `ReasoningEffort` onto the Chat Completions
 /// `reasoning_effort` string values -- same 1:1 mapping as
 /// `harness-integration-openai-responses`'s own `reasoning_effort_to_responses`.
-pub fn reasoning_effort_to_openai(
-    effort: harness_protocol::backend::ReasoningEffort,
-) -> String {
+pub fn reasoning_effort_to_openai(effort: harness_protocol::backend::ReasoningEffort) -> String {
     use harness_protocol::backend::ReasoningEffort;
     match effort {
         ReasoningEffort::Low => "low",
@@ -84,7 +82,7 @@ pub struct OpenAiJsonSchema {
 
 impl OpenAiResponseFormat {
     /// Translate the provider-neutral format. Returns `None` for
-    /// [`ResponseFormat::Text`] so the field is omitted entirely rather than
+    /// `ResponseFormat::Text` so the field is omitted entirely rather than
     /// sent as an explicit `{"type":"text"}` — some OpenAI-compatible
     /// servers reject fields they don't implement, and text is their default
     /// anyway.
@@ -876,9 +874,14 @@ data: [DONE]\n\n";
         parser
             .push_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
             .expect("chunk parses");
-        let error = parser.finish().expect_err("must reject a stream missing [DONE]");
+        let error = parser
+            .finish()
+            .expect_err("must reject a stream missing [DONE]");
         assert!(matches!(error, ModelError::StreamInterrupted { .. }));
-        assert!(error.is_retryable(), "a dropped connection, not malformed data, should be retried");
+        assert!(
+            error.is_retryable(),
+            "a dropped connection, not malformed data, should be retried"
+        );
     }
 
     #[test]
@@ -915,7 +918,10 @@ data: [DONE]\n\n";
     fn reasoning_effort_maps_onto_the_expected_strings() {
         use harness_protocol::backend::ReasoningEffort;
         assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Low), "low");
-        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Medium), "medium");
+        assert_eq!(
+            reasoning_effort_to_openai(ReasoningEffort::Medium),
+            "medium"
+        );
         assert_eq!(reasoning_effort_to_openai(ReasoningEffort::High), "high");
     }
 
@@ -955,7 +961,9 @@ data: [DONE]\n\n";
     fn reasoning_field_spelling_is_also_accepted() {
         let mut parser = OpenAiSseParser::new();
         let events = parser
-            .push_chunk(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"pondering\"}}]}\n\n")
+            .push_chunk(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"pondering\"}}]}\n\n",
+            )
             .expect("valid chunk");
         assert!(matches!(
             events.as_slice(),

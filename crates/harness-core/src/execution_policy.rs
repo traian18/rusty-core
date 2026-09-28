@@ -34,7 +34,8 @@ fn enabled(policy: &ExecutionPolicy, name: &str) -> bool {
 
 pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
     let permission = match name {
-        "report_progress" | "ask_user_question" => return true,
+        // `decide` is advisory: the IDE asks a decision model and returns its pick.
+        "report_progress" | "ask_user_question" | "decide" => return true,
         "write_plan" => return policy.mode == ExecutionMode::Plan,
         "read_file" | "fs.read" | "open_document" => "read_file",
         "write_file" | "fs.edit" => {
@@ -138,5 +139,21 @@ mod tests {
         policy.enabled_tools.clear();
         assert!(!allows_tool(&policy, "web_extract"));
         assert!(!allows_tool(&policy, "web_fetch"));
+    }
+
+    #[test]
+    fn decide_is_allowed_without_any_grant_in_every_mode() {
+        for mode in [
+            ExecutionMode::Execute,
+            ExecutionMode::Plan,
+            ExecutionMode::Virtual,
+        ] {
+            let policy = ExecutionPolicy {
+                mode,
+                enabled_tools: vec![],
+                allowed_mcp_servers: vec![],
+            };
+            assert!(allows_tool(&policy, "decide"));
+        }
     }
 }

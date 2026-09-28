@@ -719,8 +719,9 @@ impl SessionHandle {
     ///
     /// Applied as a partial update — fields left unset in `params` keep
     /// their previous value (see `ExecutionParams::merge_over`). Takes
-    /// effect starting with the next prompt/steer/follow-up; never mutates
-    /// an already-in-flight run. Use this both to change the session's
+    /// effect starting with the root agent's next model request -- the next
+    /// prompt/steer/follow-up, or the active run's next turn -- and never
+    /// mutates an already-in-flight request. Use this both to change the session's
     /// standing default (e.g. "switch this session to opus") and, sent
     /// immediately before one `send`, as a one-off override for the next
     /// run only if you follow it with another call reverting the field.

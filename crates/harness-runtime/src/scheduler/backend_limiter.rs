@@ -1,9 +1,9 @@
 //! Per-backend concurrency and sliding-window rate limiting.
 //!
-//! [`BackendLimiters`] is the single subsystem responsible for everything
+//! `BackendLimiters` is the single subsystem responsible for everything
 //! that is specific to one [`BackendId`]: its own concurrency ceiling and
 //! its own `requests_per_minute` / `tokens_per_minute` sliding window. It is
-//! deliberately independent of the global [`GlobalPermits`](crate::scheduler::permits::GlobalPermits)
+//! deliberately independent of the global `GlobalPermits`
 //! ceilings — a request must hold a permit from *both* systems before it may
 //! proceed.
 
@@ -22,7 +22,7 @@ use crate::scheduler::rate_window::RateWindow;
 // BackendRateLimits
 // ---------------------------------------------------------------------------
 
-/// Per-backend rate and concurrency limits for the [`BackendLimiters`] system.
+/// Per-backend rate and concurrency limits for the `BackendLimiters` system.
 ///
 /// These limits are applied **in addition** to the global backend concurrency
 /// ceiling ([`SchedulerConfig::max_concurrent_backend_requests`](crate::scheduler::SchedulerConfig::max_concurrent_backend_requests)).

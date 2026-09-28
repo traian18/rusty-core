@@ -19,7 +19,10 @@ impl OpenAiResponsesBackend {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(config: OpenAiResponsesConfig) -> GenericModelBackend {
         let recovery = config.recovery.clone();
-        GenericModelBackend::new_with_recovery(Arc::new(OpenAiResponsesClient::new(config)), recovery)
+        GenericModelBackend::new_with_recovery(
+            Arc::new(OpenAiResponsesClient::new(config)),
+            recovery,
+        )
     }
 }
 

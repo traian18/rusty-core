@@ -9,7 +9,7 @@
 //! * The number of **concurrent child processes** in flight.
 //!
 //! In addition to the global concurrency ceilings, the scheduler provides
-//! a [`BackendLimiters`](backend_limiter::BackendLimiters) system that
+//! a `BackendLimiters` system that
 //! enforces per-backend concurrency and sliding-window rate limits
 //! (requests per minute, tokens per minute).
 //!
@@ -37,15 +37,15 @@
 //!
 //! - **Configuration & errors ([`config`])**: [`SchedulerConfig`] capacities
 //!   and the typed [`CapacityError`] bounded-wait rejection.
-//! - **Global ceilings ([`permits`])**: [`permits::GlobalPermits`] owns the
+//! - **Global ceilings ([`permits`])**: `permits::GlobalPermits` owns the
 //!   five capacity semaphores and all acquire/try-acquire/cancellable logic
 //!   for them, plus the [`PermitSnapshot`]/[`SchedulerSnapshot`] diagnostics
 //!   types.
-//! - **Per-backend throttling ([`backend_limiter`])**: [`backend_limiter::BackendLimiters`]
+//! - **Per-backend throttling ([`backend_limiter`])**: `backend_limiter::BackendLimiters`
 //!   owns per-[`BackendId`] concurrency semaphores and sliding-window rate
-//!   bookkeeping ([`rate_window`]), entirely independent of the global
+//!   bookkeeping (`rate_window`), entirely independent of the global
 //!   ceilings — a request needs a permit from both systems.
-//! - **Metrics ([`metrics`])**: one shared instrumentation path
+//! - **Metrics (`metrics`)**: one shared instrumentation path
 //!   (`record_acquired`/`record_cancelled`) reused by every acquire method
 //!   instead of duplicating it per permit kind.
 //! - **Scheduler ([`Scheduler`])**: a thin facade that composes the above
@@ -92,8 +92,8 @@ mod cancellation_tests;
 
 /// Top-level concurrency throttle for the harness runtime.
 ///
-/// A thin facade composing [`GlobalPermits`] (the five capacity semaphores)
-/// and [`BackendLimiters`] (per-backend concurrency and rate limiting).
+/// A thin facade composing `GlobalPermits` (the five capacity semaphores)
+/// and `BackendLimiters` (per-backend concurrency and rate limiting).
 /// Every method below acquires an [`OwnedSemaphorePermit`] (or a
 /// [`BackendPermitGuard`]) that is independent of any borrow on `self`,
 /// so permits can be moved into spawned [`tokio::spawn`] tasks without

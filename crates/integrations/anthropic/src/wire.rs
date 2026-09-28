@@ -699,7 +699,10 @@ impl AnthropicSseParser {
                         }
                     }
                     "tool_use" => {
-                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                        let name = block
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or_default();
                         let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
                         if name == STRUCTURED_OUTPUT_TOOL {
                             events.push(ModelEvent::TextDelta {
@@ -809,7 +812,10 @@ mod tests {
         assert!(!is_valid_anthropic_tool_name("web.fetch"), "dot");
         assert!(!is_valid_anthropic_tool_name("Fetch URL"), "space");
         assert!(!is_valid_anthropic_tool_name("mcp:get_weather"), "colon");
-        assert!(!is_valid_anthropic_tool_name(&"x".repeat(129)), "over 128 chars");
+        assert!(
+            !is_valid_anthropic_tool_name(&"x".repeat(129)),
+            "over 128 chars"
+        );
     }
 
     #[test]
@@ -853,9 +859,15 @@ mod tests {
     #[test]
     fn an_explicit_reasoning_effort_scales_the_budget() {
         let full = 8192 - 1024;
-        let low = resolve_thinking(false, Some(ReasoningEffort::Low), 8192).unwrap().unwrap();
-        let medium = resolve_thinking(false, Some(ReasoningEffort::Medium), 8192).unwrap().unwrap();
-        let high = resolve_thinking(false, Some(ReasoningEffort::High), 8192).unwrap().unwrap();
+        let low = resolve_thinking(false, Some(ReasoningEffort::Low), 8192)
+            .unwrap()
+            .unwrap();
+        let medium = resolve_thinking(false, Some(ReasoningEffort::Medium), 8192)
+            .unwrap()
+            .unwrap();
+        let high = resolve_thinking(false, Some(ReasoningEffort::High), 8192)
+            .unwrap()
+            .unwrap();
         assert_eq!(low.budget_tokens, full / 4);
         assert_eq!(medium.budget_tokens, full / 2);
         assert_eq!(high.budget_tokens, full);
@@ -870,7 +882,9 @@ mod tests {
         // (e.g. from a model reference's `::reasoning=` suffix, never
         // `extended_thinking`) got silently no thinking block, even though
         // the capability check let the request through.
-        assert!(resolve_thinking(false, Some(ReasoningEffort::Low), 8192).unwrap().is_some());
+        assert!(resolve_thinking(false, Some(ReasoningEffort::Low), 8192)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -878,7 +892,9 @@ mod tests {
         // full_budget = 2048 - 1024 = 1024; full_budget / 4 = 256, which the
         // `.max(1024)` floor must bring back up to 1024, clamped to not
         // exceed full_budget by the trailing `.min(full_budget)`.
-        let low = resolve_thinking(false, Some(ReasoningEffort::Low), 2048).unwrap().unwrap();
+        let low = resolve_thinking(false, Some(ReasoningEffort::Low), 2048)
+            .unwrap()
+            .unwrap();
         assert_eq!(low.budget_tokens, 1024);
     }
 
@@ -1008,9 +1024,14 @@ data: {"type":"message_stop"}
         parser
             .push_chunk(b"event: ping\ndata: {}\n\n")
             .expect("ping parses");
-        let error = parser.finish().expect_err("must reject a stream missing message_stop");
+        let error = parser
+            .finish()
+            .expect_err("must reject a stream missing message_stop");
         assert!(matches!(error, ModelError::StreamInterrupted { .. }));
-        assert!(error.is_retryable(), "a dropped connection, not malformed data, should be retried");
+        assert!(
+            error.is_retryable(),
+            "a dropped connection, not malformed data, should be retried"
+        );
     }
 
     #[test]
@@ -1064,7 +1085,9 @@ data: {"type":"message_stop"}
             .push_chunk(json_body.to_string().as_bytes())
             .expect("json body chunked");
         let (events, result) = parser.finish().expect("finish parses non-streaming json");
-        assert!(events.iter().any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "Hello from OpenCode Haiku")));
+        assert!(events.iter().any(
+            |e| matches!(e, ModelEvent::TextDelta { delta } if delta == "Hello from OpenCode Haiku")
+        ));
         assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
         assert_eq!(result.usage.input_tokens.value(), Some(12));
         assert_eq!(result.usage.output_tokens.value(), Some(6));

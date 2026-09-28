@@ -51,6 +51,14 @@ pub enum MutationCommand {
         id: PermissionId,
         decision: PermissionDecision,
     },
+    /// Update the session's execution params (e.g. switch its model). A
+    /// partial update: unset fields keep their value. Applies from the root
+    /// agent's next model request, including the next one within an active
+    /// run. Gated by the `configure_execution` protocol capability.
+    ConfigureExecution {
+        // Boxed: the params are much larger than every other variant.
+        params: Box<crate::backend::ExecutionParams>,
+    },
     CloseSession,
 }
 
@@ -273,6 +281,9 @@ pub struct ProtocolCapabilities {
     /// `MutationCommand::Pause`/`Resume` are accepted and drive a real,
     /// recoverable pause of the active run.
     pub pause_resume: bool,
+    /// `MutationCommand::ConfigureExecution` is accepted.
+    #[serde(default)]
+    pub configure_execution: bool,
 }
 
 impl Default for ProtocolCapabilities {
@@ -287,6 +298,7 @@ impl Default for ProtocolCapabilities {
             event_gap_signals: true,
             durable_idempotency: false,
             pause_resume: true,
+            configure_execution: true,
         }
     }
 }
@@ -393,6 +405,35 @@ mod tests {
         assert!(capabilities.event_gap_signals);
         assert!(!capabilities.durable_idempotency);
         assert!(capabilities.pause_resume);
+        assert!(capabilities.configure_execution);
+    }
+
+    #[test]
+    fn configure_execution_round_trips_as_a_partial_params_update() {
+        let command = MutationCommand::ConfigureExecution {
+            params: Box::new(crate::backend::ExecutionParams {
+                model: Some("claude-opus-4-20250514".into()),
+                ..Default::default()
+            }),
+        };
+        let encoded = serde_json::to_value(&command).expect("serialize");
+        assert_eq!(encoded["type"], "configure_execution");
+        assert_eq!(
+            encoded["payload"]["params"]["model"],
+            "claude-opus-4-20250514"
+        );
+
+        // A client sends only the fields it changes.
+        let decoded: MutationCommand = serde_json::from_value(serde_json::json!({
+            "type": "configure_execution",
+            "payload": { "params": { "model": "gpt-5", "reasoning_effort": "high" } }
+        }))
+        .expect("deserialize");
+        let MutationCommand::ConfigureExecution { params } = decoded else {
+            panic!("decoded the wrong variant");
+        };
+        assert_eq!(params.model.as_deref(), Some("gpt-5"));
+        assert_eq!(params.max_tokens, None);
     }
 
     #[test]

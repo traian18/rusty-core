@@ -476,7 +476,10 @@ async fn anthropic_backend_handles_non_streaming_json_response() {
             body
         );
         use tokio::io::AsyncWriteExt;
-        socket.write_all(response.as_bytes()).await.expect("write json response");
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write json response");
         socket.shutdown().await.expect("shutdown json response");
     });
 

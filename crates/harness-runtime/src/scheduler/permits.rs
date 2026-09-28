@@ -1,10 +1,10 @@
 //! Global concurrency ceilings: session, agent, backend-request, tool, and
 //! process semaphores.
 //!
-//! [`GlobalPermits`] owns the five independent `tokio::sync::Semaphore`s that
+//! `GlobalPermits` owns the five independent `tokio::sync::Semaphore`s that
 //! cap harness-wide concurrency and is the only place that knows how to
 //! acquire, time out, or cancel a wait against them. It is deliberately
-//! unaware of per-backend rate limiting — see [`BackendLimiters`](crate::scheduler::backend_limiter::BackendLimiters)
+//! unaware of per-backend rate limiting — see `BackendLimiters`
 //! for that concern.
 
 use std::sync::Arc;

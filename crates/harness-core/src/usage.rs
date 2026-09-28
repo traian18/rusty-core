@@ -69,7 +69,9 @@ fn add_metrics(left: &AgentUsageMetrics, right: &AgentUsageMetrics) -> AgentUsag
         input_tokens: left.input_tokens.checked_add(right.input_tokens),
         output_tokens: left.output_tokens.checked_add(right.output_tokens),
         cache_read_tokens: left.cache_read_tokens.checked_add(right.cache_read_tokens),
-        cache_write_tokens: left.cache_write_tokens.checked_add(right.cache_write_tokens),
+        cache_write_tokens: left
+            .cache_write_tokens
+            .checked_add(right.cache_write_tokens),
         reasoning_tokens: left.reasoning_tokens.checked_add(right.reasoning_tokens),
         total_cost: checked_add_cost(left.total_cost, right.total_cost),
     }
@@ -122,9 +124,8 @@ impl UsageLedger {
     /// request count, tool-call count, total tokens, and total cost —
     /// excluding any descendants.
     pub fn self_metrics(&self) -> AgentUsageMetrics {
-        let aggregated = aggregate_model_usage(
-            self.records.iter().map(|record| &record.model_usage),
-        );
+        let aggregated =
+            aggregate_model_usage(self.records.iter().map(|record| &record.model_usage));
         AgentUsageMetrics {
             total_runs: self.runs,
             total_requests: self.records.len() as u64,

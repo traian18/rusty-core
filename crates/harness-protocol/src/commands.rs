@@ -250,8 +250,9 @@ pub enum AgentCommand {
     ///
     /// Applied as a partial update via `ExecutionParams::merge_over` — fields
     /// left unset in `params` keep their previous value. Takes effect
-    /// starting with the *next* run this agent starts; it never mutates an
-    /// already-in-flight request. This is the only mutation path for
+    /// starting with this agent's *next* model request -- including the next
+    /// one within an active run (e.g. after its pending tools finish); it
+    /// never mutates an already-in-flight request. This is the only mutation path for
     /// execution params — both "set the session default at creation" and
     /// "override for the next prompt" go through this same command, sent
     /// immediately before `StartRun`/`Steer`/`FollowUp` for the latter case.

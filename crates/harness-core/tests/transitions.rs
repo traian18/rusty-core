@@ -906,6 +906,61 @@ fn configured_execution_params_reach_the_next_runs_execution_request() {
 }
 
 #[test]
+fn configure_execution_mid_run_applies_to_the_next_model_request_of_that_run() {
+    // Hosts rely on this to switch models between a run's model turns (e.g.
+    // stepping up to a stronger model from inside a tool call).
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    let call_id = ToolCallId::new();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+    let mut result = completed_result();
+    result.finish_reason = "tool_use".into();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result,
+        },
+    });
+
+    // Sent while the tool is still pending, before its result.
+    let configured = agent.apply(AgentCommand::ConfigureExecution {
+        params: harness_protocol::backend::ExecutionParams {
+            model: Some("claude-opus-4-20250514".to_string()),
+            ..Default::default()
+        },
+    });
+    assert!(configured.is_empty());
+
+    let effects = agent.apply(AgentCommand::ToolCompleted {
+        call_id,
+        result: ToolResult {
+            call_id,
+            output: serde_json::json!({"ok": true}),
+            is_error: false,
+        },
+    });
+    let request = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AgentEffect::ExecuteBackend { request } => Some(request),
+            _ => None,
+        })
+        .expect("the finished tool must trigger the run's next model request");
+    assert_eq!(request.run_id, run_id);
+    assert_eq!(
+        request.params.model.as_deref(),
+        Some("claude-opus-4-20250514")
+    );
+}
+
+#[test]
 fn configure_execution_is_a_partial_update_that_preserves_unset_fields() {
     let mut agent = create_agent(PermissionMode::Allow);
     agent.apply(AgentCommand::ConfigureExecution {

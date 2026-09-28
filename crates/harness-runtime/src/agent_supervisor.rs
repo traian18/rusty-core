@@ -45,7 +45,8 @@ struct AgentHandle {
 /// The result of spawning according to SpawnMode.
 #[derive(Debug, Clone)]
 pub enum SpawnOutcome {
-    Awaited(AgentResult),
+    /// Boxed: a child's full result is far larger than a `Detached` id.
+    Awaited(Box<AgentResult>),
     Detached(AgentId),
 }
 
@@ -386,7 +387,9 @@ impl AgentSupervisor {
 
         match mode {
             SpawnMode::Concurrent => Ok(SpawnOutcome::Detached(child_id)),
-            SpawnMode::AwaitResult => Ok(SpawnOutcome::Awaited(self.await_child(child_id).await?)),
+            SpawnMode::AwaitResult => Ok(SpawnOutcome::Awaited(Box::new(
+                self.await_child(child_id).await?,
+            ))),
         }
     }
 

@@ -241,9 +241,7 @@ impl Harness {
             "anthropic" | "openai" => {
                 serde_json::json!({"default_model": selection.provider_model_id.clone()})
             }
-            "codex" | "github-copilot"
-                if selection.provider_model_id == "default" =>
-            {
+            "codex" | "github-copilot" if selection.provider_model_id == "default" => {
                 serde_json::json!({})
             }
             "codex" => {

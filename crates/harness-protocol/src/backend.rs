@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId, ToolCallId};
+use crate::ids::{
+    BackendId, ConfigurationId, IntegrationId, ModelId, RequestId, RunId, ToolCallId,
+};
 
 use crate::messages::AgentMessage;
 use crate::tools::{ToolCall, ToolDescriptor, ToolResultSummary};

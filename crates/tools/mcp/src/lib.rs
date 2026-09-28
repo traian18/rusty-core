@@ -13,7 +13,7 @@
 //!
 //! **Transports**: stdio (spawn a process) and streamable HTTP (POST to an
 //! endpoint, reply as JSON or SSE). Both sit behind one internal trait, so
-//! everything above `McpClient` is written once — see [`transport`].
+//! everything above `McpClient` is written once — see `transport`.
 //!
 //! **Methods**: `tools/*` only — `initialize` →
 //! `notifications/initialized` → `tools/list` → `tools/call`. Resources,

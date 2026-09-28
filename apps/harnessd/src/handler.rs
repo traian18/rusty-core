@@ -172,6 +172,8 @@ impl HarnessRpcHandler {
         RpcResponseBody::Failure(RpcError::new(code, category, retryable, message))
     }
 
+    // One parameter per field of the `CreateSession` wire request.
+    #[allow(clippy::too_many_arguments)]
     async fn create_session(
         &self,
         execution_policy: Option<harness_protocol::tools::ExecutionPolicy>,
@@ -380,6 +382,7 @@ impl HarnessRpcHandler {
                 | MutationCommand::Pause
                 | MutationCommand::Resume
                 | MutationCommand::ResolvePermission { .. }
+                | MutationCommand::ConfigureExecution { .. }
                 | MutationCommand::CloseSession
         );
         let operation = match command {
@@ -391,6 +394,9 @@ impl HarnessRpcHandler {
             MutationCommand::Resume => handle.resume().await,
             MutationCommand::ResolvePermission { id, decision } => {
                 handle.resolve_permission(id, decision).await
+            }
+            MutationCommand::ConfigureExecution { params } => {
+                handle.set_execution_params(*params).await
             }
             MutationCommand::CloseSession => handle.close().await,
         };

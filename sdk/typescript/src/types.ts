@@ -211,6 +211,8 @@ export interface ProtocolCapabilities {
   event_gap_signals: boolean;
   durable_idempotency: boolean;
   pause_resume: boolean;
+  /** `configure_execution` mutations are accepted. */
+  configure_execution?: boolean;
 }
 
 export interface MutationMetadata {
@@ -219,6 +221,30 @@ export interface MutationMetadata {
   run_id: RunId | null;
   expected_session_revision: number | null;
   trace_id: string | null;
+}
+
+export type ReasoningEffort = "low" | "medium" | "high";
+
+export type ResponseFormat =
+  | { type: "text" }
+  | { type: "json_object" }
+  | { type: "json_schema"; name: string; schema: unknown; strict?: boolean };
+
+/**
+ * Mirrors `harness_protocol::backend::ExecutionParams`. Every field is
+ * optional: an absent field means "keep the current value" in a
+ * `configure_execution` update (and "use the provider's default" at session
+ * creation), not "clear it".
+ */
+export interface ExecutionParams {
+  model?: string;
+  max_tokens?: number;
+  temperature?: number;
+  stop_sequences?: string[];
+  reasoning_effort?: ReasoningEffort;
+  extended_thinking?: boolean;
+  response_format?: ResponseFormat;
+  provider_options?: unknown;
 }
 
 export type MutationCommand =
@@ -232,6 +258,8 @@ export type MutationCommand =
       type: "resolve_permission";
       payload: { id: PermissionId; decision: PermissionDecision };
     }
+  /** Applies from the root agent's next model request, even mid-run. */
+  | { type: "configure_execution"; payload: { params: ExecutionParams } }
   | { type: "close_session" };
 
 export type AdmissionResult =

@@ -161,16 +161,18 @@ fn content_blocks_to_responses_input(content: &[ContentBlock]) -> Vec<ResponsesI
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(ResponsesInputContentPart::InputText {
-                text: text.clone(),
-            }),
-            ContentBlock::Image { mime_type, data } => Some(ResponsesInputContentPart::InputImage {
-                detail: "auto".to_string(),
-                image_url: format!(
-                    "data:{mime_type};base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(data)
-                ),
-            }),
+            ContentBlock::Text { text } => {
+                Some(ResponsesInputContentPart::InputText { text: text.clone() })
+            }
+            ContentBlock::Image { mime_type, data } => {
+                Some(ResponsesInputContentPart::InputImage {
+                    detail: "auto".to_string(),
+                    image_url: format!(
+                        "data:{mime_type};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    ),
+                })
+            }
             _ => None,
         })
         .collect()
@@ -441,7 +443,10 @@ impl OpenAiResponsesSseParser {
                 if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
                     return Ok(vec![]);
                 }
-                let output_index = value.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let output_index = value
+                    .get("output_index")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0);
                 let id = ToolCallId::new();
                 if let Some(provider_call_id) = item.get("call_id").and_then(|c| c.as_str()) {
                     self.tool_ids
@@ -467,7 +472,10 @@ impl OpenAiResponsesSseParser {
                 Ok(vec![event])
             }
             "response.function_call_arguments.delta" => {
-                let output_index = value.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let output_index = value
+                    .get("output_index")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0);
                 let Some(buffer) = self.tool_buffers.get(&output_index) else {
                     return Ok(vec![]);
                 };
@@ -490,7 +498,10 @@ impl OpenAiResponsesSseParser {
                 if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
                     return Ok(vec![]);
                 }
-                let output_index = value.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let output_index = value
+                    .get("output_index")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(0);
                 let Some(buffer) = self.tool_buffers.remove(&output_index) else {
                     return Ok(vec![]);
                 };
@@ -641,9 +652,18 @@ mod tests {
     #[test]
     fn reasoning_effort_maps_onto_the_responses_apis_own_effort_strings() {
         use harness_protocol::backend::ReasoningEffort;
-        assert_eq!(reasoning_effort_to_responses(ReasoningEffort::Low).effort, "low");
-        assert_eq!(reasoning_effort_to_responses(ReasoningEffort::Medium).effort, "medium");
-        assert_eq!(reasoning_effort_to_responses(ReasoningEffort::High).effort, "high");
+        assert_eq!(
+            reasoning_effort_to_responses(ReasoningEffort::Low).effort,
+            "low"
+        );
+        assert_eq!(
+            reasoning_effort_to_responses(ReasoningEffort::Medium).effort,
+            "medium"
+        );
+        assert_eq!(
+            reasoning_effort_to_responses(ReasoningEffort::High).effort,
+            "high"
+        );
     }
 
     #[test]
@@ -760,9 +780,14 @@ mod tests {
                 .as_bytes(),
             )
             .expect("valid frame");
-        let error = parser.finish().expect_err("must reject a stream missing a terminal event");
+        let error = parser
+            .finish()
+            .expect_err("must reject a stream missing a terminal event");
         assert!(matches!(error, ModelError::StreamInterrupted { .. }));
-        assert!(error.is_retryable(), "a dropped connection, not malformed data, should be retried");
+        assert!(
+            error.is_retryable(),
+            "a dropped connection, not malformed data, should be retried"
+        );
     }
 
     #[test]
@@ -829,9 +854,9 @@ mod tests {
         let (terminal, result) = parser.finish().expect("terminal event seen");
         events.extend(terminal);
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ModelEvent::ToolCallStarted { name, .. } if name == "get_weather")));
+        assert!(events.iter().any(
+            |e| matches!(e, ModelEvent::ToolCallStarted { name, .. } if name == "get_weather")
+        ));
         let completed = events
             .iter()
             .find_map(|e| match e {

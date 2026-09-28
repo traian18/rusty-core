@@ -336,7 +336,7 @@ impl AnthropicClient {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .map_or(false, |ct| ct.contains("application/json"));
+            .is_some_and(|ct| ct.contains("application/json"));
 
         if is_json {
             let body = response

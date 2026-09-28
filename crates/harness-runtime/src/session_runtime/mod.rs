@@ -15,36 +15,36 @@
 //! - [`SessionRuntime`] retains the durable store and owns the session's
 //!   shared committer and per-agent **projection table**
 //!   ([`AgentProjectionTable`]) — every runner publishes its
-//!   [`StoredAgentState`] after each transition, and [`SessionRuntime::checkpoint`]
+//!   `StoredAgentState` after each transition, and [`SessionRuntime::checkpoint`]
 //!   (plus the automatic snapshot hooks) build versioned,
-//!   dependency-recorded [`DurableSessionSnapshot`]s from those projections.
+//!   dependency-recorded `DurableSessionSnapshot`s from those projections.
 //!
 //! # Architecture & SOLID Principles
 //!
 //! Each concern below lives in its own file (Single Responsibility
 //! Principle) instead of one struct owning all of it:
 //!
-//! - **Value types ([`types`])**: [`SessionStatus`], [`SessionCommand`],
+//! - **Value types (`types`)**: [`SessionStatus`], [`SessionCommand`],
 //!   [`SessionError`], [`SessionSnapshot`], [`SessionState`] — plain data,
 //!   no behavior.
-//! - **Live status ([`live_state`])**: [`AgentLiveState`] and
+//! - **Live status (`live_state`)**: [`AgentLiveState`] and
 //!   [`LiveStateTable`], the per-agent projection every runner keeps fresh.
-//! - **Durable projection ([`projection`])**: [`AgentProjectionTable`] and
-//!   both directions of the live-agent ⇄ [`StoredAgentState`] conversion
-//!   ([`stored_agent_state`], `build_snapshot`, and the restore-side
+//! - **Durable projection (`projection`)**: [`AgentProjectionTable`] and
+//!   both directions of the live-agent ⇄ `StoredAgentState` conversion
+//!   (`stored_agent_state`, `build_snapshot`, and the restore-side
 //!   `capabilities_from_value`/`usage_from_value`).
-//! - **Event aggregation ([`event_bus`])**: [`SessionEventBus`] and the
+//! - **Event aggregation (`event_bus`)**: [`SessionEventBus`] and the
 //!   `BridgeEventSink` that forwards to an external sink.
-//! - **Automatic checkpoints ([`checkpoint`])**: `RuntimeCheckpointRequester`,
+//! - **Automatic checkpoints (`checkpoint`)**: `RuntimeCheckpointRequester`,
 //!   the [`CheckpointRequester`](harness_session_store::CheckpointRequester)
 //!   the committer calls into.
-//! - **Runner spawning ([`runner_spawn`])**: the one place that opens an
+//! - **Runner spawning (`runner_spawn`)**: the one place that opens an
 //!   agent's task channel, wires it into the supervisor/live-state/
 //!   projection/event-bus, and spawns it — shared by fresh construction,
 //!   restore, and dynamically spawned agents so those three lifecycles
 //!   cannot drift out of sync.
-//! - **Fresh construction ([`construction`])**: `SessionRuntime::new*`.
-//! - **Restore construction ([`restoration`])**: `SessionRuntime::from_stored`.
+//! - **Fresh construction (`construction`)**: `SessionRuntime::new*`.
+//! - **Restore construction (`restoration`)**: `SessionRuntime::from_stored`.
 //! - **Runtime ([`SessionRuntime`], this file)**: the struct definition and
 //!   its steady-state operations (mailbox commands, cancellation, snapshots,
 //!   checkpoints) — everything a session does once it is already running.

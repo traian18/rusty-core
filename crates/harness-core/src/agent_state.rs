@@ -23,7 +23,8 @@ pub struct AgentState {
     pub system_prompt: String,
     /// Session-level default model/execution parameters. Updated only via
     /// `AgentCommand::ConfigureExecution`; read by `execution_request()`
-    /// when building each new run's `ExecutionRequest`.
+    /// when building each `ExecutionRequest`, so a change applies from the
+    /// next model request, even within an active run.
     pub execution_params: ExecutionParams,
     /// Lossless canonical history. Compaction only changes the prepared inference view.
     pub messages: Vec<AgentMessage>,

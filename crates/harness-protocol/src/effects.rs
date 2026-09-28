@@ -30,6 +30,9 @@ pub struct PermissionRequest {
 /// implementation. The `harness-session-store` crate is responsible for
 /// converting these shapes into its own `DurableSessionEvent` /
 /// `DurableSessionSnapshot` types before writing them (spec §59).
+// Nearly every mutation is an `AppendEvent` (one per session event), so
+// boxing the large variant would add an allocation per event and save nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionMutation {
     /// Append a fully-qualified agent event to the durable session history.
