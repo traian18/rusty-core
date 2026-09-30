@@ -358,6 +358,60 @@ impl OrchestrationRunner {
         ))
     }
 
+    /// Explicit user retry from a failed checkpoint. Preserve outputs and attempt
+    /// history; never replay successful steps or silently change definitions.
+    pub fn retry_failed(
+        &self,
+        mut state: OrchestrationRunState,
+        run_id: OrchestrationRunId,
+        guidance: String,
+    ) -> Result<OrchestrationHandle, OrchestrationRuntimeError> {
+        check_restorable(&self.compiled, &state)?;
+        self.check_tool_references()?;
+        if state.status != OrchestrationStatus::Failed {
+            return Err(OrchestrationRuntimeError::Restore(
+                "only failed runs can be retried".into(),
+            ));
+        }
+        let node_id = state.failed_step.take().ok_or_else(|| {
+            OrchestrationRuntimeError::Restore("no failed step checkpoint is available".into())
+        })?;
+        let step = state
+            .steps
+            .get_mut(&node_id)
+            .ok_or_else(|| OrchestrationRuntimeError::Restore("failed step is missing".into()))?;
+        if step.status != StepStatus::Failed {
+            return Err(OrchestrationRuntimeError::Restore(
+                "checkpoint step is not failed".into(),
+            ));
+        }
+        if let Some(error) = step.error.take() {
+            step.feedback.push(error);
+        }
+        step.feedback.push(OrchestrationError::new("USER_CONTINUATION", format!(
+            "Resume this step. Earlier successful steps and their outputs are retained. The failed attempt may have changed the workspace: inspect current state before repeating actions. User guidance: {guidance}"
+        )));
+        step.status = StepStatus::Ready;
+        step.pending_permissions.clear();
+        for step in state.steps.values_mut() {
+            if step.status == StepStatus::Skipped {
+                step.status = StepStatus::Pending;
+            }
+        }
+        state.run_id = run_id;
+        state.status = OrchestrationStatus::Ready;
+        state.paused = false;
+        state.error = None;
+        state.final_output = None;
+        Ok(self.spawn(
+            state,
+            0,
+            0,
+            OrchestrationCommand::Recover,
+            CancellationToken::new(),
+        ))
+    }
+
     /// Start a run and wait for it, cancelling when `cancellation` fires.
     pub async fn run(
         &self,
@@ -977,13 +1031,19 @@ impl StepJob {
             OrchestrationNodeKind::Agent(config) => {
                 let input = resolve_inputs(&self.state, &self.node.input_bindings)?;
                 details.input = Some(input.clone());
-                let schema_ref = self.node.output_schema.as_ref().ok_or_else(|| {
-                    OrchestrationError::new(
-                        "missing_output_schema",
-                        "agent node has no output schema",
-                    )
-                })?;
-                let schema = validation.resolve(schema_ref)?;
+                let schema = if config.structured_output
+                    == harness_core::orchestration::StructuredOutputMode::Text
+                {
+                    serde_json::json!({ "type": "string" })
+                } else {
+                    let schema_ref = self.node.output_schema.as_ref().ok_or_else(|| {
+                        OrchestrationError::new(
+                            "missing_output_schema",
+                            "agent node has no output schema",
+                        )
+                    })?;
+                    validation.resolve(schema_ref)?
+                };
                 let tools = match &config.tools {
                     ToolScope::None => Vec::new(),
                     ToolScope::AllowList(tools) => tools.clone(),

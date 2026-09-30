@@ -729,7 +729,7 @@ async fn file_store_rejects_path_like_run_ids() {
 // ---------------------------------------------------------------------------
 
 mod isolated_session {
-    use harness_core::orchestration::StructuredOutputMode;
+    use harness_core::orchestration::{SchemaReference, StructuredOutputMode, VerificationCheck};
     use harness_protocol::{
         backend::{
             BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent,
@@ -862,7 +862,11 @@ mod isolated_session {
             .with_events(vec![
                 ExecutionEvent::TextDelta {
                     request_id,
-                    delta: report("completed").to_string(),
+                    delta: if mode == StructuredOutputMode::Text {
+                        "A plain message with {invalid JSON}.".into()
+                    } else {
+                        report("completed").to_string()
+                    },
                 },
                 ExecutionEvent::Completed {
                     request_id,
@@ -890,7 +894,24 @@ mod isolated_session {
         for node in &mut definition.nodes {
             if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
                 config.structured_output = mode;
+                if mode == StructuredOutputMode::Text {
+                    node.output_schema = None;
+                }
             }
+            if mode == StructuredOutputMode::Text {
+                if let OrchestrationNodeKind::Verify(config) = &mut node.kind {
+                    config.checks.clear();
+                    config.checks.push(VerificationCheck::ArtifactExists {
+                        pointer: "/report".into(),
+                    });
+                }
+            }
+        }
+        if mode == StructuredOutputMode::Text {
+            definition.output_contract.schema = SchemaReference::Inline {
+                name: "text".into(),
+                schema: json!({"type": "string"}),
+            };
         }
         let handle = OrchestrationRunner::new(
             compiled(definition),
@@ -933,6 +954,16 @@ mod isolated_session {
     }
 
     #[tokio::test]
+    async fn text_steps_never_send_or_request_a_schema_even_if_supported() {
+        for request in requests_sent(StructuredOutputMode::Text).await {
+            assert_eq!(request.params.response_format, None);
+            let prompt = prompt_of(&request);
+            assert!(!prompt.contains("JSON Schema"));
+            assert!(prompt.contains("ordinary text or Markdown"));
+        }
+    }
+
+    #[tokio::test]
     async fn fallback_steps_still_use_the_native_schema_when_the_backend_has_one() {
         for request in requests_sent(StructuredOutputMode::HostValidatedFallback).await {
             assert!(
@@ -946,4 +977,101 @@ mod isolated_session {
             assert!(!prompt_of(&request).contains("matching this JSON Schema"));
         }
     }
+}
+
+#[tokio::test]
+async fn explicit_retry_preserves_plan_and_restarts_only_failed_build() {
+    use harness_core::orchestration::{InputBinding, OutputBinding};
+    let mut definition = default_orchestration_definition();
+    let mut plan = definition
+        .nodes
+        .iter()
+        .find(|n| n.id == node("execute"))
+        .unwrap()
+        .clone();
+    plan.id = node("plan");
+    plan.name = "Plan".into();
+    definition.nodes.push(plan);
+    definition.edges[0].target = node("plan");
+    let mut edge = definition.edges[0].clone();
+    edge.id = "plan-build".into();
+    edge.source = node("plan");
+    edge.target = node("execute");
+    definition.edges.push(edge);
+    definition
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == node("execute"))
+        .unwrap()
+        .input_bindings
+        .push(InputBinding {
+            target: "plan".into(),
+            source: OutputBinding::NodeOutput {
+                node_id: node("plan"),
+                pointer: String::new(),
+            },
+        });
+    let agent = ScriptedAgent::new(vec![
+        ok(report("completed")),
+        Behavior::Return(Err(AgentExecutionError::new("backend", "HTTP 400"))),
+        ok(report("completed")),
+    ]);
+    let runner = OrchestrationRunner::new(compiled(definition), agent.clone())
+        .with_available_tools(["fs.read".into(), "fs.edit".into()]);
+    let failed = runner
+        .run(run_id("first"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(failed.state.failed_step, Some(node("execute")));
+    assert_eq!(failed.state.status, OrchestrationStatus::Failed);
+    let saved_plan = failed.state.steps[&node("plan")].clone();
+    // Round-trip through chat persistence before continuation.
+    let checkpoint = serde_json::from_value(serde_json::to_value(&failed.state).unwrap()).unwrap();
+    let continued = runner
+        .retry_failed(checkpoint, run_id("continued"), "continue please".into())
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(continued.state.status, OrchestrationStatus::Completed);
+    assert_eq!(continued.state.steps[&node("plan")], saved_plan);
+    assert_eq!(continued.state.input, Some(input()));
+    let requests = agent.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.node_id.clone())
+            .collect::<Vec<_>>(),
+        vec![node("plan"), node("execute"), node("execute")]
+    );
+    assert_eq!(requests[2].attempt, 2);
+    assert_eq!(requests[1].input, requests[2].input);
+    assert!(requests[2]
+        .feedback
+        .iter()
+        .any(|f| f.message.contains("continue please")));
+}
+
+#[tokio::test]
+async fn explicit_retry_rejects_changed_definitions_and_successful_runs() {
+    let agent = ScriptedAgent::new(vec![Behavior::Return(Err(AgentExecutionError::new(
+        "backend", "failed",
+    )))]);
+    let original = runner(agent.clone());
+    let failed = original
+        .run(run_id("first"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    let mut changed = default_orchestration_definition();
+    changed.nodes[1].name = "different definition".into();
+    let changed_runner = OrchestrationRunner::new(compiled(changed), agent.clone());
+    assert!(changed_runner
+        .retry_failed(failed.state.clone(), run_id("next"), "continue".into())
+        .is_err());
+    let mut completed = failed.state;
+    completed.status = OrchestrationStatus::Completed;
+    assert!(original
+        .retry_failed(completed, run_id("next"), "continue".into())
+        .is_err());
+    assert_eq!(agent.requests().len(), 1);
 }

@@ -158,6 +158,8 @@ pub enum ToolScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredOutputMode {
+    /// Forward the final message verbatim; no model-facing schema or JSON parsing.
+    Text,
     /// Reject the step before any model request if the backend lacks
     /// native structured output.
     #[default]
@@ -309,8 +311,10 @@ pub const MAX_STEP_ATTEMPTS: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrchestrationPolicies {
-    pub max_steps: u32,
-    pub max_total_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,8 +330,8 @@ pub struct OrchestrationPolicies {
 impl Default for OrchestrationPolicies {
     fn default() -> Self {
         Self {
-            max_steps: 64,
-            max_total_attempts: 128,
+            max_steps: None,
+            max_total_attempts: None,
             max_elapsed_ms: None,
             max_model_requests: None,
             max_tool_calls: None,

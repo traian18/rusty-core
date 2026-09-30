@@ -784,13 +784,14 @@ impl AgentRunner {
 
     /// Streams a backend request into the agent's mailbox.
     ///
-    /// The transcript is validated first; an invalid transcript is rejected
-    /// with a normal backend error. Otherwise a forwarding task relays
+    /// Repair the outgoing history, then validate it before dispatch. The
+    /// recorded transcript stays untouched. A forwarding task relays
     /// streamed events to the mailbox while a driver task holds the scheduler
     /// permits and runs the request. The driver waits for the forwarding task
     /// to drain before synthesizing a terminal event, so streamed events are
     /// never overtaken.
-    async fn execute_backend(&mut self, request: ExecutionRequest) {
+    async fn execute_backend(&mut self, mut request: ExecutionRequest) {
+        request.messages = harness_protocol::messages::repair_tool_history(request.messages);
         // Covers direct runtime construction, restore and child backends too.
         if self.backend.capabilities().backend_managed_tools {
             let _ = self.task.commands_tx.send(AgentCommand::BackendEvent {
@@ -804,7 +805,7 @@ impl AgentRunner {
             }).await;
             return;
         }
-        if let Err(error) = validate_transcript(&self.agent.state.messages) {
+        if let Err(error) = validate_transcript(&request.messages) {
             tracing::error!(
                 ?error,
                 "refusing to dispatch backend request with invalid transcript"

@@ -187,6 +187,19 @@ impl SessionHandle {
             .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
     }
 
+    /// Retry only the failed step of a validated checkpoint, on this session's backend.
+    pub async fn retry_orchestration(
+        &self,
+        request: OrchestrationRequest,
+        state: harness_core::orchestration::OrchestrationRunState,
+        guidance: String,
+    ) -> Result<OrchestrationHandle, HarnessError> {
+        self.orchestration_runner(&request.definition)
+            .await?
+            .retry_failed(state, request.run_id, guidance)
+            .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
+    }
+
     async fn orchestration_runner(
         &self,
         definition: &DefinitionRef,

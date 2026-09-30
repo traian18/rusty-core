@@ -11,6 +11,7 @@ use tracing::instrument;
 use harness_model::client::{send_event, ModelClient, ModelEventSender};
 use harness_model::events::{ModelError, ModelResult};
 use harness_model::request::{ModelCapabilities, ModelRequest};
+use harness_protocol::usage::{ModelUsage, UsageValue};
 
 use crate::config::OpenAiConfig;
 use crate::wire::{
@@ -164,7 +165,8 @@ impl ModelClient for OpenAiClient {
 
         let status = response.status();
         if status.is_success() {
-            Self::handle_success_response(response, &events, &cancel, self.tool_ids.clone()).await
+            self.handle_success_response(response, &events, &cancel, self.tool_ids.clone())
+                .await
         } else if status.as_u16() == 429 {
             Self::handle_rate_limit(response)
         } else {
@@ -175,6 +177,7 @@ impl ModelClient for OpenAiClient {
 
 impl OpenAiClient {
     async fn handle_success_response(
+        &self,
         mut response: reqwest::Response,
         events: &ModelEventSender,
         cancel: &tokio_util::sync::CancellationToken,
@@ -205,6 +208,24 @@ impl OpenAiClient {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
+        // OpenRouter occasionally ends Gemini streams without the terminal
+        // usage chunk. Its generation record is populated asynchronously and
+        // can supply the exact counters before the core session completes.
+        if parser.is_complete() && !parser.has_usage() && is_openrouter_url(&self.config.base_url) {
+            if let Some(id) = parser.response_id() {
+                if let Some(usage) = recover_openrouter_usage(
+                    &self.http_client,
+                    &self.config.base_url,
+                    &self.config.api_key,
+                    id,
+                    cancel,
+                )
+                .await
+                {
+                    parser.set_usage(usage);
+                }
+            }
+        }
         let (terminal_events, result) = parser.finish()?;
         for event in terminal_events {
             send_event(events, event, cancel).await?;
@@ -229,6 +250,82 @@ impl OpenAiClient {
     }
 }
 
+fn is_openrouter_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host == "openrouter.ai")
+}
+
+fn generation_usage(data: &serde_json::Value) -> Option<ModelUsage> {
+    let count = |native: &str, standard: &str| {
+        let native_count = data.get(native).and_then(serde_json::Value::as_u64);
+        let standard_count = data.get(standard).and_then(serde_json::Value::as_u64);
+        match native_count {
+            Some(0) => standard_count.or(native_count),
+            _ => native_count.or(standard_count),
+        }
+    };
+    let prompt = count("native_tokens_prompt", "tokens_prompt");
+    let completion = count("native_tokens_completion", "tokens_completion");
+    if prompt.unwrap_or(0) == 0 && completion.unwrap_or(0) == 0 {
+        return None;
+    }
+    let cached = data
+        .get("native_tokens_cached")
+        .and_then(serde_json::Value::as_u64);
+    let reasoning = data
+        .get("native_tokens_reasoning")
+        .and_then(serde_json::Value::as_u64);
+    Some(ModelUsage {
+        input_tokens: UsageValue::new(prompt),
+        output_tokens: UsageValue::new(completion),
+        cache_read_tokens: UsageValue::new(cached),
+        cache_write_tokens: UsageValue::new(None),
+        reasoning_tokens: UsageValue::new(reasoning),
+        total_tokens: UsageValue::new(Some(prompt.unwrap_or(0) + completion.unwrap_or(0))),
+    })
+}
+
+async fn recover_openrouter_usage(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    response_id: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<ModelUsage> {
+    let mut url =
+        reqwest::Url::parse(&format!("{}/generation", base_url.trim_end_matches('/'))).ok()?;
+    url.query_pairs_mut().append_pair("id", response_id);
+    for delay_ms in [0, 150, 350, 750, 1_500, 2_500, 4_000] {
+        tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+        }
+        let request = async {
+            let response = client
+                .get(url.clone())
+                .bearer_auth(api_key)
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let body = response.json::<serde_json::Value>().await.ok()?;
+            body.get("data").and_then(generation_usage)
+        };
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), request) => result,
+        };
+        if let Ok(Some(usage)) = result {
+            return Some(usage);
+        }
+    }
+    None
+}
+
 /// Normalize OpenAI's standard `Retry-After` header (whole seconds) using the
 /// shared, provider-neutral parser.
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
@@ -239,8 +336,13 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std:
 
 #[cfg(test)]
 mod tests {
-    use super::retry_after_from_headers;
+    use super::{
+        generation_usage, is_openrouter_url, recover_openrouter_usage, retry_after_from_headers,
+    };
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn standard_retry_after_is_normalized_to_duration() {
@@ -256,5 +358,63 @@ mod tests {
     fn missing_header_normalizes_to_none() {
         let headers = reqwest::header::HeaderMap::new();
         assert_eq!(retry_after_from_headers(&headers), None);
+    }
+
+    #[test]
+    fn openrouter_generation_usage_waits_for_real_counters() {
+        assert!(is_openrouter_url("https://openrouter.ai/api/v1"));
+        assert!(!is_openrouter_url("https://openrouter.ai.evil.test/api/v1"));
+        assert!(generation_usage(&serde_json::json!({
+            "native_tokens_prompt": 0,
+            "native_tokens_completion": 0
+        }))
+        .is_none());
+        let usage = generation_usage(&serde_json::json!({
+            "native_tokens_prompt": 0,
+            "tokens_prompt": 1_000,
+            "native_tokens_completion": 0,
+            "tokens_completion": 40,
+            "native_tokens_cached": 100,
+            "native_tokens_reasoning": 10
+        }))
+        .unwrap();
+        assert_eq!(usage.input_tokens.value(), Some(1_000));
+        assert_eq!(usage.output_tokens.value(), Some(40));
+        assert_eq!(usage.cache_read_tokens.value(), Some(100));
+        assert_eq!(usage.reasoning_tokens.value(), Some(10));
+        assert_eq!(usage.total_tokens.value(), Some(1_040));
+    }
+
+    #[tokio::test]
+    async fn generation_lookup_retries_until_openrouter_populates_usage() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0_u8; 4_096];
+                let size = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(request.starts_with("GET /api/v1/generation?id=gen-gemini HTTP/1.1"));
+                let body = if attempt == 0 {
+                    r#"{"data":{"native_tokens_prompt":0,"native_tokens_completion":0}}"#
+                } else {
+                    r#"{"data":{"native_tokens_prompt":200,"native_tokens_completion":30}}"#
+                };
+                let response = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let usage = recover_openrouter_usage(
+            &reqwest::Client::new(),
+            &format!("http://{address}/api/v1"),
+            "sk-test",
+            "gen-gemini",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.total_tokens.value(), Some(230));
+        server.await.unwrap();
     }
 }

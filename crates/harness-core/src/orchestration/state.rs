@@ -71,6 +71,9 @@ pub struct OrchestrationRunState {
     pub steps: BTreeMap<OrchestrationNodeId, StepRun>,
     pub final_output: Option<Value>,
     pub error: Option<OrchestrationError>,
+    /// The terminal failure boundary; completed upstream steps remain reusable.
+    #[serde(default)]
+    pub failed_step: Option<OrchestrationNodeId>,
     pub total_attempts: u32,
     #[serde(default)]
     pub usage: UsageSummary,
@@ -95,6 +98,7 @@ impl OrchestrationRunState {
             steps,
             final_output: None,
             error: None,
+            failed_step: None,
             total_attempts: 0,
             usage: UsageSummary::default(),
         }
@@ -567,10 +571,13 @@ fn exhausted_budget(
 ) -> Option<String> {
     let policies = &compiled.definition.policies;
     let usage = &state.usage;
-    if state.total_attempts >= policies.max_total_attempts {
+    if policies
+        .max_total_attempts
+        .is_some_and(|limit| state.total_attempts >= limit)
+    {
         return Some(format!(
             "attempt budget of {} exhausted",
-            policies.max_total_attempts
+            policies.max_total_attempts.unwrap()
         ));
     }
     let checks = [
@@ -849,6 +856,7 @@ fn fail(
             format!("retry denied by budget after: {}", error.message),
         )
     };
+    state.failed_step = Some(node_id);
     terminate_failed(state, error, effects)
 }
 

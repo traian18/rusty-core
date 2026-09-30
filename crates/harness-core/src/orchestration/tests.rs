@@ -14,6 +14,21 @@ fn report(status: &str) -> Value {
     json!({ "summary": "Done", "status": status, "artifacts": [], "claimsToVerify": [] })
 }
 
+#[test]
+fn workflow_budgets_are_optional_but_explicit_values_are_enforced() {
+    let policies: OrchestrationPolicies = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(policies.max_steps, None);
+    assert_eq!(policies.max_total_attempts, None);
+    let mut definition = default_orchestration_definition();
+    definition.policies = policies;
+    assert!(compile(definition.clone()).is_ok());
+    definition.policies.max_steps = Some(1);
+    assert!(compile(definition.clone()).is_err());
+    definition.policies.max_steps = None;
+    definition.policies.max_total_attempts = Some(0);
+    assert!(compile(definition).is_err());
+}
+
 fn started_with(compiled: &CompiledOrchestration) -> OrchestrationRunState {
     let mut state = OrchestrationRunState::new(OrchestrationRunId::from("run-1"), compiled);
     apply(
@@ -805,7 +820,7 @@ fn usage_is_accumulated_and_exhausted_budgets_deny_admission() {
 #[test]
 fn attempt_budget_denies_retries() {
     let mut definition = default_orchestration_definition();
-    definition.policies.max_total_attempts = 2;
+    definition.policies.max_total_attempts = Some(2);
     let compiled = compile(definition).unwrap();
     let mut state = started_with(&compiled);
     run_step(&compiled, &mut state, "input", json!({}));

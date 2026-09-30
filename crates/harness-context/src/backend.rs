@@ -60,10 +60,11 @@ impl ExecutionBackend for ContextAssemblingBackend {
         sink: broadcast::Sender<ExecutionEvent>,
         cancel: CancellationToken,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let request = self
+        let mut request = self
             .provider
             .assemble(request, self.workspace.as_ref())
             .await;
+        request.messages = harness_protocol::messages::repair_tool_history(request.messages);
         self.inner.execute(request, sink, cancel).await
     }
 }
@@ -174,5 +175,67 @@ mod tests {
         let seen = backend.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].system_prompt, "assembled prompt");
+    }
+
+    #[tokio::test]
+    async fn repair_runs_after_context_truncation() {
+        use crate::providers::{StaticSystemPromptProvider, TruncatingCompactionProvider};
+        use harness_protocol::{
+            ids::{MessageId, Timestamp, ToolCallId},
+            messages::{AgentMessage, ContentBlock, MessageRole},
+            tools::{ToolCall, ToolResultSummary},
+        };
+        let id = ToolCallId::new();
+        let mut request = request("system");
+        request.messages = vec![
+            AgentMessage {
+                id: MessageId::new(),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    call: ToolCall {
+                        id,
+                        name: "read".into(),
+                        arguments: Default::default(),
+                    },
+                }],
+                created_at: Timestamp::now(),
+            },
+            AgentMessage {
+                id: MessageId::new(),
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    call_id: id,
+                    result: ToolResultSummary {
+                        has_error: false,
+                        output_preview: "important retained file contents".into(),
+                    },
+                }],
+                created_at: Timestamp::now(),
+            },
+        ];
+        let backend = Arc::new(RecordingBackend {
+            seen: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(TruncatingCompactionProvider::new(
+            Arc::new(StaticSystemPromptProvider::new("system")),
+            1,
+            1,
+        ));
+        let wrapped = ContextAssemblingBackend::new(
+            backend.clone(),
+            provider,
+            Arc::new(FakeWorkspace::new()),
+        );
+        let (tx, _) = broadcast::channel(16);
+        wrapped
+            .execute(request, tx, CancellationToken::new())
+            .await
+            .unwrap();
+        let seen = backend.seen.lock().unwrap();
+        assert!(seen[0]
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::Tool));
+        assert!(seen[0].messages.iter().flat_map(|m| &m.content).any(|b| matches!(b, ContentBlock::Text { text } if text.contains("important retained file contents"))));
     }
 }

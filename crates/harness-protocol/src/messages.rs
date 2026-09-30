@@ -65,9 +65,166 @@ pub struct AgentMessage {
     pub created_at: Timestamp,
 }
 
+/// Repair the provider-facing copy of history after truncation or interruption.
+/// Move existing results beside their calls; missing outcomes are explicitly
+/// unknown, never successful. Orphaned results remain readable context.
+pub fn repair_tool_history(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    use std::collections::{HashMap, HashSet};
+    let mut results = HashMap::new();
+    let calls: HashSet<_> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| {
+            if let ContentBlock::ToolUse { call } = b {
+                Some(call.id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for block in messages.iter().flat_map(|m| &m.content) {
+        if let ContentBlock::ToolResult { call_id, result } = block {
+            results.entry(*call_id).or_insert_with(|| result.clone());
+        }
+    }
+    let mut repaired = Vec::new();
+    for mut message in messages {
+        let mut replies = Vec::new();
+        message.content = message.content.into_iter().filter_map(|block| match block {
+            ContentBlock::ToolResult { call_id, result } => {
+                (!calls.contains(&call_id)).then(|| ContentBlock::Text {
+                    text: format!("Earlier tool result ({call_id}; call omitted from context): {}", result.output_preview),
+                })
+            }
+            ContentBlock::ToolUse { ref call } => {
+                replies.push(ContentBlock::ToolResult {
+                    call_id: call.id,
+                    result: results.remove(&call.id).unwrap_or_else(|| ToolResultSummary {
+                        has_error: true,
+                        output_preview: "Tool outcome unavailable: execution may have been interrupted. Inspect the current state before retrying any action; do not assume it failed or succeeded.".into(),
+                    }),
+                });
+                Some(block)
+            }
+            _ => Some(block),
+        }).collect();
+        if message.role == MessageRole::Tool {
+            message.role = MessageRole::User;
+        }
+        if !message.content.is_empty() {
+            repaired.push(message.clone());
+        }
+        if !replies.is_empty() {
+            repaired.push(AgentMessage {
+                id: message.id,
+                role: MessageRole::Tool,
+                content: replies,
+                created_at: message.created_at,
+            });
+        }
+    }
+    repaired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message(role: MessageRole, content: Vec<ContentBlock>) -> AgentMessage {
+        AgentMessage {
+            id: MessageId::new(),
+            role,
+            content,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn repair_preserves_real_results_and_fills_only_missing_outcomes() {
+        let first = ToolCallId::new();
+        let missing = ToolCallId::new();
+        let orphan = ToolCallId::new();
+        let call = |id| ContentBlock::ToolUse {
+            call: ToolCall {
+                id,
+                name: "write_file".into(),
+                arguments: serde_json::json!({}),
+            },
+        };
+        let result = |call_id, text: &str| ContentBlock::ToolResult {
+            call_id,
+            result: ToolResultSummary {
+                has_error: false,
+                output_preview: text.into(),
+            },
+        };
+        let repaired = repair_tool_history(vec![
+            message(MessageRole::Assistant, vec![call(first), call(missing)]),
+            message(
+                MessageRole::Assistant,
+                vec![ContentBlock::Text {
+                    text: "progress".into(),
+                }],
+            ),
+            message(
+                MessageRole::Tool,
+                vec![result(first, "written successfully")],
+            ),
+            message(MessageRole::Tool, vec![result(orphan, "earlier read")]),
+        ]);
+        assert_eq!(repaired[1].role, MessageRole::Tool);
+        assert!(
+            matches!(&repaired[1].content[0], ContentBlock::ToolResult { call_id, result } if *call_id == first && result.output_preview == "written successfully" && !result.has_error)
+        );
+        assert!(
+            matches!(&repaired[1].content[1], ContentBlock::ToolResult { call_id, result } if *call_id == missing && result.has_error && result.output_preview.contains("Inspect the current state"))
+        );
+        assert_eq!(repaired[3].role, MessageRole::User);
+        assert!(
+            matches!(&repaired[3].content[0], ContentBlock::Text { text } if text.contains("earlier read"))
+        );
+        assert_eq!(
+            serde_json::to_value(&repaired).unwrap(),
+            serde_json::to_value(repair_tool_history(repaired.clone())).unwrap(),
+            "repair is idempotent"
+        );
+    }
+
+    #[test]
+    fn repair_keeps_valid_parallel_call_history_unchanged() {
+        let id = ToolCallId::new();
+        let messages = vec![
+            message(
+                MessageRole::Assistant,
+                vec![ContentBlock::ToolUse {
+                    call: ToolCall {
+                        id,
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            ),
+            message(
+                MessageRole::Tool,
+                vec![ContentBlock::ToolResult {
+                    call_id: id,
+                    result: ToolResultSummary {
+                        has_error: false,
+                        output_preview: "file".into(),
+                    },
+                }],
+            ),
+        ];
+        let repaired = repair_tool_history(messages.clone());
+        assert_eq!(
+            serde_json::to_value(&messages[0].content).unwrap(),
+            serde_json::to_value(&repaired[0].content).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&messages[1].content).unwrap(),
+            serde_json::to_value(&repaired[1].content).unwrap()
+        );
+    }
 
     #[test]
     fn message_round_trips_through_json() {

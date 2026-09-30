@@ -378,8 +378,10 @@ pub struct OpenAiSseParser {
     buffer: Vec<u8>,
     tools: HashMap<usize, ToolBuffer>,
     usage: ModelUsage,
+    usage_event_sent: bool,
     stop_reason: String,
     model: String,
+    response_id: Option<String>,
     saw_done: bool,
     result: Option<ModelResult>,
     events: Vec<ModelEvent>,
@@ -402,8 +404,10 @@ impl OpenAiSseParser {
             buffer: Vec::new(),
             tools: HashMap::new(),
             usage: ModelUsage::default(),
+            usage_event_sent: false,
             stop_reason: "stop".to_string(),
             model: String::new(),
+            response_id: None,
             saw_done: false,
             result: None,
             events: Vec::new(),
@@ -430,6 +434,24 @@ impl OpenAiSseParser {
         Ok(events)
     }
 
+    pub(crate) fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.saw_done
+    }
+
+    pub(crate) fn has_usage(&self) -> bool {
+        self.usage.total_tokens.value().unwrap_or(0) > 0
+            || self.usage.input_tokens.value().unwrap_or(0) > 0
+            || self.usage.output_tokens.value().unwrap_or(0) > 0
+    }
+
+    pub(crate) fn set_usage(&mut self, usage: ModelUsage) {
+        self.usage = usage;
+    }
+
     pub fn finish(&mut self) -> Result<(Vec<ModelEvent>, ModelResult), ModelError> {
         if self.result.is_some() {
             return Err(ModelError::Protocol {
@@ -447,6 +469,15 @@ impl OpenAiSseParser {
         }
 
         let mut terminal_events = Vec::new();
+        // Some OpenAI-compatible providers attach usage to their final
+        // choices chunk rather than emitting a separate usage-only chunk.
+        // That chunk can also carry a text/tool delta, so publish its usage
+        // here before Completed instead of dropping either event.
+        if self.has_usage() && !self.usage_event_sent {
+            terminal_events.push(ModelEvent::UsageUpdate {
+                usage: self.usage.clone(),
+            });
+        }
         let mut tools: Vec<(usize, ToolBuffer)> = self.tools.drain().collect();
         tools.sort_by_key(|(index, _)| *index);
         for (_, tool) in tools {
@@ -503,6 +534,13 @@ impl OpenAiSseParser {
                 message: format!("invalid chunk: {error}"),
             })?;
 
+        if self.response_id.is_none() {
+            self.response_id = value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned);
+        }
+
         if let Some(error) = value.get("error") {
             return Err(ModelError::BackendError {
                 message: error["message"]
@@ -519,19 +557,23 @@ impl OpenAiSseParser {
             }
         }
 
+        if let Some(usage_value) = value.get("usage").filter(|v| !v.is_null()) {
+            if let Ok(raw) = serde_json::from_value::<RawOpenAiUsage>(usage_value.clone()) {
+                self.usage = OpenAiUsageMapper::map_usage(&raw);
+            }
+        }
+
         let choices = value
             .get("choices")
             .and_then(|c| c.as_array())
             .filter(|c| !c.is_empty());
 
         let Some(choices) = choices else {
-            if let Some(usage_value) = value.get("usage").filter(|v| !v.is_null()) {
-                if let Ok(raw) = serde_json::from_value::<RawOpenAiUsage>(usage_value.clone()) {
-                    self.usage = OpenAiUsageMapper::map_usage(&raw);
-                    return Ok(Some(ModelEvent::UsageUpdate {
-                        usage: self.usage.clone(),
-                    }));
-                }
+            if value.get("usage").is_some_and(|usage| !usage.is_null()) && self.has_usage() {
+                self.usage_event_sent = true;
+                return Ok(Some(ModelEvent::UsageUpdate {
+                    usage: self.usage.clone(),
+                }));
             }
             return Ok(None);
         };
@@ -838,7 +880,7 @@ mod tests {
         assert_eq!(json["tool_calls"][0]["function"]["name"], "search");
     }
 
-    const FIXTURE: &str = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n\
+    const FIXTURE: &str = "data: {\"id\":\"gen-fixture\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n\
 data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
 data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: {\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n\
@@ -861,11 +903,39 @@ data: [DONE]\n\n";
         assert!(events
             .iter()
             .any(|e| matches!(e, ModelEvent::TextDelta { delta } if delta == "hi")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ModelEvent::UsageUpdate { .. }))
+                .count(),
+            1
+        );
         assert!(matches!(events.last(), Some(ModelEvent::Completed { .. })));
         assert_eq!(result.stop_reason, "stop");
+        assert_eq!(parser.response_id(), Some("gen-fixture"));
         assert_eq!(result.usage.input_tokens.value(), Some(2));
         assert_eq!(result.usage.output_tokens.value(), Some(1));
         assert_eq!(result.usage.total_tokens.value(), Some(3));
+    }
+
+    #[test]
+    fn usage_on_final_choice_chunk_is_emitted_before_completion() {
+        let mut parser = OpenAiSseParser::new();
+        let stream = b"data: {\"id\":\"gen-gemini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n";
+        let streamed = parser.push_chunk(stream).unwrap();
+        assert!(streamed
+            .iter()
+            .any(|event| matches!(event, ModelEvent::TextDelta { delta } if delta == "answer")));
+        assert!(parser.has_usage());
+        let (terminal, result) = parser.finish().unwrap();
+        assert_eq!(result.usage.total_tokens.value(), Some(120));
+        assert!(
+            matches!(terminal.first(), Some(ModelEvent::UsageUpdate { usage }) if usage.total_tokens.value() == Some(120))
+        );
+        assert!(matches!(
+            terminal.last(),
+            Some(ModelEvent::Completed { .. })
+        ));
     }
 
     #[test]

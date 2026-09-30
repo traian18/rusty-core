@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use super::definition::{
     EdgeCondition, OrchestrationDefinition, OrchestrationDefinitionId, OrchestrationEdge,
     OrchestrationNode, OrchestrationNodeId, OrchestrationNodeKind, OutputBinding, RetryReason,
-    SchemaReference, ToolScope, VerificationCheck, MAX_STEP_ATTEMPTS, ORCHESTRATION_SCHEMA_VERSION,
+    SchemaReference, StructuredOutputMode, ToolScope, VerificationCheck, MAX_STEP_ATTEMPTS,
+    ORCHESTRATION_SCHEMA_VERSION,
 };
 
 /// JSON Schema keywords the host validator implements. Anything else is
@@ -119,7 +120,11 @@ pub fn compile(
             "definition name cannot be empty",
         );
     }
-    if definition.nodes.len() > definition.policies.max_steps as usize {
+    if definition
+        .policies
+        .max_steps
+        .is_some_and(|limit| definition.nodes.len() > limit as usize)
+    {
         issue(
             &mut issues,
             "nodes",
@@ -127,11 +132,12 @@ pub fn compile(
             format!(
                 "definition has {} nodes but max_steps is {}",
                 definition.nodes.len(),
-                definition.policies.max_steps
+                definition.policies.max_steps.unwrap()
             ),
         );
     }
-    if definition.policies.max_steps == 0 || definition.policies.max_total_attempts == 0 {
+    if definition.policies.max_steps == Some(0) || definition.policies.max_total_attempts == Some(0)
+    {
         issue(
             &mut issues,
             "policies",
@@ -202,7 +208,9 @@ pub fn compile(
                 &mut issues,
             );
         }
-        if matches!(&node.kind, OrchestrationNodeKind::Agent(_)) && node.output_schema.is_none() {
+        if matches!(&node.kind, OrchestrationNodeKind::Agent(config) if config.structured_output != StructuredOutputMode::Text)
+            && node.output_schema.is_none()
+        {
             issue(
                 &mut issues,
                 format!("{path}.output_schema"),
