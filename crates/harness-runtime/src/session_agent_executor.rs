@@ -256,7 +256,10 @@ impl AgentStepExecutor for IsolatedSessionAgentExecutor {
                 "shared_session agent steps are not supported yet; use isolated_child",
             ));
         }
-        let native_schema = self.parent.default_backend.capabilities().structured_output;
+        // `HostValidated` opts out of the native schema even when the backend
+        // advertises it; the schema then travels in the prompt (see `prompt`).
+        let native_schema = self.parent.default_backend.capabilities().structured_output
+            && request.structured_output != StructuredOutputMode::HostValidated;
         if !native_schema && request.structured_output == StructuredOutputMode::Require {
             return Err(AgentExecutionError::new(
                 "unsupported_capability",

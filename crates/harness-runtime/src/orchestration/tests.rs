@@ -729,18 +729,23 @@ async fn file_store_rejects_path_like_run_ids() {
 // ---------------------------------------------------------------------------
 
 mod isolated_session {
+    use harness_core::orchestration::StructuredOutputMode;
     use harness_protocol::{
-        backend::{ExecutionEvent, ExecutionResult},
+        backend::{
+            BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent,
+            ExecutionRequest, ExecutionResult, ResponseFormat,
+        },
         ids::{RequestId, SessionId},
         usage::{Cost, ModelUsage},
     };
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::{
         session_agent_executor::IsolatedSessionAgentExecutor,
         session_runtime::SessionRuntime,
         testing::{FakeBackend, FakeToolRegistry},
-        traits::EventSink,
+        traits::{EventSink, ExecutionBackend},
         workspace::FakeWorkspace,
     };
 
@@ -811,5 +816,134 @@ mod isolated_session {
             }
         }
         assert!(agent_events > 0, "delegated agent events are republished");
+    }
+
+    /// Keeps every request it is sent, and otherwise behaves as the wrapped
+    /// backend -- which, like the OpenAI-compatible integration, advertises
+    /// native structured output whatever model sits behind it.
+    struct RecordingBackend {
+        inner: FakeBackend,
+        requests: Arc<Mutex<Vec<ExecutionRequest>>>,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for RecordingBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.inner.execute(request, sink, cancel).await
+        }
+    }
+
+    /// Runs the default workflow with its agent step in `mode`, against a
+    /// backend that advertises native structured output, and returns the
+    /// model requests the step made.
+    async fn requests_sent(mode: StructuredOutputMode) -> Vec<ExecutionRequest> {
+        let request_id = RequestId::new();
+        let result = ExecutionResult {
+            request_id,
+            usage: ModelUsage::default(),
+            cost: Cost::default(),
+            finish_reason: "end_turn".into(),
+        };
+        let inner = FakeBackend::new()
+            .with_events(vec![
+                ExecutionEvent::TextDelta {
+                    request_id,
+                    delta: report("completed").to_string(),
+                },
+                ExecutionEvent::Completed {
+                    request_id,
+                    result: result.clone(),
+                },
+            ])
+            .with_result(result);
+        assert!(
+            inner.capabilities().structured_output,
+            "this test is about backends that advertise native structured output"
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(RecordingBackend {
+                inner,
+                requests: requests.clone(),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        ));
+
+        let mut definition = default_orchestration_definition();
+        for node in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
+                config.structured_output = mode;
+            }
+        }
+        let handle = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(IsolatedSessionAgentExecutor::new(parent)),
+        )
+        .with_available_tools(Vec::<String>::new())
+        .start(run_id("modes"), input())
+        .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(
+            output.result.status,
+            OrchestrationOutcome::Completed,
+            "{:?}",
+            output.result
+        );
+        let sent = requests.lock().unwrap().clone();
+        assert!(!sent.is_empty(), "the step made a model request");
+        sent
+    }
+
+    fn prompt_of(request: &ExecutionRequest) -> String {
+        serde_json::to_string(&request.messages).unwrap()
+    }
+
+    /// A native schema rides on every request of a step, tool-calling turns
+    /// included. Some models reject that outright ("function calling with a
+    /// response mime type is unsupported" on Gemini), and some providers
+    /// reject a schema they judge too large, so a workflow must be able to
+    /// keep the schema out of the request and have the host validate instead.
+    #[tokio::test]
+    async fn host_validated_steps_never_send_a_native_schema() {
+        for request in requests_sent(StructuredOutputMode::HostValidated).await {
+            assert_eq!(request.params.response_format, None);
+            let prompt = prompt_of(&request);
+            assert!(
+                prompt.contains("matching this JSON Schema"),
+                "the schema travels in the prompt instead: {prompt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_steps_still_use_the_native_schema_when_the_backend_has_one() {
+        for request in requests_sent(StructuredOutputMode::HostValidatedFallback).await {
+            assert!(
+                matches!(
+                    request.params.response_format,
+                    Some(ResponseFormat::JsonSchema { strict: true, .. })
+                ),
+                "{:?}",
+                request.params.response_format
+            );
+            assert!(!prompt_of(&request).contains("matching this JSON Schema"));
+        }
     }
 }

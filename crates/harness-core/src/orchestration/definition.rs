@@ -153,8 +153,8 @@ pub enum ToolScope {
     Inherit,
 }
 
-/// How a step's output schema is enforced when the backend cannot constrain
-/// generation itself. Host-side validation always runs either way.
+/// How a step's output schema is enforced. Host-side validation always runs,
+/// whichever mode is chosen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredOutputMode {
@@ -162,8 +162,18 @@ pub enum StructuredOutputMode {
     /// native structured output.
     #[default]
     Require,
-    /// Ask for JSON text and rely on host-side validation.
+    /// Use native structured output when the backend advertises it; when it
+    /// does not, ask for JSON text and rely on host-side validation.
     HostValidatedFallback,
+    /// Never send a native schema, even to a backend that advertises support:
+    /// put the schema in the prompt, ask for JSON text, and rely on host-side
+    /// validation (with the step's retries). A backend's capability is a
+    /// property of the whole integration, not of the model behind it, and
+    /// some models cannot combine tool calls with a constrained response, or
+    /// reject a schema their constraint compiler finds too large. Every
+    /// request of a tool-using step carries the constraint, so those failures
+    /// are hard errors on the first request.
+    HostValidated,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
