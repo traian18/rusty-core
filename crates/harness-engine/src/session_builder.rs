@@ -109,6 +109,16 @@ pub enum HarnessError {
     SessionManager(#[from] SessionManagerError),
     #[error("session store error: {0}")]
     Store(#[from] harness_session_store::StoreError),
+    #[error("session {0} is not active")]
+    SessionUnavailable(SessionId),
+    #[error("invalid orchestration definition: {0}")]
+    OrchestrationDefinition(String),
+    #[error("orchestration runtime error: {0}")]
+    OrchestrationRuntime(String),
+    #[error("orchestration is not configured; enable it with HarnessBuilder::orchestration or SessionBuilder::orchestration")]
+    OrchestrationNotConfigured,
+    #[error("behavior profile error: {0}")]
+    Profile(String),
 }
 
 struct PendingIntegration {
@@ -174,6 +184,18 @@ pub struct SessionBuilder {
     /// Skill directories to scan at [`start`](Self::start) — see
     /// [`skills`](Self::skills). `None` disables skills entirely.
     skills: Option<SkillsConfig>,
+    /// Orchestration support for the started session — see
+    /// [`orchestration`](Self::orchestration).
+    orchestration: Option<crate::orchestration::OrchestrationConfig>,
+    /// Host profile registry; defaults to the built-ins only.
+    profiles: Option<crate::profiles::ProfilesConfig>,
+    /// The profile the root agent starts with — see [`profile`](Self::profile).
+    profile: Option<harness_core::behavior::ProfileRef>,
+    /// Workspace root to load `.rusty/profiles/` from.
+    workspace_profiles: Option<std::path::PathBuf>,
+    child_behavior_resolver: Option<Arc<dyn harness_core::behavior::ChildBehaviorResolver>>,
+    command_trust: crate::profiles::CommandTrust,
+    allow_draft_profiles: bool,
 }
 
 impl SessionBuilder {
@@ -201,6 +223,13 @@ impl SessionBuilder {
             mcp_servers: Vec::new(),
             optional_mcp_servers: Default::default(),
             skills: None,
+            orchestration: None,
+            profiles: None,
+            profile: None,
+            workspace_profiles: None,
+            child_behavior_resolver: None,
+            command_trust: Default::default(),
+            allow_draft_profiles: false,
         }
     }
 
@@ -228,6 +257,13 @@ impl SessionBuilder {
             mcp_servers: Vec::new(),
             optional_mcp_servers: Default::default(),
             skills: None,
+            orchestration: None,
+            profiles: None,
+            profile: None,
+            workspace_profiles: None,
+            child_behavior_resolver: None,
+            command_trust: Default::default(),
+            allow_draft_profiles: false,
         }
     }
 
@@ -286,6 +322,72 @@ impl SessionBuilder {
     pub fn optional_mcp_server(mut self, config: McpServerConfig) -> Self {
         self.optional_mcp_servers.insert(config.name.clone());
         self.mcp_servers.push(config);
+        self
+    }
+
+    /// Use `config`'s profile registry. Sessions created through a
+    /// [`Harness`](crate::Harness) get the harness's registry automatically.
+    pub fn profiles(mut self, config: crate::profiles::ProfilesConfig) -> Self {
+        self.profiles = Some(config);
+        self
+    }
+
+    /// Start the root agent under this behavior profile. Without it the
+    /// workspace default applies (see [`workspace_profiles`](Self::workspace_profiles)),
+    /// then the built-in `rusty.default`. An unresolvable reference fails
+    /// [`start`](Self::start) before any side effect.
+    pub fn profile(mut self, reference: harness_core::behavior::ProfileRef) -> Self {
+        self.profile = Some(reference);
+        self
+    }
+
+    /// Load profiles from `<root>/.rusty/profiles/` (and its `config.json`
+    /// default). Opt-in, like skills, because workspace content is only
+    /// trusted when the host says so.
+    pub fn workspace_profiles(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace_profiles = Some(root.into());
+        self
+    }
+
+    /// Decide how spawned child agents get their behavior. Defaults to the
+    /// parent profile's `children` policy (inherit).
+    pub fn child_behavior_resolver(
+        mut self,
+        resolver: Arc<dyn harness_core::behavior::ChildBehaviorResolver>,
+    ) -> Self {
+        self.child_behavior_resolver = Some(resolver);
+        self
+    }
+
+    /// Let behavior profiles run shell commands as completion-gate checks
+    /// (`command` evaluators, compatible with Claude Code / Codex `Stop`
+    /// hooks). Off by default: commands run arbitrary processes in the
+    /// workspace.
+    pub fn allow_command_evaluators(mut self, allow: bool) -> Self {
+        self.command_trust.allowed = allow;
+        self
+    }
+
+    /// Also let profiles loaded from the workspace (`.rusty/profiles/`) run
+    /// commands. Requires [`allow_command_evaluators`](Self::allow_command_evaluators).
+    pub fn trust_workspace_commands(mut self, trust: bool) -> Self {
+        self.command_trust.trust_workspace = trust;
+        self
+    }
+
+    /// Let draft profiles run: exact draft revisions resolve, and a
+    /// reference without a revision picks the newest draft too. For editors
+    /// and development, where profiles are tried before they are published.
+    pub fn allow_draft_profiles(mut self, allow: bool) -> Self {
+        self.allow_draft_profiles = allow;
+        self
+    }
+
+    /// Enable orchestrated workflows on the started session (see
+    /// [`SessionHandle::start_orchestration`]). Sessions created through a
+    /// [`Harness`](crate::Harness) inherit its configuration.
+    pub fn orchestration(mut self, config: crate::orchestration::OrchestrationConfig) -> Self {
+        self.orchestration = Some(config);
         self
     }
 
@@ -421,6 +523,23 @@ impl SessionBuilder {
     /// spawning. The resulting `Arc<SessionRuntime>` is registered with
     /// the manager for centralized lifecycle control.
     pub async fn start(self) -> Result<SessionHandle, HarnessError> {
+        // Resolve the behavior profile first so a bad reference or a broken
+        // workspace profile fails before MCP servers or backends are started.
+        let mut profile_registry = self
+            .profiles
+            .as_ref()
+            .map(crate::profiles::ProfilesConfig::snapshot)
+            .unwrap_or_default()
+            .allow_drafts(self.allow_draft_profiles);
+        if let Some(root) = &self.workspace_profiles {
+            crate::profiles::load_workspace_profiles(root, &mut profile_registry)?;
+        }
+        let root_profile = crate::profiles::resolve_bundle(
+            &profile_registry,
+            self.profile.as_ref(),
+            self.command_trust,
+        )?;
+
         let (backend, persisted_selection) = match (self.backend, self.integration) {
             (Some(backend), _) => (backend, None),
             (None, Some(integration)) => {
@@ -607,6 +726,9 @@ impl SessionBuilder {
             .create_session(backend, tool_registry, workspace, event_sink, root_toolset)
             .await?;
         runtime.integrations.extend_from(&self.integrations)?;
+        if let Some(resolver) = self.child_behavior_resolver {
+            runtime.set_child_behavior_resolver(resolver);
+        }
         let session_id = runtime.session_id;
 
         let client = SessionClient::new(runtime);
@@ -615,11 +737,17 @@ impl SessionBuilder {
                 .send(SessionCommand::ConfigureExecution(params))
                 .await?;
         }
+        if !root_profile.is_default() {
+            client.send(root_profile.command()).await?;
+        }
 
         Ok(SessionHandle {
             client,
             session_id,
             session_manager,
+            orchestration: self.orchestration,
+            profiles: Arc::new(profile_registry),
+            command_trust: self.command_trust,
         })
     }
 }
@@ -643,8 +771,14 @@ pub struct ContextInspection {
 
 pub struct SessionHandle {
     client: SessionClient,
-    session_id: SessionId,
-    session_manager: Arc<SessionManager>,
+    pub(crate) session_id: SessionId,
+    pub(crate) session_manager: Arc<SessionManager>,
+    pub(crate) orchestration: Option<crate::orchestration::OrchestrationConfig>,
+    /// Profiles this session resolves references against (host registry
+    /// plus any workspace profiles loaded at start).
+    pub(crate) profiles: Arc<harness_core::behavior::ProfileRegistry>,
+    /// Whether this session's profiles may run commands.
+    pub(crate) command_trust: crate::profiles::CommandTrust,
 }
 
 impl SessionHandle {
@@ -659,13 +793,46 @@ impl SessionHandle {
     pub(crate) fn from_runtime(
         runtime: Arc<SessionRuntime>,
         session_manager: Arc<SessionManager>,
+        orchestration: Option<crate::orchestration::OrchestrationConfig>,
+        profiles: Arc<harness_core::behavior::ProfileRegistry>,
     ) -> Self {
         let session_id = runtime.session_id;
+        // A restored agent keeps the trust it was installed with; new
+        // installs through this handle get none unless re-granted.
         Self {
             client: SessionClient::new(runtime),
             session_id,
             session_manager,
+            orchestration,
+            profiles,
+            command_trust: Default::default(),
         }
+    }
+
+    /// The behavior profile the root agent is running under.
+    pub async fn behavior_profile(
+        &self,
+    ) -> Result<harness_core::behavior::ProfileRef, HarnessError> {
+        let runtime = self
+            .session_manager
+            .session_handle(self.session_id)
+            .await
+            .ok_or(HarnessError::SessionUnavailable(self.session_id))?;
+        Ok(runtime.root_behavior().reference())
+    }
+
+    /// Switch the root agent to another registered profile (e.g. plan →
+    /// build). Takes effect immediately when the agent is idle; during a run
+    /// it applies before the next model request, and the model is told its
+    /// mode changed.
+    pub async fn set_behavior_profile(
+        &self,
+        reference: harness_core::behavior::ProfileRef,
+    ) -> Result<(), HarnessError> {
+        let bundle =
+            crate::profiles::resolve_bundle(&self.profiles, Some(&reference), self.command_trust)?;
+        self.client.send(bundle.command()).await?;
+        Ok(())
     }
 
     pub async fn send(&self, prompt: &str) -> Result<(), HarnessError> {
@@ -731,6 +898,31 @@ impl SessionHandle {
     ) -> Result<(), HarnessError> {
         self.client
             .send(SessionCommand::ConfigureExecution(params))
+            .await?;
+        Ok(())
+    }
+
+    /// Change the execution parameters (e.g. the model) of a session this one
+    /// delegates to -- an orchestration step running right now -- from its
+    /// next model request. The step keeps the output format it was started
+    /// with unless `params` sets one.
+    pub async fn set_delegated_execution_params(
+        &self,
+        session_id: SessionId,
+        mut params: harness_protocol::backend::ExecutionParams,
+    ) -> Result<(), HarnessError> {
+        let parent = self
+            .session_manager
+            .session_handle(self.session_id)
+            .await
+            .ok_or(HarnessError::SessionUnavailable(self.session_id))?;
+        let step = parent
+            .delegated_session(session_id)
+            .ok_or(HarnessError::SessionUnavailable(session_id))?;
+        if params.response_format.is_none() {
+            params.response_format = step.root_execution_params().response_format;
+        }
+        step.send_command(SessionCommand::ConfigureExecution(params))
             .await?;
         Ok(())
     }

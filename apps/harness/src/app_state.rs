@@ -80,6 +80,39 @@ fn log_summary(event: &AgentEvent) -> Option<String> {
         }
         AgentEvent::Failed { error } => Some(format!("FAILED [{}] {}", error.code, error.message)),
         AgentEvent::Completed { outcome } => Some(format!("completed: {outcome:?}")),
+        AgentEvent::BehaviorRuleFired {
+            profile,
+            rule_id,
+            event,
+            action,
+        } => Some(format!(
+            "rule {rule_id} ({profile}) fired on {event}: {action}"
+        )),
+        AgentEvent::ContextInjected {
+            source,
+            placement,
+            chars,
+        } => Some(format!(
+            "context injected by {source} ({placement}, {chars} chars)"
+        )),
+        AgentEvent::ToolCallDenied {
+            call_id, reason, ..
+        } => Some(format!("tool call denied {call_id:?}: {reason}")),
+        AgentEvent::ProfileChanged { from, to } => Some(format!("profile {from} → {to}")),
+        AgentEvent::CompletionGateEvaluated {
+            attempt,
+            passed,
+            continuing,
+            failed_checks,
+        } => Some(format!(
+            "completion gate #{attempt}: {} {}",
+            if *passed { "passed" } else { "failed" },
+            if *continuing {
+                format!("(sent back: {})", failed_checks.join(", "))
+            } else {
+                String::new()
+            }
+        )),
     }
 }
 
@@ -567,6 +600,26 @@ impl AppState {
                 message: error.message,
             }),
             AgentEvent::Completed { outcome } => self.notice(format!("Run completed: {outcome:?}")),
+            AgentEvent::ToolCallDenied { reason, .. } => {
+                self.notice(format!("Tool call denied: {reason}"))
+            }
+            AgentEvent::ProfileChanged { to, .. } => self.notice(format!("Profile: {to}")),
+            AgentEvent::CompletionGateEvaluated {
+                passed: false,
+                continuing,
+                failed_checks,
+                ..
+            } => self.notice(if continuing {
+                format!(
+                    "Completion rejected ({}); continuing",
+                    failed_checks.join(", ")
+                )
+            } else {
+                format!("Completion gate not passed ({})", failed_checks.join(", "))
+            }),
+            AgentEvent::BehaviorRuleFired { .. }
+            | AgentEvent::ContextInjected { .. }
+            | AgentEvent::CompletionGateEvaluated { .. } => {}
         }
 
         if self.auto_follow {

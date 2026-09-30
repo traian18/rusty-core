@@ -70,7 +70,7 @@ fn session_status_from_live(live: &AgentLiveState, fallback: SessionStatus) -> S
     use AgentStatus::*;
     match live.status {
         PreparingContext | WaitingForBackend | Streaming | Executing | WaitingForPermission
-        | WaitingForChildren | Paused => SessionStatus::Running,
+        | WaitingForChildren | Verifying | Paused => SessionStatus::Running,
         Cancelled => SessionStatus::Cancelled,
         Failed => SessionStatus::Failed,
         Completed => SessionStatus::Completed,

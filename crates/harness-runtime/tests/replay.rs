@@ -207,6 +207,8 @@ fn effect_variant_name(effect: &AgentEffect) -> &'static str {
         AgentEffect::Persist { .. } => "Persist",
         AgentEffect::Emit { .. } => "Emit",
         AgentEffect::FinishRun { .. } => "FinishRun",
+        AgentEffect::EvaluateCompletion { .. } => "EvaluateCompletion",
+        AgentEffect::CancelEvaluation { .. } => "CancelEvaluation",
     }
 }
 
@@ -230,6 +232,11 @@ fn event_variant_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ChildAgentCompleted { .. } => "ChildAgentCompleted",
         AgentEvent::Failed { .. } => "Failed",
         AgentEvent::Completed { .. } => "Completed",
+        AgentEvent::BehaviorRuleFired { .. } => "BehaviorRuleFired",
+        AgentEvent::ContextInjected { .. } => "ContextInjected",
+        AgentEvent::ToolCallDenied { .. } => "ToolCallDenied",
+        AgentEvent::ProfileChanged { .. } => "ProfileChanged",
+        AgentEvent::CompletionGateEvaluated { .. } => "CompletionGateEvaluated",
     }
 }
 
@@ -294,7 +301,12 @@ fn event_matches_pattern(event: &AgentEvent, pattern: &EventPattern) -> bool {
         | AgentEvent::UsageUpdated { .. }
         | AgentEvent::ChildAgentSpawned { .. }
         | AgentEvent::ChildAgentCompleted { .. }
-        | AgentEvent::Failed { .. } => true,
+        | AgentEvent::Failed { .. }
+        | AgentEvent::BehaviorRuleFired { .. }
+        | AgentEvent::ContextInjected { .. }
+        | AgentEvent::ToolCallDenied { .. }
+        | AgentEvent::CompletionGateEvaluated { .. }
+        | AgentEvent::ProfileChanged { .. } => true,
     }
 }
 

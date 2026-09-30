@@ -550,3 +550,652 @@ async fn committed_events_match_stored_order() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -----------------------------------------------------------------------
+// Behavior profiles: child agents
+// -----------------------------------------------------------------------
+
+mod child_behavior {
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use harness_core::behavior::{
+        BehaviorState, ChildBehaviorResolver, ChildPolicyError, ProfileRef,
+    };
+    use harness_protocol::backend::{BackendCapabilities, BackendDescriptor, ExecutionRequest};
+    use harness_protocol::effects::{
+        BackendPolicy, SpawnAgentSpec, SpawnMode, ToolInheritance, WorkspacePolicy,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::traits::ExecutionBackend;
+
+    /// Records every request, then completes it like `FakeBackend`.
+    struct RecordingBackend {
+        requests: Arc<StdMutex<Vec<ExecutionRequest>>>,
+        inner: FakeBackend,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for RecordingBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            self.inner.descriptor()
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.inner.execute(request, sink, cancel).await
+        }
+    }
+
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn send(&self, _envelope: AgentEventEnvelope) {}
+    }
+
+    fn profile(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "id": id, "revision": 1, "name": id,
+            "instructions": { "text": text }
+        })
+    }
+
+    fn spec(task: &str) -> SpawnAgentSpec {
+        SpawnAgentSpec {
+            role: Some("Child role.".into()),
+            backend: BackendPolicy::Inherit,
+            tools: ToolInheritance::InheritAll,
+            workspace: WorkspacePolicy::Inherit,
+            budget: Default::default(),
+            mode: SpawnMode::Concurrent,
+            task: Some(task.into()),
+            execution_params: Default::default(),
+            origin_tool_call_id: None,
+        }
+    }
+
+    /// Starts a session under `parent_profile`, spawns one child with a
+    /// task, and returns the system prompts of the requests the child made.
+    async fn child_prompts(resolver: Option<Arc<dyn ChildBehaviorResolver>>) -> Vec<String> {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let request_id = RequestId::new();
+        let runtime = SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(RecordingBackend {
+                requests: requests.clone(),
+                inner: FakeBackend::new().with_result(ExecutionResult {
+                    request_id,
+                    usage: ModelUsage::default(),
+                    cost: Cost::default(),
+                    finish_reason: "end_turn".into(),
+                }),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        );
+        if let Some(resolver) = resolver {
+            runtime.set_child_behavior_resolver(resolver);
+        }
+        runtime
+            .send_command(SessionCommand::SetBehaviorProfile(profile(
+                "parent",
+                "PARENT PROFILE.",
+            )))
+            .await
+            .unwrap();
+        runtime
+            .send_command(SessionCommand::SpawnChild(spec("child task")))
+            .await
+            .unwrap();
+
+        // The child's request is the only one: the root never runs.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let prompts = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.system_prompt.clone())
+            .collect();
+        runtime.shutdown();
+        prompts
+    }
+
+    #[tokio::test]
+    async fn children_inherit_the_parent_profile_by_default() {
+        let prompts = child_prompts(None).await;
+        assert_eq!(prompts, vec!["Child role.\n\nPARENT PROFILE.".to_string()]);
+    }
+
+    #[derive(Debug)]
+    struct Fixed(Arc<harness_core::behavior::CompiledProfile>);
+
+    impl ChildBehaviorResolver for Fixed {
+        fn resolve(
+            &self,
+            parent: &BehaviorState,
+            _spec: &SpawnAgentSpec,
+        ) -> Result<BehaviorState, ChildPolicyError> {
+            assert_eq!(parent.reference(), ProfileRef::exact("parent", 1));
+            Ok(BehaviorState::new(self.0.clone()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Refuse;
+
+    impl ChildBehaviorResolver for Refuse {
+        fn resolve(
+            &self,
+            _parent: &BehaviorState,
+            _spec: &SpawnAgentSpec,
+        ) -> Result<BehaviorState, ChildPolicyError> {
+            Err(ChildPolicyError::Rejected("no children here".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_custom_resolver_decides_the_child_profile() {
+        let child_profile = harness_core::behavior::compile(
+            serde_json::from_value(profile("child-only", "CHILD PROFILE.")).unwrap(),
+        )
+        .unwrap();
+        let prompts = child_prompts(Some(Arc::new(Fixed(Arc::new(child_profile))))).await;
+        assert_eq!(prompts, vec!["Child role.\n\nCHILD PROFILE.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_resolver_can_refuse_to_create_a_child() {
+        assert!(child_prompts(Some(Arc::new(Refuse))).await.is_empty());
+    }
+}
+
+// -----------------------------------------------------------------------
+// Behavior profiles: completion gate evaluators, end to end
+// -----------------------------------------------------------------------
+
+mod completion_gate_e2e {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use harness_protocol::backend::{BackendCapabilities, BackendDescriptor, ExecutionRequest};
+    use harness_protocol::ids::ToolId;
+    use harness_protocol::tools::{PermissionMode, ToolCapability, ToolPolicy};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::traits::{ExecutionBackend, ToolExecutor};
+
+    /// Plays both roles: the agent always answers "Done."; the verifier
+    /// (recognised by its system prompt) answers from a script.
+    struct TwoRoleBackend {
+        inner: FakeBackend,
+        verdicts: StdMutex<VecDeque<&'static str>>,
+        agent_requests: StdMutex<Vec<ExecutionRequest>>,
+        verifier_requests: StdMutex<Vec<ExecutionRequest>>,
+    }
+
+    impl TwoRoleBackend {
+        fn new(verdicts: &[&'static str]) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FakeBackend::new(),
+                verdicts: StdMutex::new(verdicts.iter().copied().collect()),
+                agent_requests: StdMutex::new(Vec::new()),
+                verifier_requests: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for TwoRoleBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            self.inner.descriptor()
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            let is_verifier = request
+                .system_prompt
+                .starts_with("You are a strict verifier");
+            let reply = if is_verifier {
+                self.verifier_requests.lock().unwrap().push(request.clone());
+                self.verdicts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted verdict")
+                    .to_string()
+            } else {
+                self.agent_requests.lock().unwrap().push(request.clone());
+                "Done.".to_string()
+            };
+            let request_id = request.request_id;
+            let _ = sink.send(ExecutionEvent::TextDelta {
+                request_id,
+                delta: reply,
+            });
+            Ok(ExecutionResult {
+                request_id,
+                usage: ModelUsage::default(),
+                cost: Cost::default(),
+                finish_reason: "end_turn".into(),
+            })
+        }
+    }
+
+    /// A test runner that fails its first `failures` runs.
+    struct FlakyTests {
+        failures: usize,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for FlakyTests {
+        fn descriptor(&self) -> crate::traits::ToolDescriptor {
+            crate::traits::ToolDescriptor {
+                id: harness_tools::ToolId::new("run_tests"),
+                name: "run_tests".into(),
+                description: "Run the test suite".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn execute(
+            &self,
+            _input: crate::traits::ToolInput,
+            _cancel: CancellationToken,
+        ) -> Result<harness_tools::ToolResult, harness_tools::ToolError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let failing = call < self.failures;
+            Ok(harness_tools::ToolResult {
+                call_id: "test".into(),
+                output: serde_json::json!(if failing {
+                    "1 failed: test_null"
+                } else {
+                    "all passed"
+                }),
+                is_error: failing,
+            })
+        }
+    }
+
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn send(&self, _envelope: AgentEventEnvelope) {}
+    }
+
+    /// Runs one prompt under a profile with `gate` and returns the gate
+    /// events `(passed, continuing, failed_checks)` in order.
+    async fn run_gated(
+        backend: Arc<TwoRoleBackend>,
+        tool: Option<(Arc<FlakyTests>, PermissionMode)>,
+        gate: serde_json::Value,
+    ) -> Vec<(bool, bool, Vec<String>)> {
+        let mut registry = FakeToolRegistry::new();
+        let mut toolset = AgentToolset {
+            tools: HashMap::new(),
+        };
+        if let Some((executor, permission)) = tool {
+            registry.add_executor(executor);
+            let id = ToolId::new();
+            toolset.tools.insert(
+                id,
+                ToolCapability {
+                    descriptor: harness_protocol::tools::ToolDescriptor {
+                        id,
+                        name: "run_tests".into(),
+                        description: "Run the test suite".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    policy: ToolPolicy {
+                        permission,
+                        enabled: true,
+                    },
+                    delegatable: false,
+                },
+            );
+        }
+        let runtime = SessionRuntime::new_with_toolset(
+            SessionId::new(),
+            backend,
+            Arc::new(registry),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            toolset,
+        );
+        let mut events = runtime.event_bus.subscribe();
+        runtime
+            .send_command(SessionCommand::SetBehaviorProfile(serde_json::json!({
+                "schema_version": 1, "id": "gated", "revision": 1, "name": "Gated",
+                // The model never sees run_tests; only the gate uses it.
+                "tools": { "type": "none" },
+                "completion_gate": gate
+            })))
+            .await
+            .unwrap();
+        runtime
+            .send_command(SessionCommand::Prompt(UserInput {
+                text: "fix the bug".into(),
+                attachments: vec![],
+            }))
+            .await
+            .unwrap();
+
+        let mut gate_events = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("event stream").event {
+                    AgentEvent::CompletionGateEvaluated {
+                        passed,
+                        continuing,
+                        failed_checks,
+                        ..
+                    } => gate_events.push((passed, continuing, failed_checks)),
+                    AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("run finishes");
+        runtime.shutdown();
+        gate_events
+    }
+
+    #[tokio::test]
+    async fn a_tool_evaluator_keeps_the_agent_working_until_tests_pass() {
+        let backend = TwoRoleBackend::new(&[]);
+        let tests = Arc::new(FlakyTests {
+            failures: 1,
+            calls: AtomicUsize::new(0),
+        });
+        let events = run_gated(
+            backend.clone(),
+            Some((tests.clone(), PermissionMode::Allow)),
+            serde_json::json!({
+                "checks": [{ "id": "tests-green", "evaluator": { "type": "tool", "tool": "run_tests" } }]
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                (false, true, vec!["tests-green".to_string()]),
+                (true, false, vec![]),
+            ]
+        );
+        assert_eq!(tests.calls.load(Ordering::SeqCst), 2);
+        let agent_requests = backend.agent_requests.lock().unwrap();
+        assert_eq!(agent_requests.len(), 2);
+        assert!(
+            agent_requests[1].tools.is_empty(),
+            "the gate's tool stays hidden from the model"
+        );
+        let feedback = format!("{:?}", agent_requests[1].messages.last().unwrap());
+        assert!(feedback.contains("1 failed: test_null"), "{feedback}");
+    }
+
+    #[tokio::test]
+    async fn a_model_evaluator_judges_the_answer() {
+        let backend = TwoRoleBackend::new(&[
+            r#"{"passed": false, "feedback": "Explain the root cause."}"#,
+            r#"{"passed": true, "feedback": ""}"#,
+        ]);
+        let events = run_gated(
+            backend.clone(),
+            None,
+            serde_json::json!({
+                "checks": [{ "id": "judge", "evaluator": {
+                    "type": "model", "instructions": "The answer must explain the root cause."
+                } }]
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                (false, true, vec!["judge".to_string()]),
+                (true, false, vec![])
+            ]
+        );
+        let verifier = backend.verifier_requests.lock().unwrap();
+        assert_eq!(verifier.len(), 2);
+        assert!(verifier[0]
+            .system_prompt
+            .contains("The answer must explain the root cause."));
+        assert!(verifier[0].params.response_format.is_some());
+        let prompt = format!("{:?}", verifier[0].messages[0]);
+        assert!(prompt.contains("<proposed_answer>\\nDone."), "{prompt}");
+        let agent_requests = backend.agent_requests.lock().unwrap();
+        assert!(format!("{:?}", agent_requests[1].messages.last().unwrap())
+            .contains("Explain the root cause."));
+    }
+
+    #[tokio::test]
+    async fn verifier_requests_count_as_the_agents_usage() {
+        let backend = TwoRoleBackend::new(&[r#"{"passed": true, "feedback": ""}"#]);
+        let runtime = SessionRuntime::new(
+            SessionId::new(),
+            backend.clone(),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        );
+        let root = runtime.state_snapshot().root_agent_id;
+        runtime
+            .send_command(SessionCommand::SetBehaviorProfile(serde_json::json!({
+                "schema_version": 1, "id": "judged", "revision": 1, "name": "Judged",
+                "completion_gate": { "checks": [{ "id": "judge",
+                    "evaluator": { "type": "model", "instructions": "ok?" } }] }
+            })))
+            .await
+            .unwrap();
+        runtime
+            .send_command(SessionCommand::Prompt(UserInput {
+                text: "go".into(),
+                attachments: vec![],
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.agent_live_state(root).last_outcome.is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("run completes");
+        assert_eq!(
+            runtime.agent_live_state(root).total_requests,
+            2,
+            "one agent request and one verifier request"
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_evaluator_that_cannot_run_does_not_pass_silently() {
+        let backend = TwoRoleBackend::new(&[]);
+        let tests = Arc::new(FlakyTests {
+            failures: 0,
+            calls: AtomicUsize::new(0),
+        });
+        let events = run_gated(
+            backend,
+            Some((tests.clone(), PermissionMode::Ask)),
+            serde_json::json!({
+                "checks": [{ "id": "tests-green", "evaluator": { "type": "tool", "tool": "run_tests" } }],
+                "max_continuations": 0
+            }),
+        )
+        .await;
+        assert_eq!(
+            events,
+            vec![(false, false, vec!["tests-green".to_string()])]
+        );
+        assert_eq!(
+            tests.calls.load(Ordering::SeqCst),
+            0,
+            "a tool that needs approval is never run by the gate"
+        );
+    }
+
+    /// Like `run_gated`, but installs the profile as a bundle (with command
+    /// trust) in a workspace rooted at `root`. Returns the gate events and
+    /// the root agent's request count.
+    async fn run_bundled(
+        backend: Arc<TwoRoleBackend>,
+        gate: serde_json::Value,
+        root: &std::path::Path,
+        allow_commands: bool,
+    ) -> (Vec<(bool, bool, Vec<String>)>, u64) {
+        let runtime = SessionRuntime::new(
+            SessionId::new(),
+            backend,
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new().with_root(root)),
+            Arc::new(NoopSink),
+        );
+        let agent = runtime.state_snapshot().root_agent_id;
+        let mut events = runtime.event_bus.subscribe();
+        runtime
+            .send_command(SessionCommand::SetBehaviorBundle {
+                profile: serde_json::json!({
+                    "schema_version": 1, "id": "gated", "revision": 1, "name": "Gated",
+                    "completion_gate": gate
+                }),
+                library: Vec::new(),
+                allow_commands,
+            })
+            .await
+            .unwrap();
+        runtime
+            .send_command(SessionCommand::Prompt(UserInput {
+                text: "fix the bug".into(),
+                attachments: vec![],
+            }))
+            .await
+            .unwrap();
+        let mut gate_events = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = events.recv().await.expect("event stream");
+                if envelope.agent_id != agent {
+                    continue;
+                }
+                match envelope.event {
+                    AgentEvent::CompletionGateEvaluated {
+                        passed,
+                        continuing,
+                        failed_checks,
+                        ..
+                    } => gate_events.push((passed, continuing, failed_checks)),
+                    AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("run finishes");
+        // Usage from a verifier arrives with its verdict, before completion.
+        let requests = runtime.agent_live_state(agent).total_requests;
+        runtime.shutdown();
+        (gate_events, requests)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_trusted_command_follows_the_stop_hook_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({
+            "checks": [{ "id": "hook", "evaluator": { "type": "command", "command":
+                "cat > input.json; if [ -f attempted ]; then exit 0; fi; touch attempted; \
+                 echo 'Run the linter first.' >&2; exit 2" } }]
+        });
+        let (events, _) = run_bundled(TwoRoleBackend::new(&[]), gate, dir.path(), true).await;
+        assert_eq!(
+            events,
+            vec![
+                (false, true, vec!["hook".to_string()]),
+                (true, false, vec![])
+            ]
+        );
+        let input: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("input.json")).unwrap())
+                .unwrap();
+        assert_eq!(input["hook_event_name"], "Stop");
+        assert_eq!(input["last_assistant_message"], "Done.");
+        assert_eq!(
+            input["stop_hook_active"], true,
+            "second check follows a rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untrusted_command_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = serde_json::json!({
+            "checks": [{ "id": "hook", "evaluator": { "type": "command", "command": "touch ran" } }],
+            "max_continuations": 0
+        });
+        let (events, _) = run_bundled(TwoRoleBackend::new(&[]), gate, dir.path(), false).await;
+        assert_eq!(events, vec![(false, false, vec!["hook".to_string()])]);
+        assert!(!dir.path().join("ran").exists());
+    }
+
+    #[tokio::test]
+    async fn an_agent_evaluator_runs_an_isolated_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = TwoRoleBackend::new(&[
+            r#"{"passed": false, "feedback": "The root cause is not explained."}"#,
+            r#"{"passed": true, "feedback": ""}"#,
+        ]);
+        let gate = serde_json::json!({
+            "checks": [{ "id": "verifier", "evaluator": {
+                "type": "agent", "instructions": "Check that the root cause is explained." } }]
+        });
+        let (events, requests) = run_bundled(backend.clone(), gate, dir.path(), false).await;
+        assert_eq!(
+            events,
+            vec![
+                (false, true, vec!["verifier".to_string()]),
+                (true, false, vec![])
+            ]
+        );
+        let verifier = backend.verifier_requests.lock().unwrap();
+        assert_eq!(verifier.len(), 2);
+        assert!(verifier[0]
+            .system_prompt
+            .contains("Check that the root cause is explained."));
+        assert!(
+            verifier[0].tools.is_empty(),
+            "the verifier gets only the tools it names"
+        );
+        assert_eq!(requests, 4, "two agent requests and two verifier requests");
+        let agent_requests = backend.agent_requests.lock().unwrap();
+        assert!(format!("{:?}", agent_requests[1].messages.last().unwrap())
+            .contains("The root cause is not explained."));
+    }
+}

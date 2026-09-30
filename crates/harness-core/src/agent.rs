@@ -90,6 +90,8 @@ impl Agent {
                 last_error: None,
                 transition_sequence: 0,
                 depth,
+                behavior: Default::default(),
+                pending_profile: None,
             },
             backend,
             capabilities,

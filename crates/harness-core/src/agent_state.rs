@@ -8,6 +8,7 @@ use harness_protocol::ids::{AgentId, PermissionId, RunId, Timestamp, ToolCallId}
 use harness_protocol::messages::AgentMessage;
 use harness_protocol::tools::ToolCall;
 
+use crate::behavior::{BehaviorState, CompiledProfile};
 use crate::context_state::AgentContextState;
 
 #[derive(Debug, Clone)]
@@ -48,4 +49,12 @@ pub struct AgentState {
     /// parent depth plus one for a child. Read-only from the core's
     /// perspective; the runtime supervisor enforces depth limits.
     pub depth: u32,
+    /// Active behavior profile and this run's counters.
+    pub behavior: BehaviorState,
+    /// A switch requested while a run is active (by a rule or the host),
+    /// with the library it brings; applied before the next model request.
+    pub pending_profile: Option<(
+        std::sync::Arc<CompiledProfile>,
+        std::sync::Arc<crate::behavior::ProfileRegistry>,
+    )>,
 }

@@ -136,6 +136,15 @@ impl SessionRestorerEngine {
                     message: "root agent's backend was not re-created".into(),
                 })?;
 
+        for agent in &snapshot.agents {
+            harness_core::behavior::BehaviorState::from_stored(agent.behavior.as_ref()).map_err(
+                |error| SessionManagerError::BehaviorRestore {
+                    agent: agent.agent_id,
+                    error,
+                },
+            )?;
+        }
+
         let session_permit = self.scheduler.acquire_session_permit().await;
         let runtime = Arc::new(SessionRuntime::from_stored(
             id,

@@ -99,7 +99,13 @@ pub fn replay_snapshot(
             | AgentEvent::AssistantTextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolCallRequested { .. }
-            | AgentEvent::ToolCallProgress { .. } => {}
+            | AgentEvent::ToolCallProgress { .. }
+            // Behavior state travels in snapshots, not in replayed events.
+            | AgentEvent::BehaviorRuleFired { .. }
+            | AgentEvent::ContextInjected { .. }
+            | AgentEvent::ToolCallDenied { .. }
+            | AgentEvent::CompletionGateEvaluated { .. }
+            | AgentEvent::ProfileChanged { .. } => {}
         }
 
         snapshot.session_sequence = sequence;
@@ -158,6 +164,7 @@ mod tests {
             budget: AgentBudget::default(),
             capabilities: serde_json::Value::Null,
             usage: serde_json::Value::Null,
+            behavior: None,
         }
     }
 

@@ -29,6 +29,8 @@ pub struct Harness {
     pub(crate) sessions: Arc<SessionManager>,
     pub(crate) session_store: Arc<dyn SessionStore>,
     pub(crate) model_cache: Arc<RwLock<HashMap<ProviderKey, Vec<ModelDescriptor>>>>,
+    pub(crate) orchestration: Option<crate::orchestration::OrchestrationConfig>,
+    pub(crate) profiles: crate::profiles::ProfilesConfig,
 }
 
 impl Harness {
@@ -282,6 +284,8 @@ impl Harness {
             )),
             session_store: store,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
+            orchestration: None,
+            profiles: Default::default(),
         }
     }
 
@@ -315,10 +319,28 @@ impl Harness {
     /// Begin building a session using this harness's integration registry
     /// and session manager.
     pub fn session(&self) -> SessionBuilder {
-        SessionBuilder::with_integrations_and_manager(
+        let builder = SessionBuilder::with_integrations_and_manager(
             self.integrations.clone(),
             self.sessions.clone(),
         )
+        .profiles(self.profiles.clone());
+        match &self.orchestration {
+            Some(config) => builder.orchestration(config.clone()),
+            None => builder,
+        }
+    }
+
+    /// The orchestration configuration, when enabled via
+    /// [`HarnessBuilder::orchestration`](crate::HarnessBuilder::orchestration).
+    /// Use it to register additional workflow definitions.
+    pub fn orchestration(&self) -> Option<&crate::orchestration::OrchestrationConfig> {
+        self.orchestration.as_ref()
+    }
+
+    /// The host's behavior-profile registry. Register profiles here (e.g.
+    /// from an editor); sessions started afterwards can reference them.
+    pub fn profiles(&self) -> &crate::profiles::ProfilesConfig {
+        &self.profiles
     }
 
     /// Lists durable sessions newest-first for frontend discovery.
@@ -355,7 +377,12 @@ impl Harness {
                 Arc::new(NoopEventSink),
             )
             .await?;
-        Ok(SessionHandle::from_runtime(runtime, self.sessions.clone()))
+        Ok(SessionHandle::from_runtime(
+            runtime,
+            self.sessions.clone(),
+            self.orchestration.clone(),
+            Arc::new(self.profiles.snapshot()),
+        ))
     }
 
     /// Restore a previously persisted session, returning a live
@@ -393,7 +420,12 @@ impl Harness {
                 Arc::new(NoopEventSink),
             )
             .await?;
-        Ok(SessionHandle::from_runtime(runtime, self.sessions.clone()))
+        Ok(SessionHandle::from_runtime(
+            runtime,
+            self.sessions.clone(),
+            self.orchestration.clone(),
+            Arc::new(self.profiles.snapshot()),
+        ))
     }
 }
 

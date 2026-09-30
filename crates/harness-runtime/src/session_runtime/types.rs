@@ -54,6 +54,17 @@ pub enum SessionCommand {
     /// (model, max_tokens, temperature, reasoning, ...). See
     /// `AgentCommand::ConfigureExecution`.
     ConfigureExecution(ExecutionParams),
+    /// Replace the root agent's behavior profile (a full, validated profile
+    /// document). See `AgentCommand::SetBehaviorProfile`.
+    SetBehaviorProfile(serde_json::Value),
+    /// Replace the root agent's behavior profile together with its switch
+    /// library (every profile reachable through `switch_profile`).
+    SetBehaviorBundle {
+        profile: serde_json::Value,
+        library: Vec<serde_json::Value>,
+        /// Whether these profiles may run `command` evaluators.
+        allow_commands: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

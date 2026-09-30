@@ -9,7 +9,9 @@ pub mod call_context;
 pub mod executor;
 pub mod registry;
 
-pub use call_context::{current_tool_call_id, with_tool_call_id};
+pub use call_context::{
+    current_tool_call_id, current_tool_session_id, with_tool_call, with_tool_call_id,
+};
 pub use executor::{
     CancellationToken, ExecutionFailure, ExecutionResult, FailureKind, ProgressPhase,
     ToolDescriptor, ToolError, ToolExecutor, ToolId, ToolInput, ToolProgress, ToolResult,

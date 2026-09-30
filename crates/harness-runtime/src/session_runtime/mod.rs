@@ -166,9 +166,37 @@ pub struct SessionRuntime {
     /// [`shutdown()`](SessionRuntime::shutdown) and [`Drop`] cancel this
     /// token.
     bus_cancel: CancellationToken,
+    /// Live sessions this one delegates work to (orchestration steps run in
+    /// isolated sessions sharing its backend and tools), so the host can
+    /// still reach them -- e.g. to change a step's model mid-run.
+    delegated: Mutex<std::collections::HashMap<SessionId, std::sync::Weak<SessionRuntime>>>,
 }
 
 impl SessionRuntime {
+    /// Make `session` reachable through [`delegated_session`](Self::delegated_session)
+    /// while it runs work on this session's behalf.
+    pub fn register_delegated(&self, session: &Arc<SessionRuntime>) {
+        let mut delegated = self.delegated.lock().expect("delegated mutex poisoned");
+        delegated.retain(|_, weak| weak.strong_count() > 0);
+        delegated.insert(session.session_id, Arc::downgrade(session));
+    }
+
+    pub fn unregister_delegated(&self, session_id: SessionId) {
+        self.delegated
+            .lock()
+            .expect("delegated mutex poisoned")
+            .remove(&session_id);
+    }
+
+    /// A live delegated session (see [`register_delegated`](Self::register_delegated)).
+    pub fn delegated_session(&self, session_id: SessionId) -> Option<Arc<SessionRuntime>> {
+        self.delegated
+            .lock()
+            .expect("delegated mutex poisoned")
+            .get(&session_id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
     /// Cancel only the root agent's active run.
     ///
     /// This is intentionally mailbox-scoped rather than using the session
@@ -300,6 +328,20 @@ impl SessionRuntime {
             SessionCommand::ConfigureExecution(params) => {
                 AgentCommand::ConfigureExecution { params }
             }
+            SessionCommand::SetBehaviorProfile(profile) => AgentCommand::SetBehaviorProfile {
+                profile,
+                library: Vec::new(),
+                allow_commands: false,
+            },
+            SessionCommand::SetBehaviorBundle {
+                profile,
+                library,
+                allow_commands,
+            } => AgentCommand::SetBehaviorProfile {
+                profile,
+                library,
+                allow_commands,
+            },
         };
 
         self.root_agent_tx
@@ -384,6 +426,60 @@ impl SessionRuntime {
             agent_count: state.agents.len(),
             error,
         }
+    }
+
+    /// The root agent's current execution parameters (model, max tokens,
+    /// reasoning, ...), including any `ConfigureExecution` applied since
+    /// construction.
+    pub fn root_execution_params(&self) -> harness_protocol::backend::ExecutionParams {
+        let root = self
+            .state
+            .lock()
+            .expect("state mutex poisoned")
+            .root_agent_id;
+        self.projection
+            .lock()
+            .expect("projection mutex poisoned")
+            .get(&root)
+            .map(|stored| stored.execution_params.clone())
+            .unwrap_or_default()
+    }
+
+    /// The root agent's current behavior (profile and run counters), as last
+    /// published by its runner.
+    pub fn root_behavior(&self) -> harness_core::behavior::BehaviorState {
+        let root = self
+            .state
+            .lock()
+            .expect("state mutex poisoned")
+            .root_agent_id;
+        let stored = self
+            .projection
+            .lock()
+            .expect("projection mutex poisoned")
+            .get(&root)
+            .and_then(|stored| stored.behavior.clone());
+        harness_core::behavior::BehaviorState::from_stored(stored.as_ref()).unwrap_or_default()
+    }
+
+    /// Replace how this session's child agents get their behavior profile.
+    pub fn set_child_behavior_resolver(
+        &self,
+        resolver: Arc<dyn harness_core::behavior::ChildBehaviorResolver>,
+    ) {
+        self.agent_supervisor.set_child_behavior_resolver(resolver);
+    }
+
+    /// The root agent's toolset: every tool it can see and its policy.
+    pub fn root_toolset(&self) -> harness_protocol::tools::AgentToolset {
+        let state = self.state.lock().expect("state mutex poisoned");
+        state
+            .agents
+            .get(&state.root_agent_id)
+            .map(|agent| agent.capabilities.tools.clone())
+            .unwrap_or_else(|| harness_protocol::tools::AgentToolset {
+                tools: Default::default(),
+            })
     }
 
     /// Returns the current live status/usage projection for `agent_id`.

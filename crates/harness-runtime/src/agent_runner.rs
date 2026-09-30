@@ -146,6 +146,8 @@ pub struct AgentRunner {
     committer: Option<Arc<SessionCommitter>>,
     backend_tokens: HashMap<RunId, CancellationToken>,
     tool_tokens: HashMap<ToolCallId, CancellationToken>,
+    /// In-flight completion-gate evaluations, by run.
+    evaluation_tokens: HashMap<RunId, CancellationToken>,
     /// Outcome of the most recently completed `FinishRun` effect, retrieved
     /// via [`Self::take_final_result`].
     ///
@@ -302,6 +304,7 @@ impl AgentRunner {
             committer: None,
             backend_tokens: HashMap::new(),
             tool_tokens: HashMap::new(),
+            evaluation_tokens: HashMap::new(),
             final_result: None,
             supervision: None,
             session_store: None,
@@ -536,6 +539,12 @@ impl AgentRunner {
                 }
                 AgentEffect::Persist { mutation } => {
                     self.persist(mutation).await;
+                }
+                AgentEffect::EvaluateCompletion { request } => self.evaluate_completion(request),
+                AgentEffect::CancelEvaluation { run_id } => {
+                    if let Some(token) = self.evaluation_tokens.remove(&run_id) {
+                        token.cancel();
+                    }
                 }
             }
         }
@@ -931,6 +940,7 @@ impl AgentRunner {
         // comfortably inside `max_concurrent_tool_executions`.
         let spawns_process = name == "shell.exec";
         let tool_name_for_metrics = name.clone();
+        let session_id = self.agent.session_id.to_string();
 
         tokio::spawn(async move {
             // Like provider capacity, tool capacity is a cancellable queue
@@ -959,8 +969,9 @@ impl AgentRunner {
 
             let input = harness_tools::ToolInput { arguments };
             let tool_call_start = std::time::Instant::now();
-            let outcome = harness_tools::with_tool_call_id(
+            let outcome = harness_tools::with_tool_call(
                 call_id.to_string(),
+                session_id,
                 executor.execute(input, token),
             )
             .await;
@@ -1036,14 +1047,19 @@ impl AgentRunner {
                             "note": "running concurrently; its own completion will appear as ChildAgentCompleted",
                         }),
                     ),
-                    Some(Ok(result)) => (
-                        false,
-                        serde_json::json!({
+                    Some(Ok(result)) => {
+                        let mut output = serde_json::json!({
                             "child_agent_id": outcome.child_id.to_string(),
                             "status": "completed",
                             "summary": result.summary,
-                        }),
-                    ),
+                        });
+                        // Tell the parent when the child finished without
+                        // passing its completion gate.
+                        if let Some(passed) = result.gate_passed {
+                            output["gate_passed"] = serde_json::json!(passed);
+                        }
+                        (false, output)
+                    }
                     Some(Err(message)) => (
                         true,
                         serde_json::json!({
@@ -1079,6 +1095,62 @@ impl AgentRunner {
                 Box::pin(self.dispatch_effects(effects)).await;
             }
         }
+    }
+
+    /// Run the completion gate's evaluators off the mailbox loop and report
+    /// the verdicts back as `CompletionEvaluated`, like a tool result.
+    fn evaluate_completion(
+        &mut self,
+        request: harness_protocol::effects::CompletionEvaluationRequest,
+    ) {
+        let token = self.cancel.child_token();
+        if let Some(previous) = self.evaluation_tokens.insert(request.run_id, token.clone()) {
+            previous.cancel();
+        }
+        let context = crate::completion_gate::GateContext {
+            backend: self.backend.clone(),
+            tool_registry: self.tool_registry.clone(),
+            workspace: self.workspace.clone(),
+            commands_trusted: self.agent.state.behavior.commands_trusted,
+            tool_permissions: self
+                .agent
+                .capabilities
+                .tools
+                .tools
+                .values()
+                .filter(|capability| capability.policy.enabled)
+                .map(|capability| {
+                    (
+                        capability.descriptor.name.clone(),
+                        capability.policy.permission.clone(),
+                    )
+                })
+                .collect(),
+            params: self
+                .agent
+                .state
+                .behavior
+                .profile
+                .execution_params(&self.agent.state.execution_params),
+        };
+        let commands = self.task.commands_tx.clone();
+        tokio::spawn(async move {
+            let (verdicts, usage) =
+                crate::completion_gate::evaluate(&context, &request, &token).await;
+            // A cancelled evaluation still spent its requests; report them
+            // so usage stays truthful (the core ignores the stale verdicts).
+            if token.is_cancelled() && usage.is_empty() {
+                return;
+            }
+            let _ = commands
+                .send(AgentCommand::CompletionEvaluated {
+                    run_id: request.run_id,
+                    attempt: request.attempt,
+                    verdicts,
+                    usage,
+                })
+                .await;
+        });
     }
 
     fn cancel_backend(&mut self, run_id: RunId) {

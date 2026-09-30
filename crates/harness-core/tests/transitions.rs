@@ -652,6 +652,7 @@ fn child_commands_do_not_crash_parent_state() {
         result: AgentResult {
             summary: "done".into(),
             usage: AgentUsageSummary::default(),
+            gate_passed: None,
         },
     });
     assert!(agent.state.children.is_empty());

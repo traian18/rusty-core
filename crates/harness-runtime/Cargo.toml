@@ -1,6 +1,6 @@
 [package]
 name = "harness-runtime"
-version = "0.2.2"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ harness-protocol = { path = "../harness-protocol" }
 harness-session-store = { path = "../harness-session-store", default-features = false }
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process", "io-util"] }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }

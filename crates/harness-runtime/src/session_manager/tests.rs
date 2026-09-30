@@ -952,3 +952,143 @@ async fn active_session_registry_operations() {
     assert!(!registry.contains(session_id).await);
     assert!(registry.get(session_id).await.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Behavior profiles across checkpoint/restore
+// ---------------------------------------------------------------------------
+
+fn custom_profile_document() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "id": "restorable",
+        "revision": 2,
+        "name": "Restorable",
+        "instructions": { "text": "Keep this across restarts." },
+        "limits": { "max_turns": 7 }
+    })
+}
+
+/// Runs one prompt under a custom profile, then drops the manager without
+/// closing — the snapshot written at the end of the run is all that
+/// survives. Returns the session id and the store.
+async fn crashed_session_with_profile(backend_name: &'static str) -> (SessionId, Arc<MemoryStore>) {
+    let store = Arc::new(MemoryStore::new());
+    let manager = SessionManager::new_with_store(
+        Arc::new(Scheduler::new(SchedulerConfig::default())),
+        Some(store.clone() as Arc<dyn SessionStore>),
+    );
+    let runtime = manager
+        .create_session(
+            Arc::new(CountingBackend {
+                calls: Arc::new(AtomicUsize::new(0)),
+                inner: noop_backend_inner(),
+                name: backend_name,
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            AgentToolset {
+                tools: HashMap::new(),
+            },
+        )
+        .await
+        .expect("create_session");
+    runtime
+        .send_command(crate::session_runtime::SessionCommand::SetBehaviorProfile(
+            custom_profile_document(),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .send_command(crate::session_runtime::SessionCommand::Prompt(
+            harness_protocol::commands::UserInput {
+                text: "run under the profile".into(),
+                attachments: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    let root = runtime.state_snapshot().root_agent_id;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while runtime.agent_live_state(root).last_outcome.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run completes");
+    assert_eq!(
+        runtime.root_behavior().reference(),
+        harness_core::behavior::ProfileRef::exact("restorable", 2)
+    );
+    (runtime.session_id, store)
+}
+
+async fn restore_with(
+    store: Arc<MemoryStore>,
+    session_id: SessionId,
+    backend_name: &'static str,
+) -> Result<Arc<crate::session_runtime::SessionRuntime>, SessionManagerError> {
+    let integrations = Arc::new(IntegrationRegistry::new());
+    integrations
+        .register(Arc::new(CountingBackendFactory {
+            id: "behavior-restore-integration",
+            name: backend_name,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .unwrap();
+    SessionManager::new_with_store(
+        Arc::new(Scheduler::new(SchedulerConfig::default())),
+        Some(store as Arc<dyn SessionStore>),
+    )
+    .restore_session(
+        session_id,
+        integrations,
+        Arc::new(FakeToolRegistry::new()),
+        Arc::new(FakeWorkspace::new()),
+        Arc::new(NoopSink),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_restored_session_keeps_its_behavior_profile() {
+    const NAME: &str = "behavior-restore-backend";
+    let (session_id, store) = crashed_session_with_profile(NAME).await;
+    let restored = restore_with(store, session_id, NAME)
+        .await
+        .expect("restore succeeds");
+    let behavior = restored.root_behavior();
+    assert_eq!(
+        behavior.reference(),
+        harness_core::behavior::ProfileRef::exact("restorable", 2)
+    );
+    assert_eq!(behavior.profile.profile.limits.max_turns, Some(7));
+}
+
+#[tokio::test]
+async fn restore_refuses_a_snapshot_whose_profile_was_altered() {
+    const NAME: &str = "behavior-tamper-backend";
+    let (session_id, store) = crashed_session_with_profile(NAME).await;
+
+    let mut snapshot = store
+        .load_session(session_id)
+        .await
+        .unwrap()
+        .snapshot
+        .expect("a snapshot was written at the end of the run");
+    let behavior = snapshot.agents[0]
+        .behavior
+        .as_mut()
+        .expect("behavior stored");
+    behavior["profile"]["limits"]["max_turns"] = serde_json::json!(10_000);
+    store.save_snapshot(snapshot).await.unwrap();
+
+    let error = restore_with(store, session_id, NAME)
+        .await
+        .err()
+        .expect("restore must fail closed");
+    assert!(
+        matches!(error, SessionManagerError::BehaviorRestore { .. }),
+        "{error}"
+    );
+}

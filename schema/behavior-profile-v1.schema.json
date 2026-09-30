@@ -1,0 +1,1290 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BehaviorProfile",
+  "description": "A behavior profile: what an agent is told, what it may use, and how its loop is bounded. See `BEHAVIOR_LAYER_DESIGN.md` §5.\n\nUnknown fields are rejected everywhere except `metadata`, which belongs to editors and is preserved but never interpreted.",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "revision",
+    "schema_version"
+  ],
+  "properties": {
+    "children": {
+      "default": {
+        "type": "inherit"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ChildPolicy"
+        }
+      ]
+    },
+    "completion_gate": {
+      "description": "Checks a proposed final answer must pass before the run may finish (`BEHAVIOR_LAYER_DESIGN.md` §7).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompletionGate"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "execution": {
+      "default": {},
+      "allOf": [
+        {
+          "$ref": "#/definitions/ExecutionOverlay"
+        }
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "instructions": {
+      "default": {
+        "mode": "append",
+        "text": ""
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Instructions"
+        }
+      ]
+    },
+    "limits": {
+      "default": {},
+      "allOf": [
+        {
+          "$ref": "#/definitions/Limits"
+        }
+      ]
+    },
+    "metadata": {
+      "default": null
+    },
+    "name": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "rules": {
+      "description": "Loop rules: on an event, when a condition holds, do an action. Evaluated in order (`BEHAVIOR_LAYER_DESIGN.md` §6).",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Rule"
+      }
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "status": {
+      "default": "published",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DefinitionStatus"
+        }
+      ]
+    },
+    "tool_overrides": {
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/ToolOverride"
+      }
+    },
+    "tools": {
+      "description": "Tools visible to and executable by the agent, intersected with what the session grants. Defaults to `inherit`: a profile narrows, never widens.",
+      "default": {
+        "type": "inherit"
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/ToolScope"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Action": {
+      "oneOf": [
+        {
+          "description": "Add context for the model (guidance).",
+          "type": "object",
+          "required": [
+            "inject"
+          ],
+          "properties": {
+            "inject": {
+              "$ref": "#/definitions/Inject"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Refuse the tool call; the model receives `reason` as the result (enforced, `PreToolUse` only).",
+          "type": "object",
+          "required": [
+            "deny"
+          ],
+          "properties": {
+            "deny": {
+              "type": "object",
+              "required": [
+                "reason"
+              ],
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Require approval for this call even if policy allows it (enforced, `PreToolUse` only).",
+          "type": "object",
+          "required": [
+            "ask"
+          ],
+          "properties": {
+            "ask": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Skip the approval prompt for this call. Applies only where the effective permission is `ask`; never overrides a denial (enforced, `PreToolUse` only).",
+          "type": "object",
+          "required": [
+            "allow"
+          ],
+          "properties": {
+            "allow": {
+              "type": "object",
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Fail the run with `BEHAVIOR_STOP` (enforced).",
+          "type": "object",
+          "required": [
+            "stop_run"
+          ],
+          "properties": {
+            "stop_run": {
+              "type": "object",
+              "required": [
+                "reason"
+              ],
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Switch to another profile from the next model request (enforced for tools, parameters and limits; the model is told about the switch). The target must be resolvable when this profile is installed.",
+          "type": "object",
+          "required": [
+            "switch_profile"
+          ],
+          "properties": {
+            "switch_profile": {
+              "type": "object",
+              "required": [
+                "profile"
+              ],
+              "properties": {
+                "profile": {
+                  "$ref": "#/definitions/ProfileRef"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "JSON merge patch (RFC 7396) applied to the tool arguments before the call is approved or executed (enforced, `PreToolUse` only). The model is told the arguments were adjusted.",
+          "type": "object",
+          "required": [
+            "rewrite_args"
+          ],
+          "properties": {
+            "rewrite_args": {
+              "type": "object",
+              "required": [
+                "merge"
+              ],
+              "properties": {
+                "merge": true
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Change what the model receives as the tool result (enforced, post-tool events only). Exactly one of `replace` or `append`.",
+          "type": "object",
+          "required": [
+            "rewrite_result"
+          ],
+          "properties": {
+            "rewrite_result": {
+              "type": "object",
+              "properties": {
+                "append": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "replace": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ArgMatch": {
+      "type": "object",
+      "required": [
+        "pointer"
+      ],
+      "properties": {
+        "contains": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "equals": true,
+        "glob": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pointer": {
+          "description": "JSON Pointer into the tool arguments (`\"\"` is the whole value).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ChildPolicy": {
+      "description": "How spawned child agents get their behavior (`BEHAVIOR_LAYER_DESIGN.md` §8a). Only `inherit` is implemented; the other types are reserved so the format stays stable, and the compiler rejects them.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "inherit"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "profile",
+            "type"
+          ],
+          "properties": {
+            "profile": {
+              "$ref": "#/definitions/ProfileRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "named"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "overrides": {
+              "default": null
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "derived"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "ref",
+            "type"
+          ],
+          "properties": {
+            "ref": {
+              "$ref": "#/definitions/ProfileRef"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "policy"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Comparison": {
+      "description": "Every bound given must hold.",
+      "type": "object",
+      "properties": {
+        "eq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "gte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "lte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompletionGate": {
+      "description": "When the model proposes a final answer (a turn with no tool calls), every check runs. If any fails, their feedback is sent back as a user message and the loop continues, up to `max_continuations` times.",
+      "type": "object",
+      "required": [
+        "checks"
+      ],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GateCheck"
+          }
+        },
+        "max_continuations": {
+          "default": 3,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "on_exhausted": {
+          "description": "What happens when checks still fail after the last continuation. Defaults to `accept`: the run completes and the `CompletionGateEvaluated` event reports `passed: false`. Workflow steps treat an unpassed gate as a failed attempt.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OnExhausted"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Condition": {
+      "description": "A declarative, side-effect-free predicate over the loop's state and the event. There are no expressions and no regular expressions; globs use `*` (within a path segment), `**` (across segments) and `?`.",
+      "oneOf": [
+        {
+          "description": "The event's tool name matches (tool events only).",
+          "type": "object",
+          "required": [
+            "tool"
+          ],
+          "properties": {
+            "tool": {
+              "$ref": "#/definitions/NameMatch"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A value inside the tool arguments matches (tool events only).",
+          "type": "object",
+          "required": [
+            "arg"
+          ],
+          "properties": {
+            "arg": {
+              "$ref": "#/definitions/ArgMatch"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The tool result text contains this string (post-tool events only).",
+          "type": "object",
+          "required": [
+            "result_contains"
+          ],
+          "properties": {
+            "result_contains": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The run's current turn number (1-based).",
+          "type": "object",
+          "required": [
+            "turn"
+          ],
+          "properties": {
+            "turn": {
+              "$ref": "#/definitions/Comparison"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Executed calls of a tool in this run.",
+          "type": "object",
+          "required": [
+            "calls"
+          ],
+          "properties": {
+            "calls": {
+              "$ref": "#/definitions/ToolCount"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Turns since the tool was last executed (or since the run started).",
+          "type": "object",
+          "required": [
+            "turns_since_call"
+          ],
+          "properties": {
+            "turns_since_call": {
+              "$ref": "#/definitions/ToolCount"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Executed calls of `called` since the last executed call of `of`. False when `of` has not been called in this run.",
+          "type": "object",
+          "required": [
+            "since_last_call"
+          ],
+          "properties": {
+            "since_last_call": {
+              "$ref": "#/definitions/SinceLastCall"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Consecutive requests of the same tool with identical arguments, including the current one (`PreToolUse` only).",
+          "type": "object",
+          "required": [
+            "repeated_call"
+          ],
+          "properties": {
+            "repeated_call": {
+              "$ref": "#/definitions/Comparison"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The id of the profile active before this one (`ProfileEntered` only).",
+          "type": "object",
+          "required": [
+            "profile_entered_from"
+          ],
+          "properties": {
+            "profile_entered_from": {
+              "$ref": "#/definitions/NameMatch"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Condition"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "any"
+          ],
+          "properties": {
+            "any": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Condition"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "not"
+          ],
+          "properties": {
+            "not": {
+              "$ref": "#/definitions/Condition"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "DefinitionStatus": {
+      "description": "Publication state of a definition revision.\n\nPublished revisions are immutable; drafts only execute when the registry explicitly allows them (development mode).",
+      "type": "string",
+      "enum": [
+        "draft",
+        "published",
+        "deprecated"
+      ]
+    },
+    "ErrorPolicy": {
+      "type": "string",
+      "enum": [
+        "fail",
+        "pass"
+      ]
+    },
+    "EvaluatorSpec": {
+      "oneOf": [
+        {
+          "description": "Run a registered tool directly. Passes when it succeeds; its output becomes the feedback. The session must allow the tool without approval. The profile's tool scope does not apply: a gate may use a tool the model cannot see.",
+          "type": "object",
+          "required": [
+            "tool",
+            "type"
+          ],
+          "properties": {
+            "args": {
+              "default": null
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tool"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Ask a model whether the answer is acceptable. It returns `{\"passed\": bool, \"feedback\": string}`, validated by the host.",
+          "type": "object",
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "properties": {
+            "instructions": {
+              "type": "string"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "transcript_messages": {
+              "description": "How many recent transcript messages the evaluator sees.",
+              "default": 10,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "model"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An isolated verifier agent that can investigate with its own tools before answering `{\"passed\": bool, \"feedback\": string}`. Its tools must be allowed by the session without approval.",
+          "type": "object",
+          "required": [
+            "instructions",
+            "type"
+          ],
+          "properties": {
+            "instructions": {
+              "type": "string"
+            },
+            "max_turns": {
+              "default": 8,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "transcript_messages": {
+              "default": 10,
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agent"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A shell command following the Claude Code / Codex `Stop` hook contract: JSON on stdin; exit 0 passes (unless stdout is `{\"decision\": \"block\", \"reason\": ...}`), exit 2 fails with stderr as feedback, anything else is an error. Runs only when the host trusts the profile to run commands.",
+          "type": "object",
+          "required": [
+            "command",
+            "type"
+          ],
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "default": 60000,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "command"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ExecutionOverlay": {
+      "description": "Execution parameters applied over the session's while the profile is active. Unset fields keep the session's value.",
+      "type": "object",
+      "properties": {
+        "max_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffortSetting"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temperature": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GateCheck": {
+      "description": "One check: either a declarative `require` condition (evaluated instantly, no I/O) or an `evaluator` (runs a tool or asks a model).",
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "error_policy": {
+          "description": "How an evaluator that cannot produce a verdict counts.",
+          "default": "fail",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ErrorPolicy"
+            }
+          ]
+        },
+        "evaluator": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EvaluatorSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "feedback": {
+          "description": "Sent to the model when the check fails. For evaluators, defaults to the evaluator's own feedback.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "metadata": true,
+        "require": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "Inject": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "placement": {
+          "description": "Where the text goes. Defaults by event: `with_result` for tool events, `next_request` otherwise.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "InstructionMode": {
+      "oneOf": [
+        {
+          "description": "Added after the agent's own system prompt.",
+          "type": "string",
+          "enum": [
+            "append"
+          ]
+        },
+        {
+          "description": "Replaces the agent's own system prompt.",
+          "type": "string",
+          "enum": [
+            "replace"
+          ]
+        }
+      ]
+    },
+    "Instructions": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "default": "append",
+          "allOf": [
+            {
+              "$ref": "#/definitions/InstructionMode"
+            }
+          ]
+        },
+        "text": {
+          "default": "",
+          "type": "string"
+        },
+        "variants": {
+          "description": "Per-model-family wording, keyed by a lowercase substring of the model id (e.g. `\"claude\"`, `\"gpt\"`, `\"gemini\"`). The first key, in sorted order, contained in the active model id replaces `text`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Limits": {
+      "description": "Per-run bounds on the agent loop.",
+      "type": "object",
+      "properties": {
+        "final_turn_prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_tool_calls": {
+          "description": "Maximum tool calls per run. Reaching it makes the next request the final turn; calls beyond it are denied.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_turns": {
+          "description": "Maximum model requests per run. The last one is sent with no tools and `final_turn_prompt`, so the model must answer in text.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "NameMatch": {
+      "description": "One tool-name glob, or a list of them (any may match).",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "OnExhausted": {
+      "oneOf": [
+        {
+          "description": "Fail the run with `GATE_EXHAUSTED`.",
+          "type": "string",
+          "enum": [
+            "fail"
+          ]
+        },
+        {
+          "description": "Complete the run, reported as not passed.",
+          "type": "string",
+          "enum": [
+            "accept"
+          ]
+        }
+      ]
+    },
+    "Placement": {
+      "oneOf": [
+        {
+          "description": "Appended to the tool call's result; stored in the transcript.",
+          "type": "string",
+          "enum": [
+            "with_result"
+          ]
+        },
+        {
+          "description": "Appended to the next outgoing request only; not stored.",
+          "type": "string",
+          "enum": [
+            "next_request"
+          ]
+        },
+        {
+          "description": "Appended to the run's user message; stored (`RunStart` only).",
+          "type": "string",
+          "enum": [
+            "persistent"
+          ]
+        }
+      ]
+    },
+    "ProfileRef": {
+      "description": "Reference to a profile revision. Without a revision it means the highest published revision of `id` (or the newest draft, where drafts are allowed).",
+      "type": "object",
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReasoningEffortSetting": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "Rule": {
+      "description": "`on <event> [when <condition>] do <action>`.",
+      "type": "object",
+      "required": [
+        "do",
+        "id",
+        "on"
+      ],
+      "properties": {
+        "do": {
+          "$ref": "#/definitions/Action"
+        },
+        "id": {
+          "description": "Stable identifier, reported in events and used by editors.",
+          "type": "string"
+        },
+        "max_fires": {
+          "description": "Maximum firings per run. Unlimited when absent.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "metadata": true,
+        "on": {
+          "$ref": "#/definitions/RuleEvent"
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Condition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RuleEvent": {
+      "description": "Loop events, named after the Claude Code / Codex hook events.",
+      "oneOf": [
+        {
+          "description": "A run starts, after the user's input is recorded.",
+          "type": "string",
+          "enum": [
+            "RunStart"
+          ]
+        },
+        {
+          "description": "Before every new model request (not re-issues after a pause).",
+          "type": "string",
+          "enum": [
+            "BeforeModelRequest"
+          ]
+        },
+        {
+          "description": "The model requested a tool, before permission and execution.",
+          "type": "string",
+          "enum": [
+            "PreToolUse"
+          ]
+        },
+        {
+          "description": "An executed tool succeeded.",
+          "type": "string",
+          "enum": [
+            "PostToolUse"
+          ]
+        },
+        {
+          "description": "An executed tool failed or reported an error.",
+          "type": "string",
+          "enum": [
+            "PostToolUseFailure"
+          ]
+        },
+        {
+          "description": "This profile became active by a switch (rule, host, or a new run under a newly set profile). Fires before the first request under it.",
+          "type": "string",
+          "enum": [
+            "ProfileEntered"
+          ]
+        }
+      ]
+    },
+    "SinceLastCall": {
+      "type": "object",
+      "required": [
+        "called",
+        "of"
+      ],
+      "properties": {
+        "called": {
+          "$ref": "#/definitions/NameMatch"
+        },
+        "eq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "gte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "lte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "of": {
+          "$ref": "#/definitions/NameMatch"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolCount": {
+      "type": "object",
+      "required": [
+        "tool"
+      ],
+      "properties": {
+        "eq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "gte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "lte": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "tool": {
+          "$ref": "#/definitions/NameMatch"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolOverride": {
+      "type": "object",
+      "properties": {
+        "description_append": {
+          "description": "Appended to the tool's description as sent to the model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission": {
+          "description": "Tightens the session's policy for this tool; it can never loosen it.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ToolPermission"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToolPermission": {
+      "description": "Ordered from least to most restrictive.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "ask",
+        "deny"
+      ]
+    },
+    "ToolScope": {
+      "description": "Which tools an agent step may see and execute.\n\nThere is deliberately no deny list: a tool registered after the definition was written must never become available implicitly. `Inherit` is resolved into an explicit allow list at run start and recorded on every attempt.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "tools",
+            "type"
+          ],
+          "properties": {
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "allow_list"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "inherit"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

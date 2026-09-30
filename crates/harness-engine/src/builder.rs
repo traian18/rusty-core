@@ -46,6 +46,10 @@ pub struct HarnessBuilder {
     integrations: Vec<Arc<dyn IntegrationFactory>>,
     /// Durable session store; `None` falls back to the in-memory no-op store.
     session_store: Option<Arc<dyn SessionStore>>,
+    /// Orchestration layer; `None` leaves it disabled.
+    orchestration: Option<crate::orchestration::OrchestrationConfig>,
+    /// Host behavior-profile registry; defaults to the built-ins.
+    profiles: crate::profiles::ProfilesConfig,
 }
 
 impl HarnessBuilder {
@@ -54,6 +58,8 @@ impl HarnessBuilder {
         Self {
             integrations: Vec::new(),
             session_store: None,
+            orchestration: None,
+            profiles: Default::default(),
         }
     }
 
@@ -73,6 +79,20 @@ impl HarnessBuilder {
     /// store and emits a `tracing::warn!`.
     pub fn session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Enables the orchestration layer. Without it, direct sessions work
+    /// exactly as before and orchestration calls return
+    /// [`HarnessError::OrchestrationNotConfigured`].
+    pub fn orchestration(mut self, config: crate::orchestration::OrchestrationConfig) -> Self {
+        self.orchestration = Some(config);
+        self
+    }
+
+    /// Use `config` as the host's behavior-profile registry.
+    pub fn profiles(mut self, config: crate::profiles::ProfilesConfig) -> Self {
+        self.profiles = config;
         self
     }
 
@@ -115,6 +135,8 @@ impl HarnessBuilder {
             sessions,
             session_store: store,
             model_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            orchestration: self.orchestration,
+            profiles: self.profiles,
         })
     }
 }

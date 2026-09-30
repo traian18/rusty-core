@@ -48,6 +48,7 @@ export type AgentStatus =
   | "Executing"
   | "WaitingForPermission"
   | "WaitingForChildren"
+  | "Verifying"
   | "Paused"
   | "Completed"
   | "Cancelled"
@@ -186,7 +187,37 @@ export type AgentEvent =
   | { ChildAgentSpawned: { agent_id: AgentId } }
   | { ChildAgentCompleted: { agent_id: AgentId; outcome: AgentOutcome } }
   | { Failed: { error: AgentError } }
-  | { Completed: { outcome: AgentOutcome } };
+  | { Completed: { outcome: AgentOutcome } }
+  /** A behavior-profile rule fired. `profile` is `id@revision`. */
+  | {
+      BehaviorRuleFired: {
+        profile: string;
+        rule_id: string;
+        event: string;
+        action: string;
+      };
+    }
+  /** Harness-authored context was added for the model. */
+  | { ContextInjected: { source: string; placement: string; chars: number } }
+  /** The harness refused a tool call before execution. */
+  | {
+      ToolCallDenied: {
+        call_id: ToolCallId;
+        rule_id: string | null;
+        reason: string;
+      };
+    }
+  /** The completion gate checked a proposed final answer. */
+  | {
+      CompletionGateEvaluated: {
+        attempt: number;
+        passed: boolean;
+        continuing: boolean;
+        failed_checks: string[];
+      };
+    }
+  /** The agent's behavior profile changed (`id@revision`). */
+  | { ProfileChanged: { from: string; to: string } };
 
 export interface AgentEventEnvelope {
   event_id: EventId;
@@ -213,6 +244,8 @@ export interface ProtocolCapabilities {
   pause_resume: boolean;
   /** `configure_execution` mutations are accepted. */
   configure_execution?: boolean;
+  /** Agents run under behavior profiles and emit behavior events. */
+  behavior_profiles?: boolean;
 }
 
 export interface MutationMetadata {

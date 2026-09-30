@@ -16,12 +16,16 @@
 pub mod agent_runner;
 pub mod agent_supervisor;
 pub mod cancellation;
+mod completion_gate;
 pub mod integration;
+pub mod orchestration;
 pub mod permissions;
 pub mod resource_manager;
 pub mod restore;
 pub mod rpc;
 pub mod scheduler;
+pub mod scoped_tools;
+pub mod session_agent_executor;
 pub mod session_client;
 pub mod session_manager;
 pub mod session_runtime;

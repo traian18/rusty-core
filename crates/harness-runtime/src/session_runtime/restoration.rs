@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use harness_core::agent::Agent;
 use harness_core::agent_state::{AgentState, PendingToolCall};
+use harness_core::behavior::BehaviorState;
 use harness_protocol::ids::SessionId;
 use harness_session_store::{SessionCommitter, SessionStore, StoredAgentState};
 
@@ -104,6 +105,11 @@ impl SessionRuntime {
                     last_error: stored.last_error,
                     transition_sequence: stored.transition_sequence,
                     depth: stored.depth,
+                    // Validated by the restorer before this point; a failure
+                    // here means a caller skipped that check.
+                    behavior: BehaviorState::from_stored(stored.behavior.as_ref())
+                        .expect("stored behavior validated before restore"),
+                    pending_profile: None,
                 },
                 backend: stored.backend,
                 capabilities: capabilities_from_value(&stored.capabilities),
@@ -226,6 +232,7 @@ impl SessionRuntime {
             root_agent_tx,
             root_task_handle: Mutex::new(None),
             bus_cancel,
+            delegated: Mutex::new(Default::default()),
         };
 
         // Stash the root task handle so SessionManager can supervise it.

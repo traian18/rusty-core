@@ -87,6 +87,7 @@ pub(crate) fn stored_agent_state(agent: &Agent) -> StoredAgentState {
         budget: agent.budget.clone(),
         capabilities: serde_json::to_value(&agent.capabilities).unwrap_or(serde_json::Value::Null),
         usage: serde_json::to_value(&agent.usage).unwrap_or(serde_json::Value::Null),
+        behavior: Some(agent.state.behavior.to_stored()),
     }
 }
 

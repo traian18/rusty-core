@@ -284,6 +284,10 @@ pub struct ProtocolCapabilities {
     /// `MutationCommand::ConfigureExecution` is accepted.
     #[serde(default)]
     pub configure_execution: bool,
+    /// Agents run under behavior profiles and may emit `BehaviorRuleFired`,
+    /// `ContextInjected`, `ToolCallDenied`, and `ProfileChanged`.
+    #[serde(default)]
+    pub behavior_profiles: bool,
 }
 
 impl Default for ProtocolCapabilities {
@@ -299,6 +303,7 @@ impl Default for ProtocolCapabilities {
             durable_idempotency: false,
             pause_resume: true,
             configure_execution: true,
+            behavior_profiles: true,
         }
     }
 }

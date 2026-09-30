@@ -155,6 +155,36 @@ pub enum AgentEffect {
     FinishRun {
         result: AgentResult,
     },
+    /// Run the completion gate's evaluator checks (tool or model) and report
+    /// back with `AgentCommand::CompletionEvaluated`.
+    EvaluateCompletion {
+        request: CompletionEvaluationRequest,
+    },
+    /// Abandon any in-flight completion evaluation for `run_id`.
+    CancelEvaluation {
+        run_id: RunId,
+    },
+}
+
+/// Evaluator checks for one completion attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionEvaluationRequest {
+    pub run_id: RunId,
+    /// Increments per evaluation within a run; verdicts for an older attempt
+    /// are ignored.
+    pub attempt: u32,
+    pub checks: Vec<CompletionCheckSpec>,
+    /// The final assistant text the model proposed as its answer.
+    pub final_response: String,
+    /// The most recent transcript messages, for evaluators that need context.
+    pub transcript: Vec<crate::messages::AgentMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionCheckSpec {
+    pub id: String,
+    /// The evaluator definition (`harness_core::behavior::EvaluatorSpec`).
+    pub evaluator: serde_json::Value,
 }
 
 #[cfg(test)]

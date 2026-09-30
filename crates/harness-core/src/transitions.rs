@@ -1,8 +1,11 @@
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{
-    AgentCommand, AgentError, AgentResult, AgentStatus, Attachment, PermissionDecision, UserInput,
+    AgentCommand, AgentError, AgentResult, AgentStatus, Attachment, CheckVerdict,
+    PermissionDecision, UserInput, VerdictOutcome,
 };
-use harness_protocol::effects::{AgentEffect, PermissionRequest, ToolRequest};
+use harness_protocol::effects::{
+    AgentEffect, CompletionCheckSpec, CompletionEvaluationRequest, PermissionRequest, ToolRequest,
+};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
 use harness_protocol::ids::{
     AgentId, MessageId, PermissionId, RequestId, RunId, Timestamp, ToolCallId,
@@ -15,6 +18,11 @@ use harness_protocol::usage::{
 
 use crate::agent::Agent;
 use crate::agent_state::PendingToolCall;
+use crate::behavior::{
+    compile, merge_patch, system_reminder, BehaviorProfile, CompiledProfile, EnteredFrom,
+    ErrorPolicy, EvaluatorSpec, OnExhausted, Placement, ProfileRef, ProfileRegistry, RuleEvent,
+    RuleOutcome, RuleStop, ToolDecision, ToolEvent, TurnPlan, MAX_SWITCHES_PER_RUN,
+};
 use crate::transcript::validate_transcript;
 
 /// M3: caps how large a single assistant message's assembled text can grow
@@ -22,6 +30,9 @@ use crate::transcript::validate_transcript;
 /// backend stream grows `AgentState.messages` — held for the run's (and,
 /// once persisted, the session's) entire lifetime — without bound.
 const MAX_ASSISTANT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Recent transcript messages handed to `command` gate evaluators.
+const COMMAND_TRANSCRIPT_MESSAGES: usize = 20;
 
 /// Appends `delta` to `text`, stopping (with a one-time truncation marker)
 /// once `text` would exceed [`MAX_ASSISTANT_TEXT_BYTES`]. Once truncated,
@@ -108,6 +119,53 @@ fn push_bounded(text: &mut String, delta: &str) {
     text.push_str(TRUNCATION_MARKER);
 }
 
+/// Compile a profile and its switch library, and check that every switch
+/// target reachable from the profile resolves within the library.
+fn install_bundle(
+    profile: serde_json::Value,
+    library: Vec<serde_json::Value>,
+) -> Option<(
+    std::sync::Arc<CompiledProfile>,
+    std::sync::Arc<ProfileRegistry>,
+)> {
+    let profile = compile(serde_json::from_value::<BehaviorProfile>(profile).ok()?).ok()?;
+    let documents = library
+        .into_iter()
+        .map(serde_json::from_value::<BehaviorProfile>)
+        .chain(std::iter::once(Ok(profile.profile.clone())))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let registry = ProfileRegistry::from_library(documents).ok()?;
+    let profile = std::sync::Arc::new(profile);
+    registry.resolve_closure(&profile).ok()?;
+    Some((profile, std::sync::Arc::new(registry)))
+}
+
+/// Append harness text to the end of an outgoing request without touching
+/// the canonical transcript. Every provider sends a tool result's
+/// `output_preview`, but some drop text blocks inside tool messages, so a
+/// request ending in tool results carries the text on the last result.
+fn append_to_request_tail(messages: &mut [AgentMessage], text: &str) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if last.role == MessageRole::Tool {
+        if let Some(ContentBlock::ToolResult { result, .. }) = last
+            .content
+            .iter_mut()
+            .rev()
+            .find(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        {
+            result.output_preview.push_str("\n\n");
+            result.output_preview.push_str(text);
+            return;
+        }
+    }
+    last.content.push(ContentBlock::Text {
+        text: text.to_string(),
+    });
+}
+
 impl Agent {
     pub fn apply(&mut self, command: AgentCommand) -> Vec<AgentEffect> {
         match command {
@@ -134,7 +192,250 @@ impl Agent {
             AgentCommand::Pause => self.pause(),
             AgentCommand::Resume => self.resume(),
             AgentCommand::ConfigureExecution { params } => self.configure_execution(params),
+            AgentCommand::SetBehaviorProfile {
+                profile,
+                library,
+                allow_commands,
+            } => self.set_behavior_profile(profile, library, allow_commands),
+            AgentCommand::CompletionEvaluated {
+                run_id,
+                attempt,
+                verdicts,
+                usage,
+            } => self.completion_evaluated(run_id, attempt, verdicts, usage),
         }
+    }
+
+    /// Install a profile and its switch library. Hosts validate both
+    /// against their registry before sending, so an invalid document or an
+    /// unresolvable switch target here is a host bug; the command is ignored
+    /// rather than half-applied. An idle agent switches at once; during a
+    /// run the switch applies before the next model request.
+    fn set_behavior_profile(
+        &mut self,
+        profile: serde_json::Value,
+        library: Vec<serde_json::Value>,
+        allow_commands: bool,
+    ) -> Vec<AgentEffect> {
+        self.state.behavior.commands_trusted = allow_commands;
+        let Some((compiled, library)) = install_bundle(profile, library) else {
+            debug_assert!(false, "SetBehaviorProfile received an invalid bundle");
+            return Vec::new();
+        };
+        if self.state.active_run.is_some() {
+            self.state.pending_profile = Some((compiled, library));
+            Vec::new()
+        } else {
+            self.apply_switch(compiled, library)
+        }
+    }
+
+    /// Make `profile` active. Counters start fresh and the switch is
+    /// announced (and `ProfileEntered` rules fire) before the next request.
+    fn apply_switch(
+        &mut self,
+        profile: std::sync::Arc<crate::behavior::CompiledProfile>,
+        library: std::sync::Arc<crate::behavior::ProfileRegistry>,
+    ) -> Vec<AgentEffect> {
+        let from = self.state.behavior.reference();
+        if self.state.behavior.profile.content_hash == profile.content_hash {
+            self.state.behavior.library = library;
+            return Vec::new();
+        }
+        self.state.behavior = self.state.behavior.switched_to(profile, library);
+        let mut effects = vec![AgentEffect::Emit {
+            event: AgentEvent::ProfileChanged {
+                from: from.to_string(),
+                to: self.state.behavior.reference().to_string(),
+            },
+        }];
+        if self.state.active_run.is_some()
+            && self.state.behavior.run.switches > MAX_SWITCHES_PER_RUN
+        {
+            effects.extend(self.fail(
+                "BEHAVIOR_SWITCH_LOOP",
+                format!(
+                    "more than {MAX_SWITCHES_PER_RUN} profile switches in one run (last to {})",
+                    self.state.behavior.reference()
+                ),
+            ));
+        }
+        effects
+    }
+
+    /// Tell the model its mode changed (only when there is earlier
+    /// conversation to reinterpret) and fire `ProfileEntered` rules.
+    fn enter_profile(&mut self, from: EnteredFrom) -> Result<Vec<AgentEffect>, Vec<AgentEffect>> {
+        let behavior = &self.state.behavior;
+        let has_history = self
+            .state
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Assistant);
+        if has_history {
+            let from_name = from.name.clone();
+            let mut tools: Vec<String> = self
+                .capabilities
+                .tools
+                .enabled_descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.name.clone())
+                .filter(|name| behavior.profile.allows_tool(name))
+                .collect();
+            tools.sort();
+            let text = format!(
+                "Your operating mode changed from {from_name} to {}. Tools available now: {}. \
+                 Follow the instructions for this mode from here on.",
+                behavior.profile.profile.name,
+                if tools.is_empty() {
+                    "none".to_string()
+                } else {
+                    tools.join(", ")
+                }
+            );
+            let source = format!("profile:{}", behavior.reference());
+            let reminder = system_reminder(&source, &text);
+            let chars = reminder.chars().count() as u64;
+            self.state.behavior.run.pending_request.push(reminder);
+            let mut effects = vec![AgentEffect::Emit {
+                event: AgentEvent::ContextInjected {
+                    source,
+                    placement: Placement::NextRequest.name().into(),
+                    chars,
+                },
+            }];
+            effects.extend(self.entered_rules(&from.profile)?);
+            return Ok(effects);
+        }
+        self.entered_rules(&from.profile)
+    }
+
+    fn entered_rules(&mut self, from: &ProfileRef) -> Result<Vec<AgentEffect>, Vec<AgentEffect>> {
+        let outcome = self.state.behavior.evaluate_entered(from.id.as_str());
+        let mut effects = self.apply_rule_outcome(&outcome, None);
+        if let Some(stop) = &outcome.stop {
+            effects.extend(self.behavior_stop(stop));
+            return Err(effects);
+        }
+        Ok(effects)
+    }
+
+    /// Record a rule evaluation: emit what fired, and route injected
+    /// context to where its placement says. `with_result` text is held for
+    /// `call_id` until its result is recorded.
+    fn apply_rule_outcome(
+        &mut self,
+        outcome: &RuleOutcome,
+        call_id: Option<ToolCallId>,
+    ) -> Vec<AgentEffect> {
+        let profile = self.state.behavior.reference().to_string();
+        let mut effects: Vec<AgentEffect> = outcome
+            .fired
+            .iter()
+            .map(|fired| AgentEffect::Emit {
+                event: AgentEvent::BehaviorRuleFired {
+                    profile: profile.clone(),
+                    rule_id: fired.rule_id.clone(),
+                    event: fired.event.name().into(),
+                    action: fired.action.into(),
+                },
+            })
+            .collect();
+        for injection in &outcome.injections {
+            match (injection.placement, call_id) {
+                (Placement::WithResult, Some(call_id)) => self
+                    .state
+                    .behavior
+                    .run
+                    .pending_results
+                    .push((call_id, injection.text.clone())),
+                (Placement::Persistent, _) => {
+                    if let Some(message) = self
+                        .state
+                        .messages
+                        .last_mut()
+                        .filter(|message| message.role == MessageRole::User)
+                    {
+                        message.content.push(ContentBlock::Text {
+                            text: injection.text.clone(),
+                        });
+                    }
+                }
+                _ => self
+                    .state
+                    .behavior
+                    .run
+                    .pending_request
+                    .push(injection.text.clone()),
+            }
+            effects.push(AgentEffect::Emit {
+                event: AgentEvent::ContextInjected {
+                    source: format!("profile:{profile} rule:{}", injection.rule_id),
+                    placement: injection.placement.name().into(),
+                    chars: injection.text.chars().count() as u64,
+                },
+            });
+        }
+        if let Some((_, target)) = &outcome.switch {
+            match self.state.behavior.resolve_switch(target) {
+                Some(next) => {
+                    let library = self.state.behavior.library.clone();
+                    self.state.pending_profile = Some((next, library));
+                }
+                // Installed bundles are closed over their switch targets.
+                None => debug_assert!(false, "switch target {target} missing from the library"),
+            }
+        }
+        effects
+    }
+
+    fn behavior_stop(&mut self, stop: &RuleStop) -> Vec<AgentEffect> {
+        self.fail(
+            "BEHAVIOR_STOP",
+            format!("stopped by rule {}: {}", stop.rule_id, stop.reason),
+        )
+    }
+
+    /// Count a new model request against the profile's limits. Returns the
+    /// failure effects when the model kept calling tools after its final turn.
+    ///
+    /// On success, returns the effects of `BeforeModelRequest` rules.
+    fn begin_turn(&mut self) -> Result<Vec<AgentEffect>, Vec<AgentEffect>> {
+        let mut effects = Vec::new();
+        if let Some((profile, library)) = self.state.pending_profile.take() {
+            effects.extend(self.apply_switch(profile, library));
+            if self.state.status == AgentStatus::Failed {
+                return Err(effects);
+            }
+        }
+        if let Some(from) = self.state.behavior.entered_from.take() {
+            match self.enter_profile(from) {
+                Ok(entered) => effects.extend(entered),
+                Err(failure) => {
+                    effects.extend(failure);
+                    return Err(effects);
+                }
+            }
+        }
+        if let TurnPlan::Exceeded = self.state.behavior.begin_turn() {
+            return Err(self.fail(
+                "BEHAVIOR_LIMIT_EXCEEDED",
+                format!(
+                    "the model requested tools after its final turn under profile {}",
+                    self.state.behavior.reference()
+                ),
+            ));
+        }
+        let outcome = self
+            .state
+            .behavior
+            .evaluate(RuleEvent::BeforeModelRequest, None);
+        effects.extend(self.apply_rule_outcome(&outcome, None));
+        if let Some(stop) = &outcome.stop {
+            effects.extend(self.behavior_stop(stop));
+            return Err(effects);
+        }
+        Ok(effects)
     }
 
     /// Applies a partial `ExecutionParams` update over the session-level
@@ -174,22 +475,61 @@ impl Agent {
         Timestamp::from_sequence(self.take_sequence())
     }
 
+    /// Build the request for the next model call. The behavior profile
+    /// shapes it here — tools, descriptions, parameters, system prompt, and
+    /// the final-turn prompt — without touching the canonical transcript.
     fn execution_request(&mut self, run_id: RunId) -> ExecutionRequest {
+        self.build_request(run_id, false)
+    }
+
+    /// `reissue` rebuilds the request for a turn already counted (resume
+    /// after pause): it repeats that turn's injected context instead of
+    /// consuming new pending context.
+    fn build_request(&mut self, run_id: RunId, reissue: bool) -> ExecutionRequest {
         self.state.backend_in_flight = true;
-        let tools = self
-            .capabilities
-            .tools
-            .enabled_descriptors()
-            .into_iter()
-            .cloned()
-            .collect();
-        let params = self.state.execution_params.clone();
+        let profile = self.state.behavior.profile.clone();
+        let final_turn = self.state.behavior.run.final_turn;
+        let tools = if final_turn {
+            Vec::new()
+        } else {
+            self.capabilities
+                .tools
+                .enabled_descriptors()
+                .into_iter()
+                .filter(|descriptor| profile.allows_tool(&descriptor.name))
+                .map(|descriptor| {
+                    let mut descriptor = descriptor.clone();
+                    descriptor.description =
+                        profile.tool_description(&descriptor.name, &descriptor.description);
+                    descriptor
+                })
+                .collect()
+        };
+        let params = profile.execution_params(&self.state.execution_params);
         let extended_thinking = params.extended_thinking.unwrap_or(false);
+        let system_prompt =
+            profile.system_prompt(&self.state.system_prompt, params.model.as_deref());
+        let mut messages = self.state.messages.clone();
+        let run = &mut self.state.behavior.run;
+        if !reissue {
+            run.last_request = std::mem::take(&mut run.pending_request);
+        }
+        for text in run.last_request.clone() {
+            append_to_request_tail(&mut messages, &text);
+        }
+        if final_turn {
+            if let Some(prompt) = &profile.profile.limits.final_turn_prompt {
+                append_to_request_tail(
+                    &mut messages,
+                    &system_reminder(&format!("profile:{}", profile.reference()), prompt),
+                );
+            }
+        }
         ExecutionRequest {
             request_id: self.next_request_id(),
             run_id,
-            system_prompt: self.state.system_prompt.clone(),
-            messages: self.state.messages.clone(),
+            system_prompt,
+            messages,
             tools,
             extended_thinking,
             params,
@@ -226,6 +566,7 @@ impl Agent {
                 result: AgentResult {
                     summary: error.message,
                     usage: self.terminal_usage_summary(),
+                    gate_passed: None,
                 },
             },
         ]
@@ -246,6 +587,13 @@ impl Agent {
         if let Err(error) = validate_attachments(&input.attachments) {
             return self.fail("ATTACHMENT_TOO_LARGE", error);
         }
+        let mut effects = Vec::new();
+        // A switch requested during the previous run applies to this one
+        // from its start, so `RunStart` rules run under it too.
+        if let Some((profile, library)) = self.state.pending_profile.take() {
+            effects.extend(self.apply_switch(profile, library));
+        }
+        self.state.behavior.reset_run();
         let from = self.state.status;
         let run_id = self.next_run_id();
         let message_id = self.next_message_id();
@@ -265,14 +613,26 @@ impl Agent {
         });
         self.state.status = AgentStatus::PreparingContext;
         self.state.active_run = Some(run_id);
+        let outcome = self.state.behavior.evaluate(RuleEvent::RunStart, None);
+        effects.extend(self.apply_rule_outcome(&outcome, None));
+        if let Some(stop) = &outcome.stop {
+            effects.extend(self.behavior_stop(stop));
+            return effects;
+        }
+        match self.begin_turn() {
+            Ok(turn_effects) => effects.extend(turn_effects),
+            Err(failure) => {
+                effects.extend(failure);
+                return effects;
+            }
+        }
         let request = self.execution_request(run_id);
-        vec![
-            Self::state_changed(from, AgentStatus::PreparingContext),
-            AgentEffect::ExecuteBackend { request },
-            AgentEffect::Emit {
-                event: AgentEvent::RunStarted { run_id },
-            },
-        ]
+        effects.push(Self::state_changed(from, AgentStatus::PreparingContext));
+        effects.push(AgentEffect::ExecuteBackend { request });
+        effects.push(AgentEffect::Emit {
+            event: AgentEvent::RunStarted { run_id },
+        });
+        effects
     }
 
     fn backend_event(&mut self, run_id: RunId, event: ExecutionEvent) -> Vec<AgentEffect> {
@@ -388,28 +748,268 @@ impl Agent {
                 if is_tool_turn {
                     return self.continue_after_tools();
                 }
-                let from = self.state.status;
-                self.state.status = AgentStatus::Idle;
-                self.state.active_run = None;
-                self.usage.runs = self.usage.runs.saturating_add(1);
-                let effects = vec![
-                    Self::state_changed(from, AgentStatus::Idle),
-                    AgentEffect::Emit {
-                        event: AgentEvent::Completed {
-                            outcome: AgentOutcome::Success,
-                        },
-                    },
-                    AgentEffect::FinishRun {
-                        result: AgentResult {
-                            summary: format!("Run completed: {}", result.finish_reason),
-                            usage: self.terminal_usage_summary(),
-                        },
-                    },
-                ];
-                effects
+                self.propose_completion(run_id, format!("Run completed: {}", result.finish_reason))
             }
             ExecutionEvent::Error { error, .. } => self.fail("BACKEND_ERROR", format!("{error:?}")),
         }
+    }
+
+    fn finish_success(&mut self, summary: String, gate_passed: Option<bool>) -> Vec<AgentEffect> {
+        let from = self.state.status;
+        self.state.status = AgentStatus::Idle;
+        self.state.active_run = None;
+        self.usage.runs = self.usage.runs.saturating_add(1);
+        vec![
+            Self::state_changed(from, AgentStatus::Idle),
+            AgentEffect::Emit {
+                event: AgentEvent::Completed {
+                    outcome: AgentOutcome::Success,
+                },
+            },
+            AgentEffect::FinishRun {
+                result: AgentResult {
+                    summary,
+                    usage: self.terminal_usage_summary(),
+                    gate_passed,
+                },
+            },
+        ]
+    }
+
+    /// The model produced a turn with no tool calls: its proposed final
+    /// answer. Without a completion gate the run finishes. With one,
+    /// declarative checks run now; evaluator checks are handed to the
+    /// runtime and the agent waits in `Verifying`.
+    fn propose_completion(&mut self, run_id: RunId, summary: String) -> Vec<AgentEffect> {
+        let profile = self.state.behavior.profile.clone();
+        let Some(gate) = &profile.profile.completion_gate else {
+            return self.finish_success(summary, None);
+        };
+        self.state.behavior.run.gate_attempts += 1;
+        let failures: Vec<(String, String)> = gate
+            .checks
+            .iter()
+            .filter_map(|check| {
+                let condition = check.require.as_ref()?;
+                (!self.state.behavior.condition_holds(condition))
+                    .then(|| (check.id.clone(), check.feedback.clone().unwrap_or_default()))
+            })
+            .collect();
+        let evaluators: Vec<CompletionCheckSpec> = gate
+            .checks
+            .iter()
+            .filter_map(|check| {
+                check
+                    .evaluator
+                    .as_ref()
+                    .map(|evaluator| CompletionCheckSpec {
+                        id: check.id.clone(),
+                        evaluator: serde_json::to_value(evaluator).expect("evaluators serialize"),
+                    })
+            })
+            .collect();
+        // Declarative failures are decided without I/O; evaluators only run
+        // once those pass.
+        if !failures.is_empty() || evaluators.is_empty() {
+            return self.gate_decided(run_id, failures, summary);
+        }
+        let transcript_messages = gate
+            .checks
+            .iter()
+            .filter_map(|check| match &check.evaluator {
+                Some(EvaluatorSpec::Model {
+                    transcript_messages,
+                    ..
+                })
+                | Some(EvaluatorSpec::Agent {
+                    transcript_messages,
+                    ..
+                }) => Some(*transcript_messages as usize),
+                Some(EvaluatorSpec::Command { .. }) => Some(COMMAND_TRANSCRIPT_MESSAGES),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let messages = &self.state.messages;
+        let transcript = messages[messages.len().saturating_sub(transcript_messages)..].to_vec();
+        let final_response = self.final_response_text();
+        let from = self.state.status;
+        self.state.status = AgentStatus::Verifying;
+        vec![
+            Self::state_changed(from, AgentStatus::Verifying),
+            AgentEffect::EvaluateCompletion {
+                request: CompletionEvaluationRequest {
+                    run_id,
+                    attempt: self.state.behavior.run.gate_attempts,
+                    checks: evaluators,
+                    final_response,
+                    transcript,
+                },
+            },
+        ]
+    }
+
+    fn final_response_text(&self) -> String {
+        self.state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
+    }
+
+    fn completion_evaluated(
+        &mut self,
+        run_id: RunId,
+        attempt: u32,
+        verdicts: Vec<CheckVerdict>,
+        usage: Vec<UsageRecord>,
+    ) -> Vec<AgentEffect> {
+        // Evaluator requests were made either way, so they always count.
+        let mut effects = Vec::new();
+        if !usage.is_empty() {
+            self.usage.records.extend(usage);
+            effects.push(AgentEffect::Emit {
+                event: AgentEvent::UsageUpdated {
+                    usage: AgentUsageSnapshot {
+                        agent_id: self.id.to_string(),
+                        model: self.state.execution_params.model.clone(),
+                        metrics: self.usage.self_metrics(),
+                        timestamp: self.next_timestamp().to_rfc3339(),
+                    },
+                },
+            });
+        }
+        // Stale or unexpected verdicts (cancelled, superseded) are ignored.
+        if self.state.status != AgentStatus::Verifying
+            || self.state.active_run != Some(run_id)
+            || self.state.behavior.run.gate_attempts != attempt
+        {
+            return effects;
+        }
+        let profile = self.state.behavior.profile.clone();
+        let Some(gate) = &profile.profile.completion_gate else {
+            return Vec::new();
+        };
+        let failures = gate
+            .checks
+            .iter()
+            .filter(|check| check.evaluator.is_some())
+            .filter_map(|check| {
+                let outcome = verdicts
+                    .iter()
+                    .find(|verdict| verdict.id == check.id)
+                    .map(|verdict| verdict.outcome.clone())
+                    .unwrap_or(VerdictOutcome::Error {
+                        message: "no verdict was produced".into(),
+                    });
+                let feedback = match outcome {
+                    VerdictOutcome::Pass => return None,
+                    VerdictOutcome::Fail { feedback } => feedback,
+                    VerdictOutcome::Error { .. } if check.error_policy == ErrorPolicy::Pass => {
+                        return None
+                    }
+                    VerdictOutcome::Error { message } => {
+                        format!("the check could not be evaluated: {message}")
+                    }
+                };
+                Some((check.id.clone(), check.feedback.clone().unwrap_or(feedback)))
+            })
+            .collect();
+        let summary = "Run completed: end_turn".to_string();
+        effects.extend(self.gate_decided(run_id, failures, summary));
+        effects
+    }
+
+    /// Apply the gate's decision: finish, send the rejection back and
+    /// continue, or handle exhaustion.
+    fn gate_decided(
+        &mut self,
+        run_id: RunId,
+        failures: Vec<(String, String)>,
+        summary: String,
+    ) -> Vec<AgentEffect> {
+        let profile = self.state.behavior.profile.clone();
+        let gate = profile
+            .profile
+            .completion_gate
+            .as_ref()
+            .expect("only called with a gate");
+        let attempt = self.state.behavior.run.gate_attempts;
+        let failed_checks: Vec<String> = failures.iter().map(|(id, _)| id.clone()).collect();
+        let evaluated = |passed: bool, continuing: bool| AgentEffect::Emit {
+            event: AgentEvent::CompletionGateEvaluated {
+                attempt,
+                passed,
+                continuing,
+                failed_checks: failed_checks.clone(),
+            },
+        };
+        if failures.is_empty() {
+            let mut effects = vec![evaluated(true, false)];
+            effects.extend(self.finish_success(summary, Some(true)));
+            return effects;
+        }
+        let run = &self.state.behavior.run;
+        let can_continue = run.gate_continuations < gate.max_continuations && !run.final_turn;
+        if !can_continue {
+            let mut effects = vec![evaluated(false, false)];
+            match gate.on_exhausted.unwrap_or(OnExhausted::Accept) {
+                OnExhausted::Accept => effects.extend(self.finish_success(summary, Some(false))),
+                OnExhausted::Fail => effects.extend(self.fail(
+                    "GATE_EXHAUSTED",
+                    format!(
+                        "completion gate still failing after {} continuation(s): {}",
+                        run.gate_continuations,
+                        failed_checks.join(", ")
+                    ),
+                )),
+            }
+            return effects;
+        }
+
+        self.state.behavior.run.gate_continuations += 1;
+        let mut text = String::from(
+            "Your answer was not accepted yet. Address the following before finishing:",
+        );
+        for (id, feedback) in &failures {
+            text.push_str(&format!("\n- [{id}] {feedback}"));
+        }
+        let message_id = self.next_message_id();
+        let created_at = self.next_timestamp();
+        self.state.messages.push(AgentMessage {
+            id: message_id,
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: system_reminder(&format!("gate:{}", profile.reference()), &text),
+            }],
+            created_at,
+        });
+        let mut effects = vec![evaluated(false, true)];
+        match self.begin_turn() {
+            Ok(turn_effects) => effects.extend(turn_effects),
+            Err(failure) => {
+                effects.extend(failure);
+                return effects;
+            }
+        }
+        let from = self.state.status;
+        self.state.status = AgentStatus::WaitingForBackend;
+        let request = self.execution_request(run_id);
+        effects.push(Self::state_changed(from, AgentStatus::WaitingForBackend));
+        effects.push(AgentEffect::ExecuteBackend { request });
+        effects
     }
 
     fn start_next_queued_run(&mut self) -> Vec<AgentEffect> {
@@ -432,18 +1032,96 @@ impl Agent {
                 started_at,
             },
         );
-        let permission = self
+        let mut effects = vec![AgentEffect::Emit {
+            event: AgentEvent::ToolCallRequested { call: call.clone() },
+        }];
+        let Some(session_mode) = self
             .capabilities
             .tools
             .tools
             .values()
             .find(|capability| capability.descriptor.name == call.name && capability.policy.enabled)
-            .map(|capability| capability.policy.permission.clone());
-        let mut effects = vec![AgentEffect::Emit {
-            event: AgentEvent::ToolCallRequested { call: call.clone() },
-        }];
-        match permission {
-            Some(PermissionMode::Allow) => {
+            .map(|capability| capability.policy.permission.clone())
+        else {
+            effects.extend(self.tool_failed(call_id, ToolError::PermissionDenied));
+            return effects;
+        };
+
+        // The profile narrows what the session grants: a tool outside its
+        // scope is not executable even if the model names it.
+        let profile = self.state.behavior.profile.clone();
+        if !profile.allows_tool(&call.name) {
+            let reason = format!(
+                "Tool {} is not available under profile {}.",
+                call.name,
+                profile.reference()
+            );
+            effects.extend(self.deny_tool(call_id, None, reason));
+            return effects;
+        }
+
+        // Rules see the request next. A `deny` decides; `ask`/`allow` adjust
+        // the permission, which a tool override may already have tightened.
+        self.state.behavior.note_tool_request(&call);
+        let outcome = self.state.behavior.evaluate(
+            RuleEvent::PreToolUse,
+            Some(ToolEvent {
+                call: &call,
+                result: None,
+            }),
+        );
+        effects.extend(self.apply_rule_outcome(&outcome, Some(call_id)));
+        if let Some(stop) = &outcome.stop {
+            effects.extend(self.deny_tool(
+                call_id,
+                Some(stop.rule_id.clone()),
+                stop.reason.clone(),
+            ));
+            effects.extend(self.behavior_stop(stop));
+            return effects;
+        }
+        let session_denies = matches!(session_mode, PermissionMode::Deny);
+        let mut mode = profile.permission(&call.name, session_mode);
+        match &outcome.decision {
+            Some(ToolDecision::Deny { rule_id, reason }) => {
+                effects.extend(self.deny_tool(call_id, Some(rule_id.clone()), reason.clone()));
+                return effects;
+            }
+            Some(ToolDecision::Ask { .. }) if !matches!(mode, PermissionMode::Deny) => {
+                mode = PermissionMode::Ask
+            }
+            Some(ToolDecision::Allow { .. }) if matches!(mode, PermissionMode::Ask) => {
+                mode = PermissionMode::Allow
+            }
+            _ => {}
+        }
+        if matches!(mode, PermissionMode::Deny) {
+            if session_denies {
+                effects.extend(self.tool_failed(call_id, ToolError::PermissionDenied));
+            } else {
+                let reason = format!(
+                    "Tool {} is denied by profile {}.",
+                    call.name,
+                    profile.reference()
+                );
+                effects.extend(self.deny_tool(call_id, None, reason));
+            }
+            return effects;
+        }
+        let call = self.rewrite_arguments(call, &outcome);
+        // Calls past the run's tool budget (or on the final turn) are refused.
+        if !self.state.behavior.admit_tool_call() {
+            let reason = if self.state.behavior.run.final_turn {
+                "No tools are available on the final turn. Answer in text.".to_string()
+            } else {
+                "The tool-call budget for this run is exhausted. Answer with what you have."
+                    .to_string()
+            };
+            effects.extend(self.deny_tool(call_id, None, reason));
+            return effects;
+        }
+        match mode {
+            PermissionMode::Allow => {
                 self.state.status = AgentStatus::Executing;
                 effects.push(Self::state_changed(from, AgentStatus::Executing));
                 effects.push(AgentEffect::ExecuteTool {
@@ -453,7 +1131,7 @@ impl Agent {
                     },
                 });
             }
-            Some(PermissionMode::Ask) => {
+            PermissionMode::Ask => {
                 self.state.status = AgentStatus::WaitingForPermission;
                 effects.push(Self::state_changed(from, AgentStatus::WaitingForPermission));
                 let permission_id = self.next_permission_id();
@@ -472,43 +1150,141 @@ impl Agent {
                 });
                 effects.push(AgentEffect::RequestPermission { request });
             }
-            Some(PermissionMode::Deny) | None => {
-                effects.extend(self.tool_failed(call_id, ToolError::PermissionDenied));
-            }
+            // Denials returned above.
+            PermissionMode::Deny => {}
         }
         effects
     }
 
     fn tool_completed(&mut self, call_id: ToolCallId, result: ToolResult) -> Vec<AgentEffect> {
-        if self.state.pending_tools.remove(&call_id).is_none() {
+        let Some(pending) = self.state.pending_tools.remove(&call_id) else {
             return Vec::new();
-        }
+        };
         self.state
             .pending_permissions
             .retain(|_, id| *id != call_id);
         self.record_tool_result(
-            call_id,
+            pending.call,
+            true,
             result.is_error,
             serde_json::to_string(&result.output).unwrap_or_default(),
         )
     }
 
     fn tool_failed(&mut self, call_id: ToolCallId, error: ToolError) -> Vec<AgentEffect> {
-        if self.state.pending_tools.remove(&call_id).is_none() {
+        let Some(pending) = self.state.pending_tools.remove(&call_id) else {
             return Vec::new();
-        }
+        };
         self.state
             .pending_permissions
             .retain(|_, id| *id != call_id);
-        self.record_tool_result(call_id, true, format!("{error:?}"))
+        // A refused call never ran; one that failed while running did.
+        let executed = !matches!(
+            error,
+            ToolError::PermissionDenied | ToolError::Denied { .. }
+        );
+        let preview = match error {
+            ToolError::Denied { reason } => format!("Denied: {reason}"),
+            other => format!("{other:?}"),
+        };
+        self.record_tool_result(pending.call, executed, true, preview)
+    }
+
+    /// Apply `rewrite_args` merge patches. The pending call is replaced, so
+    /// approval prompts and execution see the rewritten arguments; the model
+    /// is told what ran through a note on the result.
+    fn rewrite_arguments(&mut self, mut call: ToolCall, outcome: &RuleOutcome) -> ToolCall {
+        if outcome.rewrite_args.is_empty() {
+            return call;
+        }
+        for (_, patch) in &outcome.rewrite_args {
+            merge_patch(&mut call.arguments, patch);
+        }
+        if let Some(pending) = self.state.pending_tools.get_mut(&call.id) {
+            pending.call.arguments = call.arguments.clone();
+        }
+        let rules: Vec<&str> = outcome
+            .rewrite_args
+            .iter()
+            .map(|(rule_id, _)| rule_id.as_str())
+            .collect();
+        let note = system_reminder(
+            &format!(
+                "profile:{} rule:{}",
+                self.state.behavior.reference(),
+                rules.join(",")
+            ),
+            &format!(
+                "The harness adjusted this call's arguments before running it: {}",
+                call.arguments
+            ),
+        );
+        self.state
+            .behavior
+            .run
+            .pending_results
+            .push((call.id, note));
+        call
+    }
+
+    /// Refuse a tool call before execution, telling the model why.
+    fn deny_tool(
+        &mut self,
+        call_id: ToolCallId,
+        rule_id: Option<String>,
+        reason: String,
+    ) -> Vec<AgentEffect> {
+        let mut effects = vec![AgentEffect::Emit {
+            event: AgentEvent::ToolCallDenied {
+                call_id,
+                rule_id,
+                reason: reason.clone(),
+            },
+        }];
+        effects.extend(self.tool_failed(call_id, ToolError::Denied { reason }));
+        effects
     }
 
     fn record_tool_result(
         &mut self,
-        call_id: ToolCallId,
+        call: ToolCall,
+        executed: bool,
         has_error: bool,
-        preview: String,
+        mut preview: String,
     ) -> Vec<AgentEffect> {
+        let call_id = call.id;
+        let mut effects = Vec::new();
+        let mut stop = None;
+        if executed {
+            self.state.behavior.note_executed(&call.name);
+            let event = if has_error {
+                RuleEvent::PostToolUseFailure
+            } else {
+                RuleEvent::PostToolUse
+            };
+            let outcome = self.state.behavior.evaluate(
+                event,
+                Some(ToolEvent {
+                    call: &call,
+                    result: Some(&preview),
+                }),
+            );
+            effects.extend(self.apply_rule_outcome(&outcome, Some(call_id)));
+            for (_, rewrite) in &outcome.rewrite_result {
+                rewrite.apply(&mut preview);
+            }
+            stop = outcome.stop;
+        }
+        let run = &mut self.state.behavior.run;
+        run.pending_results.retain(|(pending_call, text)| {
+            if *pending_call == call_id {
+                preview.push_str("\n\n");
+                preview.push_str(text);
+                false
+            } else {
+                true
+            }
+        });
         self.usage.tool_calls = self.usage.tool_calls.saturating_add(1);
         let message_id = self.next_message_id();
         let created_at = self.next_timestamp();
@@ -524,7 +1300,7 @@ impl Agent {
             }],
             created_at,
         });
-        let mut effects = vec![AgentEffect::Emit {
+        effects.push(AgentEffect::Emit {
             event: AgentEvent::ToolCallCompleted {
                 call_id,
                 result: ToolResultSummary {
@@ -532,8 +1308,12 @@ impl Agent {
                     output_preview: preview,
                 },
             },
-        }];
-        effects.extend(self.continue_after_tools());
+        });
+        // The result is recorded first so the transcript stays valid.
+        match stop {
+            Some(stop) => effects.extend(self.behavior_stop(&stop)),
+            None => effects.extend(self.continue_after_tools()),
+        }
         effects
     }
 
@@ -541,6 +1321,13 @@ impl Agent {
         let mut effects = Vec::new();
         if self.state.pending_tools.is_empty() && !self.state.backend_in_flight {
             if let Some(run_id) = self.state.active_run {
+                match self.begin_turn() {
+                    Ok(turn_effects) => effects.extend(turn_effects),
+                    Err(failure) => {
+                        effects.extend(failure);
+                        return effects;
+                    }
+                }
                 let from = self.state.status;
                 self.state.status = AgentStatus::WaitingForBackend;
                 let request = self.execution_request(run_id);
@@ -679,6 +1466,9 @@ impl Agent {
         let mut effects = Vec::new();
         if let Some(run_id) = self.state.active_run {
             effects.push(AgentEffect::CancelBackend { run_id });
+            if from == AgentStatus::Verifying {
+                effects.push(AgentEffect::CancelEvaluation { run_id });
+            }
         }
 
         let mut calls: Vec<_> = self.state.pending_tools.keys().copied().collect();
@@ -724,9 +1514,15 @@ impl Agent {
     }
 
     fn pause(&mut self) -> Vec<AgentEffect> {
+        // A completion evaluation is short and bounded; pausing mid-way would
+        // discard its verdict and make resume re-ask the model. It is not
+        // interruptible by pause (cancel still stops it).
         if matches!(
             self.state.status,
-            AgentStatus::Paused | AgentStatus::Cancelled | AgentStatus::Failed
+            AgentStatus::Paused
+                | AgentStatus::Cancelled
+                | AgentStatus::Failed
+                | AgentStatus::Verifying
         ) {
             return Vec::new();
         }
@@ -742,7 +1538,7 @@ impl Agent {
         match self.state.active_run {
             Some(run_id) => {
                 self.state.status = AgentStatus::WaitingForBackend;
-                let request = self.execution_request(run_id);
+                let request = self.build_request(run_id, true);
                 vec![
                     Self::state_changed(AgentStatus::Paused, AgentStatus::WaitingForBackend),
                     AgentEffect::ExecuteBackend { request },

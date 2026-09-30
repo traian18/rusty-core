@@ -57,4 +57,15 @@ pub enum SessionManagerError {
     /// This provides a typed, fail-fast rejection instead of blocking the caller indefinitely at capacity.
     #[error("session admission rejected: {0}")]
     AtCapacity(#[from] crate::scheduler::CapacityError),
+
+    /// A stored agent's behavior profile could not be restored (malformed,
+    /// no longer valid, or its content hash does not match). Restoring
+    /// under different rules than the session ran with is refused.
+    #[error("agent {agent} behavior cannot be restored: {error}")]
+    BehaviorRestore {
+        /// The agent whose behavior failed to restore.
+        agent: harness_protocol::ids::AgentId,
+        /// The restore failure.
+        error: harness_core::behavior::BehaviorRestoreError,
+    },
 }

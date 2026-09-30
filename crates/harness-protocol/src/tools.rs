@@ -99,6 +99,11 @@ pub enum ToolError {
     PermissionDenied,
     Timeout,
     Internal,
+    /// Refused by the harness (behavior profile scope, limits, or a rule)
+    /// before execution. `reason` is shown to the model as the result.
+    Denied {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

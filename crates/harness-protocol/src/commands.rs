@@ -46,6 +46,11 @@ pub struct AgentResult {
     pub summary: String,
     /// Token usage and cost for the run.
     pub usage: AgentUsageSummary,
+    /// Whether the run's completion gate passed. `None` when the agent's
+    /// profile has no gate; `Some(false)` when the run finished (accepted)
+    /// with checks still failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_passed: Option<bool>,
 }
 
 /// The user's decision in response to a permission request.
@@ -95,6 +100,8 @@ pub enum AgentStatus {
     WaitingForPermission,
     /// Agent has spawned children and is waiting for them to complete.
     WaitingForChildren,
+    /// The model proposed a final answer; the completion gate is checking it.
+    Verifying,
     /// Agent has been explicitly paused.
     Paused,
     /// Agent has completed its run successfully.
@@ -259,6 +266,51 @@ pub enum AgentCommand {
     ConfigureExecution {
         params: crate::backend::ExecutionParams,
     },
+
+    /// Replace the agent's behavior profile (a full profile document, see
+    /// `harness_core::behavior`). Applied immediately when the agent has no
+    /// active run, otherwise when the next run starts. Hosts resolve and
+    /// validate the document against their profile registry before sending.
+    SetBehaviorProfile {
+        profile: serde_json::Value,
+        /// Every profile `profile` can reach through `switch_profile`
+        /// rules, resolved by the host. The agent switches only within it.
+        #[serde(default)]
+        library: Vec<serde_json::Value>,
+        /// Whether these profiles may run shell commands (`command`
+        /// evaluators). Hosts grant this only to profiles they trust.
+        #[serde(default)]
+        allow_commands: bool,
+    },
+
+    /// Verdicts for a completion evaluation (`AgentEffect::EvaluateCompletion`).
+    CompletionEvaluated {
+        run_id: crate::ids::RunId,
+        attempt: u32,
+        verdicts: Vec<CheckVerdict>,
+        /// Model requests made by evaluators, counted as the agent's usage.
+        #[serde(default)]
+        usage: Vec<crate::usage::UsageRecord>,
+    },
+}
+
+/// The result of one completion-gate evaluator check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckVerdict {
+    pub id: String,
+    pub outcome: VerdictOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerdictOutcome {
+    Pass,
+    Fail {
+        feedback: String,
+    },
+    /// The evaluator could not produce a verdict.
+    Error {
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +443,7 @@ mod tests {
             result: AgentResult {
                 summary: "done".into(),
                 usage: AgentUsageSummary::default(),
+                gate_passed: None,
             },
         };
 

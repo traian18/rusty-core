@@ -276,6 +276,7 @@ impl SessionRuntime {
             root_agent_tx,
             root_task_handle: Mutex::new(None),
             bus_cancel,
+            delegated: Mutex::new(Default::default()),
         };
 
         // Stash the root task handle so SessionManager can supervise it.

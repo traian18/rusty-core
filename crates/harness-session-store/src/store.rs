@@ -121,6 +121,11 @@ pub struct StoredAgentState {
     pub budget: AgentBudget,
     pub capabilities: serde_json::Value,
     pub usage: serde_json::Value,
+    /// Behavior profile and run counters (`harness_core::behavior`).
+    /// Additive: snapshots from before the behavior layer have none and
+    /// restore under the built-in default profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<serde_json::Value>,
 }
 
 /// Non-secret durable metadata captured with a snapshot (RC-302/RC-304).

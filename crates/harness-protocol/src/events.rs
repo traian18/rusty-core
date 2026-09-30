@@ -220,6 +220,54 @@ pub enum AgentEvent {
         /// The final outcome of the run.
         outcome: AgentOutcome,
     },
+
+    /// A behavior profile rule fired.
+    BehaviorRuleFired {
+        /// The active profile, as `id@revision`.
+        profile: String,
+        rule_id: String,
+        /// The loop event, e.g. `PreToolUse`.
+        event: String,
+        /// The action taken, e.g. `deny` or `inject`.
+        action: String,
+    },
+
+    /// Harness-authored context was added for the model.
+    ContextInjected {
+        /// What produced it, e.g. `profile:reviewer@2 rule:test-after-edit`.
+        source: String,
+        /// `with_result`, `next_request`, or `persistent`.
+        placement: String,
+        /// Length of the injected text in characters.
+        chars: u64,
+    },
+
+    /// The harness refused a tool call before execution.
+    ToolCallDenied {
+        call_id: ToolCallId,
+        /// The rule that denied it; `None` for scope or limit denials.
+        rule_id: Option<String>,
+        reason: String,
+    },
+
+    /// The completion gate checked a proposed final answer.
+    CompletionGateEvaluated {
+        /// Evaluation number within the run, starting at 1.
+        attempt: u32,
+        passed: bool,
+        /// `true` when the rejection was sent back and the run continues.
+        continuing: bool,
+        /// Ids of the checks that failed.
+        failed_checks: Vec<String>,
+    },
+
+    /// The agent's behavior profile changed.
+    ProfileChanged {
+        /// Previous profile, as `id@revision`.
+        from: String,
+        /// New profile, as `id@revision`.
+        to: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

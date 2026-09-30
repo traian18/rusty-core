@@ -1,5 +1,6 @@
 //! Hierarchical supervision and child-agent spawning for one session.
 
+use harness_core::behavior::{ChildBehaviorResolver, PolicyChildBehaviorResolver};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
@@ -68,6 +69,8 @@ pub enum SupervisorError {
     BudgetEscalation(&'static str),
     #[error("child {0:?} finished without producing a result")]
     ChildResultLost(AgentId),
+    #[error("child behavior: {0}")]
+    ChildBehavior(#[from] harness_core::behavior::ChildPolicyError),
 }
 
 #[derive(Clone)]
@@ -81,6 +84,9 @@ pub struct AgentSupervisor {
     child_capabilities: Arc<RwLock<HashMap<AgentId, AgentCapabilities>>>,
     child_workspaces: Arc<RwLock<HashMap<AgentId, Arc<dyn Workspace>>>>,
     agent_tokens: Arc<StdRwLock<HashMap<AgentId, CancellationToken>>>,
+    /// Decides the behavior profile each spawned child starts with. Shared
+    /// by every clone of this supervisor, so replacing it applies session-wide.
+    child_behavior: Arc<StdRwLock<Arc<dyn ChildBehaviorResolver>>>,
 }
 
 impl AgentSupervisor {
@@ -93,7 +99,17 @@ impl AgentSupervisor {
             child_capabilities: Arc::new(RwLock::new(HashMap::new())),
             child_workspaces: Arc::new(RwLock::new(HashMap::new())),
             agent_tokens: Arc::new(StdRwLock::new(HashMap::new())),
+            child_behavior: Arc::new(StdRwLock::new(Arc::new(PolicyChildBehaviorResolver))),
         }
+    }
+
+    /// Replace how children get their behavior profile (default: follow the
+    /// parent profile's `children` policy, i.e. inherit).
+    pub fn set_child_behavior_resolver(&self, resolver: Arc<dyn ChildBehaviorResolver>) {
+        *self
+            .child_behavior
+            .write()
+            .expect("child behavior lock poisoned") = resolver;
     }
 
     /// Registers an already-created agent token (notably the session root),
@@ -202,7 +218,13 @@ impl AgentSupervisor {
             .map(CancellationToken::child_token)
             .unwrap_or_else(|| self.session_cancel.child_token());
 
-        // 7. Construct the child and its runner.
+        // 7. Resolve the child's behavior, then construct it and its runner.
+        let child_behavior = self
+            .child_behavior
+            .read()
+            .expect("child behavior lock poisoned")
+            .clone()
+            .resolve(&parent.state.behavior, &spec)?;
         let mut child_agent = Agent::new(
             child_id,
             parent.session_id,
@@ -227,6 +249,7 @@ impl AgentSupervisor {
         // comment for why this is a plain state assignment rather than
         // going through `BackendPolicy::Explicit`.
         child_agent.state.execution_params = spec.execution_params.clone();
+        child_agent.state.behavior = child_behavior;
 
         let (task, commands_tx) = AgentTask::new(child_id);
         let (result_tx, result_rx) = oneshot::channel::<AgentResult>();
@@ -281,6 +304,7 @@ impl AgentSupervisor {
                     AgentResult {
                         summary: format!("child {child_id:?} failed"),
                         usage: Default::default(),
+                        gate_passed: None,
                     },
                 ),
                 None => {
@@ -290,6 +314,7 @@ impl AgentSupervisor {
                             runner.agent.state.status
                         ),
                         usage: Default::default(),
+                        gate_passed: None,
                     };
                     (
                         AgentCommand::ChildCompleted {
@@ -1396,6 +1421,7 @@ mod tests {
             result: AgentResult {
                 summary: "a".into(),
                 usage: usage_a.clone(),
+                gate_passed: None,
             },
         });
         root.apply(AgentCommand::ChildCompleted {
@@ -1403,6 +1429,7 @@ mod tests {
             result: AgentResult {
                 summary: "b".into(),
                 usage: usage_b.clone(),
+                gate_passed: None,
             },
         });
 

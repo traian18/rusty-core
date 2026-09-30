@@ -319,6 +319,7 @@ mod tests {
                 budget: AgentBudget::default(),
                 capabilities: serde_json::Value::Null,
                 usage: serde_json::Value::Null,
+                behavior: None,
             }],
             session_sequence: seq,
             timestamp: Timestamp::now(),
