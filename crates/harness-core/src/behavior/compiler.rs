@@ -4,6 +4,7 @@ use harness_protocol::backend::{ExecutionParams, ReasoningEffort};
 use harness_protocol::tools::PermissionMode;
 
 use crate::orchestration::ToolScope;
+use crate::tool_alias::granted_by;
 
 use super::definition::{
     Action, BehaviorProfile, ChildPolicy, Comparison, CompletionGate, Condition, EvaluatorSpec,
@@ -340,6 +341,9 @@ fn validate_condition(
         Condition::Turn(comparison) => {
             validate_comparison(comparison, &format!("{path}.turn"), issue)
         }
+        Condition::ToolOffered(names) => {
+            validate_names(names, &format!("{path}.tool_offered"), issue)
+        }
         Condition::Calls(count) | Condition::TurnsSinceCall(count) => {
             validate_names(&count.tool, &format!("{path}.tool"), issue);
             validate_comparison(&count.comparison(), path, issue);
@@ -468,7 +472,8 @@ fn validate_gate_condition(
         Condition::Turn(_)
         | Condition::Calls(_)
         | Condition::TurnsSinceCall(_)
-        | Condition::SinceLastCall(_) => {}
+        | Condition::SinceLastCall(_)
+        | Condition::ToolOffered(_) => {}
     }
     // The shared checks (comparisons, name patterns, empty combinators).
     validate_condition(condition, RuleEvent::BeforeModelRequest, path, issue);
@@ -723,11 +728,16 @@ impl CompiledProfile {
         }
     }
 
-    /// Whether the profile's scope lets the model see and call `tool`.
+    /// Whether the profile's scope lets the model see and call `tool`. An
+    /// allow-list naming a tool also admits what that tool's grant covers (see
+    /// [`crate::tool_alias`]): `write_file` brings `edit_file` with it, and
+    /// `read_file` brings `project_info`.
     pub fn allows_tool(&self, tool: &str) -> bool {
         match &self.profile.tools {
             ToolScope::None => false,
-            ToolScope::AllowList(tools) => tools.iter().any(|allowed| allowed == tool),
+            ToolScope::AllowList(tools) => tools
+                .iter()
+                .any(|allowed| allowed == tool || granted_by(tool) == Some(allowed.as_str())),
             ToolScope::Inherit => true,
         }
     }
@@ -740,11 +750,19 @@ impl CompiledProfile {
             PermissionMode::Ask => ToolPermission::Ask,
             PermissionMode::Deny => ToolPermission::Deny,
         };
-        let profile_level = self
-            .profile
-            .tool_overrides
-            .get(tool)
-            .and_then(|override_| override_.permission)
+        let override_level = |name: &str| {
+            self.profile
+                .tool_overrides
+                .get(name)
+                .and_then(|override_| override_.permission)
+        };
+        // An override on the tool whose grant covers this one binds it too;
+        // when both are set the stricter applies, so naming this tool cannot
+        // loosen what the other denies.
+        let profile_level = override_level(tool)
+            .into_iter()
+            .chain(granted_by(tool).and_then(override_level))
+            .max()
             .unwrap_or(ToolPermission::Allow);
         match session_level.max(profile_level) {
             ToolPermission::Allow => PermissionMode::Allow,

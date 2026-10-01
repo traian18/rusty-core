@@ -9,6 +9,7 @@ use harness_core::behavior::{
 use harness_core::orchestration::{
     AgentContextMode, DelegatedRunRef, RetryReason, StructuredOutputMode, UsageSummary,
 };
+use harness_core::tool_alias::with_aliases;
 use harness_protocol::{
     backend::ResponseFormat,
     commands::{AgentError, UserInput},
@@ -302,13 +303,15 @@ impl AgentStepExecutor for IsolatedSessionAgentExecutor {
         }
 
         let (profile, library) = self.step_profile(&request)?;
+        // A step scoped to `write_file` may also use its aliases (`edit_file`).
+        let step_tools = with_aliases(&request.tools);
         let registry: Arc<dyn ToolRegistry> = Arc::new(ScopedToolRegistry::new(
             self.parent.tool_registry.clone(),
-            request.tools.clone(),
+            step_tools.clone(),
         ));
         let backend = Arc::new(ScopedExecutionBackend::new(
             self.parent.default_backend.clone(),
-            request.tools.clone(),
+            step_tools,
         ));
         let toolset = self.scoped_toolset(registry.as_ref());
         let runtime = Arc::new(SessionRuntime::new_with_toolset(

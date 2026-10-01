@@ -290,6 +290,398 @@ fn tool_scope_and_overrides_only_ever_narrow() {
 }
 
 #[test]
+fn edit_file_follows_the_write_file_scope_and_permission_of_a_profile() {
+    let mut scoped = profile("p", 1);
+    scoped.tools = ToolScope::AllowList(vec!["read_file".into(), "write_file".into()]);
+    scoped.tool_overrides.insert(
+        "write_file".into(),
+        ToolOverride {
+            permission: Some(ToolPermission::Ask),
+            description_append: Some("Write complete content.".into()),
+        },
+    );
+    let scoped = compiled(scoped);
+    assert!(
+        scoped.allows_tool("edit_file"),
+        "an allow-list naming write_file admits edit_file"
+    );
+    assert!(
+        matches!(
+            scoped.permission("edit_file", PermissionMode::Allow),
+            PermissionMode::Ask
+        ),
+        "write_file's permission override binds edit_file"
+    );
+    assert_eq!(
+        scoped.tool_description("edit_file", "Edit."),
+        "Edit.",
+        "descriptions stay per tool: write_file's note is about whole-file content"
+    );
+
+    let mut read_only = profile("p", 2);
+    read_only.tools = ToolScope::AllowList(vec!["read_file".into()]);
+    assert!(
+        !compiled(read_only).allows_tool("edit_file"),
+        "no write grant, no edit_file"
+    );
+
+    let mut alias_only = profile("p", 3);
+    alias_only.tools = ToolScope::AllowList(vec!["edit_file".into()]);
+    let alias_only = compiled(alias_only);
+    assert!(alias_only.allows_tool("edit_file"));
+    assert!(
+        !alias_only.allows_tool("write_file"),
+        "an alias alone does not grant the tool it follows"
+    );
+
+    let mut loosened = profile("p", 4);
+    loosened.tool_overrides.insert(
+        "write_file".into(),
+        ToolOverride {
+            permission: Some(ToolPermission::Deny),
+            description_append: None,
+        },
+    );
+    loosened.tool_overrides.insert(
+        "edit_file".into(),
+        ToolOverride {
+            permission: Some(ToolPermission::Allow),
+            description_append: None,
+        },
+    );
+    assert!(
+        matches!(
+            compiled(loosened).permission("edit_file", PermissionMode::Allow),
+            PermissionMode::Deny
+        ),
+        "naming the alias cannot loosen what the tool it follows denies"
+    );
+}
+
+#[test]
+fn project_info_is_admitted_by_a_read_file_scope_and_permission() {
+    let mut analyze = profile("p", 1);
+    analyze.tools = ToolScope::AllowList(vec![
+        "read_file".into(),
+        "list_files".into(),
+        "search_codebase".into(),
+    ]);
+    analyze.tool_overrides.insert(
+        "read_file".into(),
+        ToolOverride {
+            permission: Some(ToolPermission::Ask),
+            description_append: Some("Read narrowly.".into()),
+        },
+    );
+    let analyze = compiled(analyze);
+    assert!(
+        analyze.allows_tool("project_info"),
+        "a read-only profile's allow-list names read_file, which admits project_info"
+    );
+    assert!(
+        !analyze.allows_tool("edit_file"),
+        "reading does not admit editing"
+    );
+    assert!(matches!(
+        analyze.permission("project_info", PermissionMode::Allow),
+        PermissionMode::Ask
+    ));
+    assert_eq!(
+        analyze.tool_description("project_info", "Detect."),
+        "Detect.",
+        "descriptions stay per tool"
+    );
+
+    let mut no_reading = profile("p", 2);
+    no_reading.tools = ToolScope::AllowList(vec!["list_files".into()]);
+    assert!(!compiled(no_reading).allows_tool("project_info"));
+}
+
+#[test]
+fn project_info_does_not_count_as_reading_for_rules() {
+    let mut state = state_with(json!([
+        { "id": "no-read-yet", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "read_file", "eq": 0 } },
+          "do": { "inject": { "text": "read something" } } },
+        { "id": "no-reading", "on": "PreToolUse", "when": { "tool": ["read_file"] },
+          "do": { "deny": { "reason": "no reading" } } }
+    ]));
+    let fired = |state: &mut BehaviorState| -> Vec<String> {
+        state.begin_turn();
+        state
+            .evaluate(RuleEvent::BeforeModelRequest, None)
+            .fired
+            .into_iter()
+            .map(|fired| fired.rule_id)
+            .collect()
+    };
+
+    assert_eq!(fired(&mut state), ["no-read-yet"]);
+    state.note_executed("project_info");
+    assert_eq!(
+        fired(&mut state),
+        ["no-read-yet"],
+        "a gate that wants evidence of reading is not satisfied by project_info"
+    );
+    state.note_executed("read_file");
+    assert!(fired(&mut state).is_empty());
+
+    assert!(matches!(
+        pre(&mut state, &call("read_file", json!({}))).decision,
+        Some(ToolDecision::Deny { .. })
+    ));
+    assert_eq!(
+        pre(&mut state, &call("project_info", json!({}))).decision,
+        None,
+        "a deny written for read_file does not reach project_info"
+    );
+}
+
+#[test]
+fn run_check_is_a_run_command_for_scopes_permissions_rules_and_gates() {
+    let mut docs = profile("p", 1);
+    docs.tools = ToolScope::AllowList(vec!["read_file".into(), "run_command".into()]);
+    docs.tool_overrides.insert(
+        "run_command".into(),
+        ToolOverride {
+            permission: Some(ToolPermission::Ask),
+            description_append: None,
+        },
+    );
+    let docs = compiled(docs);
+    assert!(
+        docs.allows_tool("run_check"),
+        "an allow-list naming run_command admits run_check"
+    );
+    assert!(matches!(
+        docs.permission("run_check", PermissionMode::Allow),
+        PermissionMode::Ask
+    ));
+
+    let mut no_commands = profile("p", 2);
+    no_commands.tools = ToolScope::AllowList(vec!["read_file".into()]);
+    assert!(!compiled(no_commands).allows_tool("run_check"));
+
+    let mut state = state_with(json!([
+        { "id": "no-commands", "on": "PreToolUse", "when": { "tool": ["run_command"] },
+          "do": { "deny": { "reason": "Documentation work does not run commands." } } },
+        { "id": "no-evidence", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": ["read_file", "search_codebase", "run_command"], "eq": 0 } },
+          "do": { "inject": { "text": "inspect something first" } } }
+    ]));
+    assert!(
+        matches!(
+            pre(&mut state, &call("run_check", json!({}))).decision,
+            Some(ToolDecision::Deny { .. })
+        ),
+        "a profile that forbids running commands forbids running checks"
+    );
+    let fired = |state: &mut BehaviorState| -> Vec<String> {
+        state.begin_turn();
+        state
+            .evaluate(RuleEvent::BeforeModelRequest, None)
+            .fired
+            .into_iter()
+            .map(|fired| fired.rule_id)
+            .collect()
+    };
+    assert_eq!(fired(&mut state), ["no-evidence"]);
+    state.note_executed("run_check");
+    assert!(
+        fired(&mut state).is_empty(),
+        "a gate that wants a command to have run is met by run_check"
+    );
+}
+
+/// Evaluates `BeforeModelRequest` rules on a new turn and returns the ids that fired.
+fn fired_on_new_turn(state: &mut BehaviorState) -> Vec<String> {
+    state.begin_turn();
+    state
+        .evaluate(RuleEvent::BeforeModelRequest, None)
+        .fired
+        .into_iter()
+        .map(|fired| fired.rule_id)
+        .collect()
+}
+
+#[test]
+fn outcome_narrows_a_call_count_to_calls_that_succeeded_or_failed() {
+    let mut state = state_with(json!([
+        { "id": "failed", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "run_check", "outcome": "failed", "gte": 1 } },
+          "do": { "inject": { "text": "a check failed" } } },
+        { "id": "passed", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "run_check", "outcome": "succeeded", "gte": 1 } },
+          "do": { "inject": { "text": "a check passed" } } },
+        { "id": "ran", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "run_check", "gte": 1 } },
+          "do": { "inject": { "text": "a check ran" } } }
+    ]));
+    assert!(fired_on_new_turn(&mut state).is_empty());
+    state.note_executed_with("run_check", true);
+    assert_eq!(fired_on_new_turn(&mut state), ["failed", "ran"]);
+    state.note_executed_with("run_check", false);
+    assert_eq!(fired_on_new_turn(&mut state), ["failed", "passed", "ran"]);
+}
+
+#[test]
+fn since_last_call_with_an_outcome_means_a_passing_check_since_the_last_edit() {
+    let mut state = state_with(json!([
+        { "id": "verified", "on": "BeforeModelRequest",
+          "when": { "since_last_call": { "of": "write_file", "called": "run_check", "outcome": "succeeded", "gte": 1 } },
+          "do": { "inject": { "text": "verified" } } }
+    ]));
+    state.note_executed("write_file");
+    state.note_executed_with("run_check", true);
+    assert!(
+        fired_on_new_turn(&mut state).is_empty(),
+        "a check that failed after the edit is not a passing one"
+    );
+    state.note_executed_with("run_check", false);
+    assert_eq!(fired_on_new_turn(&mut state), ["verified"]);
+
+    state.note_executed("edit_file");
+    assert!(
+        fired_on_new_turn(&mut state).is_empty(),
+        "edit_file is a write: a new edit needs a new passing check"
+    );
+    state.note_executed_with("run_check", false);
+    assert_eq!(fired_on_new_turn(&mut state), ["verified"]);
+
+    state.note_executed_with("write_file", true);
+    assert!(
+        fired_on_new_turn(&mut state).is_empty(),
+        "`of` matches a call whatever its outcome"
+    );
+}
+
+#[test]
+fn turns_since_call_with_an_outcome_ignores_calls_with_the_other_outcome() {
+    let mut state = state_with(json!([
+        { "id": "stale-pass", "on": "BeforeModelRequest",
+          "when": { "turns_since_call": { "tool": "run_check", "outcome": "succeeded", "gte": 2 } },
+          "do": { "inject": { "text": "re-run the check" } } }
+    ]));
+    assert!(fired_on_new_turn(&mut state).is_empty(), "turn 1");
+    assert_eq!(
+        fired_on_new_turn(&mut state),
+        ["stale-pass"],
+        "turn 2: never passed"
+    );
+    state.note_executed_with("run_check", false);
+    assert!(
+        fired_on_new_turn(&mut state).is_empty(),
+        "turn 3: passed on turn 2"
+    );
+    state.note_executed_with("run_check", true);
+    assert_eq!(
+        fired_on_new_turn(&mut state),
+        ["stale-pass"],
+        "turn 4: a failure on turn 3 does not refresh a pass"
+    );
+}
+
+#[test]
+fn tool_offered_reads_the_latest_offering_and_follows_aliases() {
+    let mut state = state_with(json!([
+        { "id": "can-run-commands", "on": "BeforeModelRequest",
+          "when": { "tool_offered": ["run_command"] },
+          "do": { "inject": { "text": "you can run commands" } } },
+        { "id": "cannot-edit", "on": "BeforeModelRequest",
+          "when": { "not": { "tool_offered": "write_file" } },
+          "do": { "inject": { "text": "you cannot edit" } } }
+    ]));
+    assert_eq!(
+        fired_on_new_turn(&mut state),
+        ["cannot-edit"],
+        "nothing has been offered yet"
+    );
+    state.note_offered(vec!["read_file".into(), "run_check".into()]);
+    assert_eq!(
+        fired_on_new_turn(&mut state),
+        ["can-run-commands", "cannot-edit"],
+        "run_check is a run_command, so a rule about run_command sees it"
+    );
+    state.note_offered(vec!["edit_file".into(), "read_file".into()]);
+    assert!(
+        fired_on_new_turn(&mut state).is_empty(),
+        "edit_file is a write_file, and run_check is gone"
+    );
+    state.note_offered(vec!["z".into(), "a".into(), "z".into()]);
+    assert_eq!(state.run.offered_tools, ["a", "z"], "sorted, one of each");
+}
+
+#[test]
+fn saved_state_without_outcomes_still_loads_and_unused_fields_add_nothing() {
+    let old: ExecutedCall =
+        serde_json::from_value(json!({ "turn": 2, "tool": "fs.edit" })).unwrap();
+    assert!(!old.failed, "older state counts as succeeded");
+    assert_eq!(
+        serde_json::to_value(ExecutedCall {
+            turn: 1,
+            tool: "run_check".into(),
+            failed: false
+        })
+        .unwrap(),
+        json!({ "turn": 1, "tool": "run_check" })
+    );
+    assert_eq!(
+        serde_json::to_value(ExecutedCall {
+            turn: 1,
+            tool: "run_check".into(),
+            failed: true
+        })
+        .unwrap(),
+        json!({ "turn": 1, "tool": "run_check", "failed": true })
+    );
+    let counters = serde_json::to_value(RunCounters::default()).unwrap();
+    assert!(counters.get("offered_tools").is_none());
+}
+
+#[test]
+fn outcome_and_tool_offered_are_valid_in_rules_and_gates_and_round_trip() {
+    let compiled = with_gate(json!({
+        "checks": [{
+            "id": "checked",
+            "require": { "any": [
+                { "calls": { "tool": "write_file", "eq": 0 } },
+                { "not": { "tool_offered": "run_check" } },
+                { "since_last_call": { "of": "write_file", "called": "run_check", "outcome": "succeeded", "gte": 1 } }
+            ] },
+            "feedback": "Run run_check."
+        }]
+    }))
+    .expect("valid gate");
+    let json = serde_json::to_value(&compiled.profile).unwrap();
+    let again: BehaviorProfile = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(again, compiled.profile);
+    assert!(json.to_string().contains("\"outcome\":\"succeeded\""));
+
+    // `any` is the default and is left out of the saved document.
+    let plain = with_rules(json!([
+        { "id": "r", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "run_check", "outcome": "any", "gte": 1 } },
+          "do": { "inject": { "text": "x" } } }
+    ]))
+    .unwrap();
+    assert!(!serde_json::to_string(&plain.profile)
+        .unwrap()
+        .contains("outcome"));
+
+    // A name that does not exist is rejected, and so is an empty tool pattern.
+    let mut document = serde_json::to_value(profile("ruled", 1)).unwrap();
+    document["rules"] = json!([{ "id": "r", "on": "BeforeModelRequest",
+        "when": { "calls": { "tool": "run_check", "outcome": "sometimes", "gte": 1 } },
+        "do": { "inject": { "text": "x" } } }]);
+    assert!(serde_json::from_value::<BehaviorProfile>(document).is_err());
+    assert!(with_rules(json!([
+        { "id": "r", "on": "BeforeModelRequest",
+          "when": { "tool_offered": "" }, "do": { "inject": { "text": "x" } } }
+    ]))
+    .is_err());
+}
+
+#[test]
 fn execution_overlay_only_sets_what_it_names() {
     let mut profile = profile("p", 1);
     profile.execution = ExecutionOverlay {
@@ -805,6 +1197,69 @@ fn history_conditions_follow_executed_calls() {
         fired(&mut state),
         ["stale-decision"],
         "turn 3: decision is 2 turns old"
+    );
+}
+
+#[test]
+fn a_rule_for_write_file_also_covers_edit_file_but_not_the_reverse() {
+    let mut state = state_with(json!([
+        { "id": "read-only", "on": "PreToolUse", "when": { "tool": ["write_file"] },
+          "do": { "deny": { "reason": "read-only" } } },
+        { "id": "alias-only", "on": "PreToolUse", "when": { "tool": "edit_file" },
+          "do": { "inject": { "text": "targeted" } } }
+    ]));
+    let fired = |state: &mut BehaviorState, name: &str| -> Vec<String> {
+        pre(state, &call(name, json!({})))
+            .fired
+            .into_iter()
+            .map(|fired| fired.rule_id)
+            .collect()
+    };
+
+    assert_eq!(fired(&mut state, "write_file"), ["read-only"]);
+    assert_eq!(
+        fired(&mut state, "edit_file"),
+        ["read-only", "alias-only"],
+        "a deny written for write_file cannot be sidestepped by editing instead"
+    );
+    assert!(fired(&mut state, "read_file").is_empty());
+    assert!(matches!(
+        pre(&mut state, &call("edit_file", json!({}))).decision,
+        Some(ToolDecision::Deny { .. })
+    ));
+}
+
+#[test]
+fn history_conditions_count_edit_file_as_write_file() {
+    let mut state = state_with(json!([
+        { "id": "unchecked-write", "on": "BeforeModelRequest",
+          "when": { "since_last_call": { "of": "write_file", "called": ["run_command", "read_file"], "eq": 0 } },
+          "do": { "inject": { "text": "check your work" } } },
+        { "id": "no-write-yet", "on": "BeforeModelRequest",
+          "when": { "calls": { "tool": "write_file", "eq": 0 } },
+          "do": { "inject": { "text": "write something" } } }
+    ]));
+    let fired = |state: &mut BehaviorState| -> Vec<String> {
+        state.begin_turn();
+        state
+            .evaluate(RuleEvent::BeforeModelRequest, None)
+            .fired
+            .into_iter()
+            .map(|fired| fired.rule_id)
+            .collect()
+    };
+
+    assert_eq!(fired(&mut state), ["no-write-yet"]);
+    state.note_executed("edit_file");
+    assert_eq!(
+        fired(&mut state),
+        ["unchecked-write"],
+        "an edit is a write: it ends 'no write yet' and starts 'unchecked'"
+    );
+    state.note_executed("run_command");
+    assert!(
+        fired(&mut state).is_empty(),
+        "checking after the edit satisfies the rule, as it would after write_file"
     );
 }
 

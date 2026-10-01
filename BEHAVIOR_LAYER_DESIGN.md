@@ -238,11 +238,20 @@ Each condition is an object with exactly one key. Comparisons take any of `eq`, 
 { "calls": { "tool": "smart_fetch", "eq": 0 } }                    // executed calls this run
 { "turns_since_call": { "tool": "infer_decision", "gte": 4 } }
 { "since_last_call": { "of": "fs.edit", "called": "run_tests", "eq": 0 } }   // ordering; false if `of` never ran
+{ "calls": { "tool": "run_check", "outcome": "failed", "gte": 1 } }  // only calls whose result was an error ("succeeded" is the other)
+{ "since_last_call": { "of": "write_file", "called": "run_check", "outcome": "succeeded", "gte": 1 } }   // a passing check since the last edit
+{ "tool_offered": "run_check" }                                    // a matching tool was offered on the latest request
 { "repeated_call": { "gte": 3 } }                                  // same tool + args in a row (PreToolUse)
 { "all": [ ... ] }  { "any": [ ... ] }  { "not": { ... } }
 ```
 
 "Executed" means the tool actually ran. Calls refused by the harness or denied by the user don't count. `profile_entered_from` arrives with profile switching (phase 4).
+
+**Outcome.** `calls`, `turns_since_call` and the `called` side of `since_last_call` take an optional `outcome` of `succeeded` or `failed`; the default counts every executed call. A call *failed* when its result was an error (`ToolResult.is_error`), which is recorded per executed call. So a tool that reports a failing check as an error is counted as failed and one that passed as succeeded. A tool that returns text for a failed command with no error flag always counts as succeeded: the engine cannot read an exit code out of its output, so a tool that wants to be judged on pass/fail must report failure as an error. `of` matches a call whatever its outcome. State saved before outcomes existed loads with every call counted as succeeded.
+
+**Tool offered.** `tool_offered` is true when a tool matching the pattern was among the tools the agent's latest request that offered any tools offered (a forced final turn offers none and does not change the answer). It exists so a gate can avoid demanding something the agent had no way to do: "a check ran since your last edit, *or* no way to run a check was offered". Without that escape a gate that names a tool the session never gave the agent can never be satisfied, and with `on_exhausted: "fail"` it fails the run.
+
+**Tool aliases.** A few tools are the same kind of act as another and share its rules, listed in `tool_alias.rs`. An *alias* follows the tool it names everywhere: a rule, gate or allow-list for `write_file` also covers `edit_file`, and one for `run_command` also covers `run_check` and `install_dependencies`, so a profile that forbids running commands cannot be sidestepped by calling the other tool. The reverse does not hold: a pattern naming the alias matches only the alias, which is how a gate asks for *a check* (`run_check`) and not for any command. A tool that is merely *granted with* another (`project_info` with `read_file`) is admitted by that tool's allow-list and permission override but keeps its own name in rules and history.
 
 Every condition is a function of `BehaviorState` + the event payload, so it can be tested exhaustively.
 

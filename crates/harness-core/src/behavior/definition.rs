@@ -311,13 +311,20 @@ pub enum Condition {
     ResultContains(String),
     /// The run's current turn number (1-based).
     Turn(Comparison),
-    /// Executed calls of a tool in this run.
+    /// Executed calls of a tool in this run. `outcome` narrows it to calls
+    /// that succeeded or failed.
     Calls(ToolCount),
     /// Turns since the tool was last executed (or since the run started).
+    /// `outcome` narrows it to the last call that succeeded or failed.
     TurnsSinceCall(ToolCount),
     /// Executed calls of `called` since the last executed call of `of`.
-    /// False when `of` has not been called in this run.
+    /// False when `of` has not been called in this run. `outcome` narrows
+    /// the counted `called` calls to those that succeeded or failed.
     SinceLastCall(SinceLastCall),
+    /// A tool matching this was offered to the model on its latest request.
+    /// Lets a gate skip a requirement the model had no way to meet, such as
+    /// "run a check" in a session that was given no way to run one.
+    ToolOffered(NameMatch),
     /// Consecutive requests of the same tool with identical arguments,
     /// including the current one (`PreToolUse` only).
     RepeatedCall(Comparison),
@@ -382,10 +389,43 @@ impl Comparison {
     }
 }
 
+/// Which executed calls a count looks at. A call *failed* when its result was
+/// an error, so a tool that reports a failing check as an error (the IDE's
+/// `run_check`) is counted as failed, and one that passed as succeeded. A
+/// tool that returns text for a failed command with no error flag (such as
+/// `run_command`) always counts as succeeded: the engine cannot see an exit
+/// code inside its output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    /// Every executed call.
+    #[default]
+    Any,
+    Succeeded,
+    Failed,
+}
+
+impl CallOutcome {
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    /// Whether a call that `failed` (or not) is one this filter counts.
+    pub fn admits(self, failed: bool) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Succeeded => !failed,
+            Self::Failed => failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCount {
     pub tool: NameMatch,
+    #[serde(default, skip_serializing_if = "CallOutcome::is_any")]
+    pub outcome: CallOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eq: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -409,6 +449,9 @@ impl ToolCount {
 pub struct SinceLastCall {
     pub of: NameMatch,
     pub called: NameMatch,
+    /// Which of the `called` calls count. `of` always matches any outcome.
+    #[serde(default, skip_serializing_if = "CallOutcome::is_any")]
+    pub outcome: CallOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eq: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

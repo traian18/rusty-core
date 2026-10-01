@@ -10,6 +10,7 @@ mod content_hash;
 pub mod context_state;
 pub mod execution_policy;
 pub mod orchestration;
+pub mod tool_alias;
 pub mod transcript;
 pub mod transitions;
 pub mod usage;

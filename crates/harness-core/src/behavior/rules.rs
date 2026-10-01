@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use super::definition::{Action, ArgMatch, Condition, NameMatch, Placement, RuleEvent};
 use super::state::{BehaviorState, RunCounters};
+use crate::tool_alias::followed_tool;
 
 /// The tool involved in a tool event.
 #[derive(Debug, Clone, Copy)]
@@ -215,19 +216,39 @@ impl BehaviorState {
         }
     }
 
-    /// Record that a tool actually executed (not denied) in this turn.
+    /// Record that a tool actually executed (not denied) in this turn, and
+    /// that it succeeded. See [`Self::note_executed_with`].
     pub fn note_executed(&mut self, tool: &str) {
+        self.note_executed_with(tool, false);
+    }
+
+    /// Record that a tool actually executed (not denied) in this turn.
+    /// `failed` is whether its result was an error, which is what the
+    /// `outcome` filter of `calls`, `turns_since_call` and `since_last_call`
+    /// reads.
+    pub fn note_executed_with(&mut self, tool: &str, failed: bool) {
         let turn = self.run.turns;
         self.run.executed.push(super::state::ExecutedCall {
             turn,
             tool: tool.to_string(),
+            failed,
         });
+    }
+
+    /// Record the tools the latest request offered the model. Not called for
+    /// a forced final turn, which offers none.
+    pub fn note_offered(&mut self, mut tools: Vec<String>) {
+        tools.sort();
+        tools.dedup();
+        self.run.offered_tools = tools;
     }
 }
 
 fn holds(condition: &Condition, tool: Option<ToolEvent<'_>>, run: &RunCounters) -> bool {
     match condition {
-        Condition::Tool(names) => tool.is_some_and(|tool| name_matches(names, &tool.call.name)),
+        Condition::Tool(names) => {
+            tool.is_some_and(|tool| tool_name_matches(names, &tool.call.name))
+        }
         Condition::Arg(arg) => tool.is_some_and(|tool| arg_matches(arg, &tool.call.arguments)),
         Condition::ResultContains(needle) => tool
             .and_then(|tool| tool.result)
@@ -237,7 +258,9 @@ fn holds(condition: &Condition, tool: Option<ToolEvent<'_>>, run: &RunCounters) 
             let calls = run
                 .executed
                 .iter()
-                .filter(|call| name_matches(&count.tool, &call.tool))
+                .filter(|call| {
+                    count.outcome.admits(call.failed) && tool_name_matches(&count.tool, &call.tool)
+                })
                 .count();
             count.comparison().holds(saturate(calls))
         }
@@ -246,7 +269,9 @@ fn holds(condition: &Condition, tool: Option<ToolEvent<'_>>, run: &RunCounters) 
                 .executed
                 .iter()
                 .rev()
-                .find(|call| name_matches(&count.tool, &call.tool))
+                .find(|call| {
+                    count.outcome.admits(call.failed) && tool_name_matches(&count.tool, &call.tool)
+                })
                 .map_or(0, |call| call.turn);
             count.comparison().holds(run.turns.saturating_sub(last))
         }
@@ -254,16 +279,23 @@ fn holds(condition: &Condition, tool: Option<ToolEvent<'_>>, run: &RunCounters) 
             let Some(position) = run
                 .executed
                 .iter()
-                .rposition(|call| name_matches(&since.of, &call.tool))
+                .rposition(|call| tool_name_matches(&since.of, &call.tool))
             else {
                 return false;
             };
             let calls = run.executed[position + 1..]
                 .iter()
-                .filter(|call| name_matches(&since.called, &call.tool))
+                .filter(|call| {
+                    since.outcome.admits(call.failed)
+                        && tool_name_matches(&since.called, &call.tool)
+                })
                 .count();
             since.comparison().holds(saturate(calls))
         }
+        Condition::ToolOffered(names) => run
+            .offered_tools
+            .iter()
+            .any(|tool| tool_name_matches(names, tool)),
         Condition::RepeatedCall(comparison) => {
             comparison.holds(run.streak.as_ref().map_or(0, |streak| streak.count))
         }
@@ -286,6 +318,14 @@ pub(crate) fn name_matches(names: &NameMatch, name: &str) -> bool {
         .patterns()
         .iter()
         .any(|pattern| glob_match(pattern, name))
+}
+
+/// [`name_matches`] for a *tool* name: a pattern that matches the tool an
+/// alias follows (`write_file`) also matches the alias (`edit_file`), so a
+/// rule written for one cannot be sidestepped by calling the other.
+pub(crate) fn tool_name_matches(names: &NameMatch, tool: &str) -> bool {
+    name_matches(names, tool)
+        || followed_tool(tool).is_some_and(|followed| name_matches(names, followed))
 }
 
 fn arg_matches(arg: &ArgMatch, arguments: &Value) -> bool {

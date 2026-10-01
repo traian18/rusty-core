@@ -27,8 +27,14 @@ use harness_protocol::usage::{AgentBudget, Cost, ModelUsage};
 use serde_json::{json, Value};
 
 fn agent(gate: Value, limits: Value) -> Agent {
-    let tools = ["fs.edit", "run_tests"]
-        .into_iter()
+    agent_with_tools(&["fs.edit", "run_tests"], gate, limits)
+}
+
+/// An agent offered exactly `names` as tools.
+fn agent_with_tools(names: &[&str], gate: Value, limits: Value) -> Agent {
+    let tools = names
+        .iter()
+        .copied()
         .map(|name| {
             let id = ToolId::new();
             (
@@ -135,6 +141,16 @@ fn answer(agent: &mut Agent, run_id: RunId, text: &str) -> Vec<AgentEffect> {
 
 /// The model calls `tool`, the tool succeeds, and the loop continues.
 fn use_tool(agent: &mut Agent, run_id: RunId, tool: &str) -> Vec<AgentEffect> {
+    use_tool_result(agent, run_id, tool, false)
+}
+
+/// The model calls `tool` and its result is an error when `is_error`.
+fn use_tool_result(
+    agent: &mut Agent,
+    run_id: RunId,
+    tool: &str,
+    is_error: bool,
+) -> Vec<AgentEffect> {
     let call = ToolCall {
         id: ToolCallId::new(),
         name: tool.into(),
@@ -163,7 +179,7 @@ fn use_tool(agent: &mut Agent, run_id: RunId, tool: &str) -> Vec<AgentEffect> {
         result: ToolResult {
             call_id,
             output: json!("ok"),
-            is_error: false,
+            is_error,
         },
     })
 }
@@ -456,6 +472,127 @@ fn a_rejection_on_the_final_turn_cannot_continue() {
         "no turn is left to address the feedback"
     );
     assert!(completed(&effects));
+}
+
+/// "Nothing was edited, or a check passed after the last edit."
+fn passing_check_gate() -> Value {
+    json!({
+        "checks": [{
+            "id": "check-passed",
+            "require": { "any": [
+                { "calls": { "tool": "fs.edit", "eq": 0 } },
+                { "since_last_call": { "of": "fs.edit", "called": "run_check", "outcome": "succeeded", "gte": 1 } }
+            ] },
+            "feedback": "No check has passed since your last edit. Run run_check."
+        }],
+        "max_continuations": 6
+    })
+}
+
+#[test]
+fn a_gate_can_require_a_passing_check_since_the_last_edit() {
+    let mut agent = agent_with_tools(&["fs.edit", "run_check"], passing_check_gate(), json!({}));
+    let run_id = start(&mut agent);
+    use_tool(&mut agent, run_id, "fs.edit");
+    use_tool_result(&mut agent, run_id, "run_check", true);
+
+    let effects = answer(&mut agent, run_id, "Done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["check-passed".into()])),
+        "a check that ran and failed is not a passing check"
+    );
+    assert!(continues(&effects));
+    assert!(
+        last_user_text(&agent).contains("[check-passed] No check has passed since your last edit.")
+    );
+
+    use_tool_result(&mut agent, run_id, "run_check", false);
+    let effects = answer(&mut agent, run_id, "Done, the check passes.");
+    assert_eq!(gate_event(&effects), Some((true, false, vec![])));
+    assert!(completed(&effects));
+}
+
+#[test]
+fn an_edit_after_a_passing_check_needs_another_passing_check() {
+    let mut agent = agent_with_tools(&["fs.edit", "run_check"], passing_check_gate(), json!({}));
+    let run_id = start(&mut agent);
+    use_tool(&mut agent, run_id, "fs.edit");
+    use_tool_result(&mut agent, run_id, "run_check", false);
+    use_tool(&mut agent, run_id, "fs.edit");
+
+    let effects = answer(&mut agent, run_id, "Done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["check-passed".into()])),
+        "the pass came before the last edit"
+    );
+    use_tool_result(&mut agent, run_id, "run_check", false);
+    assert!(completed(&answer(&mut agent, run_id, "Done")));
+}
+
+/// Nothing edited; or no way to run a check was offered; or a check ran after the last edit.
+fn check_ran_or_impossible_gate() -> Value {
+    json!({
+        "checks": [{
+            "id": "checked",
+            "require": { "any": [
+                { "calls": { "tool": "fs.edit", "eq": 0 } },
+                { "not": { "tool_offered": "run_check" } },
+                { "since_last_call": { "of": "fs.edit", "called": "run_check", "gte": 1 } }
+            ] },
+            "feedback": "Run run_check."
+        }]
+    })
+}
+
+#[test]
+fn a_gate_does_not_demand_a_tool_the_agent_was_never_offered() {
+    let mut without = agent_with_tools(&["fs.edit"], check_ran_or_impossible_gate(), json!({}));
+    let run_id = start(&mut without);
+    use_tool(&mut without, run_id, "fs.edit");
+    let effects = answer(&mut without, run_id, "Done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((true, false, vec![])),
+        "there was no way to run a check, so none is required"
+    );
+    assert!(completed(&effects));
+
+    let mut with = agent_with_tools(
+        &["fs.edit", "run_check"],
+        check_ran_or_impossible_gate(),
+        json!({}),
+    );
+    let run_id = start(&mut with);
+    use_tool(&mut with, run_id, "fs.edit");
+    let effects = answer(&mut with, run_id, "Done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["checked".into()]))
+    );
+    // A check that ran and failed still counts as having run one: this gate asks for an attempt.
+    use_tool_result(&mut with, run_id, "run_check", true);
+    let effects = answer(&mut with, run_id, "The check fails; here is why.");
+    assert_eq!(gate_event(&effects), Some((true, false, vec![])));
+}
+
+#[test]
+fn a_forced_final_turn_does_not_make_the_gate_think_no_tools_were_offered() {
+    // Turn 2 is the final turn and offers no tools, but run_check was offered on turn 1.
+    let mut agent = agent_with_tools(
+        &["fs.edit", "run_check"],
+        check_ran_or_impossible_gate(),
+        json!({ "max_turns": 2 }),
+    );
+    let run_id = start(&mut agent);
+    use_tool(&mut agent, run_id, "fs.edit");
+    let effects = answer(&mut agent, run_id, "Done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, false, vec!["checked".into()])),
+        "run_check was available, so the missing check still counts against the run"
+    );
 }
 
 #[test]

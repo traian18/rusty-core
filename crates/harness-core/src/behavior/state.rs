@@ -47,6 +47,11 @@ pub struct RunCounters {
     /// Tools that actually executed, in order, with the turn they ran in.
     #[serde(default)]
     pub executed: Vec<ExecutedCall>,
+    /// Names of the tools the latest request that offered any tools offered,
+    /// sorted. A forced final turn offers none and leaves this as it was, so
+    /// `tool_offered` still answers for the tools the agent really had.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_tools: Vec<String>,
     /// The latest run of identical tool requests, for loop detection.
     #[serde(default)]
     pub streak: Option<CallStreak>,
@@ -79,6 +84,14 @@ pub struct RunCounters {
 pub struct ExecutedCall {
     pub turn: u32,
     pub tool: String,
+    /// The call's result was an error. Absent from older saved state, which
+    /// counts as a success; omitted when false so that state is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub failed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

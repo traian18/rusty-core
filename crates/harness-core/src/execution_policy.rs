@@ -37,8 +37,11 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         // `decide` is advisory: the IDE asks a decision model and returns its pick.
         "report_progress" | "ask_user_question" | "decide" => return true,
         "write_plan" => return policy.mode == ExecutionMode::Plan,
-        "read_file" | "fs.read" | "open_document" => "read_file",
-        "write_file" | "fs.edit" => {
+        // `project_info` is the IDE's project-detection tool: it only reads
+        // manifests, so it shares the `read_file` grant (in plan mode too).
+        "read_file" | "fs.read" | "open_document" | "project_info" => "read_file",
+        // `edit_file` is the IDE's targeted patch tool: same grant as `write_file`.
+        "write_file" | "edit_file" | "fs.edit" => {
             if policy.mode == ExecutionMode::Plan {
                 return false;
             }
@@ -48,7 +51,10 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         "search_codebase" | "workspace.search" => "search_codebase",
         // web_extract fetches a page like web_fetch, so it needs the same network grant.
         "web_search" | "web_fetch" | "web_extract" => "web_search",
-        "run_command" | "shell.exec" => {
+        // `run_check` (the IDE's project-check tool) and `install_dependencies`
+        // run commands through the same executor, so they need everything
+        // `run_command` needs.
+        "run_command" | "shell.exec" | "run_check" | "install_dependencies" => {
             // The current command executor has host filesystem/network access.
             if policy.mode != ExecutionMode::Execute
                 || !enabled(policy, "write_file")
@@ -139,6 +145,79 @@ mod tests {
         policy.enabled_tools.clear();
         assert!(!allows_tool(&policy, "web_extract"));
         assert!(!allows_tool(&policy, "web_fetch"));
+    }
+
+    #[test]
+    fn edit_file_follows_the_write_file_grant_and_never_runs_in_plan_mode() {
+        let mut policy = ExecutionPolicy {
+            mode: ExecutionMode::Execute,
+            enabled_tools: vec!["write_file".into()],
+            allowed_mcp_servers: vec![],
+        };
+        assert!(allows_tool(&policy, "edit_file"));
+        policy.mode = ExecutionMode::Virtual;
+        assert!(allows_tool(&policy, "edit_file"));
+        policy.mode = ExecutionMode::Plan;
+        assert!(!allows_tool(&policy, "edit_file"));
+        policy.mode = ExecutionMode::Execute;
+        policy.enabled_tools = vec!["read_file".into()];
+        assert!(
+            !allows_tool(&policy, "edit_file"),
+            "no write grant, no edit_file"
+        );
+    }
+
+    #[test]
+    fn run_check_needs_everything_run_command_needs() {
+        let mut policy = ExecutionPolicy {
+            mode: ExecutionMode::Execute,
+            enabled_tools: vec!["run_command".into()],
+            allowed_mcp_servers: vec![],
+        };
+        assert!(
+            !allows_tool(&policy, "run_check"),
+            "commands also need file and network grants"
+        );
+        policy.enabled_tools.push("write_file".into());
+        assert!(!allows_tool(&policy, "run_check"));
+        policy.enabled_tools.push("web_search".into());
+        assert!(allows_tool(&policy, "run_check"));
+        assert!(allows_tool(&policy, "install_dependencies"));
+        policy.mode = ExecutionMode::Plan;
+        assert!(!allows_tool(&policy, "run_check"));
+        assert!(!allows_tool(&policy, "install_dependencies"));
+        policy.mode = ExecutionMode::Virtual;
+        assert!(!allows_tool(&policy, "run_check"));
+        policy.mode = ExecutionMode::Execute;
+        policy.enabled_tools.retain(|name| name != "run_command");
+        assert!(
+            !allows_tool(&policy, "run_check"),
+            "no run_command grant, no run_check"
+        );
+    }
+
+    #[test]
+    fn project_info_follows_the_read_file_grant_in_every_mode() {
+        let mut policy = ExecutionPolicy {
+            mode: ExecutionMode::Execute,
+            enabled_tools: vec!["read_file".into()],
+            allowed_mcp_servers: vec![],
+        };
+        for mode in [
+            ExecutionMode::Execute,
+            ExecutionMode::Plan,
+            ExecutionMode::Virtual,
+        ] {
+            policy.mode = mode;
+            assert!(allows_tool(&policy, "project_info"));
+        }
+        policy.enabled_tools = vec!["write_file".into()];
+        assert!(
+            !allows_tool(&policy, "project_info"),
+            "writing does not grant reading"
+        );
+        policy.enabled_tools.clear();
+        assert!(!allows_tool(&policy, "project_info"));
     }
 
     #[test]

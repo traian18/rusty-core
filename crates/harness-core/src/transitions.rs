@@ -505,6 +505,12 @@ impl Agent {
                 })
                 .collect()
         };
+        // Remember what the agent was really offered, for `tool_offered`. A
+        // forced final turn offers nothing and says nothing about the toolset.
+        if !final_turn {
+            let offered = tools.iter().map(|tool| tool.name.clone()).collect();
+            self.state.behavior.note_offered(offered);
+        }
         let params = profile.execution_params(&self.state.execution_params);
         let extended_thinking = params.extended_thinking.unwrap_or(false);
         let system_prompt =
@@ -1256,7 +1262,9 @@ impl Agent {
         let mut effects = Vec::new();
         let mut stop = None;
         if executed {
-            self.state.behavior.note_executed(&call.name);
+            self.state
+                .behavior
+                .note_executed_with(&call.name, has_error);
             let event = if has_error {
                 RuleEvent::PostToolUseFailure
             } else {

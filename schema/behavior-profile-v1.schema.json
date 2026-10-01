@@ -313,6 +313,25 @@
       },
       "additionalProperties": false
     },
+    "CallOutcome": {
+      "description": "Which executed calls a count looks at. A call *failed* when its result was an error, so a tool that reports a failing check as an error (the IDE's `run_check`) is counted as failed, and one that passed as succeeded. A tool that returns text for a failed command with no error flag (such as `run_command`) always counts as succeeded: the engine cannot see an exit code inside its output.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "succeeded",
+            "failed"
+          ]
+        },
+        {
+          "description": "Every executed call.",
+          "type": "string",
+          "enum": [
+            "any"
+          ]
+        }
+      ]
+    },
     "ChildPolicy": {
       "description": "How spawned child agents get their behavior (`BEHAVIOR_LAYER_DESIGN.md` §8a). Only `inherit` is implemented; the other types are reserved so the format stays stable, and the compiler rejects them.",
       "oneOf": [
@@ -509,7 +528,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Executed calls of a tool in this run.",
+          "description": "Executed calls of a tool in this run. `outcome` narrows it to calls that succeeded or failed.",
           "type": "object",
           "required": [
             "calls"
@@ -522,7 +541,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Turns since the tool was last executed (or since the run started).",
+          "description": "Turns since the tool was last executed (or since the run started). `outcome` narrows it to the last call that succeeded or failed.",
           "type": "object",
           "required": [
             "turns_since_call"
@@ -535,7 +554,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Executed calls of `called` since the last executed call of `of`. False when `of` has not been called in this run.",
+          "description": "Executed calls of `called` since the last executed call of `of`. False when `of` has not been called in this run. `outcome` narrows the counted `called` calls to those that succeeded or failed.",
           "type": "object",
           "required": [
             "since_last_call"
@@ -543,6 +562,19 @@
           "properties": {
             "since_last_call": {
               "$ref": "#/definitions/SinceLastCall"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A tool matching this was offered to the model on its latest request. Lets a gate skip a requirement the model had no way to meet, such as \"run a check\" in a session that was given no way to run one.",
+          "type": "object",
+          "required": [
+            "tool_offered"
+          ],
+          "properties": {
+            "tool_offered": {
+              "$ref": "#/definitions/NameMatch"
             }
           },
           "additionalProperties": false
@@ -1159,6 +1191,14 @@
         },
         "of": {
           "$ref": "#/definitions/NameMatch"
+        },
+        "outcome": {
+          "description": "Which of the `called` calls count. `of` always matches any outcome.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CallOutcome"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -1192,6 +1232,9 @@
           ],
           "format": "uint32",
           "minimum": 0.0
+        },
+        "outcome": {
+          "$ref": "#/definitions/CallOutcome"
         },
         "tool": {
           "$ref": "#/definitions/NameMatch"
