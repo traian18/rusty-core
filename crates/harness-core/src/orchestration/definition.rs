@@ -309,7 +309,7 @@ pub enum RetryReason {
 /// Upper bound on any node's `retry.max_attempts`.
 pub const MAX_STEP_ATTEMPTS: u32 = 10;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OrchestrationPolicies {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<u32>,
@@ -325,20 +325,6 @@ pub struct OrchestrationPolicies {
     pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
-}
-
-impl Default for OrchestrationPolicies {
-    fn default() -> Self {
-        Self {
-            max_steps: None,
-            max_total_attempts: None,
-            max_elapsed_ms: None,
-            max_model_requests: None,
-            max_tool_calls: None,
-            max_tokens: None,
-            max_cost_usd: None,
-        }
-    }
 }
 
 const fn default_true() -> bool {

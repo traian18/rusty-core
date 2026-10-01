@@ -25,7 +25,10 @@ impl Catalog {
     /// Returns `None` when nothing usable is listed, so callers fall back to
     /// letting the API decide rather than rejecting every request.
     pub fn parse(payload: &Value) -> Option<Self> {
-        let entries = payload.get("data").and_then(Value::as_array).or_else(|| payload.as_array())?;
+        let entries = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| payload.as_array())?;
         let models: Vec<_> = entries
             .iter()
             .filter_map(|entry| {
@@ -45,7 +48,12 @@ impl Catalog {
                     picker_enabled: entry["model_picker_enabled"].as_bool().unwrap_or(true),
                     endpoints: entry["supported_endpoints"]
                         .as_array()
-                        .map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 })
             })
@@ -106,11 +114,23 @@ mod tests {
     fn keeps_only_chat_models_the_account_may_use() {
         let catalog = Catalog::parse(&payload()).unwrap();
         for unusable in ["text-embedding-3-small", "gpt-4.1", "claude-opus-9"] {
-            assert!(catalog.get(unusable).is_none(), "{unusable} must be excluded");
+            assert!(
+                catalog.get(unusable).is_none(),
+                "{unusable} must be excluded"
+            );
         }
-        assert!(catalog.get("gpt-4.1-2025-04-14").is_some(), "hidden aliases stay callable");
-        assert_eq!(catalog.selectable_ids(), ["gpt-5-mini", "claude-sonnet-4.5"]);
-        assert_eq!(catalog.get("gpt-5-mini").unwrap().endpoints, ["/chat/completions", "/responses"]);
+        assert!(
+            catalog.get("gpt-4.1-2025-04-14").is_some(),
+            "hidden aliases stay callable"
+        );
+        assert_eq!(
+            catalog.selectable_ids(),
+            ["gpt-5-mini", "claude-sonnet-4.5"]
+        );
+        assert_eq!(
+            catalog.get("gpt-5-mini").unwrap().endpoints,
+            ["/chat/completions", "/responses"]
+        );
     }
 
     #[test]
@@ -124,15 +144,24 @@ mod tests {
             {"id": "b", "model_picker_enabled": true, "is_chat_fallback": true},
             {"id": "c", "model_picker_enabled": true}
         ]});
-        assert_eq!(Catalog::parse(&no_default).unwrap().pick_auto("gpt-4.1"), Some("b"));
+        assert_eq!(
+            Catalog::parse(&no_default).unwrap().pick_auto("gpt-4.1"),
+            Some("b")
+        );
         let plain = json!([{"id": "a"}, {"id": "b"}]);
-        assert_eq!(Catalog::parse(&plain).unwrap().pick_auto("gpt-4.1"), Some("a"));
+        assert_eq!(
+            Catalog::parse(&plain).unwrap().pick_auto("gpt-4.1"),
+            Some("a")
+        );
     }
 
     #[test]
     fn unusable_or_malformed_payloads_yield_no_catalog() {
         assert!(Catalog::parse(&json!({"data": []})).is_none());
         assert!(Catalog::parse(&json!({"error": "nope"})).is_none());
-        assert!(Catalog::parse(&json!({"data": [{"id": "x", "policy": {"state": "disabled"}}]})).is_none());
+        assert!(
+            Catalog::parse(&json!({"data": [{"id": "x", "policy": {"state": "disabled"}}]}))
+                .is_none()
+        );
     }
 }

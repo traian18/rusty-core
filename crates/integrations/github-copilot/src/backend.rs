@@ -81,10 +81,7 @@ impl CopilotClient {
     /// `model_not_supported`). A model the user chose is always sent as-is:
     /// the catalog is a best-effort guess about the account, Copilot's answer
     /// is the truth, so the catalog never blocks a request on its own.
-    async fn resolve_model(
-        &self,
-        requested: Option<&str>,
-    ) -> (String, Option<Arc<Catalog>>) {
+    async fn resolve_model(&self, requested: Option<&str>) -> (String, Option<Arc<Catalog>>) {
         let catalog = match &self.catalog {
             Some(source) => source.get().await,
             None => None,
@@ -114,9 +111,18 @@ fn explain_rejection(error: ModelError, model: &str, catalog: Option<&Catalog>) 
     let hint = if listed.is_empty() {
         String::new()
     } else {
-        let shown = listed.iter().take(12).copied().collect::<Vec<_>>().join(", ");
+        let shown = listed
+            .iter()
+            .take(12)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
         let more = listed.len().saturating_sub(12);
-        let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
         format!(" Models this account lists: {shown}{more}.")
     };
     ModelError::BackendError {
@@ -460,12 +466,15 @@ mod tests {
                                 .unwrap_or(0);
                             if bytes.len() >= end + 4 + length {
                                 let path = head.split_whitespace().nth(1).unwrap().to_owned();
-                                let body = serde_json::from_slice(&bytes[end + 4..end + 4 + length])
-                                    .unwrap_or(serde_json::Value::Null);
+                                let body =
+                                    serde_json::from_slice(&bytes[end + 4..end + 4 + length])
+                                        .unwrap_or(serde_json::Value::Null);
                                 break (path, body);
                             }
                         };
-                        let refused = body["model"].as_str().is_some_and(|m| rejected.iter().any(|r| r == m));
+                        let refused = body["model"]
+                            .as_str()
+                            .is_some_and(|m| rejected.iter().any(|r| r == m));
                         log.lock().unwrap().push((path.clone(), body));
                         let (status, content_type, payload) = match (path.as_str(), catalog) {
                             _ if refused => ("400 Bad Request", "application/json", r#"{"error":{"message":"The requested model is not supported.","code":"model_not_supported","param":"model","type":"invalid_request_error"}}"#.to_string()),
@@ -490,11 +499,17 @@ mod tests {
             let path = credentials.path().join("config.json");
             std::fs::write(
                 &path,
-                serde_json::json!({"lastLoggedInUser":{"login":"test","token":"fixture"}}).to_string(),
+                serde_json::json!({"lastLoggedInUser":{"login":"test","token":"fixture"}})
+                    .to_string(),
             )
             .unwrap();
             let auth = Arc::new(CopilotAuth::new(Some(path), "github.com".into()));
-            Self { root, requests, _credentials: credentials, auth }
+            Self {
+                root,
+                requests,
+                _credentials: credentials,
+                auth,
+            }
         }
         fn client(&self) -> CopilotClient {
             let mut chat = OpenAiConfig::new("");
@@ -519,7 +534,12 @@ mod tests {
                 .collect()
         }
         fn catalog_fetches(&self) -> usize {
-            self.requests.lock().unwrap().iter().filter(|(path, _)| path == "/models").count()
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path == "/models")
+                .count()
         }
     }
     async fn ask(client: &CopilotClient, model: Option<&str>) -> Result<ModelResult, ModelError> {
@@ -532,7 +552,9 @@ mod tests {
             messages: vec![AgentMessage {
                 id: MessageId::new(),
                 role: MessageRole::User,
-                content: vec![ContentBlock::Text { text: "hello".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
                 created_at: Timestamp::now(),
             }],
             tools: vec![],
@@ -568,8 +590,15 @@ mod tests {
         // Both spellings of "auto": the UI's literal id and no model at all.
         ask(&client, Some("auto")).await.unwrap();
         ask(&client, None).await.unwrap();
-        assert_eq!(mock.completion_models(), ["claude-sonnet-4.5", "claude-sonnet-4.5"]);
-        assert_eq!(mock.catalog_fetches(), 1, "catalog is cached between requests");
+        assert_eq!(
+            mock.completion_models(),
+            ["claude-sonnet-4.5", "claude-sonnet-4.5"]
+        );
+        assert_eq!(
+            mock.catalog_fetches(),
+            1,
+            "catalog is cached between requests"
+        );
     }
 
     #[tokio::test]
@@ -597,10 +626,23 @@ mod tests {
         let ModelError::BackendError { message, .. } = error else {
             panic!("expected a backend error");
         };
-        assert_eq!(mock.completion_models(), ["gpt-4o"], "Copilot, not the catalog, made the call");
-        assert!(message.contains("\"gpt-4o\"") && message.contains("model_not_supported"), "{message}");
-        assert!(message.contains("claude-sonnet-4.5") && message.contains("gemini-2.5-pro"), "{message}");
-        assert!(!message.contains("gpt-4.1,") && !message.contains(", gpt-4.1"), "disabled models are not suggested: {message}");
+        assert_eq!(
+            mock.completion_models(),
+            ["gpt-4o"],
+            "Copilot, not the catalog, made the call"
+        );
+        assert!(
+            message.contains("\"gpt-4o\"") && message.contains("model_not_supported"),
+            "{message}"
+        );
+        assert!(
+            message.contains("claude-sonnet-4.5") && message.contains("gemini-2.5-pro"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("gpt-4.1,") && !message.contains(", gpt-4.1"),
+            "disabled models are not suggested: {message}"
+        );
     }
 
     #[tokio::test]
@@ -610,7 +652,10 @@ mod tests {
         let ModelError::BackendError { message, .. } = error else {
             panic!("expected a backend error");
         };
-        assert!(message.contains("model_not_supported") && !message.contains("lists:"), "{message}");
+        assert!(
+            message.contains("model_not_supported") && !message.contains("lists:"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -618,7 +663,8 @@ mod tests {
         let mock = MockCopilot::start(Some(serde_json::json!({"data": [
             {"id": "gpt-4.1", "policy": {"state": "disabled"}, "model_picker_enabled": false},
             {"id": "claude-sonnet-4.5", "model_picker_enabled": false}
-        ]}))).await;
+        ]})))
+        .await;
         ask(&mock.client(), Some("auto")).await.unwrap();
         assert_eq!(mock.completion_models(), ["claude-sonnet-4.5"]);
     }
@@ -659,8 +705,15 @@ mod tests {
             ("gpt-5.4", true),
             ("not-in-catalog", false),
         ] {
-            assert_eq!(routes_to_responses(model, Some(&catalog)), responses, "{model}");
+            assert_eq!(
+                routes_to_responses(model, Some(&catalog)),
+                responses,
+                "{model}"
+            );
         }
-        assert!(routes_to_responses("gpt-5.2", None), "no catalog keeps name-based routing");
+        assert!(
+            routes_to_responses("gpt-5.2", None),
+            "no catalog keeps name-based routing"
+        );
     }
 }
