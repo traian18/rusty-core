@@ -5,6 +5,17 @@ GPT-5 and later use Responses (except GPT-5 mini); other models use Chat
 Completions, matching OpenCode's provider routing. Model responses only propose
 tool calls. All tool authorization and execution belong to the harness.
 
+Models are resolved against the account's own catalog (`GET /models`, cached for
+five minutes). Copilot answers `400 model_not_supported` for any model the plan or
+organization policy has not enabled, so `auto` picks the configured default
+(`gpt-4.1`) only when the account has it, then Copilot's chat default and
+fallback, then the first selectable model. A model the user chose is always sent
+as-is; the catalog never rejects it. If Copilot itself answers
+`model_not_supported`, that response is kept and annotated with the models the
+account lists. The catalog's `supported_endpoints`
+overrides the name-based Responses/Chat routing when they disagree. If the
+catalog cannot be read, requests proceed unchecked and the API decides.
+
 Credentials are read from `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`,
 then the selected account in `$COPILOT_HOME/config.json` (default
 `~/.copilot/config.json`). File credentials and macOS's `copilot-cli` Keychain
