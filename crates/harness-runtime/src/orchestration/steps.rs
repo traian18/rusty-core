@@ -487,17 +487,61 @@ pub(crate) async fn execute_verify(
     } else {
         Err(OrchestrationError::retryable(
             "verification_failed",
-            format!(
-                "{}\n\n{}",
-                issues.join("; "),
-                crate::markdown_reply::render_input(
-                    &json!({"criteria": input["check"]["criteria"]})
-                )
-            ),
+            verification_repair_focus(&input, &issues),
             RetryReason::VerificationFailed,
         ))
     };
     (result, evidence)
+}
+
+fn verification_repair_focus(input: &Value, issues: &[String]) -> String {
+    let mut parts = vec![format!("Verification did not pass: {}", issues.join("; "))];
+    let unresolved = input["check"]["criteria"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|criterion| criterion["status"].as_str() != Some("pass"))
+        .map(|criterion| {
+            let id = criterion["id"].as_str().unwrap_or("unnamed criterion");
+            let status = criterion["status"].as_str().unwrap_or("unverified");
+            let evidence = criterion["evidence"]
+                .as_str()
+                .unwrap_or("No evidence supplied");
+            format!("- {id} [{status}]: {evidence}")
+        })
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        parts.push(format!(
+            "Focus on these unmet criteria:\n{}",
+            unresolved.join("\n")
+        ));
+    }
+    if let Some(summary) = input["check"]["summary"].as_str() {
+        parts.push(format!("Review summary: {summary}"));
+    }
+    parts.join("\n\n")
+}
+
+#[cfg(test)]
+mod verification_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn repair_feedback_names_only_unmet_criteria_and_their_evidence() {
+        let input = json!({"check": {
+            "summary": "Native notifications still need work.",
+            "criteria": [
+                {"id": "C1", "status": "pass", "evidence": "Types exist."},
+                {"id": "C2", "status": "fail", "evidence": "No native delivery in notifications.rs."},
+                {"id": "C3", "status": "unverified", "evidence": "No question adapter test."}
+            ]
+        }});
+        let focus = verification_repair_focus(&input, &["verdict was fail".into()]);
+        assert!(focus.contains("C2 [fail]: No native delivery in notifications.rs."));
+        assert!(focus.contains("C3 [unverified]: No question adapter test."));
+        assert!(!focus.contains("C1 [pass]"));
+        assert!(focus.contains("Review summary: Native notifications still need work."));
+    }
 }
 
 /// Which result answers which expected criterion. IDs are matched loosely

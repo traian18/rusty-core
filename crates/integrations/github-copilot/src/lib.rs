@@ -4,5 +4,7 @@ pub mod auth;
 mod backend;
 mod catalog;
 mod config;
-pub use backend::{GitHubCopilotBackend, GitHubCopilotFactory};
+pub mod credentials;
+pub use backend::{api_root, GitHubCopilotBackend, GitHubCopilotFactory};
 pub use config::GitHubCopilotConfig;
+pub use harness_model::auth::InferenceAuth;

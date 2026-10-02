@@ -13,6 +13,7 @@ pub(crate) struct CatalogModel {
     pub is_fallback: bool,
     pub picker_enabled: bool,
     pub endpoints: Vec<String>,
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -40,12 +41,16 @@ impl Catalog {
                 let enabled = entry
                     .pointer("/policy/state")
                     .and_then(Value::as_str)
-                    .map_or(true, |state| state == "enabled");
+                    .map_or(true, |state| state != "disabled");
                 (chat && enabled).then(|| CatalogModel {
                     id: id.to_owned(),
                     is_default: entry["is_chat_default"].as_bool().unwrap_or(false),
                     is_fallback: entry["is_chat_fallback"].as_bool().unwrap_or(false),
                     picker_enabled: entry["model_picker_enabled"].as_bool().unwrap_or(true),
+                    max_output_tokens: entry
+                        .pointer("/capabilities/limits/max_output_tokens")
+                        .and_then(Value::as_u64)
+                        .filter(|limit| *limit > 0),
                     endpoints: entry["supported_endpoints"]
                         .as_array()
                         .map(|list| {
@@ -113,7 +118,7 @@ mod tests {
     #[test]
     fn keeps_only_chat_models_the_account_may_use() {
         let catalog = Catalog::parse(&payload()).unwrap();
-        for unusable in ["text-embedding-3-small", "gpt-4.1", "claude-opus-9"] {
+        for unusable in ["text-embedding-3-small", "gpt-4.1"] {
             assert!(
                 catalog.get(unusable).is_none(),
                 "{unusable} must be excluded"
@@ -125,7 +130,7 @@ mod tests {
         );
         assert_eq!(
             catalog.selectable_ids(),
-            ["gpt-5-mini", "claude-sonnet-4.5"]
+            ["claude-opus-9", "gpt-5-mini", "claude-sonnet-4.5"]
         );
         assert_eq!(
             catalog.get("gpt-5-mini").unwrap().endpoints,

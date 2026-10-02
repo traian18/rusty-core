@@ -22,6 +22,7 @@ use crate::providers::{
     ProviderKey,
 };
 use crate::session_builder::{HarnessError, SessionBuilder, SessionHandle};
+use crate::tool_factory::build_executor_for;
 
 /// Public entry point for registering integrations and creating sessions.
 pub struct Harness {
@@ -363,7 +364,7 @@ impl Harness {
     ) -> Result<SessionHandle, HarnessError> {
         let registry = SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor = SessionBuilder::build_executor_for(descriptor, workspace.clone());
+            let executor = build_executor_for(descriptor, workspace.clone());
             let _ = registry.register(executor);
         }
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(registry);

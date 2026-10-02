@@ -4,6 +4,13 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// API version used by OpenCode's direct Copilot integration. It does not
+/// make the direct API's catalog equivalent to the Copilot CLI catalog.
+const COPILOT_API_VERSION: &str = "2026-06-01";
+// Custom OAuth apps need the developer integration route. Without this header
+// the same valid credential reaches Copilot's legacy-only model catalog.
+const COPILOT_INTEGRATION_ID: &str = "copilot-developer-cli";
+
 pub struct CopilotAuth {
     path: Option<PathBuf>,
     host: String,
@@ -34,7 +41,7 @@ impl CopilotAuth {
                     .map(|h| PathBuf::from(h).join(".copilot/config.json"))
             })
             .ok_or_else(|| error("Cannot locate Copilot sign-in."))?;
-        let data = std::fs::read_to_string(path).map_err(|_| {
+        let data = std::fs::read_to_string(&path).map_err(|_| {
             error("No Copilot credentials found. Sign in in Settings or set COPILOT_GITHUB_TOKEN.")
         })?;
         let data = data
@@ -44,6 +51,10 @@ impl CopilotAuth {
             .join("\n");
         let value: Value = serde_json::from_str(&data)
             .map_err(|_| error("Invalid Copilot credential configuration."))?;
+        if value["format"] == crate::credentials::CREDENTIAL_FORMAT {
+            return crate::credentials::load_token(&path, &self.host)
+                .map_err(|message| error(&message));
+        }
         let (account, token) = selected_credential(&value, &self.host)?;
         if let Some(token) = token {
             return Ok(token);
@@ -141,7 +152,15 @@ impl InferenceAuth for CopilotAuth {
             .map_err(|_| error("Invalid Copilot token."))?;
         bearer.set_sensitive(true);
         headers.insert(AUTHORIZATION, bearer);
+        headers.insert(
+            "copilot-integration-id",
+            HeaderValue::from_static(COPILOT_INTEGRATION_ID),
+        );
         headers.insert("user-agent", HeaderValue::from_static("rusty-harness/0.2"));
+        headers.insert(
+            "x-github-api-version",
+            HeaderValue::from_static(COPILOT_API_VERSION),
+        );
         headers.insert(
             "openai-intent",
             HeaderValue::from_static("conversation-edits"),
@@ -150,7 +169,7 @@ impl InferenceAuth for CopilotAuth {
         let user_initiated = messages
             .and_then(Value::as_array)
             .and_then(|m| m.last())
-            .is_some_and(|m| m["role"] == "user" && !contains_image(m));
+            .is_some_and(|m| m["role"] == "user" && !only_tool_results(m));
         headers.insert(
             "x-initiator",
             HeaderValue::from_static(if user_initiated { "user" } else { "agent" }),
@@ -160,6 +179,11 @@ impl InferenceAuth for CopilotAuth {
         }
         Ok(headers)
     }
+}
+fn only_tool_results(message: &Value) -> bool {
+    message["content"].as_array().is_some_and(|blocks| {
+        !blocks.is_empty() && blocks.iter().all(|block| block["type"] == "tool_result")
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -187,11 +211,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(headers["x-initiator"], "agent");
+        assert_eq!(headers["x-github-api-version"], COPILOT_API_VERSION);
         assert!(headers[AUTHORIZATION].is_sensitive());
         let headers = auth
             .headers(&serde_json::json!({"messages":[{"role":"user","content":"hello"}]}))
             .await
             .unwrap();
         assert_eq!(headers["x-initiator"], "user");
+        assert_eq!(headers["copilot-integration-id"], "copilot-developer-cli");
+        let headers = auth.headers(&serde_json::json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"image","source":{}}]}]}]})).await.unwrap();
+        assert_eq!(headers["x-initiator"], "agent");
+        assert_eq!(headers["copilot-vision-request"], "true");
+        let headers = auth.headers(&serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,fixture"}}]}]})).await.unwrap();
+        assert_eq!(headers["x-initiator"], "user");
+        assert_eq!(headers["copilot-vision-request"], "true");
     }
 }

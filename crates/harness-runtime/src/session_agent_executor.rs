@@ -176,6 +176,13 @@ impl IsolatedSessionAgentExecutor {
                 prompt.push_str(&format!("\n- [{}] {}", rejection.code, rejection.message));
             }
             prompt.push_str("\n</rejections>");
+            if request
+                .feedback
+                .iter()
+                .any(|item| item.code == "verification_failed")
+            {
+                prompt.push_str("\n\nRepair the work before handing it off again: inspect the code and tests named in each unmet criterion, implement the missing behavior, and rerun the relevant checks. Reconcile every failed or unverified criterion against the workspace. Passing existing tests alone does not satisfy a criterion whose behavior is still missing.");
+            }
             for continuation in request
                 .feedback
                 .iter()

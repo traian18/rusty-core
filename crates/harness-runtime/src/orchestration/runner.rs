@@ -378,14 +378,53 @@ impl OrchestrationRunner {
         })?;
         let step = state
             .steps
-            .get_mut(&node_id)
+            .get(&node_id)
             .ok_or_else(|| OrchestrationRuntimeError::Restore("failed step is missing".into()))?;
         if step.status != StepStatus::Failed {
             return Err(OrchestrationRuntimeError::Restore(
                 "checkpoint step is not failed".into(),
             ));
         }
-        if let Some(error) = step.error.take() {
+        let repair_target = match self.compiled.node(&node_id).map(|node| &node.kind) {
+            Some(OrchestrationNodeKind::Verify(config))
+                if state
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "verification_failed") =>
+            {
+                config.retry_target.clone()
+            }
+            _ => None,
+        };
+        let error = state
+            .steps
+            .get_mut(&node_id)
+            .and_then(|step| step.error.take());
+        let resumed_node = if let Some(target_id) = repair_target {
+            // An explicit continuation grants the repair target another attempt after its
+            // automatic retries have run out. Clear downstream results so the
+            // next review checks the repaired workspace, not stale output.
+            for span_node in &self.compiled.retry_spans[&node_id] {
+                let step = state
+                    .steps
+                    .get_mut(span_node)
+                    .expect("retry span step exists");
+                step.status = StepStatus::Pending;
+                step.output = None;
+                step.pending_permissions.clear();
+                if span_node != &target_id {
+                    step.checkpoint = None;
+                }
+            }
+            target_id
+        } else {
+            node_id
+        };
+        let step = state
+            .steps
+            .get_mut(&resumed_node)
+            .expect("resumed step exists");
+        if let Some(error) = error {
             step.feedback.push(error);
         }
         step.feedback.push(OrchestrationError::new("USER_CONTINUATION", format!(

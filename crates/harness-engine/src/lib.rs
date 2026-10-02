@@ -2,12 +2,14 @@
 
 //! High-level public harness and session API plus runtime composition.
 
+mod backend;
 pub mod builder;
 pub mod harness;
 pub mod orchestration;
 pub mod profiles;
 pub mod providers;
 pub mod session_builder;
+mod tool_factory;
 pub mod validation;
 
 pub use builder::HarnessBuilder;

@@ -2,83 +2,28 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
-use harness_protocol::backend::{
-    ExecutionError, ExecutionEvent, ExecutionRequest, ExecutionResult,
-};
+use crate::backend::{discovered_capability, BroadcastEventSink, ToolAdvertisingBackend};
+use crate::tool_factory::build_executor_for;
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::{PermissionId, SessionId};
-use harness_protocol::tools::{AgentToolset, PermissionMode, ToolCapability, ToolPolicy};
+use harness_protocol::tools::AgentToolset;
 use harness_runtime::session_client::{SessionClient, SessionSnapshot};
 use harness_runtime::session_manager::{SessionManager, SessionManagerError};
 use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
-use harness_runtime::traits::{EventSink, ExecutionBackend, ToolRegistry};
+use harness_runtime::traits::{ExecutionBackend, ToolRegistry};
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 
 pub use harness_skills::SkillsConfig;
 use harness_skills::{SkillCatalog, SkillsContextProvider};
-use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
-use harness_tool_git::{GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
 pub use harness_tool_mcp::{McpServerConfig, McpTransportConfig};
-use harness_tool_shell::ExecTool;
-use harness_tool_web::FetchTool;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
-
-struct BroadcastEventSink {
-    tx: broadcast::Sender<AgentEventEnvelope>,
-}
-
-/// Ensures tools configured on the public session builder are advertised to
-/// the backend even when the lower-level agent capability projection is empty.
-struct ToolAdvertisingBackend {
-    inner: Arc<dyn ExecutionBackend>,
-    tools: Vec<harness_protocol::tools::ToolDescriptor>,
-    selection: Option<harness_protocol::backend::PersistedBackendSelection>,
-}
-
-#[async_trait]
-impl ExecutionBackend for ToolAdvertisingBackend {
-    fn descriptor(&self) -> harness_protocol::backend::BackendDescriptor {
-        let mut descriptor = self.inner.descriptor();
-        if let Some(selection) = &self.selection {
-            descriptor.name = format!(
-                "{} [{}:{}]",
-                descriptor.name, selection.provider, selection.provider_model_id
-            );
-        }
-        descriptor
-    }
-
-    fn capabilities(&self) -> harness_protocol::backend::BackendCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn execute(
-        &self,
-        mut request: ExecutionRequest,
-        sink: broadcast::Sender<ExecutionEvent>,
-        cancel: CancellationToken,
-    ) -> Result<ExecutionResult, ExecutionError> {
-        if request.tools.is_empty() {
-            request.tools = self.tools.clone();
-        }
-        self.inner.execute(request, sink, cancel).await
-    }
-}
-
-impl EventSink for BroadcastEventSink {
-    fn send(&self, envelope: AgentEventEnvelope) {
-        let _ = self.tx.send(envelope);
-    }
-}
 
 /// Errors raised while configuring or operating a session.
 #[derive(Debug, thiserror::Error)]
@@ -124,35 +69,6 @@ pub enum HarnessError {
 struct PendingIntegration {
     id: String,
     config: serde_json::Value,
-}
-
-/// Projects a tool executor's descriptor into the protocol-level
-/// [`ToolCapability`] the root agent's toolset carries.
-///
-/// Shared by every path in [`SessionBuilder::start`] that turns registered
-/// executors into capabilities — MCP tools, skill tools, and the
-/// derive-from-registry fallback — so all three agree on the id, the
-/// `name`-is-the-tool-id convention, and the default policy.
-fn discovered_capability(
-    descriptor: harness_tools::ToolDescriptor,
-) -> (harness_protocol::ids::ToolId, ToolCapability) {
-    let id = harness_protocol::ids::ToolId::new();
-    (
-        id,
-        ToolCapability {
-            descriptor: harness_protocol::tools::ToolDescriptor {
-                id,
-                name: descriptor.id.to_string(),
-                description: descriptor.description,
-                input_schema: descriptor.input_schema,
-            },
-            policy: ToolPolicy {
-                permission: PermissionMode::Allow,
-                enabled: true,
-            },
-            delegatable: false,
-        },
-    )
 }
 
 /// Fluent builder for direct or registry-backed sessions.
@@ -469,7 +385,7 @@ impl SessionBuilder {
         // 1. Register all tool executors into the registry.
         let registry = harness_runtime::traits::SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor = Self::build_executor_for(descriptor, workspace.clone());
+            let executor = build_executor_for(descriptor, workspace.clone());
             let _ = registry.register(executor);
         }
 
@@ -478,42 +394,6 @@ impl SessionBuilder {
         self.root_toolset = Some(toolset);
         self.workspace = Some(workspace);
         self
-    }
-
-    /// Build the appropriate executor for a given tool descriptor.
-    ///
-    /// Maps known descriptor name strings to concrete tool implementations.
-    pub(crate) fn build_executor_for(
-        descriptor: &harness_protocol::tools::ToolDescriptor,
-        workspace: Arc<dyn harness_runtime::traits::Workspace>,
-    ) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
-        match descriptor.name.as_str() {
-            "fs.read" => Arc::new(ReadTool::new(workspace)),
-            "fs.edit" => Arc::new(EditTool::new(workspace)),
-            "workspace.search" => Arc::new(SearchTool::new(workspace)),
-            "shell.exec" => Arc::new(ExecTool::new()),
-            // Git tools resolve the repo directly from the workspace root
-            // via git2::Repository::discover — they don't go through the
-            // Workspace trait's virtual filesystem access.
-            "git.status" => Arc::new(GitStatusTool::new(workspace.root().to_path_buf())),
-            "git.diff" => Arc::new(GitDiffTool::new(workspace.root().to_path_buf())),
-            "git.log" => Arc::new(GitLogTool::new(workspace.root().to_path_buf())),
-            "git.show" => Arc::new(GitShowTool::new(workspace.root().to_path_buf())),
-            "web_fetch" => Arc::new(FetchTool::new()),
-            _ => {
-                // Create a fallback that always fails
-                // Convert protocol descriptor to harness-tools descriptor
-                let tool_desc = harness_tools::ToolDescriptor {
-                    id: harness_tools::ToolId::new(&descriptor.name),
-                    name: descriptor.name.clone(),
-                    description: descriptor.description.clone(),
-                    input_schema: descriptor.input_schema.clone(),
-                };
-                Arc::new(harness_tools::UnknownTool {
-                    descriptor: tool_desc,
-                })
-            }
-        }
     }
 
     /// Resolve configuration and create the live session.

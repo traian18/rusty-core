@@ -21,6 +21,7 @@ harness-model = { path = "../../harness-model" }
 harness-generic-backend = { path = "../../harness-generic-backend" }
 harness-integration-openai = { path = "../openai" }
 harness-integration-openai-responses = { path = "../openai-responses" }
+harness-integration-anthropic = { path = "../anthropic" }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

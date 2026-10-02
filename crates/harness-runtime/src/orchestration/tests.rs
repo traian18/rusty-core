@@ -282,6 +282,44 @@ async fn persistent_verification_failure_fails_the_run() {
 }
 
 #[tokio::test]
+async fn explicit_continuation_repairs_a_failed_verification_from_build() {
+    let agent = ScriptedAgent::new(vec![
+        ok(report("blocked")),
+        ok(report("failed")),
+        ok(report("completed")),
+    ]);
+    let runner = runner(agent.clone());
+    let failed = runner
+        .run(run_id("verify-failed"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(failed.state.failed_step, Some(node("verify")));
+
+    let resumed = runner
+        .retry_failed(
+            failed.state,
+            run_id("verify-continued"),
+            "fix the remaining work".into(),
+        )
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(resumed.state.status, OrchestrationStatus::Completed);
+    let requests = agent.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].node_id, node("execute"));
+    assert!(requests[2]
+        .feedback
+        .iter()
+        .any(|error| error.code == "verification_failed"));
+    assert!(requests[2]
+        .feedback
+        .iter()
+        .any(|error| error.message.contains("fix the remaining work")));
+}
+
+#[tokio::test]
 async fn unresolvable_artifacts_fail_verification() {
     struct Missing;
     #[async_trait]
