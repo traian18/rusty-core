@@ -112,6 +112,9 @@ impl OrchestrationRunState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepRun {
+    /// Durable task progress. Kept on a retry of this step, cleared when an upstream step is invalidated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Value>,
     pub status: StepStatus,
     /// Every attempt, in order. Never overwritten on retry.
     pub attempts: Vec<StepAttempt>,
@@ -130,6 +133,7 @@ pub struct StepRun {
 impl Default for StepRun {
     fn default() -> Self {
         Self {
+            checkpoint: None,
             status: StepStatus::Pending,
             attempts: Vec::new(),
             output: None,
@@ -264,6 +268,11 @@ pub mod error_codes {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrchestrationCommand {
+    RecordCheckpoint {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        value: Value,
+    },
     Start {
         input: Value,
     },
@@ -329,6 +338,12 @@ pub enum OrchestrationEffect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrchestrationEvent {
+    TaskProgress {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        completed: usize,
+        total: usize,
+    },
     RunStarted,
     RunRestored,
     RunPaused,
@@ -506,6 +521,23 @@ pub fn apply(
         ));
     }
     match command {
+        OrchestrationCommand::RecordCheckpoint {
+            node_id,
+            attempt,
+            value,
+        } => {
+            let completed = value["completed"].as_array().map_or(0, Vec::len);
+            let total = value["plan"]["tasks"].as_array().map_or(0, Vec::len);
+            active_attempt_mut(compiled, state, &node_id, attempt)?.checkpoint = Some(value);
+            Ok(vec![OrchestrationEffect::Emit(
+                OrchestrationEvent::TaskProgress {
+                    node_id,
+                    attempt,
+                    completed,
+                    total,
+                },
+            )])
+        }
         OrchestrationCommand::Start { input } => start(compiled, state, input),
         OrchestrationCommand::StepAdmitted { node_id, attempt } => {
             admit(compiled, state, node_id, attempt)
@@ -818,6 +850,9 @@ fn fail(
                     let step = state.steps.get_mut(span_node).expect("span step exists");
                     step.status = StepStatus::Pending;
                     step.output = None;
+                    if span_node != target_id {
+                        step.checkpoint = None;
+                    }
                 }
                 let target_step = state.steps.get_mut(target_id).expect("target step exists");
                 target_step.status = StepStatus::RetryScheduled;

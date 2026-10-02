@@ -34,6 +34,7 @@ enum Behavior {
     Gate(Arc<Notify>, Value),
     /// Block until cancelled and record that cancellation arrived.
     AwaitCancel(Arc<AtomicBool>),
+    ExhaustUsage,
 }
 
 #[derive(Default)]
@@ -77,6 +78,16 @@ impl AgentStepExecutor for ScriptedAgent {
             .expect("scripted behavior");
         let value = match behavior {
             Behavior::Return(result) => result?,
+            Behavior::ExhaustUsage => {
+                context.signal(StepSignal::Usage(
+                    harness_core::orchestration::UsageSummary {
+                        model_requests: 2,
+                        ..Default::default()
+                    },
+                ));
+                context.cancellation.cancelled().await;
+                return Err(AgentExecutionError::new("cancelled", "budget cancelled"));
+            }
             Behavior::AskPermission(value) => {
                 context.signal(StepSignal::PermissionRequested {
                     permission_id: "perm-1".into(),
@@ -733,7 +744,7 @@ mod isolated_session {
     use harness_protocol::{
         backend::{
             BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent,
-            ExecutionRequest, ExecutionResult, ResponseFormat,
+            ExecutionRequest, ExecutionResult,
         },
         ids::{RequestId, SessionId},
         usage::{Cost, ModelUsage},
@@ -847,6 +858,168 @@ mod isolated_session {
         }
     }
 
+    struct QueueBackend {
+        replies: Mutex<VecDeque<Value>>,
+        requests: Arc<Mutex<Vec<ExecutionRequest>>>,
+    }
+    #[async_trait]
+    impl ExecutionBackend for QueueBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            FakeBackend::new().descriptor()
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            FakeBackend::new().capabilities()
+        }
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected model call");
+            let request_id = request.request_id;
+            let result = ExecutionResult {
+                request_id,
+                usage: ModelUsage::default(),
+                cost: Cost::default(),
+                finish_reason: "end_turn".into(),
+            };
+            FakeBackend::new()
+                .with_events(vec![
+                    ExecutionEvent::TextDelta {
+                        request_id,
+                        delta: reply.to_string(),
+                    },
+                    ExecutionEvent::Completed {
+                        request_id,
+                        result: result.clone(),
+                    },
+                ])
+                .with_result(result)
+                .execute(request, sink, cancel)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn task_queue_repairs_and_resumes_without_repeating_accepted_tasks() {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskQueueConfig},
+        };
+        let built = json!({"status":"complete","summary":"implemented"});
+        let reviewed = |id: &str| json!({"status":"complete","summary":"inspected actual code","criteria":[{"id":id,"evidence":"file.rs:12 implements behavior"}]});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(SessionId::new(), Arc::new(QueueBackend {
+            requests: requests.clone(),
+            replies: Mutex::new(vec![built.clone(), reviewed("C1"), built.clone(), json!({"status":"needs_repair","summary":"missing edge case","criteria":[]}), json!({"status":"blocked_user","summary":"access denied"}), built, reviewed("C2")].into()),
+        }), Arc::new(FakeToolRegistry::new()), Arc::new(FakeWorkspace::new()), Arc::new(NoopSink)));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: ProfileRef {
+                        id: "rusty.default".into(),
+                        revision: None,
+                    },
+                    review_instructions: "Inspect the task criteria.".into(),
+                    max_repairs: 2,
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.output_schema = Some(definition.output_contract.schema.clone());
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"two changes","plan":{"status":"ready","summary":"two tasks","requirements":[{"id":"R1","text":"both changes","criteria":[{"id":"C1","text":"first"},{"id":"C2","text":"second"}]}],"tasks":[{"id":"T1","instructions":"first","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]},{"id":"T2","instructions":"second","requirement_ids":["R1"],"criterion_ids":["C2"],"depends_on":["T1"]}]}});
+        let failed = runner
+            .start(run_id("queue-first"), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.state.status,
+            OrchestrationStatus::Failed,
+            "{:?}",
+            failed.result
+        );
+        let checkpoint = failed.state.steps[&node("execute")]
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(checkpoint["completed"].as_array().unwrap().len(), 1);
+        assert_eq!(checkpoint["current"]["task_id"], "T2");
+        let saved = serde_json::from_value(serde_json::to_value(&failed.state).unwrap()).unwrap();
+        let continued = runner
+            .retry_failed(
+                saved,
+                run_id("queue-resumed"),
+                "environment fixed; continue".into(),
+            )
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(
+            continued.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            continued.result
+        );
+        assert_eq!(
+            continued.result.output.as_ref().unwrap()["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            7,
+            "one task review, local repair, then resume only second task"
+        );
+        let session_ids: std::collections::HashSet<_> = sent.iter().map(|r| r.run_id).collect();
+        assert_eq!(
+            session_ids.len(),
+            7,
+            "every builder/reviewer has a fresh run"
+        );
+        assert!(prompt_of(&sent[4]).contains("missing edge case"));
+        assert!(prompt_of(&sent[5]).contains("access denied"));
+    }
+
     /// Runs the default workflow with its agent step in `mode`, against a
     /// backend that advertises native structured output, and returns the
     /// model requests the step made.
@@ -947,8 +1120,8 @@ mod isolated_session {
             assert_eq!(request.params.response_format, None);
             let prompt = prompt_of(&request);
             assert!(
-                prompt.contains("matching this JSON Schema"),
-                "the schema travels in the prompt instead: {prompt}"
+                prompt.contains("plain Markdown, not JSON") && !prompt.contains("JSON Schema"),
+                "the reply layout travels in the prompt instead: {prompt}"
             );
         }
     }
@@ -963,18 +1136,13 @@ mod isolated_session {
         }
     }
 
+    /// Object schemas are answered in Markdown, so even a backend with
+    /// native structured output is not asked for JSON.
     #[tokio::test]
-    async fn fallback_steps_still_use_the_native_schema_when_the_backend_has_one() {
+    async fn fallback_steps_ask_for_markdown_even_when_the_backend_has_native_schemas() {
         for request in requests_sent(StructuredOutputMode::HostValidatedFallback).await {
-            assert!(
-                matches!(
-                    request.params.response_format,
-                    Some(ResponseFormat::JsonSchema { strict: true, .. })
-                ),
-                "{:?}",
-                request.params.response_format
-            );
-            assert!(!prompt_of(&request).contains("matching this JSON Schema"));
+            assert_eq!(request.params.response_format, None);
+            assert!(prompt_of(&request).contains("plain Markdown, not JSON"));
         }
     }
 }
@@ -1074,4 +1242,55 @@ async fn explicit_retry_rejects_changed_definitions_and_successful_runs() {
         .retry_failed(completed, run_id("next"), "continue".into())
         .is_err());
     assert_eq!(agent.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn live_usage_budget_stops_a_long_running_queue_step() {
+    let mut definition = default_orchestration_definition();
+    definition.policies.max_model_requests = Some(2);
+    let runner = OrchestrationRunner::new(
+        compiled(definition),
+        ScriptedAgent::new(vec![Behavior::ExhaustUsage]),
+    )
+    .with_available_tools(Vec::<String>::new());
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        runner.start(run_id("live-budget"), input()).unwrap().wait(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Failed);
+    assert_eq!(
+        output.result.error.unwrap().code,
+        error_codes::BUDGET_EXHAUSTED
+    );
+}
+
+#[test]
+fn acceptance_rejects_missing_and_failed_requirements_but_not_renamed_ids() {
+    let plan = json!({"requirements":[{"criteria":[{"id":"C1"},{"id":"C2"}]}]});
+    let pass = json!({"id":"C1","status":"pass","evidence":"observed behavior"});
+    let second = json!({"id":"C2","status":"pass","evidence":"regression test passed"});
+    let coverage =
+        |results: Value| super::steps::requirement_coverage(Some(&plan), Some(&results)).0;
+    assert!(!coverage(json!([pass])));
+    assert!(!coverage(json!([pass, pass])));
+    assert!(!coverage(
+        json!([pass,{"id":"C2","status":"fail","evidence":"defect"}])
+    ));
+    assert!(coverage(json!([pass, second])));
+    // IDs are matched loosely, and results numbered another way answer in order.
+    assert!(coverage(json!([
+        {"id":"c-1","status":"pass","evidence":"observed behavior"},
+        {"id":"C-2","status":"pass","evidence":"regression test passed"}
+    ])));
+    assert!(coverage(json!([
+        {"id":"1","status":"pass","evidence":"observed behavior"},
+        {"id":"2","status":"pass","evidence":"regression test passed"}
+    ])));
+    assert!(!coverage(json!([
+        {"id":"1","status":"pass","evidence":"observed behavior"},
+        {"id":"2","status":"fail","evidence":"defect"}
+    ])));
 }

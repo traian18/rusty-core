@@ -33,10 +33,10 @@ pub fn default_orchestration_definition() -> OrchestrationDefinition {
                 name: "execution_report".into(),
                 schema: report_schema.clone(),
             },
-            source: OutputBinding::NodeOutput {
+            source: Some(OutputBinding::NodeOutput {
                 node_id: execute.clone(),
                 pointer: String::new(),
-            },
+            }),
             strict: true,
         },
         nodes: vec![
@@ -54,6 +54,7 @@ pub fn default_orchestration_definition() -> OrchestrationDefinition {
                 id: execute.clone(),
                 name: "Execute".into(),
                 kind: OrchestrationNodeKind::Agent(AgentNodeConfig {
+                    task_queue: None,
                     instructions: "Complete the user's request and return the execution report."
                         .into(),
                     tools: ToolScope::Inherit,

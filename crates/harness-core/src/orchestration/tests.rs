@@ -1064,3 +1064,13 @@ fn recovery_rejects_a_different_definition() {
         "definition_hash_mismatch"
     );
 }
+
+#[test]
+fn an_output_contract_is_optional() {
+    let mut value = serde_json::to_value(default_orchestration_definition()).unwrap();
+    value.as_object_mut().unwrap().remove("output_contract");
+    let definition: OrchestrationDefinition = serde_json::from_value(value).unwrap();
+    assert!(definition.output_contract.source.is_none());
+    assert!(!definition.output_contract.strict);
+    compile(definition).expect("compiles without a contract");
+}

@@ -8,7 +8,7 @@
 
 mod runner;
 mod schema;
-mod steps;
+pub(crate) mod steps;
 mod store;
 
 pub use runner::{

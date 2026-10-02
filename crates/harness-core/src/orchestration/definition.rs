@@ -67,6 +67,8 @@ pub struct OrchestrationDefinition {
     pub status: DefinitionStatus,
     #[serde(default)]
     pub input_schema: Option<SchemaReference>,
+    /// Optional: by default the result is the text of the output node.
+    #[serde(default)]
     pub output_contract: OutputContract,
     pub nodes: Vec<OrchestrationNode>,
     pub edges: Vec<OrchestrationEdge>,
@@ -121,8 +123,19 @@ pub struct InputNodeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskQueueConfig {
+    /// Pointer to a typed requirement/task plan in the bound input.
+    pub plan_pointer: String,
+    pub review_profile: crate::behavior::ProfileRef,
+    pub review_instructions: String,
+    pub max_repairs: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentNodeConfig {
     pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_queue: Option<TaskQueueConfig>,
     /// Tools visible to and executable by this step. Missing means `none`:
     /// a step never gains tools it did not declare.
     #[serde(default)]
@@ -200,6 +213,11 @@ pub struct VerifyNodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VerificationCheck {
+    /// Every expected acceptance criterion has exactly one passing, evidenced result.
+    RequirementsSatisfied {
+        plan_pointer: String,
+        results_pointer: String,
+    },
     /// Every bound upstream output conforms to its producer's output schema.
     Schema,
     /// The string at `pointer` equals `equals`.
@@ -215,6 +233,7 @@ pub enum VerificationCheck {
 impl VerificationCheck {
     pub fn id(&self) -> String {
         match self {
+            Self::RequirementsSatisfied { .. } => "requirements_satisfied".into(),
             Self::Schema => "schema".into(),
             Self::RequiredStatus { pointer, .. } => format!("required_status:{pointer}"),
             Self::ArtifactExists { pointer } => format!("artifact_exists:{pointer}"),
@@ -268,9 +287,26 @@ pub enum OutputBinding {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputContract {
     pub schema: SchemaReference,
-    pub source: OutputBinding,
+    /// Which node produces the result; omitted, it is the output node's own
+    /// source (the usual case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<OutputBinding>,
     #[serde(default = "default_true")]
     pub strict: bool,
+}
+
+impl Default for OutputContract {
+    /// A written result, taken from the output node and not schema-checked.
+    fn default() -> Self {
+        Self {
+            schema: SchemaReference::Inline {
+                name: "result".into(),
+                schema: serde_json::json!({"type": "string"}),
+            },
+            source: None,
+            strict: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -831,8 +831,56 @@ impl RunLoop {
             return Ok(());
         };
         match signal {
+            StepSignal::Checkpoint { value, committed } => {
+                let node_id = active.node_id.clone();
+                let attempt = active.attempt;
+                let result = self
+                    .apply(OrchestrationCommand::RecordCheckpoint {
+                        node_id,
+                        attempt,
+                        value,
+                    })
+                    .await;
+                let _ = committed.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                result?;
+            }
             StepSignal::Delegated(delegated) => active.delegated = Some(delegated),
-            StepSignal::Usage(usage) => active.usage = usage,
+            StepSignal::Usage(usage) => {
+                active.usage = usage;
+                let mut total = self.state.usage.clone();
+                total.add(&active.usage);
+                let policies = &self.runner.compiled.definition.policies;
+                let exhausted = [
+                    (
+                        "model request",
+                        policies.max_model_requests,
+                        total.model_requests,
+                    ),
+                    ("tool call", policies.max_tool_calls, total.tool_calls),
+                    ("token", policies.max_tokens, total.tokens),
+                ]
+                .into_iter()
+                .find(|(_, limit, used)| limit.is_some_and(|limit| *used >= limit));
+                let message = exhausted
+                    .map(|(name, limit, used)| {
+                        format!(
+                            "{name} budget of {} exhausted ({used} used)",
+                            limit.unwrap()
+                        )
+                    })
+                    .or_else(|| {
+                        policies
+                            .max_cost_usd
+                            .filter(|limit| total.cost_usd >= *limit)
+                            .map(|limit| format!("cost budget of ${limit} exhausted"))
+                    });
+                if let Some(message) = message {
+                    self.apply(OrchestrationCommand::Abort {
+                        error: OrchestrationError::new(error_codes::BUDGET_EXHAUSTED, message),
+                    })
+                    .await?;
+                }
+            }
             StepSignal::Agent(envelope) => {
                 let correlation = self.correlation(self.active.as_ref().expect("active"));
                 let _ =
@@ -926,7 +974,45 @@ impl RunLoop {
         while let Ok(signal) = active.signals.try_recv() {
             match signal {
                 StepSignal::Delegated(delegated) => active.delegated = Some(delegated),
-                StepSignal::Usage(usage) => active.usage = usage,
+                StepSignal::Usage(usage) => {
+                    active.usage = usage;
+                    let mut total = self.state.usage.clone();
+                    total.add(&active.usage);
+                    let policies = &self.runner.compiled.definition.policies;
+                    let exhausted = [
+                        (
+                            "model request",
+                            policies.max_model_requests,
+                            total.model_requests,
+                        ),
+                        ("tool call", policies.max_tool_calls, total.tool_calls),
+                        ("token", policies.max_tokens, total.tokens),
+                    ]
+                    .into_iter()
+                    .find(|(_, limit, used)| limit.is_some_and(|limit| *used >= limit));
+                    let message = exhausted
+                        .map(|(name, limit, used)| {
+                            format!(
+                                "{name} budget of {} exhausted ({used} used)",
+                                limit.unwrap()
+                            )
+                        })
+                        .or_else(|| {
+                            policies
+                                .max_cost_usd
+                                .filter(|limit| total.cost_usd >= *limit)
+                                .map(|limit| format!("cost budget of ${limit} exhausted"))
+                        });
+                    if let Some(message) = message {
+                        self.apply(OrchestrationCommand::Abort {
+                            error: OrchestrationError::new(error_codes::BUDGET_EXHAUSTED, message),
+                        })
+                        .await?;
+                    }
+                }
+                StepSignal::Checkpoint { committed, .. } => {
+                    let _ = committed.send(Err("attempt ended before checkpoint commit".into()));
+                }
                 StepSignal::Agent(_) | StepSignal::PermissionRequested { .. } => {}
             }
         }
@@ -1060,6 +1146,8 @@ impl StepJob {
                 };
                 details.tools = Some(tools.clone());
                 let request = AgentStepRequest {
+                    task_queue: config.task_queue.clone(),
+                    checkpoint: self.state.steps[&self.node.id].checkpoint.clone(),
                     run_id: self.state.run_id.clone(),
                     node_id: self.node.id.clone(),
                     attempt: self.attempt,

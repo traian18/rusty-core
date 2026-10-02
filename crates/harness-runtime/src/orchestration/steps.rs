@@ -27,6 +27,8 @@ use super::schema::{SchemaResolver, SchemaValidator};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentStepRequest {
+    pub task_queue: Option<harness_core::orchestration::TaskQueueConfig>,
+    pub checkpoint: Option<Value>,
     pub run_id: OrchestrationRunId,
     pub node_id: OrchestrationNodeId,
     pub attempt: u32,
@@ -94,8 +96,12 @@ impl From<AgentExecutionError> for OrchestrationError {
 }
 
 /// Observations an executor reports while an attempt is in flight.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum StepSignal {
+    Checkpoint {
+        value: Value,
+        committed: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// The session/agent/run executing the attempt. Sent as soon as known so
     /// even failed or cancelled attempts are correlated.
     Delegated(DelegatedRunRef),
@@ -142,6 +148,20 @@ impl StepContext {
         let (signals, _) = mpsc::unbounded_channel();
         let (_, permissions) = mpsc::unbounded_channel();
         Self::new(cancellation, signals, permissions)
+    }
+
+    pub async fn checkpoint(&self, value: Value) -> Result<(), AgentExecutionError> {
+        let (committed, ack) = tokio::sync::oneshot::channel();
+        self.signals
+            .send(StepSignal::Checkpoint { value, committed })
+            .map_err(|_| {
+                AgentExecutionError::new("checkpoint_failed", "workflow stopped before checkpoint")
+            })?;
+        ack.await
+            .map_err(|_| {
+                AgentExecutionError::new("checkpoint_failed", "checkpoint was not committed")
+            })?
+            .map_err(|error| AgentExecutionError::new("checkpoint_failed", error))
     }
 
     pub fn signal(&self, signal: StepSignal) {
@@ -353,6 +373,10 @@ pub(crate) async fn execute_verify(
     let mut evidence = Vec::new();
     for check in &config.checks {
         let (passed, detail) = match check {
+            VerificationCheck::RequirementsSatisfied {
+                plan_pointer,
+                results_pointer,
+            } => requirement_coverage(input.pointer(plan_pointer), input.pointer(results_pointer)),
             VerificationCheck::Schema => {
                 let mut issues = Vec::new();
                 for binding in &node.input_bindings {
@@ -448,12 +472,93 @@ pub(crate) async fn execute_verify(
     });
     let result = if issues.is_empty() {
         Ok(report)
+    } else if input
+        .get("check")
+        .and_then(|v| v.get("verdict"))
+        .and_then(Value::as_str)
+        .is_some_and(|v| v.starts_with("blocked_environment:") || v.starts_with("blocked_user:"))
+    {
+        Err(OrchestrationError::new(
+            "verification_blocked",
+            input["check"]["summary"]
+                .as_str()
+                .unwrap_or("Verification blocked"),
+        ))
     } else {
         Err(OrchestrationError::retryable(
             "verification_failed",
-            issues.join("; "),
+            format!(
+                "{}\n\n{}",
+                issues.join("; "),
+                crate::markdown_reply::render_input(
+                    &json!({"criteria": input["check"]["criteria"]})
+                )
+            ),
             RetryReason::VerificationFailed,
         ))
     };
     (result, evidence)
+}
+
+/// Which result answers which expected criterion. IDs are matched loosely
+/// (`C-1`, `c1` and `C1` are one); when the results carry none of the expected
+/// IDs (a reply that numbered them its own way) the same number of results
+/// answers the criteria in order.
+pub(crate) fn match_results<'a>(
+    expected: &[&str],
+    results: &'a [Value],
+    id_of: impl Fn(&Value) -> Option<&str>,
+) -> Vec<Option<&'a Value>> {
+    let key = |id: &str| {
+        id.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let by_id: Vec<Option<&Value>> = expected
+        .iter()
+        .map(|id| {
+            results
+                .iter()
+                .find(|result| id_of(result).is_some_and(|found| key(found) == key(id)))
+        })
+        .collect();
+    if by_id.iter().all(Option::is_none) && results.len() == expected.len() {
+        return results.iter().map(Some).collect();
+    }
+    by_id
+}
+
+/// A missing or failed criterion must never be mistaken for acceptance.
+pub(crate) fn requirement_coverage(
+    plan: Option<&Value>,
+    results: Option<&Value>,
+) -> (bool, String) {
+    let expected: Vec<_> = plan
+        .and_then(|p| p["requirements"].as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r["criteria"].as_array().into_iter().flatten())
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    let Some(results) = results.and_then(Value::as_array) else {
+        return (false, "criterion results are missing".into());
+    };
+    let matched = match_results(&expected, results, |r| r["id"].as_str());
+    let passed = !expected.is_empty()
+        && matched.iter().all(|result| {
+            result.is_some_and(|r| {
+                r["status"] == "pass"
+                    && r["evidence"].as_str().is_some_and(|s| !s.trim().is_empty())
+            })
+        });
+    (
+        passed,
+        if passed {
+            "all acceptance criteria have passing evidence"
+        } else {
+            "missing, failed or unevidenced acceptance criteria"
+        }
+        .into(),
+    )
 }

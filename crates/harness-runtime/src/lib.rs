@@ -18,6 +18,7 @@ pub mod agent_supervisor;
 pub mod cancellation;
 mod completion_gate;
 pub mod integration;
+mod markdown_reply;
 pub mod orchestration;
 pub mod permissions;
 pub mod resource_manager;
@@ -30,6 +31,7 @@ pub mod session_client;
 pub mod session_manager;
 pub mod session_runtime;
 pub mod spawn_tool;
+mod task_queue;
 pub mod traits;
 pub mod workspace;
 

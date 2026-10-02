@@ -182,6 +182,21 @@ pub fn compile(
             );
         }
         if let OrchestrationNodeKind::Agent(config) = &node.kind {
+            if let Some(queue) = &config.task_queue {
+                validate_pointer(
+                    &queue.plan_pointer,
+                    &format!("{path}.config.task_queue.plan_pointer"),
+                    &mut issues,
+                );
+                if queue.max_repairs > 5 || queue.review_instructions.trim().is_empty() {
+                    issue(
+                        &mut issues,
+                        format!("{path}.config.task_queue"),
+                        "invalid_task_queue",
+                        "task queues require reviewer instructions and at most five repairs",
+                    );
+                }
+            }
             if config.instructions.trim().is_empty() {
                 issue(
                     &mut issues,
@@ -566,6 +581,17 @@ fn validate_data_flow(
                 }
                 for check in &config.checks {
                     let pointer = match check {
+                        VerificationCheck::RequirementsSatisfied {
+                            plan_pointer,
+                            results_pointer,
+                        } => {
+                            validate_pointer(
+                                plan_pointer,
+                                &format!("nodes.{}.config.checks", node.id),
+                                issues,
+                            );
+                            results_pointer
+                        }
                         VerificationCheck::Schema => {
                             let has_schema = node.input_bindings.iter().any(|binding| {
                                 matches!(&binding.source, OutputBinding::NodeOutput { node_id, .. }
@@ -596,7 +622,9 @@ fn validate_data_flow(
         }
     }
 
-    let source = &definition.output_contract.source;
+    let Some(source) = &definition.output_contract.source else {
+        return;
+    };
     validate_pointer(
         binding_pointer(source),
         "output_contract.source.pointer",
