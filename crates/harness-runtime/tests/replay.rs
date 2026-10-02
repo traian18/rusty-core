@@ -237,6 +237,7 @@ fn event_variant_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCallDenied { .. } => "ToolCallDenied",
         AgentEvent::ProfileChanged { .. } => "ProfileChanged",
         AgentEvent::CompletionGateEvaluated { .. } => "CompletionGateEvaluated",
+        AgentEvent::ModelRequestPrepared { .. } => "ModelRequestPrepared",
     }
 }
 
@@ -306,6 +307,7 @@ fn event_matches_pattern(event: &AgentEvent, pattern: &EventPattern) -> bool {
         | AgentEvent::ContextInjected { .. }
         | AgentEvent::ToolCallDenied { .. }
         | AgentEvent::CompletionGateEvaluated { .. }
+        | AgentEvent::ModelRequestPrepared { .. }
         | AgentEvent::ProfileChanged { .. } => true,
     }
 }

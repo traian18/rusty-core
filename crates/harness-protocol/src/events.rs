@@ -103,6 +103,11 @@ pub struct AgentEventEnvelope {
 /// child-agent activity, and final outcomes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentEvent {
+    /// Opt-in diagnostic at the common dispatch boundary. Never durable in
+    /// the session store; hosts must redact before persisting trajectories.
+    ModelRequestPrepared {
+        request: Box<crate::backend::ExecutionRequest>,
+    },
     /// The agent's status changed (e.g. `Idle` → `PreparingContext`).
     StateChanged {
         /// The previous status.

@@ -99,6 +99,7 @@ fn log_summary(event: &AgentEvent) -> Option<String> {
             call_id, reason, ..
         } => Some(format!("tool call denied {call_id:?}: {reason}")),
         AgentEvent::ProfileChanged { from, to } => Some(format!("profile {from} → {to}")),
+        AgentEvent::ModelRequestPrepared { .. } => Some("model request prepared".to_owned()),
         AgentEvent::CompletionGateEvaluated {
             attempt,
             passed,
@@ -619,6 +620,7 @@ impl AppState {
             }),
             AgentEvent::BehaviorRuleFired { .. }
             | AgentEvent::ContextInjected { .. }
+            | AgentEvent::ModelRequestPrepared { .. }
             | AgentEvent::CompletionGateEvaluated { .. } => {}
         }
 

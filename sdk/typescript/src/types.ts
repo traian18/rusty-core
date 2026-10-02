@@ -174,6 +174,8 @@ export type AgentEvent =
   | { StateChanged: { from: AgentStatus; to: AgentStatus } }
   | { RunStarted: { run_id: RunId } }
   | { BackendRequestStarted: { request_id: RequestId } }
+  /** Opt-in, ephemeral effective request trace; redact before persistence. */
+  | { ModelRequestPrepared: { request: Record<string, unknown> } }
   | { AssistantMessageStarted: { message_id: MessageId } }
   | { AssistantTextDelta: { message_id: MessageId; delta: string } }
   | { ReasoningDelta: { message_id: MessageId; delta: string } }

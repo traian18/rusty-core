@@ -105,6 +105,7 @@ pub fn replay_snapshot(
             | AgentEvent::ContextInjected { .. }
             | AgentEvent::ToolCallDenied { .. }
             | AgentEvent::CompletionGateEvaluated { .. }
+            | AgentEvent::ModelRequestPrepared { .. }
             | AgentEvent::ProfileChanged { .. } => {}
         }
 

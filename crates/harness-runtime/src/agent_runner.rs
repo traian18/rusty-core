@@ -827,6 +827,15 @@ impl AgentRunner {
             return;
         }
 
+        if request.params.provider_options["rusty"]["trace_model_requests"] == true
+            && !self
+                .emit(AgentEvent::ModelRequestPrepared {
+                    request: Box::new(request.clone()),
+                })
+                .await
+        {
+            return;
+        }
         let backend_id = self.backend.descriptor().id;
         let run_id = request.run_id;
         let request_id = request.request_id;
