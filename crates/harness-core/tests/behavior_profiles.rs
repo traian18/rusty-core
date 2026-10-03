@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use harness_core::agent::Agent;
 use harness_core::behavior::{
     default_profile_definition, BehaviorProfile, ExecutionOverlay, Limits, ProfileId, ToolOverride,
-    ToolPermission,
+    ToolPermission, FINAL_TURN_GRACE,
 };
 use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
 use harness_core::orchestration::ToolScope;
@@ -369,9 +369,16 @@ fn tool_calls_after_the_final_turn_fail_the_run() {
     let (run_id, first) = start(&mut agent);
     assert!(first.tools.is_empty(), "a one-turn run offers no tools");
 
-    let (call_id, effects) = request_tool(&mut agent, run_id, "fs.read");
-    assert!(denied(&effects), "the model named a tool anyway");
-    let _ = call_id;
+    // The model gets FINAL_TURN_GRACE retries, each still without tools.
+    for _ in 0..FINAL_TURN_GRACE {
+        let (_, effects) = request_tool(&mut agent, run_id, "fs.read");
+        assert!(denied(&effects), "the model named a tool anyway");
+        let effects = end_turn(&mut agent, run_id, "tool_use");
+        assert_ne!(agent.state.status, AgentStatus::Failed);
+        assert!(requests(&effects)[0].tools.is_empty());
+    }
+    let (_, effects) = request_tool(&mut agent, run_id, "fs.read");
+    assert!(denied(&effects));
     let effects = end_turn(&mut agent, run_id, "tool_use");
     assert_eq!(agent.state.status, AgentStatus::Failed);
     assert!(effects.iter().any(|effect| matches!(effect,

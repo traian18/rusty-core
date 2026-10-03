@@ -584,9 +584,14 @@ mod tests {
                         let refused = body["model"]
                             .as_str()
                             .is_some_and(|m| rejected.iter().any(|r| r == m));
+                        let budget_thinking_refused = body["model"] == "claude-adaptive-fixture"
+                            && body["thinking"]["type"] == "enabled";
                         log.lock().unwrap().push((path.clone(), body));
                         let (status, content_type, payload) = match (path.as_str(), catalog) {
                             _ if refused => ("400 Bad Request", "application/json", r#"{"error":{"message":"The requested model is not supported.","code":"model_not_supported","param":"model","type":"invalid_request_error"}}"#.to_string()),
+                            // An adaptive-only model, under an id the client
+                            // can't recognize, refusing budget thinking.
+                            ("/v1/messages", _) if budget_thinking_refused => ("400 Bad Request", "application/json", r#"{"type":"error","error":{"type":"invalid_request_error","message":"\"thinking.type.enabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}}"#.to_string()),
                             ("/models", Some(catalog)) => ("200 OK", "application/json", catalog.to_string()),
                             ("/models", None) => ("500 Internal Server Error", "application/json", "{}".into()),
                             ("/v1/messages", _) => {
@@ -675,11 +680,14 @@ mod tests {
         client: &CopilotClient,
         model: Option<&str>,
     ) -> Result<(ModelResult, Vec<harness_model::ModelEvent>), ModelError> {
+        ask_request(client, model_request(model)).await
+    }
+    fn model_request(model: Option<&str>) -> ModelRequest {
         use harness_protocol::{
             ids::{MessageId, Timestamp},
             messages::{AgentMessage, ContentBlock, MessageRole},
         };
-        let request = ModelRequest {
+        ModelRequest {
             system_prompt: String::new(),
             messages: vec![AgentMessage {
                 id: MessageId::new(),
@@ -698,7 +706,12 @@ mod tests {
             reasoning_effort: None,
             response_format: None,
             provider_options: serde_json::Value::Null,
-        };
+        }
+    }
+    async fn ask_request(
+        client: &CopilotClient,
+        request: ModelRequest,
+    ) -> Result<(ModelResult, Vec<harness_model::ModelEvent>), ModelError> {
         let (events, mut receiver) = tokio::sync::mpsc::channel(32);
         let capture = tokio::spawn(async move {
             let mut captured = Vec::new();
@@ -732,6 +745,38 @@ mod tests {
         assert_eq!(requests[1].0, "/v1/messages");
         assert_eq!(requests[1].1["max_tokens"], 32);
         assert_eq!(requests[1].1["messages"][0]["role"], "user");
+    }
+    #[tokio::test]
+    async fn a_model_refusing_budget_thinking_is_retried_with_adaptive_thinking() {
+        let mock = MockCopilot::start(Some(serde_json::json!({"data":[{
+            "id":"claude-adaptive-fixture", "supported_endpoints":["/v1/messages"]
+        }]})))
+        .await;
+        let client = mock.client();
+        let request = || ModelRequest {
+            max_tokens: Some(16_000),
+            reasoning_effort: Some(harness_protocol::backend::ReasoningEffort::Medium),
+            ..model_request(Some("claude-adaptive-fixture"))
+        };
+        let (result, _) = ask_request(&client, request()).await.unwrap();
+        assert_eq!(result.stop_reason, "tool_use");
+        // The learned model skips the rejected attempt on the next turn.
+        ask_request(&client, request()).await.unwrap();
+
+        let requests = mock.requests.lock().unwrap();
+        let thinking: Vec<_> = requests
+            .iter()
+            .filter(|(path, _)| path == "/v1/messages")
+            .map(|(_, body)| (body["thinking"].clone(), body["output_config"].clone()))
+            .collect();
+        let adaptive = (
+            serde_json::json!({"type": "adaptive"}),
+            serde_json::json!({"effort": "medium"}),
+        );
+        assert_eq!(thinking.len(), 3);
+        assert_eq!(thinking[0].0["type"], "enabled");
+        assert_eq!(thinking[1], adaptive);
+        assert_eq!(thinking[2], adaptive);
     }
     fn account_without_gpt_4_1() -> serde_json::Value {
         serde_json::json!({"data": [

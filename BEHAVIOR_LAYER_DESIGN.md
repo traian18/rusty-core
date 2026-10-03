@@ -648,7 +648,7 @@ Further suggestions will be added here before implementation starts.
 - **`SetBehaviorProfile` carries the full, host-validated document.** The core recompiles it. It applies immediately when the agent is idle, otherwise at the start of the next run. Phase 4 changes this to "next request" and adds the announcement.
 - **`SessionHandle::set_behavior_profile` already exists**, with the next-run semantics above. §12 had it in phase 4.
 - **Denials in phase 1 use the existing `ToolError::PermissionDenied`.** This covers out-of-scope tools, calls over the tool budget, and tools named on the final turn. `ToolError::Denied { reason }` arrives with phase 2 rules.
-- **Limits are per run.** Counters reset when a run starts. A model that calls tools after its final turn fails the run with `BEHAVIOR_LIMIT_EXCEEDED`.
+- **Limits are per run.** Counters reset when a run starts. A model that calls tools on its final turn is denied and asked again for text, up to `FINAL_TURN_GRACE` (2) retries; after that the run fails with `BEHAVIOR_LIMIT_EXCEEDED`.
 - **The final-turn prompt goes on the last tool result** of the outgoing request, or into a text block when the request ends with a user message, and never into the stored transcript. Some providers drop text blocks inside tool messages (§3).
 - **Built-in ids are reserved by prefix** (`rusty.`), not just `rusty.default@1`.
 - **Profile events** (`ProfileChanged`, …) ship with phase 2's event set; phase 1 adds no `AgentEvent` variants.

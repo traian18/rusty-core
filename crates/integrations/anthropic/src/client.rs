@@ -2,7 +2,7 @@
 //!
 //! [`ModelClient`]: harness_model::client::ModelClient
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,8 +15,9 @@ use harness_model::request::{ModelCapabilities, ModelRequest};
 
 use crate::config::AnthropicConfig;
 use crate::wire::{
-    build_system, convert_messages_with_tool_ids, resolve_thinking, tool_descriptor_to_anthropic,
-    AnthropicRequest, AnthropicSseParser, ProviderToolIds,
+    build_system, convert_messages_with_tool_ids, is_adaptive_thinking_rejection,
+    requires_adaptive_thinking, resolve_adaptive_thinking, resolve_thinking,
+    tool_descriptor_to_anthropic, AnthropicRequest, AnthropicSseParser, ProviderToolIds,
 };
 
 /// Client for the Anthropic Messages API.
@@ -39,6 +40,10 @@ pub struct AnthropicClient {
     http_client: reqwest::Client,
     /// Provider-issued tool IDs retained across model turns.
     tool_ids: ProviderToolIds,
+    /// Models a provider has rejected budget (`"enabled"`) thinking for, so
+    /// later requests go straight to adaptive thinking instead of paying for
+    /// the rejected round trip again.
+    adaptive_thinking_models: Arc<Mutex<HashSet<String>>>,
     auth: Option<Arc<dyn harness_model::auth::InferenceAuth>>,
 }
 
@@ -58,6 +63,7 @@ impl AnthropicClient {
             config,
             http_client,
             tool_ids: Arc::new(Mutex::new(HashMap::new())),
+            adaptive_thinking_models: Arc::new(Mutex::new(HashSet::new())),
             auth: None,
         }
     }
@@ -133,68 +139,85 @@ impl ModelClient for AnthropicClient {
 
         let requested_max_tokens = request.max_tokens.unwrap_or(self.config.default_max_tokens);
         let url = format!("{}/v1/messages", self.config.base_url);
-        let body = self.build_body(&request, requested_max_tokens)?;
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-            result = self.send_messages(&url, &body) => result?,
-        };
-        let status = response.status();
+        let model = self.model_for(&request);
+        let mut max_tokens = requested_max_tokens;
+        let mut adaptive = self.uses_adaptive_thinking(&model);
+        let mut corrected_max_tokens = false;
+        let wants_thinking = request.extended_thinking || request.reasoning_effort.is_some();
 
-        if status.is_success() {
-            return Self::handle_success_response(
-                response,
-                &events,
-                &cancel,
-                self.tool_ids.clone(),
-            )
-            .await;
-        }
-        if status.as_u16() == 429 {
-            return Self::handle_rate_limit(response);
-        }
-        if status.as_u16() != 400 {
-            return Self::handle_error_response(response, status).await;
-        }
+        loop {
+            let body = self.build_body(&request, max_tokens, adaptive)?;
+            let response = tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                result = self.send_messages(&url, &body) => result?,
+            };
+            let status = response.status();
 
-        // A model's real per-model output-token ceiling isn't reliably known
-        // ahead of time by every caller (it varies per model and changes as
-        // new ones ship), so a too-high `max_tokens` reaches here as a
-        // provider-side 400 instead of being pre-validated locally. Anthropic
-        // reports it in a stable, parseable shape: "max_tokens: <requested> >
-        // <allowed>, which is the maximum allowed number of output tokens for
-        // <model>" -- also seen relayed verbatim through a gateway's own
-        // "Upstream request failed: ..." wrapper (OpenCode Zen's `anthropic`
-        // route does this). Rather than fail a request the model could have
-        // answered fine at its real limit, self-correct once and retry with
-        // that limit instead of the guessed one -- this is also why the
-        // extended-thinking budget (itself a function of `max_tokens`, see
-        // `resolve_thinking`) is re-derived via `build_body` rather than the
-        // rejected request simply being replayed with one field patched.
-        let error_body = response.text().await.unwrap_or_default();
-        let Some(allowed) =
-            parse_max_tokens_ceiling(&error_body).filter(|&allowed| allowed < requested_max_tokens)
-        else {
+            if status.is_success() {
+                return Self::handle_success_response(
+                    response,
+                    &events,
+                    &cancel,
+                    self.tool_ids.clone(),
+                )
+                .await;
+            }
+            if status.as_u16() == 429 {
+                return Self::handle_rate_limit(response);
+            }
+            if status.as_u16() != 400 {
+                return Self::handle_error_response(response, status).await;
+            }
+            let error_body = response.text().await.unwrap_or_default();
+
+            // Newer models (Claude Opus 4.7 onward) reject budget thinking
+            // outright and accept only adaptive thinking. Model ids differ by
+            // gateway (Copilot spells them `claude-opus-4.7`) and new ones
+            // keep shipping, so `requires_adaptive_thinking` can't be the only
+            // guard: switch once on the provider's own rejection, and remember
+            // the model so the rest of the session skips the failed attempt.
+            if wants_thinking && !adaptive && is_adaptive_thinking_rejection(&error_body) {
+                tracing::warn!(
+                    model,
+                    "provider rejected budget thinking for this model; retrying with adaptive thinking"
+                );
+                self.adaptive_thinking_models
+                    .lock()
+                    .expect("adaptive-thinking model set poisoned")
+                    .insert(model.clone());
+                adaptive = true;
+                continue;
+            }
+
+            // A model's real per-model output-token ceiling isn't reliably known
+            // ahead of time by every caller (it varies per model and changes as
+            // new ones ship), so a too-high `max_tokens` reaches here as a
+            // provider-side 400 instead of being pre-validated locally. Anthropic
+            // reports it in a stable, parseable shape: "max_tokens: <requested> >
+            // <allowed>, which is the maximum allowed number of output tokens for
+            // <model>" -- also seen relayed verbatim through a gateway's own
+            // "Upstream request failed: ..." wrapper (OpenCode Zen's `anthropic`
+            // route does this). Rather than fail a request the model could have
+            // answered fine at its real limit, self-correct once and retry with
+            // that limit instead of the guessed one -- this is also why the
+            // extended-thinking budget (itself a function of `max_tokens`, see
+            // `resolve_thinking`) is re-derived via `build_body` rather than the
+            // rejected request simply being replayed with one field patched.
+            if !corrected_max_tokens {
+                if let Some(allowed) =
+                    parse_max_tokens_ceiling(&error_body).filter(|&allowed| allowed < max_tokens)
+                {
+                    tracing::warn!(
+                        requested = max_tokens,
+                        allowed,
+                        "provider rejected max_tokens above the model's real output ceiling; retrying once with the corrected value"
+                    );
+                    corrected_max_tokens = true;
+                    max_tokens = allowed;
+                    continue;
+                }
+            }
             return Self::handle_error_response_from_body(status, error_body);
-        };
-        tracing::warn!(
-            requested = requested_max_tokens,
-            allowed,
-            "provider rejected max_tokens above the model's real output ceiling; retrying once with the corrected value"
-        );
-        let corrected_body = self.build_body(&request, allowed)?;
-        let retry_response = tokio::select! {
-            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-            result = self.send_messages(&url, &corrected_body) => result?,
-        };
-        let retry_status = retry_response.status();
-
-        if retry_status.is_success() {
-            Self::handle_success_response(retry_response, &events, &cancel, self.tool_ids.clone())
-                .await
-        } else if retry_status.as_u16() == 429 {
-            Self::handle_rate_limit(retry_response)
-        } else {
-            Self::handle_error_response(retry_response, retry_status).await
         }
     }
 }
@@ -210,6 +233,7 @@ impl AnthropicClient {
         &self,
         request: &ModelRequest,
         max_tokens: u64,
+        adaptive_thinking: bool,
     ) -> Result<serde_json::Value, ModelError> {
         // Anthropic has no `response_format`; a non-text format is emulated
         // with a forced single-purpose tool call. See `structured_output_tool`.
@@ -218,11 +242,22 @@ impl AnthropicClient {
             .as_ref()
             .and_then(crate::wire::structured_output_tool);
 
+        let (thinking, output_config) = if adaptive_thinking {
+            resolve_adaptive_thinking(request.extended_thinking, request.reasoning_effort)
+                .map_or((None, None), |(thinking, effort)| (Some(thinking), effort))
+        } else {
+            (
+                resolve_thinking(
+                    request.extended_thinking,
+                    request.reasoning_effort,
+                    max_tokens,
+                )?,
+                None,
+            )
+        };
+
         let anthropic_request = AnthropicRequest {
-            model: request
-                .model
-                .clone()
-                .unwrap_or_else(|| self.config.default_model.clone()),
+            model: self.model_for(request),
             system: if !request.system_prompt.is_empty() {
                 Some(request.system_prompt.clone())
             } else {
@@ -254,11 +289,8 @@ impl AnthropicClient {
             } else {
                 Some(request.stop_sequences.clone())
             },
-            thinking: resolve_thinking(
-                request.extended_thinking,
-                request.reasoning_effort,
-                max_tokens,
-            )?,
+            thinking,
+            output_config,
             stream: true,
         };
 
@@ -275,6 +307,24 @@ impl AnthropicClient {
             &request.provider_options,
             "anthropic",
         ))
+    }
+
+    fn model_for(&self, request: &ModelRequest) -> String {
+        request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.config.default_model.clone())
+    }
+
+    /// Whether requests for `model` should use adaptive rather than budget
+    /// thinking: known up front, or learned from an earlier rejection.
+    fn uses_adaptive_thinking(&self, model: &str) -> bool {
+        requires_adaptive_thinking(model)
+            || self
+                .adaptive_thinking_models
+                .lock()
+                .expect("adaptive-thinking model set poisoned")
+                .contains(model)
     }
 
     /// Builds the POST request (URL + auth/content headers), ready for
@@ -540,10 +590,18 @@ mod tests {
     fn build_body_rederives_the_thinking_budget_for_the_corrected_max_tokens() {
         let client = client();
         let high_budget = client
-            .build_body(&request(128_000, Some(ReasoningEffort::High)), 128_000)
+            .build_body(
+                &request(128_000, Some(ReasoningEffort::High)),
+                128_000,
+                false,
+            )
             .expect("build_body succeeds");
         let corrected_budget = client
-            .build_body(&request(128_000, Some(ReasoningEffort::High)), 64_000)
+            .build_body(
+                &request(128_000, Some(ReasoningEffort::High)),
+                64_000,
+                false,
+            )
             .expect("build_body succeeds after correction");
 
         assert_eq!(high_budget["max_tokens"], 128_000);
@@ -570,8 +628,26 @@ mod tests {
     fn build_body_sends_no_thinking_field_when_no_reasoning_was_requested() {
         let client = client();
         let body = client
-            .build_body(&request(64_000, None), 64_000)
+            .build_body(&request(64_000, None), 64_000, false)
             .expect("build_body succeeds");
         assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_body_sends_adaptive_thinking_with_an_effort_instead_of_a_budget() {
+        let client = client();
+        let body = client
+            .build_body(&request(64_000, Some(ReasoningEffort::Low)), 64_000, true)
+            .expect("build_body succeeds");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn adaptive_only_models_use_adaptive_thinking_without_a_failed_attempt() {
+        let client = client();
+        assert!(client.uses_adaptive_thinking("claude-opus-4.7"));
+        assert!(!client.uses_adaptive_thinking("claude-sonnet-4.5"));
     }
 }

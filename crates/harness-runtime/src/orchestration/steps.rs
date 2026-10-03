@@ -522,28 +522,6 @@ fn verification_repair_focus(input: &Value, issues: &[String]) -> String {
     parts.join("\n\n")
 }
 
-#[cfg(test)]
-mod verification_feedback_tests {
-    use super::*;
-
-    #[test]
-    fn repair_feedback_names_only_unmet_criteria_and_their_evidence() {
-        let input = json!({"check": {
-            "summary": "Native notifications still need work.",
-            "criteria": [
-                {"id": "C1", "status": "pass", "evidence": "Types exist."},
-                {"id": "C2", "status": "fail", "evidence": "No native delivery in notifications.rs."},
-                {"id": "C3", "status": "unverified", "evidence": "No question adapter test."}
-            ]
-        }});
-        let focus = verification_repair_focus(&input, &["verdict was fail".into()]);
-        assert!(focus.contains("C2 [fail]: No native delivery in notifications.rs."));
-        assert!(focus.contains("C3 [unverified]: No question adapter test."));
-        assert!(!focus.contains("C1 [pass]"));
-        assert!(focus.contains("Review summary: Native notifications still need work."));
-    }
-}
-
 /// Which result answers which expected criterion. IDs are matched loosely
 /// (`C-1`, `c1` and `C1` are one); when the results carry none of the expected
 /// IDs (a reply that numbered them its own way) the same number of results
@@ -605,4 +583,26 @@ pub(crate) fn requirement_coverage(
         }
         .into(),
     )
+}
+
+#[cfg(test)]
+mod verification_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn repair_feedback_names_only_unmet_criteria_and_their_evidence() {
+        let input = json!({"check": {
+            "summary": "Native notifications still need work.",
+            "criteria": [
+                {"id": "C1", "status": "pass", "evidence": "Types exist."},
+                {"id": "C2", "status": "fail", "evidence": "No native delivery in notifications.rs."},
+                {"id": "C3", "status": "unverified", "evidence": "No question adapter test."}
+            ]
+        }});
+        let focus = verification_repair_focus(&input, &["verdict was fail".into()]);
+        assert!(focus.contains("C2 [fail]: No native delivery in notifications.rs."));
+        assert!(focus.contains("C3 [unverified]: No question adapter test."));
+        assert!(!focus.contains("C1 [pass]"));
+        assert!(focus.contains("Review summary: Native notifications still need work."));
+    }
 }

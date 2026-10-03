@@ -27,7 +27,7 @@ pub use rules::{
 };
 pub use state::{
     BehaviorRestoreError, BehaviorState, CallStreak, EnteredFrom, ExecutedCall, RunCounters,
-    TurnPlan, MAX_SWITCHES_PER_RUN,
+    TurnPlan, FINAL_TURN_GRACE, MAX_SWITCHES_PER_RUN,
 };
 
 /// JSON Schema of the profile document, for editors.

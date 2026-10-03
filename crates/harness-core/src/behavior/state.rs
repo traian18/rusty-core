@@ -41,6 +41,10 @@ pub struct RunCounters {
     pub tool_calls: u32,
     /// The last request was sent as the final turn (no tools offered).
     pub final_turn: bool,
+    /// Extra requests granted after the final turn because the model still
+    /// asked for tools. Bounded by [`FINAL_TURN_GRACE`].
+    #[serde(default)]
+    pub final_grace_used: u32,
     /// Firings per rule id, for `max_fires`.
     #[serde(default)]
     pub fired: BTreeMap<String, u32>,
@@ -100,6 +104,10 @@ pub struct CallStreak {
     pub signature: String,
     pub count: u32,
 }
+
+/// How many times the model may call tools on the final turn and still be
+/// asked again for a text answer before the run fails.
+pub const FINAL_TURN_GRACE: u32 = 2;
 
 /// What the next model request should look like.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +185,14 @@ impl BehaviorState {
     /// decide its shape against the profile's limits.
     pub fn begin_turn(&mut self) -> TurnPlan {
         if self.run.final_turn {
-            return TurnPlan::Exceeded;
+            if self.run.final_grace_used >= FINAL_TURN_GRACE {
+                return TurnPlan::Exceeded;
+            }
+            // The model asked for tools again; retry the tool-less final turn.
+            self.run.final_grace_used += 1;
+            return TurnPlan::Final {
+                prompt: self.profile.profile.limits.final_turn_prompt.clone(),
+            };
         }
         self.run.turns += 1;
         let limits = &self.profile.profile.limits;

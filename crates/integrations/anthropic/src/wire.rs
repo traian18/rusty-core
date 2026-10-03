@@ -28,6 +28,10 @@ pub struct AnthropicRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+    /// Carries the effort level for adaptive thinking -- see
+    /// [`resolve_adaptive_thinking`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<AnthropicOutputConfig>,
     /// Set only when emulating structured output — see
     /// [`STRUCTURED_OUTPUT_TOOL`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,7 +145,77 @@ pub struct AnthropicTool {
 pub struct AnthropicThinking {
     #[serde(rename = "type")]
     pub kind: String,
-    pub budget_tokens: u64,
+    /// Present for `"enabled"` thinking only; `"adaptive"` thinking takes no
+    /// budget and is steered by [`AnthropicOutputConfig::effort`] instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnthropicOutputConfig {
+    pub effort: &'static str,
+}
+
+/// Whether `model` is known to reject `thinking.type: "enabled"` and accept
+/// only `"adaptive"` (Claude Opus 4.7 onward and the Claude 5 family).
+/// Matches both Anthropic's own ids (`claude-opus-4-7`) and gateway spellings
+/// such as GitHub Copilot's (`claude-opus-4.7`). A model this misses is still
+/// handled: the client recognizes the provider's rejection and retries in
+/// adaptive mode -- see `is_adaptive_thinking_rejection`.
+pub fn requires_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase().replace('.', "-");
+    if model.contains("mythos") {
+        return true;
+    }
+    ["opus", "sonnet", "haiku", "fable"].iter().any(|family| {
+        let Some(rest) = model.split(&format!("{family}-")).nth(1) else {
+            return false;
+        };
+        let mut numbers = rest.split('-').map(|part| part.parse::<u32>().ok()).take(2);
+        let major = numbers.next().flatten();
+        let minor = numbers.next().flatten().filter(|minor| *minor < 100);
+        match (major, minor) {
+            (Some(major), _) if major >= 5 => true,
+            (Some(4), Some(minor)) => *family == "opus" && minor >= 7,
+            _ => false,
+        }
+    })
+}
+
+/// Recognizes the 400 a provider returns for budget thinking on a model that
+/// only supports adaptive thinking: `"thinking.type.enabled" is not
+/// supported for this model. Use "thinking.type.adaptive" ...`, possibly
+/// relayed (and re-escaped) inside a gateway's own error envelope.
+pub fn is_adaptive_thinking_rejection(body: &str) -> bool {
+    body.contains("thinking.type.enabled") && body.contains("thinking.type.adaptive")
+}
+
+/// The adaptive-thinking counterpart of [`resolve_thinking`]: the same
+/// request fields select it, but the model sizes its own thinking and an
+/// explicit level travels as `output_config.effort`. A bare
+/// `extended_thinking: true` leaves the effort at the provider default.
+pub fn resolve_adaptive_thinking(
+    extended_thinking: bool,
+    reasoning_effort: Option<harness_protocol::backend::ReasoningEffort>,
+) -> Option<(AnthropicThinking, Option<AnthropicOutputConfig>)> {
+    if !extended_thinking && reasoning_effort.is_none() {
+        return None;
+    }
+    use harness_protocol::backend::ReasoningEffort;
+    let effort = reasoning_effort.map(|effort| AnthropicOutputConfig {
+        effort: match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        },
+    });
+    Some((
+        AnthropicThinking {
+            kind: "adaptive".to_string(),
+            budget_tokens: None,
+        },
+        effort,
+    ))
 }
 
 /// Resolves the outgoing `thinking` block from a [`ModelRequest`](harness_model::request::ModelRequest)'s
@@ -177,7 +251,7 @@ pub fn resolve_thinking(
     };
     Ok(Some(AnthropicThinking {
         kind: "enabled".to_string(),
-        budget_tokens,
+        budget_tokens: Some(budget_tokens),
     }))
 }
 
@@ -853,7 +927,7 @@ mod tests {
     fn bare_extended_thinking_uses_the_full_available_budget() {
         let thinking = resolve_thinking(true, None, 8192).unwrap().unwrap();
         assert_eq!(thinking.kind, "enabled");
-        assert_eq!(thinking.budget_tokens, 8192 - 1024);
+        assert_eq!(thinking.budget_tokens, Some(8192 - 1024));
     }
 
     #[test]
@@ -868,9 +942,9 @@ mod tests {
         let high = resolve_thinking(false, Some(ReasoningEffort::High), 8192)
             .unwrap()
             .unwrap();
-        assert_eq!(low.budget_tokens, full / 4);
-        assert_eq!(medium.budget_tokens, full / 2);
-        assert_eq!(high.budget_tokens, full);
+        assert_eq!(low.budget_tokens, Some(full / 4));
+        assert_eq!(medium.budget_tokens, Some(full / 2));
+        assert_eq!(high.budget_tokens, Some(full));
         assert!(low.budget_tokens < medium.budget_tokens);
         assert!(medium.budget_tokens < high.budget_tokens);
     }
@@ -895,7 +969,56 @@ mod tests {
         let low = resolve_thinking(false, Some(ReasoningEffort::Low), 2048)
             .unwrap()
             .unwrap();
-        assert_eq!(low.budget_tokens, 1024);
+        assert_eq!(low.budget_tokens, Some(1024));
+    }
+
+    #[test]
+    fn adaptive_only_models_are_recognized_in_anthropic_and_gateway_spellings() {
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4.7",
+            "claude-opus-4-8-20260101",
+            "claude-opus-5-5",
+            "claude-sonnet-5.5",
+            "claude-fable-5-1",
+            "claude-mythos-preview",
+        ] {
+            assert!(requires_adaptive_thinking(model), "{model}");
+        }
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4.1",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-latest",
+            "gpt-5",
+        ] {
+            assert!(!requires_adaptive_thinking(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_sends_no_budget_and_maps_the_effort() {
+        let (thinking, output_config) =
+            resolve_adaptive_thinking(false, Some(ReasoningEffort::Medium)).unwrap();
+        let thinking = serde_json::to_value(thinking).unwrap();
+        assert_eq!(thinking, serde_json::json!({"type": "adaptive"}));
+        assert_eq!(output_config.unwrap().effort, "medium");
+
+        let (_, output_config) = resolve_adaptive_thinking(true, None).unwrap();
+        assert!(output_config.is_none());
+        assert!(resolve_adaptive_thinking(false, None).is_none());
+    }
+
+    #[test]
+    fn recognizes_the_adaptive_thinking_rejection_relayed_by_copilot() {
+        let body = r#"{"error":{"message":"HTTP 400 Bad Request: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"\\\"thinking.type.enabled\\\" is not supported for this model. Use \\\"thinking.type.adaptive\\\" and \\\"output_config.effort\\\" to control thinking behavior.\"}}"}}"#;
+        assert!(is_adaptive_thinking_rejection(body));
+        assert!(!is_adaptive_thinking_rejection(
+            "max_tokens: 128000 > 64000, which is the maximum allowed"
+        ));
     }
 
     #[test]

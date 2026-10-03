@@ -881,6 +881,16 @@ fn turn_limit_makes_the_last_turn_final_then_refuses_more() {
         }
     );
     assert!(!state.admit_tool_call(), "no tools on the final turn");
+    for _ in 0..FINAL_TURN_GRACE {
+        assert_eq!(
+            state.begin_turn(),
+            TurnPlan::Final {
+                prompt: Some("Wrap up.".into())
+            },
+            "grace retries repeat the final turn"
+        );
+        assert!(!state.admit_tool_call());
+    }
     assert_eq!(state.begin_turn(), TurnPlan::Exceeded);
 
     state.reset_run();

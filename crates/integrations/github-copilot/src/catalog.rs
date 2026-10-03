@@ -38,10 +38,8 @@ impl Catalog {
                     .pointer("/capabilities/type")
                     .and_then(Value::as_str)
                     .map_or(true, |kind| kind == "chat");
-                let enabled = entry
-                    .pointer("/policy/state")
-                    .and_then(Value::as_str)
-                    .map_or(true, |state| state != "disabled");
+                let enabled =
+                    entry.pointer("/policy/state").and_then(Value::as_str) != Some("disabled");
                 (chat && enabled).then(|| CatalogModel {
                     id: id.to_owned(),
                     is_default: entry["is_chat_default"].as_bool().unwrap_or(false),
