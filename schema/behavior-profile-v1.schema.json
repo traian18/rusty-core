@@ -1061,9 +1061,13 @@
     "ReasoningEffortSetting": {
       "type": "string",
       "enum": [
+        "minimal",
         "low",
         "medium",
-        "high"
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
       ]
     },
     "Rule": {

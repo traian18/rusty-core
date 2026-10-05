@@ -51,21 +51,13 @@ pub struct ResponsesReasoning {
     pub effort: String,
 }
 
-/// Maps rusty-core's 3-level `ReasoningEffort` onto the Responses API's own
-/// `"low"`/`"medium"`/`"high"` string values -- a 1:1 mapping, no clamping
-/// needed (unlike the UI's own 5-level picker, already clamped down to these
-/// three levels by `providerMapping.ts` before it ever reaches Rust).
+/// Maps rusty-core's `ReasoningEffort` onto the Responses API's own
+/// `reasoning.effort` string (see `ReasoningEffort::openai_wire_value`).
 pub fn reasoning_effort_to_responses(
     effort: harness_protocol::backend::ReasoningEffort,
 ) -> ResponsesReasoning {
-    use harness_protocol::backend::ReasoningEffort;
-    let effort = match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    };
     ResponsesReasoning {
-        effort: effort.to_string(),
+        effort: effort.openai_wire_value().to_string(),
     }
 }
 
@@ -589,14 +581,20 @@ impl OpenAiResponsesSseParser {
                 Err(ModelError::BackendError { message, code })
             }
             "error" => {
-                let message = value
-                    .get("message")
-                    .and_then(|m| m.as_str())
+                // The OpenAI API puts code/message at the top level; the ChatGPT
+                // subscription backend nests them under `error` (e.g.
+                // `{"type":"error","error":{"code":"server_is_overloaded",...}}`).
+                let field = |name: &str| {
+                    value
+                        .get(name)
+                        .or_else(|| value.get("error").and_then(|e| e.get(name)))
+                        .and_then(|v| v.as_str())
+                };
+                let message = field("message")
                     .unwrap_or("Responses stream error")
                     .to_string();
-                let code = value
-                    .get("code")
-                    .and_then(|c| c.as_str())
+                let code = field("code")
+                    .or_else(|| value.pointer("/error/type").and_then(|t| t.as_str()))
                     .unwrap_or("stream_error")
                     .to_string();
                 Err(ModelError::BackendError { message, code })
@@ -664,6 +662,14 @@ mod tests {
             reasoning_effort_to_responses(ReasoningEffort::High).effort,
             "high"
         );
+        for (effort, wire) in [
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+            (ReasoningEffort::Ultra, "max"),
+        ] {
+            assert_eq!(reasoning_effort_to_responses(effort).effort, wire);
+        }
     }
 
     #[test]
@@ -887,5 +893,31 @@ mod tests {
             result,
             Err(ModelError::BackendError { code, .. }) if code == "server_error"
         ));
+    }
+
+    #[test]
+    fn nested_stream_error_surfaces_its_code_and_message() {
+        let mut parser = OpenAiResponsesSseParser::new();
+        let result = parser.push_chunk(
+            frame(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "service_unavailable_error",
+                    "code": "server_is_overloaded",
+                    "message": "Our servers are currently overloaded."
+                },
+                "sequence_number": 2
+            }))
+            .as_bytes(),
+        );
+        let Err(error @ ModelError::BackendError { .. }) = result else {
+            panic!("expected backend error, got {result:?}");
+        };
+        let ModelError::BackendError { code, message } = &error else {
+            unreachable!()
+        };
+        assert_eq!(code, "server_is_overloaded");
+        assert_eq!(message, "Our servers are currently overloaded.");
+        assert!(error.is_retryable());
     }
 }

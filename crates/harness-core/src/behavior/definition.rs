@@ -184,9 +184,14 @@ pub struct ExecutionOverlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffortSetting {
+    Minimal,
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+    Ultra,
 }
 
 /// Per-run bounds on the agent loop.

@@ -132,6 +132,15 @@ impl ModelError {
             Self::BackendError { code, .. } => {
                 code == "request_failed"
                     || code == "408"
+                    // Transient failures reported in-stream by OpenAI Responses backends.
+                    || matches!(
+                        code.as_str(),
+                        "server_is_overloaded"
+                            | "service_unavailable_error"
+                            | "server_error"
+                            | "internal_server_error"
+                            | "slow_down"
+                    )
                     || code
                         .parse::<u16>()
                         .is_ok_and(|status| (500..600).contains(&status))
@@ -165,6 +174,16 @@ mod tests {
         assert!(ModelError::BackendError {
             message: String::new(),
             code: "503".into()
+        }
+        .is_retryable());
+        assert!(ModelError::BackendError {
+            message: String::new(),
+            code: "server_is_overloaded".into()
+        }
+        .is_retryable());
+        assert!(!ModelError::BackendError {
+            message: String::new(),
+            code: "stream_error".into()
         }
         .is_retryable());
         assert!(!ModelError::InvalidRequest {

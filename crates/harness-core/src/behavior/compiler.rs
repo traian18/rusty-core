@@ -799,9 +799,13 @@ impl CompiledProfile {
         }
         if let Some(effort) = overlay.reasoning_effort {
             params.reasoning_effort = Some(match effort {
+                ReasoningEffortSetting::Minimal => ReasoningEffort::Minimal,
                 ReasoningEffortSetting::Low => ReasoningEffort::Low,
                 ReasoningEffortSetting::Medium => ReasoningEffort::Medium,
                 ReasoningEffortSetting::High => ReasoningEffort::High,
+                ReasoningEffortSetting::XHigh => ReasoningEffort::XHigh,
+                ReasoningEffortSetting::Max => ReasoningEffort::Max,
+                ReasoningEffortSetting::Ultra => ReasoningEffort::Ultra,
             });
         }
         params

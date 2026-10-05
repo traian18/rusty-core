@@ -146,9 +146,41 @@ pub struct BackendBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    /// The level's serialized name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// The `reasoning.effort` / `reasoning_effort` value OpenAI-style APIs
+    /// accept. `ultra` is not an API level: Codex defines it as `max`
+    /// reasoning plus client-side sub-agent delegation, so it is sent as `max`.
+    /// Which levels a model accepts is model-specific; callers only send
+    /// levels the model's catalog entry advertises.
+    pub fn openai_wire_value(self) -> &'static str {
+        match self {
+            Self::Ultra => "max",
+            other => other.as_str(),
+        }
+    }
 }
 
 /// Provider-neutral constraint on the shape of the model's response.

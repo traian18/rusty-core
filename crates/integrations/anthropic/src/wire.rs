@@ -203,10 +203,12 @@ pub fn resolve_adaptive_thinking(
     }
     use harness_protocol::backend::ReasoningEffort;
     let effort = reasoning_effort.map(|effort| AnthropicOutputConfig {
+        // Anthropic's effort scale is low/medium/high/max; clamp the rest.
         effort: match effort {
-            ReasoningEffort::Low => "low",
+            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
+            ReasoningEffort::High | ReasoningEffort::XHigh => "high",
+            ReasoningEffort::Max | ReasoningEffort::Ultra => "max",
         },
     });
     Some((
@@ -245,9 +247,17 @@ pub fn resolve_thinking(
     let full_budget = max_tokens - 1024;
     use harness_protocol::backend::ReasoningEffort;
     let budget_tokens = match reasoning_effort {
-        Some(ReasoningEffort::Low) => (full_budget / 4).max(1024).min(full_budget),
+        Some(ReasoningEffort::Minimal | ReasoningEffort::Low) => {
+            (full_budget / 4).max(1024).min(full_budget)
+        }
         Some(ReasoningEffort::Medium) => (full_budget / 2).max(1024).min(full_budget),
-        Some(ReasoningEffort::High) | None => full_budget,
+        Some(
+            ReasoningEffort::High
+            | ReasoningEffort::XHigh
+            | ReasoningEffort::Max
+            | ReasoningEffort::Ultra,
+        )
+        | None => full_budget,
     };
     Ok(Some(AnthropicThinking {
         kind: "enabled".to_string(),

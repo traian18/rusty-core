@@ -42,17 +42,11 @@ pub struct OpenAiRequest {
     pub stream_options: StreamOptions,
 }
 
-/// Maps rusty-core's 3-level `ReasoningEffort` onto the Chat Completions
+/// Maps rusty-core's `ReasoningEffort` onto the Chat Completions
 /// `reasoning_effort` string values -- same 1:1 mapping as
 /// `harness-integration-openai-responses`'s own `reasoning_effort_to_responses`.
 pub fn reasoning_effort_to_openai(effort: harness_protocol::backend::ReasoningEffort) -> String {
-    use harness_protocol::backend::ReasoningEffort;
-    match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-    }
-    .to_string()
+    effort.openai_wire_value().to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -993,6 +987,9 @@ data: [DONE]\n\n";
             "medium"
         );
         assert_eq!(reasoning_effort_to_openai(ReasoningEffort::High), "high");
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::XHigh), "xhigh");
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Max), "max");
+        assert_eq!(reasoning_effort_to_openai(ReasoningEffort::Ultra), "max");
     }
 
     #[test]

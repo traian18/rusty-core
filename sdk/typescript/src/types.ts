@@ -258,7 +258,7 @@ export interface MutationMetadata {
   trace_id: string | null;
 }
 
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export type ResponseFormat =
   | { type: "text" }
