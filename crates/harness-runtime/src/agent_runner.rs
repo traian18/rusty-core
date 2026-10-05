@@ -941,6 +941,7 @@ impl AgentRunner {
         let commands = self.task.commands_tx.clone();
         let executor = self.tool_registry.get_executor(&name);
         let scheduler = self.scheduler.clone();
+        let tool_timeout = scheduler.tool_call_timeout();
 
         // M3: `shell.exec` (and any future tool with the same shape) forks a
         // real OS process, which is a heavier resource than "a tool call" in
@@ -979,12 +980,31 @@ impl AgentRunner {
 
             let input = harness_tools::ToolInput { arguments };
             let tool_call_start = std::time::Instant::now();
-            let outcome = harness_tools::with_tool_call(
-                call_id.to_string(),
-                session_id,
-                executor.execute(input, token),
+            // Cancelling the token (not just dropping the future) lets the
+            // executor reap what it started, e.g. a shell process group.
+            let timeout_token = token.clone();
+            let outcome = match tokio::time::timeout(
+                tool_timeout,
+                harness_tools::with_tool_call(
+                    call_id.to_string(),
+                    session_id,
+                    executor.execute(input, token),
+                ),
             )
-            .await;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    timeout_token.cancel();
+                    tracing::warn!(tool = %tool_name_for_metrics, ?tool_timeout, "tool call timed out");
+                    metrics::counter!(
+                        "harness_tool_call_timeouts_total",
+                        "tool" => tool_name_for_metrics.clone()
+                    )
+                    .increment(1);
+                    Err(harness_tools::ToolError::Timeout)
+                }
+            };
             metrics::histogram!("harness_tool_call_duration_seconds", "tool" => tool_name_for_metrics.clone())
                 .record(tool_call_start.elapsed().as_secs_f64());
             metrics::counter!(
@@ -2146,6 +2166,69 @@ mod tests {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// A tool that never returns must not stall the run: once the scheduler's
+    /// `tool_call_timeout` elapses the call is cancelled and the core sees `ToolFailed(Timeout)`.
+    #[tokio::test]
+    async fn hung_tool_call_times_out_with_error_result() {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let mut agent = test_agent_with_ask_permission_tool(agent_id, session_id, "fs.hang");
+        for capability in agent.capabilities.tools.tools.values_mut() {
+            capability.policy.permission = harness_protocol::tools::PermissionMode::Allow;
+        }
+        let (task, _sender) = AgentTask::new(agent_id);
+
+        let mut registry = FakeToolRegistry::new();
+        registry.add_executor(Arc::new(
+            FakeToolExecutor::new(harness_tools::ToolDescriptor {
+                id: harness_tools::ToolId::new("fs.hang"),
+                name: "fs.hang".into(),
+                description: "fake hanging tool".into(),
+                input_schema: serde_json::json!({}),
+            })
+            .blocking_until_cancelled(),
+        ));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+            tool_call_timeout: Duration::from_millis(100),
+            ..SchedulerConfig::default()
+        }));
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            Arc::new(FakeBackend::new()),
+            Arc::new(registry),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            CancellationToken::new(),
+            live_state,
+            scheduler,
+        );
+
+        let call_id = harness_protocol::ids::ToolCallId::new();
+        runner
+            .execute_tool(ToolRequest {
+                call: harness_protocol::tools::ToolCall {
+                    id: call_id,
+                    name: "fs.hang".into(),
+                    arguments: serde_json::json!({}),
+                },
+                permission: harness_protocol::tools::PermissionMode::Allow,
+            })
+            .await;
+
+        let command = tokio::time::timeout(Duration::from_secs(2), runner.task.commands.recv())
+            .await
+            .expect("a hung tool must resolve once the tool timeout elapses");
+        match command {
+            Some(AgentCommand::ToolFailed { call_id: id, error }) => {
+                assert_eq!(id, call_id);
+                assert!(matches!(error, harness_protocol::tools::ToolError::Timeout));
+            }
+            other => panic!("expected ToolFailed(Timeout), got {other:?}"),
         }
     }
 

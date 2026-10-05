@@ -43,6 +43,10 @@ pub struct AgentState {
     pub pending_permissions: HashMap<PermissionId, ToolCallId>,
     pub children: Vec<AgentId>,
     pub last_error: Option<AgentError>,
+    /// Tool calls in a row that timed out. Reset by any other tool result;
+    /// reaching `MAX_CONSECUTIVE_TOOL_TIMEOUTS` fails the run so a step's
+    /// retry policy can take over instead of the model looping on a hung tool.
+    pub consecutive_tool_timeouts: u32,
     /// Monotonic source for IDs and timestamps created by deterministic transitions.
     pub transition_sequence: u64,
     /// Nesting depth in the agent tree: zero for a root agent,

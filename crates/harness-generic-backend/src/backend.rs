@@ -41,8 +41,17 @@ pub struct GenericModelBackend {
 pub struct RecoveryPolicy {
     /// Total calls allowed for a request, including its initial attempt.
     pub max_attempts: usize,
-    /// Maximum inactivity per attempt; reset on every model stream event.
-    /// Active streams have no wall-clock deadline.
+    /// Maximum wait for the first stream event of an attempt. Longer than
+    /// `idle_timeout` because the provider may queue the request or think
+    /// silently before emitting anything.
+    #[serde(
+        rename = "first_event_timeout_secs",
+        serialize_with = "serialize_duration_secs",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub first_event_timeout: Duration,
+    /// Maximum inactivity once the stream has started; reset on every model
+    /// stream event. Active streams have no wall-clock deadline.
     #[serde(
         rename = "idle_timeout_secs",
         alias = "total_deadline_secs",
@@ -79,7 +88,8 @@ impl Default for RecoveryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 2,
-            idle_timeout: Duration::from_secs(600),
+            first_event_timeout: Duration::from_secs(180),
+            idle_timeout: Duration::from_secs(120),
             circuit_failure_threshold: 3,
             circuit_open_duration: Duration::from_secs(30),
         }
@@ -280,7 +290,9 @@ impl GenericModelBackend {
             tokio::spawn(async move { client.stream(model_request, model_tx, task_cancel).await });
         let mut emitted_output = false;
         let mut requested_tools = false;
-        let mut deadline = tokio::time::Instant::now() + self.recovery.idle_timeout;
+        // Waiting for the first event may legitimately take longer than a gap
+        // mid-stream, so it gets its own limit.
+        let mut deadline = tokio::time::Instant::now() + self.recovery.first_event_timeout;
 
         let exit = loop {
             tokio::select! {
@@ -768,7 +780,8 @@ mod tests {
     fn recovery_policy_default_allows_long_streamed_answers() {
         let policy = RecoveryPolicy::default();
         assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.idle_timeout, Duration::from_secs(600));
+        assert_eq!(policy.first_event_timeout, Duration::from_secs(180));
+        assert_eq!(policy.idle_timeout, Duration::from_secs(120));
         assert_eq!(policy.circuit_failure_threshold, 3);
         assert_eq!(policy.circuit_open_duration, Duration::from_secs(30));
     }
@@ -795,6 +808,7 @@ mod tests {
     fn recovery_policy_round_trips_through_json() {
         let policy = RecoveryPolicy {
             max_attempts: 4,
+            first_event_timeout: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(20),
             circuit_failure_threshold: 7,
             circuit_open_duration: Duration::from_secs(60),
@@ -810,6 +824,7 @@ mod tests {
 
         let custom = RecoveryPolicy {
             max_attempts: 9,
+            first_event_timeout: Duration::from_secs(3),
             idle_timeout: Duration::from_secs(3),
             circuit_failure_threshold: 1,
             circuit_open_duration: Duration::from_secs(2),
@@ -837,6 +852,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 3,
+                first_event_timeout: Duration::from_secs(2),
                 idle_timeout: Duration::from_secs(2),
                 ..RecoveryPolicy::default()
             },
@@ -872,6 +888,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 2,
+                first_event_timeout: Duration::from_secs(2),
                 idle_timeout: Duration::from_secs(2),
                 ..RecoveryPolicy::default()
             },
@@ -918,6 +935,7 @@ mod tests {
             Arc::new(client),
             RecoveryPolicy {
                 max_attempts: 5,
+                first_event_timeout: Duration::from_secs(30),
                 idle_timeout: Duration::from_secs(30),
                 ..RecoveryPolicy::default()
             },
@@ -1253,6 +1271,67 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn first_event_has_its_own_longer_timeout() {
+        struct SlowStart;
+        #[async_trait]
+        impl ModelClient for SlowStart {
+            fn capabilities(&self) -> harness_model::request::ModelCapabilities {
+                FakeModelClient::new().capabilities()
+            }
+            async fn stream(
+                &self,
+                _request: ModelRequest,
+                sink: ModelEventSender,
+                _cancel: CancellationToken,
+            ) -> Result<ModelResult, ModelError> {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let _ = sink
+                    .send(ModelEvent::TextDelta {
+                        delta: "text".into(),
+                    })
+                    .await;
+                Ok(ModelResult {
+                    stop_reason: "stop".into(),
+                    usage: Default::default(),
+                    cost: Default::default(),
+                })
+            }
+        }
+        for (first_event, expect_timeout) in [(20, false), (10, true)] {
+            let backend = GenericModelBackend::new_with_recovery(
+                Arc::new(SlowStart),
+                RecoveryPolicy {
+                    first_event_timeout: Duration::from_secs(first_event),
+                    idle_timeout: Duration::from_secs(5),
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            );
+            let (sink, _rx) = broadcast::channel(32);
+            let result = backend
+                .execute(
+                    harness_protocol::backend::ExecutionRequest {
+                        request_id: RequestId::new(),
+                        run_id: harness_protocol::ids::RunId::new(),
+                        system_prompt: String::new(),
+                        messages: vec![],
+                        tools: vec![],
+                        extended_thinking: false,
+                        params: Default::default(),
+                    },
+                    sink,
+                    CancellationToken::new(),
+                )
+                .await;
+            if expect_timeout {
+                assert!(matches!(result, Err(ExecutionError::Timeout)), "{result:?}");
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn timeout_tracks_inactivity_instead_of_stream_duration() {
         struct SlowStream {
             stall: bool,
@@ -1291,6 +1370,7 @@ mod tests {
             let backend = GenericModelBackend::new_with_recovery(
                 Arc::new(SlowStream { stall }),
                 RecoveryPolicy {
+                    first_event_timeout: Duration::from_secs(10),
                     idle_timeout: Duration::from_secs(10),
                     max_attempts: 1,
                     ..Default::default()

@@ -557,6 +557,50 @@ async fn elapsed_budget_aborts_a_hanging_step() {
     assert!(cancelled.load(Ordering::SeqCst));
 }
 
+#[tokio::test]
+async fn stalled_step_is_cancelled_and_retried() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let agent = ScriptedAgent::new(vec![
+        Behavior::AwaitCancel(cancelled.clone()),
+        ok(report("completed")),
+    ]);
+    let mut definition = default_orchestration_definition();
+    definition.policies.stall_timeout_ms = Some(50);
+    let output = OrchestrationRunner::new(compiled(definition), agent.clone())
+        .with_available_tools(Vec::<String>::new())
+        .run(run_id("stall-retry"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(agent.requests().len(), 2);
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "stalled attempt was told to stop"
+    );
+    let attempts = &output.state.steps[&node("execute")].attempts;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].error.as_ref().unwrap().code, "step_stalled");
+}
+
+#[tokio::test]
+async fn stalled_step_without_retries_fails_the_run() {
+    let agent = ScriptedAgent::new(vec![Behavior::AwaitCancel(Arc::new(AtomicBool::new(
+        false,
+    )))]);
+    let mut definition = default_orchestration_definition();
+    definition.policies.stall_timeout_ms = Some(50);
+    for node in definition.nodes.iter_mut() {
+        node.retry.max_attempts = 1;
+    }
+    let output = OrchestrationRunner::new(compiled(definition), agent)
+        .with_available_tools(Vec::<String>::new())
+        .run(run_id("stall-fail"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.result.status, OrchestrationOutcome::Failed);
+    assert_eq!(output.result.error.unwrap().code, "step_stalled");
+}
+
 // ---------------------------------------------------------------------------
 // Durability and restoration
 // ---------------------------------------------------------------------------

@@ -166,6 +166,9 @@ fn append_to_request_tail(messages: &mut [AgentMessage], text: &str) {
     });
 }
 
+/// Consecutive timed-out tool calls after which a run fails with `TOOL_TIMEOUT`.
+pub const MAX_CONSECUTIVE_TOOL_TIMEOUTS: u32 = 3;
+
 impl Agent {
     pub fn apply(&mut self, command: AgentCommand) -> Vec<AgentEffect> {
         match command {
@@ -1166,6 +1169,7 @@ impl Agent {
         let Some(pending) = self.state.pending_tools.remove(&call_id) else {
             return Vec::new();
         };
+        self.state.consecutive_tool_timeouts = 0;
         self.state
             .pending_permissions
             .retain(|_, id| *id != call_id);
@@ -1189,8 +1193,17 @@ impl Agent {
             error,
             ToolError::PermissionDenied | ToolError::Denied { .. }
         );
+        if matches!(error, ToolError::Timeout) {
+            self.state.consecutive_tool_timeouts += 1;
+        } else {
+            self.state.consecutive_tool_timeouts = 0;
+        }
         let preview = match error {
             ToolError::Denied { reason } => format!("Denied: {reason}"),
+            ToolError::Timeout => format!(
+                "Tool call `{}` timed out and was cancelled. Try a narrower request or a different approach.",
+                pending.call.name
+            ),
             other => format!("{other:?}"),
         };
         self.record_tool_result(pending.call, executed, true, preview)
@@ -1318,6 +1331,15 @@ impl Agent {
             },
         });
         // The result is recorded first so the transcript stays valid.
+        if stop.is_none() && self.state.consecutive_tool_timeouts >= MAX_CONSECUTIVE_TOOL_TIMEOUTS {
+            let count = self.state.consecutive_tool_timeouts;
+            self.state.consecutive_tool_timeouts = 0;
+            effects.extend(self.fail(
+                "TOOL_TIMEOUT",
+                format!("{count} consecutive tool calls timed out"),
+            ));
+            return effects;
+        }
         match stop {
             Some(stop) => effects.extend(self.behavior_stop(&stop)),
             None => effects.extend(self.continue_after_tools()),

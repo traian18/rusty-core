@@ -101,15 +101,24 @@ mod cancellation_tests;
 pub struct Scheduler {
     permits: GlobalPermits,
     backend_limiters: BackendLimiters,
+    tool_call_timeout: std::time::Duration,
 }
 
 impl Scheduler {
     /// Creates a new `Scheduler` with the given capacities.
     pub fn new(config: SchedulerConfig) -> Self {
+        let tool_call_timeout = config.tool_call_timeout;
         Self {
             permits: GlobalPermits::new(config),
             backend_limiters: BackendLimiters::new(),
+            tool_call_timeout,
         }
+    }
+
+    /// Wall-clock cap applied to each tool call (see
+    /// [`SchedulerConfig::tool_call_timeout`]).
+    pub fn tool_call_timeout(&self) -> std::time::Duration {
+        self.tool_call_timeout
     }
 
     /// Acquires a permit for creating a new session.

@@ -110,6 +110,7 @@ impl SessionRuntime {
                     behavior: BehaviorState::from_stored(stored.behavior.as_ref())
                         .expect("stored behavior validated before restore"),
                     pending_profile: None,
+                    consecutive_tool_timeouts: 0,
                 },
                 backend: stored.backend,
                 capabilities: capabilities_from_value(&stored.capabilities),

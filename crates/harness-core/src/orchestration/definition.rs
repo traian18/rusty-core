@@ -353,6 +353,14 @@ pub struct OrchestrationPolicies {
     pub max_total_attempts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_elapsed_ms: Option<u64>,
+    /// Longest an active step may go without any sign of life (agent event,
+    /// usage report, checkpoint) before the runner cancels the attempt and
+    /// fails it as retryable. Time spent waiting on a permission decision or
+    /// while paused does not count. Must exceed the longest legitimate silent
+    /// operation, e.g. a tool call (`tool_call_timeout`) or a model's first
+    /// event (`first_event_timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_model_requests: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -34,6 +34,12 @@ pub struct SchedulerConfig {
     /// from "will never complete" — see
     /// `docs/production-readiness-roadmap.md`'s E1 finding.
     pub admission_timeout: Duration,
+    /// Hard wall-clock cap on a single tool call, from the moment it starts
+    /// executing (queueing for a permit is not counted). A call that exceeds
+    /// it is cancelled and reported to the model as a timed-out error, so a
+    /// hung tool cannot stall a run indefinitely. Tools may enforce a
+    /// shorter limit of their own (e.g. `shell.exec`'s `timeout_secs`).
+    pub tool_call_timeout: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -46,6 +52,7 @@ impl Default for SchedulerConfig {
             max_concurrent_tool_executions: 16,
             max_concurrent_processes: 8,
             admission_timeout: Duration::from_secs(5),
+            tool_call_timeout: Duration::from_secs(300),
         }
     }
 }

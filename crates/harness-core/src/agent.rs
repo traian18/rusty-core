@@ -88,6 +88,7 @@ impl Agent {
                 pending_permissions: Default::default(),
                 children: Vec::new(),
                 last_error: None,
+                consecutive_tool_timeouts: 0,
                 transition_sequence: 0,
                 depth,
                 behavior: Default::default(),

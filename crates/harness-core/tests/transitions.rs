@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use harness_core::agent::Agent;
 use harness_core::capabilities::{AgentCapabilities, CapabilityError, WorkspaceCapabilities};
+use harness_core::transitions::MAX_CONSECUTIVE_TOOL_TIMEOUTS;
 use harness_protocol::backend::{
     BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference, ExecutionEvent,
     ExecutionResult,
@@ -14,7 +15,8 @@ use harness_protocol::commands::{
 use harness_protocol::effects::{AgentEffect, ToolInheritance};
 use harness_protocol::events::{AgentEvent, AgentOutcome};
 use harness_protocol::ids::{
-    AgentId, BackendId, ConfigurationId, IntegrationId, RequestId, SessionId, ToolCallId, ToolId,
+    AgentId, BackendId, ConfigurationId, IntegrationId, RequestId, RunId, SessionId, ToolCallId,
+    ToolId,
 };
 use harness_protocol::messages::{ContentBlock, MessageRole};
 use harness_protocol::tools::{
@@ -492,6 +494,85 @@ fn tool_failure_records_result_and_continues() {
             AgentEffect::ExecuteBackend { .. }
         ]
     ));
+}
+
+/// Runs one tool turn (request, backend turn end, then `outcome`) and returns
+/// the effects of the tool result.
+fn tool_turn(agent: &mut Agent, run_id: RunId, outcome: AgentCommand) -> Vec<AgentEffect> {
+    let call_id = ToolCallId::new();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::ToolCallRequested {
+            request_id: RequestId::new(),
+            call: tool_call(call_id),
+        },
+    });
+    let mut result = completed_result();
+    result.finish_reason = "tool_use".into();
+    agent.apply(AgentCommand::BackendEvent {
+        run_id,
+        event: ExecutionEvent::Completed {
+            request_id: RequestId::new(),
+            result,
+        },
+    });
+    match outcome {
+        AgentCommand::ToolFailed { error, .. } => {
+            agent.apply(AgentCommand::ToolFailed { call_id, error })
+        }
+        AgentCommand::ToolCompleted { result, .. } => {
+            agent.apply(AgentCommand::ToolCompleted { call_id, result })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn timeout_outcome() -> AgentCommand {
+    AgentCommand::ToolFailed {
+        call_id: ToolCallId::new(),
+        error: ToolError::Timeout,
+    }
+}
+
+#[test]
+fn consecutive_tool_timeouts_fail_the_run() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    for _ in 0..MAX_CONSECUTIVE_TOOL_TIMEOUTS - 1 {
+        tool_turn(&mut agent, run_id, timeout_outcome());
+        assert_ne!(agent.state.status, AgentStatus::Failed);
+    }
+    tool_turn(&mut agent, run_id, timeout_outcome());
+    assert_eq!(agent.state.status, AgentStatus::Failed);
+    assert_eq!(
+        agent.state.last_error.as_ref().unwrap().code,
+        "TOOL_TIMEOUT"
+    );
+}
+
+#[test]
+fn a_successful_tool_result_resets_the_timeout_streak() {
+    let mut agent = create_agent(PermissionMode::Allow);
+    let run_id = start(&mut agent);
+    for _ in 0..MAX_CONSECUTIVE_TOOL_TIMEOUTS - 1 {
+        tool_turn(&mut agent, run_id, timeout_outcome());
+    }
+    tool_turn(
+        &mut agent,
+        run_id,
+        AgentCommand::ToolCompleted {
+            call_id: ToolCallId::new(),
+            result: ToolResult {
+                call_id: ToolCallId::new(),
+                output: serde_json::json!("ok"),
+                is_error: false,
+            },
+        },
+    );
+    for _ in 0..MAX_CONSECUTIVE_TOOL_TIMEOUTS - 1 {
+        tool_turn(&mut agent, run_id, timeout_outcome());
+    }
+    assert_ne!(agent.state.status, AgentStatus::Failed);
 }
 
 #[test]

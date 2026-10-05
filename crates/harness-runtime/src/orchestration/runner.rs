@@ -554,6 +554,11 @@ struct ActiveStep {
     delegated: Option<DelegatedRunRef>,
     usage: UsageSummary,
     started_at_ms: u64,
+    /// Last time the attempt showed a sign of life; feeds the stall watchdog.
+    last_activity: Instant,
+    /// Set when the watchdog cancelled the attempt, so its outcome is
+    /// reported as a retryable stall rather than a plain cancellation.
+    stalled: bool,
 }
 
 struct StepExecution {
@@ -564,6 +569,7 @@ struct StepExecution {
 enum Wake {
     Cancelled,
     Deadline,
+    Stalled,
     Control(Option<Control>),
     Signal(Option<StepSignal>),
     StepDone(Box<Result<StepExecution, tokio::task::JoinError>>),
@@ -681,6 +687,7 @@ impl RunLoop {
             }
             match self.wait().await {
                 Wake::Cancelled | Wake::Deadline => {}
+                Wake::Stalled => self.on_stalled(),
                 Wake::Control(Some(control)) => self.on_control(control).await?,
                 Wake::Control(None) => self.control_open = false,
                 Wake::Signal(Some(signal)) => self.on_signal(signal).await?,
@@ -696,6 +703,7 @@ impl RunLoop {
 
     async fn wait(&mut self) -> Wake {
         let deadline = self.deadline();
+        let stall_deadline = self.stall_deadline();
         let (signals, join) = match self.active.as_mut() {
             Some(active) => (
                 active.signals_open.then_some(&mut active.signals),
@@ -725,7 +733,38 @@ impl RunLoop {
                     None => pending().await,
                 }
             } => Wake::Deadline,
+            _ = async {
+                match stall_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => pending().await,
+                }
+            } => Wake::Stalled,
         }
+    }
+
+    /// When the active attempt becomes stale, if the watchdog applies: a
+    /// limit is set, a step is running and not already cancelled, and it is
+    /// neither paused nor waiting on a person's permission decision.
+    fn stall_deadline(&self) -> Option<Instant> {
+        let limit = self.runner.compiled.definition.policies.stall_timeout_ms?;
+        let active = self.active.as_ref().filter(|active| !active.stalled)?;
+        if self.state.paused
+            || !self.state.steps[&active.node_id]
+                .pending_permissions
+                .is_empty()
+        {
+            return None;
+        }
+        Some(active.last_activity + Duration::from_millis(limit))
+    }
+
+    fn on_stalled(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        tracing::warn!(node = %active.node_id, attempt = active.attempt, "step stalled; cancelling attempt");
+        active.stalled = true;
+        active.token.cancel();
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -851,6 +890,8 @@ impl RunLoop {
             delegated: None,
             usage: UsageSummary::default(),
             started_at_ms: now_ms(),
+            last_activity: Instant::now(),
+            stalled: false,
         });
     }
 
@@ -869,6 +910,7 @@ impl RunLoop {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
+        active.last_activity = Instant::now();
         match signal {
             StepSignal::Checkpoint { value, committed } => {
                 let node_id = active.node_id.clone();
@@ -948,6 +990,11 @@ impl RunLoop {
     }
 
     async fn on_control(&mut self, control: Control) -> Result<(), OrchestrationRuntimeError> {
+        // Pausing, resuming and answering a permission all restart the stall
+        // clock, which does not run while waiting on a person.
+        if let Some(active) = self.active.as_mut() {
+            active.last_activity = Instant::now();
+        }
         let (command, reply) = match control {
             Control::Pause(reply) => (Ok(OrchestrationCommand::Pause), reply),
             Control::Resume(reply) => (Ok(OrchestrationCommand::Resume), reply),
@@ -1067,6 +1114,23 @@ impl RunLoop {
             )),
             details: AttemptDetails::default(),
         });
+        let mut execution = execution;
+        if active.stalled {
+            execution.result = Err(OrchestrationError::retryable(
+                "step_stalled",
+                format!(
+                    "step {} made no progress for {}ms and was cancelled",
+                    active.node_id,
+                    self.runner
+                        .compiled
+                        .definition
+                        .policies
+                        .stall_timeout_ms
+                        .unwrap_or_default()
+                ),
+                RetryReason::BackendTimeout,
+            ));
+        }
         let mut details = execution.details;
         details.started_at_ms = Some(active.started_at_ms);
         details.ended_at_ms = Some(now_ms());

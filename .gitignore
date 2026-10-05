@@ -35,3 +35,7 @@ Thumbs.db
 /sdk_plan.md
 /sdk/typescript/node_modules/
 /sdk/typescript/dist/
+/AGENT_BEHAVIOR_COMPARISON.md
+/BEHAVIOR_LAYER_DESIGN.md
+/merry-weaving-riddle.md
+/ORCHESTRATION_LAYER_DESIGN.md

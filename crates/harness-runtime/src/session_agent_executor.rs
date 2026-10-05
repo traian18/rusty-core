@@ -225,6 +225,7 @@ fn classify_failure(error: AgentError) -> AgentExecutionError {
         "BACKEND_ERROR" if error.message.starts_with("Timeout") => {
             Some(RetryReason::BackendTimeout)
         }
+        "TOOL_TIMEOUT" => Some(RetryReason::ToolTimeout),
         _ => None,
     };
     AgentExecutionError {
@@ -588,6 +589,11 @@ mod tests {
         assert_eq!(
             classify_failure(error("TOOL_FAILED", "Timeout")).retry_reason,
             None
+        );
+        assert_eq!(
+            classify_failure(error("TOOL_TIMEOUT", "3 consecutive tool calls timed out"))
+                .retry_reason,
+            Some(RetryReason::ToolTimeout)
         );
     }
 
