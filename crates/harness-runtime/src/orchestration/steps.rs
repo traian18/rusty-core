@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_core::orchestration::{
-    AgentContextMode, DelegatedRunRef, Evidence, InputBinding, InputNodeConfig, OrchestrationError,
-    OrchestrationNode, OrchestrationNodeId, OrchestrationRunId, OrchestrationRunState,
-    OutputBinding, RetryReason, StructuredOutputMode, UsageSummary, VerificationCheck,
-    VerifyNodeConfig,
+    AgentContextMode, ApprovalNodeConfig, DelegatedRunRef, Evidence, InputBinding, InputDecision,
+    InputNodeConfig, InputRequest, InputResponse, OrchestrationError, OrchestrationNode,
+    OrchestrationNodeId, OrchestrationRunId, OrchestrationRunState, OutputBinding, Responder,
+    RetryReason, StructuredOutputMode, UsageSummary, VerificationCheck, VerifyNodeConfig,
 };
 use harness_protocol::{commands::PermissionDecision, events::AgentEventEnvelope};
 use serde_json::{json, Map, Value};
@@ -48,6 +48,13 @@ pub struct AgentStepRequest {
     /// Why earlier attempts were rejected (validation or verification
     /// errors). Untrusted data, like `input`.
     pub feedback: Vec<OrchestrationError>,
+    /// A task queue may offer to revise the plan: failing with
+    /// `changes_requested` re-runs the step that wrote it.
+    pub plan_revisable: bool,
+    /// How deep a flow this step starts would be, and the run's options: for
+    /// the flows a task queue runs.
+    pub subflow_depth: u32,
+    pub run_options: harness_core::orchestration::RunOptions,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +121,9 @@ pub enum StepSignal {
     Usage(UsageSummary),
     /// A raw event from the delegated agent, republished with correlation.
     Agent(Box<AgentEventEnvelope>),
+    /// The attempt asks the user a question and waits for the answer (see
+    /// [`StepContext::ask`]).
+    InputRequested(InputRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +132,20 @@ pub struct PermissionResolution {
     pub decision: PermissionDecision,
 }
 
+/// The user's answer to a question an attempt asked.
+#[derive(Debug, Clone)]
+pub struct InputAnswer {
+    pub request_id: String,
+    pub response: InputResponse,
+}
+
 /// Per-attempt channel between the runner and an executor.
 pub struct StepContext {
     pub cancellation: CancellationToken,
     signals: mpsc::UnboundedSender<StepSignal>,
     /// Decisions for permissions this attempt reported.
     pub permissions: mpsc::UnboundedReceiver<PermissionResolution>,
+    answers: mpsc::UnboundedReceiver<InputAnswer>,
 }
 
 impl StepContext {
@@ -135,11 +153,13 @@ impl StepContext {
         cancellation: CancellationToken,
         signals: mpsc::UnboundedSender<StepSignal>,
         permissions: mpsc::UnboundedReceiver<PermissionResolution>,
+        answers: mpsc::UnboundedReceiver<InputAnswer>,
     ) -> Self {
         Self {
             cancellation,
             signals,
             permissions,
+            answers,
         }
     }
 
@@ -147,7 +167,32 @@ impl StepContext {
     pub fn detached(cancellation: CancellationToken) -> Self {
         let (signals, _) = mpsc::unbounded_channel();
         let (_, permissions) = mpsc::unbounded_channel();
-        Self::new(cancellation, signals, permissions)
+        let (_, answers) = mpsc::unbounded_channel();
+        Self::new(cancellation, signals, permissions, answers)
+    }
+
+    /// Ask the user `request` and wait for the answer. The run shows as
+    /// waiting for input meanwhile, and the wait does not count as a stall.
+    pub async fn ask(
+        &mut self,
+        request: InputRequest,
+    ) -> Result<InputResponse, AgentExecutionError> {
+        let id = request.id.clone();
+        self.signals
+            .send(StepSignal::InputRequested(request))
+            .map_err(|_| AgentExecutionError::new("cancelled", "workflow stopped before asking"))?;
+        loop {
+            tokio::select! {
+                _ = self.cancellation.cancelled() => {
+                    return Err(AgentExecutionError::new("cancelled", "workflow cancelled while waiting for an answer"));
+                }
+                answer = self.answers.recv() => match answer {
+                    Some(answer) if answer.request_id == id => return Ok(answer.response),
+                    Some(_) => continue,
+                    None => return Err(AgentExecutionError::new("cancelled", "workflow stopped while waiting for an answer")),
+                },
+            }
+        }
     }
 
     pub async fn checkpoint(&self, value: Value) -> Result<(), AgentExecutionError> {
@@ -169,6 +214,32 @@ impl StepContext {
         // are observations, so dropping them then is harmless.
         let _ = self.signals.send(signal);
     }
+}
+
+/// A child run a `subflow` node asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubflowRequest {
+    pub run_id: OrchestrationRunId,
+    pub node_id: OrchestrationNodeId,
+    pub attempt: u32,
+    pub target: harness_core::orchestration::SubflowTarget,
+    /// The values bound to the node: the child's run input.
+    pub input: Value,
+    /// How deep the child is: a flow run on its own is level 0.
+    pub depth: u32,
+    pub options: harness_core::orchestration::RunOptions,
+}
+
+/// Runs the child of a `subflow` node to its end and returns its output. The
+/// engine supplies it, since it knows the other flows and the session the
+/// child shares tools and permissions with.
+#[async_trait]
+pub trait SubflowExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        request: SubflowRequest,
+        context: &mut StepContext,
+    ) -> Result<Value, AgentExecutionError>;
 }
 
 #[async_trait]
@@ -371,8 +442,29 @@ pub(crate) async fn execute_verify(
         Err(error) => return (Err(error), Vec::new()),
     };
     let mut evidence = Vec::new();
+    let mut manual_checks = Vec::new();
     for check in &config.checks {
         let (passed, detail) = match check {
+            VerificationCheck::Criteria {
+                pointer,
+                plan_pointer,
+                block_on,
+                defer,
+                max_deferred,
+            } => {
+                let expected = plan_pointer
+                    .as_ref()
+                    .map(|plan_pointer| plan_criteria(input.pointer(plan_pointer)));
+                let judged = judge_criteria(
+                    input.pointer(pointer),
+                    block_on,
+                    defer,
+                    *max_deferred,
+                    expected.as_deref(),
+                );
+                manual_checks.extend(judged.deferred);
+                (judged.passed, judged.detail)
+            }
             VerificationCheck::RequirementsSatisfied {
                 plan_pointer,
                 results_pointer,
@@ -461,7 +553,7 @@ pub(crate) async fn execute_verify(
         .filter(|item| !item.passed)
         .map(|item| format!("{}: {}", item.check, item.detail))
         .collect();
-    let report = json!({
+    let mut report = json!({
         "passed": issues.is_empty(),
         "checks": evidence.iter().map(|item| json!({
             "id": item.check,
@@ -470,6 +562,14 @@ pub(crate) async fn execute_verify(
         })).collect::<Vec<_>>(),
         "issues": issues,
     });
+    // Always present when criteria are judged, so a later step can bind to it.
+    if config
+        .checks
+        .iter()
+        .any(|check| matches!(check, VerificationCheck::Criteria { .. }))
+    {
+        report["manual_checks"] = Value::Array(manual_checks);
+    }
     let result = if issues.is_empty() {
         Ok(report)
     } else if input
@@ -487,33 +587,291 @@ pub(crate) async fn execute_verify(
     } else {
         Err(OrchestrationError::retryable(
             "verification_failed",
-            verification_repair_focus(&input, &issues),
+            verification_repair_focus(&input, &issues, &config.checks),
             RetryReason::VerificationFailed,
         ))
     };
     (result, evidence)
 }
 
-fn verification_repair_focus(input: &Value, issues: &[String]) -> String {
-    let mut parts = vec![format!("Verification did not pass: {}", issues.join("; "))];
-    let unresolved = input["check"]["criteria"]
-        .as_array()
+/// The approval step: asks the user to approve `subject`, ask for changes or
+/// reject it, unless it is skipped (nothing to review) or the run was
+/// started with auto-approve. Requested changes fail the step with
+/// `changes_requested`, which the reducer routes to the revise target.
+pub(crate) async fn execute_approval(
+    state: &OrchestrationRunState,
+    node: &OrchestrationNode,
+    config: &ApprovalNodeConfig,
+    attempt: u32,
+    context: &mut StepContext,
+) -> Result<Value, OrchestrationError> {
+    let subject = match resolve_binding(state, &config.subject) {
+        // Nothing where the subject should be is nothing to review.
+        Err(error) if error.code == "invalid_pointer" && config.skip_if_empty.is_some() => {
+            Value::Null
+        }
+        result => result?,
+    };
+    let outcome = |decision: &str, by: Responder, notes: Option<String>| {
+        json!({
+            "decision": decision,
+            "by": by,
+            "notes": notes.unwrap_or_default(),
+            "subject": subject,
+        })
+    };
+    if let Some(pointer) = &config.skip_if_empty {
+        let empty = match subject.pointer(pointer) {
+            None | Some(Value::Null) => true,
+            Some(Value::String(text)) => text.trim().is_empty(),
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(Value::Object(fields)) => fields.is_empty(),
+            Some(_) => false,
+        };
+        if empty {
+            return Ok(outcome("skipped", Responder::Auto, None));
+        }
+    }
+    if state.options.auto_approve && config.allow_auto_approve {
+        return Ok(outcome("approved", Responder::Auto, None));
+    }
+    let decision = |id: &str, label: &str, requires_text: bool| InputDecision {
+        id: id.into(),
+        label: label.into(),
+        requires_text,
+    };
+    let mut decisions = vec![decision("approve", "Approve", false)];
+    if config.revise_target().is_some() && attempt <= config.max_revisions {
+        decisions.push(decision("request_changes", "Request changes", true));
+    }
+    decisions.push(decision("reject", "Reject", false));
+    let prompt = if config.prompt.trim().is_empty() {
+        format!("Review {} before the workflow continues.", node.name)
+    } else {
+        config.prompt.clone()
+    };
+    let response = context
+        .ask(InputRequest {
+            id: format!("{}:{attempt}", node.id),
+            kind: "approval".into(),
+            prompt,
+            subject: subject.clone(),
+            decisions,
+        })
+        .await?;
+    let notes = response.text.clone().filter(|text| !text.trim().is_empty());
+    match response.decision.as_str() {
+        "approve" => Ok(outcome("approved", response.by, notes)),
+        "request_changes" => Err(OrchestrationError::retryable(
+            CHANGES_REQUESTED,
+            notes.unwrap_or_default(),
+            RetryReason::ChangesRequested,
+        )),
+        _ => Err(OrchestrationError::new(
+            "approval_rejected",
+            match notes {
+                Some(notes) => format!("{} was rejected: {notes}", node.name),
+                None => format!("{} was rejected.", node.name),
+            },
+        )),
+    }
+}
+
+/// Feedback code for changes a user asked for at an approval step. Its
+/// message is the user's own request, not model output.
+pub const CHANGES_REQUESTED: &str = "changes_requested";
+
+struct JudgedCriteria {
+    passed: bool,
+    detail: String,
+    /// `{id, how_to_test, evidence}` for every deferred criterion.
+    deferred: Vec<Value>,
+}
+
+fn criterion_status(criterion: &Value) -> String {
+    criterion["status"]
+        .as_str()
+        .unwrap_or("unverified")
+        .trim()
+        .to_lowercase()
+}
+
+fn criterion_id(criterion: &Value, index: usize) -> String {
+    criterion["id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map_or_else(|| format!("criterion {}", index + 1), str::to_owned)
+}
+
+/// The acceptance criterion ids of a task plan.
+fn plan_criteria(plan: Option<&Value>) -> Vec<String> {
+    plan.and_then(|plan| plan["requirements"].as_array())
         .into_iter()
         .flatten()
-        .filter(|criterion| criterion["status"].as_str() != Some("pass"))
-        .map(|criterion| {
-            let id = criterion["id"].as_str().unwrap_or("unnamed criterion");
-            let status = criterion["status"].as_str().unwrap_or("unverified");
-            let evidence = criterion["evidence"]
-                .as_str()
-                .unwrap_or("No evidence supplied");
-            format!("- {id} [{status}]: {evidence}")
+        .flat_map(|requirement| requirement["criteria"].as_array().into_iter().flatten())
+        .filter_map(|criterion| criterion["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Judges `value`, the reported criteria. With `expected` (a plan's criterion
+/// ids) every one must also have been reported; ids match loosely.
+fn judge_criteria(
+    value: Option<&Value>,
+    block_on: &[String],
+    defer: &[String],
+    max_deferred: Option<u32>,
+    expected: Option<&[String]>,
+) -> JudgedCriteria {
+    let failed = |detail: String| JudgedCriteria {
+        passed: false,
+        detail,
+        deferred: Vec::new(),
+    };
+    let Some(criteria) = value.and_then(Value::as_array) else {
+        return failed("criteria are missing or not an array".into());
+    };
+    if criteria.is_empty() {
+        return failed("no criteria were reported".into());
+    }
+    let mut blocking = Vec::new();
+    let mut deferred = Vec::new();
+    for (index, criterion) in criteria.iter().enumerate() {
+        let status = criterion_status(criterion);
+        let id = criterion_id(criterion, index);
+        if status == "pass" {
+            continue;
+        }
+        // Anything not explicitly deferred blocks, including statuses the
+        // check does not name: an unknown status is not a pass.
+        if !block_on.contains(&status) && defer.contains(&status) {
+            let text = |field: &str| {
+                criterion[field]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            };
+            deferred.push(json!({
+                "id": id,
+                "how_to_test": text("how_to_test").or(text("evidence")).unwrap_or("Check this by hand."),
+                "evidence": text("evidence").unwrap_or(""),
+            }));
+        } else {
+            blocking.push(format!("{id} [{status}]"));
+        }
+    }
+    if let Some(expected) = expected {
+        let wanted: Vec<&str> = expected.iter().map(String::as_str).collect();
+        let found = match_results(&wanted, criteria, |c| c["id"].as_str());
+        for (id, result) in wanted.iter().zip(found) {
+            if result.is_none() {
+                blocking.push(format!("{id} [missing]"));
+            }
+        }
+    }
+    if let Some(max) = max_deferred.filter(|max| deferred.len() > *max as usize) {
+        blocking.push(format!(
+            "{} criteria were left for manual checks, at most {max} may be",
+            deferred.len()
+        ));
+    }
+    if !blocking.is_empty() {
+        return failed(format!("not met: {}", blocking.join(", ")));
+    }
+    let passed = criteria.len() - deferred.len();
+    let detail = if deferred.is_empty() {
+        format!("{passed} criteria passed")
+    } else {
+        format!(
+            "{passed} criteria passed, {} left for manual checks",
+            deferred.len()
+        )
+    };
+    JudgedCriteria {
+        passed: true,
+        detail,
+        deferred,
+    }
+}
+
+/// What a producer sent back by a failed verification should fix. Criteria a
+/// `criteria` check defers (only a person can check them) are listed apart so
+/// the producer does not try to "fix" something that is not broken.
+fn verification_repair_focus(
+    input: &Value,
+    issues: &[String],
+    checks: &[VerificationCheck],
+) -> String {
+    let mut parts = vec![format!("Verification did not pass: {}", issues.join("; "))];
+    let line = |index: usize, criterion: &Value| {
+        let evidence = criterion["evidence"]
+            .as_str()
+            .unwrap_or("No evidence supplied");
+        format!(
+            "- {} [{}]: {evidence}",
+            criterion_id(criterion, index),
+            criterion_status(criterion)
+        )
+    };
+    let mut unresolved = Vec::new();
+    let mut manual = Vec::new();
+    let criteria_checks: Vec<_> = checks
+        .iter()
+        .filter_map(|check| match check {
+            VerificationCheck::Criteria {
+                pointer,
+                plan_pointer,
+                block_on,
+                defer,
+                ..
+            } => Some((pointer, plan_pointer, block_on, defer)),
+            _ => None,
         })
-        .collect::<Vec<_>>();
+        .collect();
+    if criteria_checks.is_empty() {
+        let criteria = input["check"]["criteria"].as_array().into_iter().flatten();
+        for (index, criterion) in criteria.enumerate() {
+            if criterion_status(criterion) != "pass" {
+                unresolved.push(line(index, criterion));
+            }
+        }
+    }
+    for (pointer, plan_pointer, block_on, defer) in criteria_checks {
+        let criteria = input.pointer(pointer).and_then(Value::as_array);
+        // Plan criteria nobody reported are unmet too.
+        if let Some(plan_pointer) = plan_pointer {
+            let expected = plan_criteria(input.pointer(plan_pointer));
+            let wanted: Vec<&str> = expected.iter().map(String::as_str).collect();
+            let found = match_results(&wanted, criteria.map_or(&[][..], Vec::as_slice), |c| {
+                c["id"].as_str()
+            });
+            for (id, result) in wanted.iter().zip(found) {
+                if result.is_none() {
+                    unresolved.push(format!("- {id} [missing]: the review did not report it"));
+                }
+            }
+        }
+        for (index, criterion) in criteria.into_iter().flatten().enumerate() {
+            let status = criterion_status(criterion);
+            if status == "pass" {
+                continue;
+            }
+            if !block_on.contains(&status) && defer.contains(&status) {
+                manual.push(line(index, criterion));
+            } else {
+                unresolved.push(line(index, criterion));
+            }
+        }
+    }
     if !unresolved.is_empty() {
         parts.push(format!(
             "Focus on these unmet criteria:\n{}",
             unresolved.join("\n")
+        ));
+    }
+    if !manual.is_empty() {
+        parts.push(format!(
+            "Left for the user to check by hand; do not try to fix these:\n{}",
+            manual.join("\n")
         ));
     }
     if let Some(summary) = input["check"]["summary"].as_str() {
@@ -599,10 +957,118 @@ mod verification_feedback_tests {
                 {"id": "C3", "status": "unverified", "evidence": "No question adapter test."}
             ]
         }});
-        let focus = verification_repair_focus(&input, &["verdict was fail".into()]);
+        let focus = verification_repair_focus(&input, &["verdict was fail".into()], &[]);
         assert!(focus.contains("C2 [fail]: No native delivery in notifications.rs."));
         assert!(focus.contains("C3 [unverified]: No question adapter test."));
         assert!(!focus.contains("C1 [pass]"));
         assert!(focus.contains("Review summary: Native notifications still need work."));
+    }
+
+    fn criteria_check(max_deferred: Option<u32>) -> VerificationCheck {
+        VerificationCheck::Criteria {
+            pointer: "/check/criteria".into(),
+            plan_pointer: None,
+            block_on: vec!["fail".into()],
+            defer: vec!["manual".into()],
+            max_deferred,
+        }
+    }
+
+    fn judge(criteria: Value, max_deferred: Option<u32>) -> JudgedCriteria {
+        let VerificationCheck::Criteria {
+            block_on, defer, ..
+        } = criteria_check(max_deferred)
+        else {
+            unreachable!()
+        };
+        judge_criteria(Some(&criteria), &block_on, &defer, max_deferred, None)
+    }
+
+    #[test]
+    fn manual_criteria_let_the_work_move_on_and_become_manual_checks() {
+        let judged = judge(
+            json!([
+                {"id": "C1", "status": "pass", "evidence": "Unit test passes."},
+                {"id": "C2", "status": "manual", "evidence": "Needs a phone.", "how_to_test": "Open the app on iOS and tap Share."}
+            ]),
+            None,
+        );
+        assert!(judged.passed, "{}", judged.detail);
+        assert_eq!(judged.detail, "1 criteria passed, 1 left for manual checks");
+        assert_eq!(
+            judged.deferred,
+            vec![
+                json!({"id": "C2", "how_to_test": "Open the app on iOS and tap Share.", "evidence": "Needs a phone."})
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_unknown_or_missing_criteria_block() {
+        let failed = judge(
+            json!([{"id": "C1", "status": "fail", "evidence": "x"}]),
+            None,
+        );
+        assert!(!failed.passed);
+        assert_eq!(failed.detail, "not met: C1 [fail]");
+        let unknown = judge(
+            json!([{"id": "C1", "status": "unverified", "evidence": "x"}]),
+            None,
+        );
+        assert!(!unknown.passed, "an undeclared status is not a pass");
+        assert!(!judge(json!([]), None).passed, "no criteria is not a pass");
+        assert!(!judge_criteria(None, &["fail".into()], &[], None, None).passed);
+    }
+
+    #[test]
+    fn plan_criteria_nobody_reported_block_as_missing() {
+        let plan = json!({"requirements": [{"id": "R1", "text": "t", "criteria": [{"id": "C-1", "text": "a"}, {"id": "C2", "text": "b"}]}]});
+        let expected = plan_criteria(Some(&plan));
+        assert_eq!(expected, ["C-1", "C2"]);
+        let reported = json!([{"id": "c1", "status": "pass", "evidence": "x"}]);
+        let block = ["fail".to_string()];
+        let judged = judge_criteria(Some(&reported), &block, &[], None, Some(&expected));
+        assert!(!judged.passed);
+        assert_eq!(judged.detail, "not met: C2 [missing]");
+        let all = json!([{"id": "C1", "status": "pass"}, {"id": "C2", "status": "pass"}]);
+        assert!(judge_criteria(Some(&all), &block, &[], None, Some(&expected)).passed);
+        let input = json!({"check": {"criteria": reported}, "plan": plan});
+        let check = VerificationCheck::Criteria {
+            pointer: "/check/criteria".into(),
+            plan_pointer: Some("/plan".into()),
+            block_on: block.to_vec(),
+            defer: vec![],
+            max_deferred: None,
+        };
+        let focus = verification_repair_focus(&input, &["criteria".into()], &[check]);
+        assert!(focus.contains("C2 [missing]"), "{focus}");
+    }
+
+    #[test]
+    fn deferring_more_than_allowed_blocks() {
+        let criteria = json!([
+            {"id": "C1", "status": "manual", "evidence": "a"},
+            {"id": "C2", "status": "manual", "evidence": "b"}
+        ]);
+        assert!(judge(criteria.clone(), Some(2)).passed);
+        let judged = judge(criteria, Some(1));
+        assert!(!judged.passed);
+        assert!(judged.detail.contains("at most 1"), "{}", judged.detail);
+    }
+
+    #[test]
+    fn repair_feedback_keeps_manual_criteria_apart_from_unmet_ones() {
+        let input = json!({"check": {"criteria": [
+            {"id": "C1", "status": "fail", "evidence": "Button does nothing."},
+            {"id": "C2", "status": "manual", "evidence": "Needs a printer."}
+        ]}});
+        let focus =
+            verification_repair_focus(&input, &["criteria".into()], &[criteria_check(None)]);
+        let (unmet, manual) = focus
+            .split_once("Left for the user to check by hand")
+            .expect("manual section");
+        assert!(unmet.contains("C1 [fail]: Button does nothing."));
+        assert!(!unmet.contains("C2"));
+        assert!(manual.contains("C2 [manual]: Needs a printer."));
     }
 }

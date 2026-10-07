@@ -100,10 +100,15 @@ pub fn validate_orchestration(document: &Value, profiles: &[Value]) -> Vec<Issue
     let registry = library_registry(profiles, None);
     for node in &definition.nodes {
         if let OrchestrationNodeKind::Agent(config) = &node.kind {
-            if let Some(reference) = &config.profile {
+            let reviewer = config
+                .task_queue
+                .as_ref()
+                .map(|queue| (&queue.review_profile, "task_queue.review_profile"));
+            let step = config.profile.as_ref().map(|profile| (profile, "profile"));
+            for (reference, field) in step.into_iter().chain(reviewer) {
                 if registry.resolve(reference).is_err() {
                     issues.push(Issue::warning(
-                        format!("nodes.{}.config.profile", node.id),
+                        format!("nodes.{}.config.{field}", node.id),
                         "unknown_profile",
                         format!("no profile {reference} in this workspace"),
                     ));

@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::definition::{
-    EdgeCondition, OrchestrationDefinition, OrchestrationDefinitionId, OrchestrationEdge,
-    OrchestrationNode, OrchestrationNodeId, OrchestrationNodeKind, OutputBinding, RetryReason,
-    SchemaReference, StructuredOutputMode, ToolScope, VerificationCheck, MAX_STEP_ATTEMPTS,
-    ORCHESTRATION_SCHEMA_VERSION,
+    AgentNodeConfig, EdgeCondition, OrchestrationDefinition, OrchestrationDefinitionId,
+    OrchestrationEdge, OrchestrationNode, OrchestrationNodeId, OrchestrationNodeKind,
+    OutputBinding, RetryReason, SchemaReference, StructuredOutputMode, SubflowTarget, ToolScope,
+    VerificationCheck, MAX_REVISIONS, MAX_STEP_ATTEMPTS, ORCHESTRATION_SCHEMA_VERSION,
 };
+use super::task_plan::{is_task_plan_schema, TASK_PLAN_SCHEMA_ID, TASK_PLAN_SCHEMA_REVISION};
 
 /// JSON Schema keywords the host validator implements. Anything else is
 /// rejected at compile time rather than silently ignored at run time.
@@ -37,9 +38,9 @@ pub struct CompiledOrchestration {
     pub outgoing: BTreeMap<OrchestrationNodeId, Vec<OrchestrationEdge>>,
     pub incoming: BTreeMap<OrchestrationNodeId, Vec<OrchestrationEdge>>,
     pub topological_rank: BTreeMap<OrchestrationNodeId, usize>,
-    /// For each verify node with a `retry_target`, the nodes reset to
-    /// `Pending` when verification sends work back upstream (target and
-    /// verify node included), in topological order.
+    /// For each verify node with a `retry_target` and each approval with a
+    /// revise target, the nodes reset to `Pending` when it sends work back
+    /// upstream (target and sending node included), in topological order.
     pub retry_spans: BTreeMap<OrchestrationNodeId, Vec<OrchestrationNodeId>>,
     /// Stable FNV-1a hash of the serialized definition. Runs record it so a
     /// restore can prove it is resuming against the exact same document.
@@ -607,6 +608,36 @@ fn validate_data_flow(
                             }
                             continue;
                         }
+                        VerificationCheck::Criteria {
+                            pointer,
+                            plan_pointer,
+                            block_on,
+                            defer,
+                            ..
+                        } => {
+                            if let Some(plan_pointer) = plan_pointer {
+                                validate_pointer(
+                                    plan_pointer,
+                                    &format!("nodes.{}.config.checks.{}", node.id, check.id()),
+                                    issues,
+                                );
+                            }
+                            if block_on.is_empty()
+                                || block_on
+                                    .iter()
+                                    .chain(defer)
+                                    .any(|status| status.trim().is_empty() || status == "pass")
+                                || block_on.iter().any(|status| defer.contains(status))
+                            {
+                                issue(
+                                    issues,
+                                    format!("nodes.{}.config.checks.{}", node.id, check.id()),
+                                    "invalid_criteria_check",
+                                    "criteria checks need at least one block_on status; block_on and defer must not overlap or name pass",
+                                );
+                            }
+                            pointer
+                        }
                         VerificationCheck::RequiredStatus { pointer, .. }
                         | VerificationCheck::ArtifactExists { pointer }
                         | VerificationCheck::ArtifactsResolvable { pointer } => pointer,
@@ -615,6 +646,124 @@ fn validate_data_flow(
                         pointer,
                         &format!("nodes.{}.config.checks.{}", node.id, check.id()),
                         issues,
+                    );
+                }
+            }
+            OrchestrationNodeKind::Agent(AgentNodeConfig {
+                task_queue: Some(queue),
+                ..
+            }) => {
+                for (name, target) in &queue.flows {
+                    let path = format!("nodes.{}.config.task_queue.flows.{name}", node.id);
+                    match target {
+                        _ if name.trim().is_empty() => issue(
+                            issues,
+                            path,
+                            "invalid_subflow",
+                            "a flow needs a name for tasks to refer to",
+                        ),
+                        SubflowTarget::Flow { id, .. } if id.as_str().trim().is_empty() => issue(
+                            issues,
+                            path,
+                            "invalid_subflow",
+                            "a flow target needs the id of a saved flow",
+                        ),
+                        SubflowTarget::Step { instructions, .. }
+                            if instructions.trim().is_empty() =>
+                        {
+                            issue(
+                                issues,
+                                path,
+                                "invalid_subflow",
+                                "a step target needs instructions",
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+                let path = format!("nodes.{}.config.task_queue.plan_pointer", node.id);
+                let binding = queue.plan_binding().and_then(|target| {
+                    node.input_bindings
+                        .iter()
+                        .find(|binding| binding.target == target)
+                });
+                let Some(binding) = binding else {
+                    issue(
+                        issues,
+                        path,
+                        "task_plan_source",
+                        format!(
+                            "plan_pointer {} must start with the name of one of this step's input bindings",
+                            queue.plan_pointer
+                        ),
+                    );
+                    continue;
+                };
+                // A plan bound whole from a step must be that step's typed
+                // task plan; anything else only fails once the run reaches
+                // this step.
+                if let OutputBinding::NodeOutput { node_id, pointer } = &binding.source {
+                    let structured_plan = nodes.get(node_id).is_some_and(|producer| {
+                        matches!(&producer.kind, OrchestrationNodeKind::Agent(config) if config.structured_output != StructuredOutputMode::Text)
+                            && producer.output_schema.as_ref().is_some_and(is_task_plan_schema)
+                    });
+                    if pointer.is_empty() && !structured_plan {
+                        issue(
+                            issues,
+                            path,
+                            "task_plan_source",
+                            format!(
+                                "{node_id} must produce a task plan: give it a structured response format (e.g. host_validated) and the output schema {{\"type\": \"registry\", \"schema_id\": \"{TASK_PLAN_SCHEMA_ID}\", \"revision\": {TASK_PLAN_SCHEMA_REVISION}}}"
+                            ),
+                        );
+                    }
+                }
+            }
+            OrchestrationNodeKind::Subflow(config) => {
+                let path = format!("nodes.{}.config.target", node.id);
+                match &config.target {
+                    SubflowTarget::Flow { id, .. } if id.as_str().trim().is_empty() => issue(
+                        issues,
+                        path,
+                        "invalid_subflow",
+                        "a flow target needs the id of a saved flow",
+                    ),
+                    SubflowTarget::Step { instructions, .. } if instructions.trim().is_empty() => {
+                        issue(
+                            issues,
+                            path,
+                            "invalid_subflow",
+                            "a step target needs instructions",
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            OrchestrationNodeKind::Approval(config) => {
+                validate_pointer(
+                    binding_pointer(&config.subject),
+                    &format!("nodes.{}.config.subject.pointer", node.id),
+                    issues,
+                );
+                check(
+                    &config.subject,
+                    &upstream,
+                    format!("nodes.{}.config.subject", node.id),
+                    issues,
+                );
+                if let Some(pointer) = &config.skip_if_empty {
+                    validate_pointer(
+                        pointer,
+                        &format!("nodes.{}.config.skip_if_empty", node.id),
+                        issues,
+                    );
+                }
+                if config.max_revisions > MAX_REVISIONS {
+                    issue(
+                        issues,
+                        format!("nodes.{}.config.max_revisions", node.id),
+                        "invalid_max_revisions",
+                        format!("max_revisions must be at most {MAX_REVISIONS}"),
                     );
                 }
             }
@@ -654,13 +803,32 @@ fn compile_retry_spans(
 ) -> BTreeMap<OrchestrationNodeId, Vec<OrchestrationNodeId>> {
     let mut spans = BTreeMap::new();
     for node in nodes.values() {
-        let OrchestrationNodeKind::Verify(config) = &node.kind else {
-            continue;
+        // A verifier sends failed work back to its retry target; an approval
+        // sends the user's requested changes back to its revise target.
+        let (target_id, path, needs_policy) = match &node.kind {
+            OrchestrationNodeKind::Verify(config) => match &config.retry_target {
+                Some(target) => (target, "retry_target", true),
+                None => continue,
+            },
+            OrchestrationNodeKind::Approval(config) => match config.revise_target() {
+                Some(target) => (target, "revise_target", false),
+                None => continue,
+            },
+            // A task queue can send the user's request to revise the plan
+            // back to the step that wrote it -- when that is an agent step.
+            OrchestrationNodeKind::Agent(_) => match node.task_plan_source() {
+                Some(target)
+                    if nodes.get(target).is_some_and(|plan| {
+                        matches!(plan.kind, OrchestrationNodeKind::Agent(_))
+                    }) =>
+                {
+                    (target, "task_queue", false)
+                }
+                _ => continue,
+            },
+            _ => continue,
         };
-        let Some(target_id) = &config.retry_target else {
-            continue;
-        };
-        let path = format!("nodes.{}.config.retry_target", node.id);
+        let path = format!("nodes.{}.config.{path}", node.id);
         let Some(target) = nodes.get(target_id) else {
             issue(
                 issues,
@@ -689,10 +857,11 @@ fn compile_retry_spans(
             );
             continue;
         }
-        if !target
-            .retry
-            .retry_on
-            .contains(&RetryReason::VerificationFailed)
+        if needs_policy
+            && !target
+                .retry
+                .retry_on
+                .contains(&RetryReason::VerificationFailed)
         {
             issue(
                 issues,

@@ -285,6 +285,51 @@ fn compiler_rejects_unsupported_schema_keywords_and_unbounded_retries() {
 }
 
 #[test]
+fn compiler_validates_criteria_checks() {
+    let with_check = |block_on: &[&str], defer: &[&str]| {
+        let mut definition = default_orchestration_definition();
+        for node in &mut definition.nodes {
+            if let OrchestrationNodeKind::Verify(config) = &mut node.kind {
+                config.checks = vec![VerificationCheck::Criteria {
+                    pointer: "/report/criteria".into(),
+                    plan_pointer: None,
+                    block_on: block_on.iter().map(|s| s.to_string()).collect(),
+                    defer: defer.iter().map(|s| s.to_string()).collect(),
+                    max_deferred: None,
+                }];
+            }
+        }
+        compile(definition)
+    };
+    with_check(&["fail"], &["manual"]).expect("valid criteria check");
+    for (block_on, defer) in [
+        (&[][..], &["manual"][..]),
+        (&["fail"], &["fail"]),
+        (&["fail"], &["pass"]),
+        (&["fail", ""], &[]),
+    ] {
+        let error = with_check(block_on, defer).expect_err("invalid criteria check");
+        assert!(
+            codes(&error).contains(&"invalid_criteria_check"),
+            "{block_on:?} / {defer:?}"
+        );
+    }
+    let parsed: VerificationCheck =
+        serde_json::from_value(json!({"type": "criteria", "pointer": "/check/criteria"})).unwrap();
+    assert_eq!(
+        parsed,
+        VerificationCheck::Criteria {
+            pointer: "/check/criteria".into(),
+            plan_pointer: None,
+            block_on: vec!["fail".into()],
+            defer: vec!["manual".into()],
+            max_deferred: None,
+        },
+        "fail blocks and manual defers by default"
+    );
+}
+
+#[test]
 fn compiler_validates_verification_retry_targets() {
     let set_target = |target: &str| {
         let mut definition = default_orchestration_definition();
@@ -1073,4 +1118,465 @@ fn an_output_contract_is_optional() {
     assert!(definition.output_contract.source.is_none());
     assert!(!definition.output_contract.strict);
     compile(definition).expect("compiles without a contract");
+}
+
+// ---------------------------------------------------------------------------
+// Approval and questions to the user
+
+/// input → plan → approve → build → output.
+fn approval_definition(approval: Value) -> OrchestrationDefinition {
+    let mut config = json!({"subject": {"type": "node_output", "node_id": "plan", "pointer": ""}});
+    for (key, value) in approval.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    let agent = |name: &str| {
+        json!({"id": name, "name": name, "type": "agent",
+            "config": {"instructions": "work", "structured_output": "text"},
+            "retry": {"max_attempts": 2, "retry_on": ["backend_rate_limited"]}})
+    };
+    serde_json::from_value(json!({
+        "schema_version": 1, "id": "approve.flow", "revision": 1, "name": "Approve",
+        "nodes": [
+            {"id": "input", "name": "Input", "type": "input", "config": {}},
+            agent("plan"),
+            {"id": "approve", "name": "Approve", "type": "approval", "config": config},
+            agent("build"),
+            {"id": "output", "name": "Output", "type": "output",
+             "config": {"source": {"type": "node_output", "node_id": "build", "pointer": ""}, "strict": false}}
+        ],
+        "edges": [
+            {"id": "e1", "source": "input", "target": "plan", "condition": "on_success"},
+            {"id": "e2", "source": "plan", "target": "approve", "condition": "on_success"},
+            {"id": "e3", "source": "approve", "target": "build", "condition": "on_success"},
+            {"id": "e4", "source": "build", "target": "output", "condition": "on_success"}
+        ]
+    }))
+    .unwrap()
+}
+
+fn question() -> InputRequest {
+    InputRequest {
+        id: "approve:1".into(),
+        kind: "approval".into(),
+        prompt: "Review the plan".into(),
+        subject: json!("the plan"),
+        decisions: vec![
+            InputDecision {
+                id: "approve".into(),
+                label: "Approve".into(),
+                requires_text: false,
+            },
+            InputDecision {
+                id: "request_changes".into(),
+                label: "Request changes".into(),
+                requires_text: true,
+            },
+        ],
+    }
+}
+
+/// A run whose approval step has asked `question()`.
+fn asking(approval: Value) -> (CompiledOrchestration, OrchestrationRunState) {
+    let compiled = compile(approval_definition(approval)).expect("approval flow compiles");
+    let mut state = started_with(&compiled);
+    run_step(&compiled, &mut state, "input", json!({"request": "x"}));
+    run_step(&compiled, &mut state, "plan", json!("the plan"));
+    admit(&compiled, &mut state, "approve", 1);
+    let effects = apply(
+        &compiled,
+        &mut state,
+        OrchestrationCommand::InputRequired {
+            node_id: id("approve"),
+            attempt: 1,
+            request: question(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        events(&effects)[..],
+        [OrchestrationEvent::InputRequested { .. }]
+    ));
+    (compiled, state)
+}
+
+fn resolve(
+    compiled: &CompiledOrchestration,
+    state: &mut OrchestrationRunState,
+    request_id: &str,
+    decision: &str,
+    text: Option<&str>,
+) -> Result<Vec<OrchestrationEffect>, TransitionError> {
+    apply(
+        compiled,
+        state,
+        OrchestrationCommand::InputResolved {
+            node_id: id("approve"),
+            attempt: 1,
+            request_id: request_id.into(),
+            response: InputResponse {
+                decision: decision.into(),
+                text: text.map(str::to_owned),
+                by: Responder::User,
+            },
+        },
+    )
+}
+
+#[test]
+fn a_question_puts_the_run_in_waiting_for_input_until_answered() {
+    let (compiled, mut state) = asking(json!({}));
+    assert_eq!(state.status, OrchestrationStatus::WaitingForInput);
+    assert_eq!(
+        state.steps[&id("approve")].status,
+        StepStatus::WaitingForInput
+    );
+    assert_eq!(state.steps[&id("approve")].pending_input, Some(question()));
+    let wrong = |state: &mut OrchestrationRunState, id: &str, decision: &str, text| {
+        resolve(&compiled, state, id, decision, text)
+            .expect_err("rejected")
+            .code
+    };
+    assert_eq!(wrong(&mut state, "other", "approve", None), "unknown_input");
+    assert_eq!(
+        wrong(&mut state, "approve:1", "maybe", None),
+        "invalid_decision"
+    );
+    assert_eq!(
+        wrong(&mut state, "approve:1", "request_changes", Some(" ")),
+        "missing_text"
+    );
+    assert_eq!(state.status, OrchestrationStatus::WaitingForInput);
+    resolve(&compiled, &mut state, "approve:1", "approve", None).unwrap();
+    assert_eq!(state.status, OrchestrationStatus::Running);
+    assert!(state.steps[&id("approve")].pending_input.is_none());
+}
+
+#[test]
+fn an_unanswered_approval_is_asked_again_after_a_restart() {
+    let (compiled, mut state) = asking(json!({}));
+    let effects = apply(&compiled, &mut state, OrchestrationCommand::Recover).unwrap();
+    assert!(!state.status.is_terminal(), "{:?}", state.error);
+    let step = &state.steps[&id("approve")];
+    assert_eq!(step.status, StepStatus::Ready);
+    assert!(step.pending_input.is_none());
+    assert!(events(&effects).contains(&&OrchestrationEvent::StepReady {
+        node_id: id("approve")
+    }));
+}
+
+#[test]
+fn requested_changes_go_back_with_a_fresh_retry_budget() {
+    let (compiled, mut state) = asking(json!({}));
+    resolve(
+        &compiled,
+        &mut state,
+        "approve:1",
+        "request_changes",
+        Some("more"),
+    )
+    .unwrap();
+    let effects = fail(
+        &compiled,
+        &mut state,
+        "approve",
+        1,
+        OrchestrationError::retryable("changes_requested", "more", RetryReason::ChangesRequested),
+    );
+    assert!(
+        events(&effects).contains(&&OrchestrationEvent::StepRetryScheduled {
+            node_id: id("plan"),
+            next_attempt: 2,
+            triggered_by: id("approve"),
+        })
+    );
+    let plan = &state.steps[&id("plan")];
+    assert_eq!(plan.status, StepStatus::RetryScheduled);
+    assert_eq!(plan.retry_base, 1);
+    assert_eq!(plan.feedback.last().unwrap().message, "more");
+    assert_eq!(state.steps[&id("approve")].status, StepStatus::Pending);
+
+    // The revised plan may still be retried after a rate limit.
+    apply(
+        &compiled,
+        &mut state,
+        OrchestrationCommand::RetryStep {
+            node_id: id("plan"),
+        },
+    )
+    .unwrap();
+    admit(&compiled, &mut state, "plan", 2);
+    fail(
+        &compiled,
+        &mut state,
+        "plan",
+        2,
+        OrchestrationError::retryable(
+            "BACKEND_ERROR",
+            "RateLimited",
+            RetryReason::BackendRateLimited,
+        ),
+    );
+    assert_eq!(state.steps[&id("plan")].status, StepStatus::RetryScheduled);
+}
+
+#[test]
+fn changes_past_the_revision_limit_end_the_run() {
+    let (compiled, mut state) = asking(json!({"max_revisions": 0}));
+    fail(
+        &compiled,
+        &mut state,
+        "approve",
+        1,
+        OrchestrationError::retryable("changes_requested", "more", RetryReason::ChangesRequested),
+    );
+    assert_eq!(state.status, OrchestrationStatus::Failed);
+}
+
+#[test]
+fn compiler_validates_approvals() {
+    let issues = |approval: Value| {
+        compile(approval_definition(approval))
+            .err()
+            .map(|error| codes(&error))
+            .unwrap_or_default()
+    };
+    assert!(
+        issues(json!({})).is_empty(),
+        "revise targets need no retry_on entry"
+    );
+    assert!(
+        issues(json!({"subject": {"type": "node_output", "node_id": "build", "pointer": ""}}))
+            .contains(&"unavailable_binding_source")
+    );
+    assert!(issues(json!({"revise_target": "build"})).contains(&"invalid_retry_target"));
+    assert!(issues(json!({"revise_target": "input"})).contains(&"invalid_retry_target"));
+    assert!(issues(json!({"revise_target": "nope"})).contains(&"unknown_retry_target"));
+    assert!(issues(json!({"max_revisions": 11})).contains(&"invalid_max_revisions"));
+    assert!(issues(json!({"skip_if_empty": "items"})).contains(&"invalid_pointer"));
+    let compiled = compile(approval_definition(json!({}))).unwrap();
+    assert_eq!(
+        compiled.retry_spans[&id("approve")],
+        vec![id("plan"), id("approve")]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task queues
+
+/// input → plan → build (a task queue over the plan) → output.
+fn queue_definition(plan: Value, plan_pointer: &str) -> OrchestrationDefinition {
+    serde_json::from_value(json!({
+        "schema_version": 1, "id": "queue.flow", "revision": 1, "name": "Queue",
+        "nodes": [
+            {"id": "input", "name": "Input", "type": "input", "config": {}},
+            plan,
+            {"id": "build", "name": "Build", "type": "agent",
+             "config": {"instructions": "build", "structured_output": "text",
+                        "task_queue": {"plan_pointer": plan_pointer, "review_profile": {"id": "review"},
+                                       "review_instructions": "review", "max_repairs": 1}},
+             "input_bindings": [{"target": "plan", "source": {"type": "node_output", "node_id": "plan", "pointer": ""}}]},
+            {"id": "output", "name": "Output", "type": "output",
+             "config": {"source": {"type": "node_output", "node_id": "build", "pointer": ""}, "strict": false}}
+        ],
+        "edges": [
+            {"id": "e1", "source": "input", "target": "plan", "condition": "on_success"},
+            {"id": "e2", "source": "plan", "target": "build", "condition": "on_success"},
+            {"id": "e3", "source": "build", "target": "output", "condition": "on_success"}
+        ]
+    }))
+    .unwrap()
+}
+
+fn plan_step(structured_output: &str, schema: Value) -> Value {
+    json!({"id": "plan", "name": "Plan", "type": "agent",
+           "config": {"instructions": "plan", "structured_output": structured_output},
+           "output_schema": schema})
+}
+
+fn registered_plan() -> Value {
+    json!({"type": "registry", "schema_id": TASK_PLAN_SCHEMA_ID, "revision": TASK_PLAN_SCHEMA_REVISION})
+}
+
+#[test]
+fn a_task_queue_needs_a_step_that_writes_a_task_plan() {
+    let queue: TaskQueueConfig = serde_json::from_value(json!({
+        "plan_pointer": "/plan", "review_profile": {"id": "review"}, "review_instructions": "r", "max_repairs": 1
+    }))
+    .unwrap();
+    assert_eq!(
+        queue.on_task_failure,
+        TaskFailurePolicy::Ask,
+        "asks by default"
+    );
+    assert_eq!(queue.plan_binding(), Some("plan"));
+
+    let compiled = compile(queue_definition(
+        plan_step("host_validated", registered_plan()),
+        "/plan",
+    ))
+    .expect("a typed plan compiles");
+    assert_eq!(
+        compiled.retry_spans[&id("build")],
+        vec![id("plan"), id("build")]
+    );
+    let inline = json!({"type": "inline", "name": "plan", "schema": task_plan_schema()});
+    assert!(compile(queue_definition(
+        plan_step("host_validated", inline),
+        "/plan"
+    ))
+    .is_ok());
+
+    let text_plan = plan_step(
+        "text",
+        json!({"type": "inline", "name": "plan", "schema": {"type": "string"}}),
+    );
+    let error = compile(queue_definition(text_plan, "/plan")).expect_err("a text plan");
+    let issue = error
+        .issues
+        .iter()
+        .find(|issue| issue.code == "task_plan_source")
+        .unwrap();
+    assert!(
+        issue.message.contains(TASK_PLAN_SCHEMA_ID),
+        "{}",
+        issue.message
+    );
+
+    let missing = compile(queue_definition(
+        plan_step("host_validated", registered_plan()),
+        "/tasks",
+    ));
+    assert!(codes(&missing.unwrap_err()).contains(&"task_plan_source"));
+}
+
+#[test]
+fn asking_to_revise_the_plan_reruns_the_planner_and_drops_the_queue_progress() {
+    let compiled = compile(queue_definition(
+        plan_step("host_validated", registered_plan()),
+        "/plan",
+    ))
+    .unwrap();
+    let mut state = started_with(&compiled);
+    run_step(&compiled, &mut state, "input", json!({"request": "x"}));
+    run_step(&compiled, &mut state, "plan", json!({"status": "ready"}));
+    admit(&compiled, &mut state, "build", 1);
+    apply(
+        &compiled,
+        &mut state,
+        OrchestrationCommand::RecordCheckpoint {
+            node_id: id("build"),
+            attempt: 1,
+            value: json!({"completed": [{"task_id": "T1"}]}),
+        },
+    )
+    .unwrap();
+    fail(
+        &compiled,
+        &mut state,
+        "build",
+        1,
+        OrchestrationError::retryable(
+            "changes_requested",
+            "split T2",
+            RetryReason::ChangesRequested,
+        ),
+    );
+    let plan = &state.steps[&id("plan")];
+    assert_eq!(plan.status, StepStatus::RetryScheduled);
+    assert_eq!(plan.feedback.last().unwrap().message, "split T2");
+    assert_eq!(plan.retry_base, 1);
+    let build = &state.steps[&id("build")];
+    assert_eq!(build.status, StepStatus::Pending);
+    assert!(build.checkpoint.is_none(), "a new plan starts a new queue");
+}
+
+#[test]
+fn the_registered_task_plan_schema_uses_only_supported_keywords() {
+    let mut definition = queue_definition(plan_step("host_validated", registered_plan()), "/plan");
+    definition.output_contract.schema = SchemaReference::Inline {
+        name: "plan".into(),
+        schema: task_plan_schema(),
+    };
+    compile(definition).expect("every keyword of the task plan schema is supported");
+}
+
+// ---------------------------------------------------------------------------
+// Subflows
+
+fn subflow_definition(target: Value) -> OrchestrationDefinition {
+    serde_json::from_value(json!({
+        "schema_version": 1, "id": "sub.flow", "revision": 1, "name": "Sub",
+        "nodes": [
+            {"id": "input", "name": "Input", "type": "input", "config": {}},
+            {"id": "sub", "name": "Sub", "type": "subflow", "config": {"target": target}},
+            {"id": "output", "name": "Output", "type": "output",
+             "config": {"source": {"type": "node_output", "node_id": "sub", "pointer": ""}, "strict": false}}
+        ],
+        "edges": [
+            {"id": "e1", "source": "input", "target": "sub", "condition": "on_success"},
+            {"id": "e2", "source": "sub", "target": "output", "condition": "on_success"}
+        ]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn subflow_targets_are_checked_and_steps_become_one_step_flows() {
+    for target in [
+        json!({"type": "flow", "id": "investigate"}),
+        json!({"type": "flow", "id": "investigate", "revision": 3}),
+        json!({"type": "step", "instructions": "Look into it.", "profile": {"id": "research"}}),
+    ] {
+        compile(subflow_definition(target)).expect("valid target");
+    }
+    for target in [
+        json!({"type": "flow", "id": "  "}),
+        json!({"type": "step", "instructions": " "}),
+    ] {
+        let error = compile(subflow_definition(target)).expect_err("invalid target");
+        assert!(codes(&error).contains(&"invalid_subflow"));
+    }
+    let target: SubflowTarget =
+        serde_json::from_value(json!({"type": "step", "instructions": "Look."})).unwrap();
+    let one_step = target
+        .step_definition(&id("sub"), &["request".into(), "context".into()])
+        .expect("a step is a flow");
+    let compiled = compile(one_step).expect("the one-step flow compiles");
+    let step = &compiled.nodes[&id("step")];
+    assert_eq!(
+        step.input_bindings
+            .iter()
+            .map(|b| b.target.as_str())
+            .collect::<Vec<_>>(),
+        ["request", "context"]
+    );
+    assert!(
+        matches!(&step.kind, OrchestrationNodeKind::Agent(config) if config.tools == ToolScope::Inherit)
+    );
+    assert!(SubflowTarget::Flow {
+        id: "x".into(),
+        revision: None
+    }
+    .step_definition(&id("sub"), &[])
+    .is_none());
+}
+
+#[test]
+fn task_queue_flows_are_checked() {
+    let with_flows = |flows: Value| {
+        let mut definition =
+            queue_definition(plan_step("host_validated", registered_plan()), "/plan");
+        let mut value = serde_json::to_value(&definition).unwrap();
+        value["nodes"][2]["config"]["task_queue"]["flows"] = flows;
+        definition = serde_json::from_value(value).unwrap();
+        compile(definition)
+    };
+    with_flows(json!({"research": {"type": "flow", "id": "investigate"}})).expect("valid flows");
+    for flows in [
+        json!({"": {"type": "flow", "id": "investigate"}}),
+        json!({"research": {"type": "flow", "id": ""}}),
+        json!({"research": {"type": "step", "instructions": ""}}),
+    ] {
+        assert!(codes(&with_flows(flows).unwrap_err()).contains(&"invalid_subflow"));
+    }
 }

@@ -7,7 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use harness_core::orchestration::{SchemaReference, SUPPORTED_SCHEMA_KEYWORDS};
+use harness_core::orchestration::{
+    task_plan_schema, SchemaReference, SUPPORTED_SCHEMA_KEYWORDS, TASK_PLAN_SCHEMA_ID,
+    TASK_PLAN_SCHEMA_REVISION,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -22,15 +25,27 @@ pub trait SchemaResolver: Send + Sync {
 }
 
 /// Resolves inline schemas directly and registry schemas from an in-memory
-/// `(schema_id, revision)` table.
-#[derive(Debug, Clone, Default)]
+/// `(schema_id, revision)` table, which always holds the built-in schemas
+/// (the task plan, [`TASK_PLAN_SCHEMA_ID`]).
+#[derive(Debug, Clone)]
 pub struct InMemorySchemaResolver {
     schemas: BTreeMap<(String, u64), Value>,
 }
 
+impl Default for InMemorySchemaResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemorySchemaResolver {
     pub fn new() -> Self {
-        Self::default()
+        let mut schemas = BTreeMap::new();
+        schemas.insert(
+            (TASK_PLAN_SCHEMA_ID.to_owned(), TASK_PLAN_SCHEMA_REVISION),
+            task_plan_schema(),
+        );
+        Self { schemas }
     }
 
     pub fn insert(&mut self, schema_id: impl Into<String>, revision: u64, schema: Value) {

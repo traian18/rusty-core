@@ -20,6 +20,9 @@ pub enum OrchestrationStatus {
     Running,
     /// The running step's delegated agent awaits a tool permission decision.
     WaitingForPermission,
+    /// The running step asked the user a question (an approval, or what to
+    /// do after a failure) and waits for the answer.
+    WaitingForInput,
     /// No new work is admitted. A step already running may still finish.
     Paused,
     Cancelling,
@@ -41,6 +44,7 @@ pub enum StepStatus {
     Ready,
     Running,
     WaitingForPermission,
+    WaitingForInput,
     RetryScheduled,
     Succeeded,
     Failed,
@@ -51,7 +55,10 @@ pub enum StepStatus {
 impl StepStatus {
     /// A step with an attempt currently in flight.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Running | Self::WaitingForPermission)
+        matches!(
+            self,
+            Self::Running | Self::WaitingForPermission | Self::WaitingForInput
+        )
     }
 }
 
@@ -77,6 +84,18 @@ pub struct OrchestrationRunState {
     pub total_attempts: u32,
     #[serde(default)]
     pub usage: UsageSummary,
+    /// How the run was started; kept with the state so a resumed run behaves the same.
+    #[serde(default)]
+    pub options: RunOptions,
+}
+
+/// Choices made when a run is started rather than in its definition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOptions {
+    /// Approval steps that allow it pass without asking, recorded as
+    /// answered by `auto`. Questions about failures are still asked.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 impl OrchestrationRunState {
@@ -101,6 +120,7 @@ impl OrchestrationRunState {
             failed_step: None,
             total_attempts: 0,
             usage: UsageSummary::default(),
+            options: RunOptions::default(),
         }
     }
 
@@ -128,6 +148,63 @@ pub struct StepRun {
     /// can request several at once).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_permissions: Vec<String>,
+    /// The question the active attempt is waiting on the user to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_input: Option<InputRequest>,
+    /// Attempts made before the user last asked for changes to this step.
+    /// Its own retry budget, and a verifier's, count from here, so asking
+    /// for changes never uses up the retries a failure would get.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retry_base: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// A question a step puts to the user; the run waits until it is answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputRequest {
+    /// Unique within the run.
+    pub id: String,
+    /// What is being asked, e.g. `approval` or `task_failure`, so a host can
+    /// present it suitably.
+    pub kind: String,
+    pub prompt: String,
+    /// The data the user decides on (a plan, a failure report, ...).
+    #[serde(default)]
+    pub subject: Value,
+    /// The answers the user may give, in display order.
+    pub decisions: Vec<InputDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDecision {
+    pub id: String,
+    pub label: String,
+    /// The answer must carry text (e.g. the changes being asked for).
+    #[serde(default)]
+    pub requires_text: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputResponse {
+    /// One of the request's decision ids.
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub by: Responder,
+}
+
+/// Who answered a question.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Responder {
+    #[default]
+    User,
+    /// The run was started with auto-approve.
+    Auto,
 }
 
 impl Default for StepRun {
@@ -140,6 +217,8 @@ impl Default for StepRun {
             error: None,
             feedback: Vec::new(),
             pending_permissions: Vec::new(),
+            pending_input: None,
+            retry_base: 0,
         }
     }
 }
@@ -303,6 +382,17 @@ pub enum OrchestrationCommand {
         permission_id: String,
         approved: bool,
     },
+    InputRequired {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        request: InputRequest,
+    },
+    InputResolved {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        request_id: String,
+        response: InputResponse,
+    },
     RetryStep {
         node_id: OrchestrationNodeId,
     },
@@ -385,6 +475,17 @@ pub enum OrchestrationEvent {
         attempt: u32,
         permission_id: String,
         approved: bool,
+    },
+    InputRequested {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        request: Box<InputRequest>,
+    },
+    InputResolved {
+        node_id: OrchestrationNodeId,
+        attempt: u32,
+        request_id: String,
+        response: Box<InputResponse>,
     },
     BudgetUpdated {
         usage: UsageSummary,
@@ -565,6 +666,17 @@ pub fn apply(
             permission_id,
             approved,
         } => permission_resolved(compiled, state, node_id, attempt, permission_id, approved),
+        OrchestrationCommand::InputRequired {
+            node_id,
+            attempt,
+            request,
+        } => input_required(compiled, state, node_id, attempt, request),
+        OrchestrationCommand::InputResolved {
+            node_id,
+            attempt,
+            request_id,
+            response,
+        } => input_resolved(compiled, state, node_id, attempt, request_id, response),
         OrchestrationCommand::RetryStep { node_id } => retry(compiled, state, node_id),
         OrchestrationCommand::Pause => pause(state),
         OrchestrationCommand::Resume => resume(state),
@@ -803,6 +915,7 @@ fn fail(
         step.status = StepStatus::Failed;
         step.error = Some(error.clone());
         step.pending_permissions.clear();
+        step.pending_input = None;
     }
     let mut effects = Vec::from_iter(usage_effect);
     effects.push(OrchestrationEffect::Emit(OrchestrationEvent::StepFailed {
@@ -816,7 +929,7 @@ fn fail(
     let own_retry = error
         .retry_reason
         .is_some_and(|reason| node.retry.retry_on.contains(&reason))
-        && attempt < node.retry.max_attempts
+        && attempt.saturating_sub(state.steps[&node_id].retry_base) < node.retry.max_attempts
         && budget_left;
     if own_retry {
         let step = state
@@ -844,33 +957,42 @@ fn fail(
             let target = compiled
                 .node(target_id)
                 .expect("compiled retry target exists");
-            let target_attempts = state.steps[target_id].attempts.len() as u32;
-            if target_attempts < target.retry.max_attempts && budget_left {
-                for span_node in &compiled.retry_spans[&node_id] {
-                    let step = state.steps.get_mut(span_node).expect("span step exists");
-                    step.status = StepStatus::Pending;
-                    step.output = None;
-                    if span_node != target_id {
-                        step.checkpoint = None;
-                    }
-                }
-                let target_step = state.steps.get_mut(target_id).expect("target step exists");
-                target_step.status = StepStatus::RetryScheduled;
-                target_step.feedback.push(error);
-                effects.push(OrchestrationEffect::Emit(
-                    OrchestrationEvent::StepRetryScheduled {
-                        node_id: target_id.clone(),
-                        next_attempt: target_attempts + 1,
-                        triggered_by: node_id,
-                    },
-                ));
-                settle(state);
+            let target_step = &state.steps[target_id];
+            let target_attempts = target_step.attempts.len() as u32;
+            if target_attempts.saturating_sub(target_step.retry_base) < target.retry.max_attempts
+                && budget_left
+            {
+                send_back(compiled, state, &node_id, target_id, error, &mut effects);
                 return Ok(effects);
             }
         }
     }
 
-    // 3. Explicit failure route, else terminal failure.
+    // 3. The user asked for changes: an approval sends them back to its
+    //    revise target (at most `max_revisions` times), a task queue sends a
+    //    plan revision back to the step that wrote the plan. Asking for
+    //    changes never uses up the target's failure retries.
+    let revise_target = match (&node.kind, error.retry_reason) {
+        (OrchestrationNodeKind::Approval(config), Some(RetryReason::ChangesRequested))
+            if attempt <= config.max_revisions =>
+        {
+            config.revise_target()
+        }
+        (OrchestrationNodeKind::Agent(_), Some(RetryReason::ChangesRequested)) => {
+            node.task_plan_source()
+        }
+        _ => None,
+    };
+    if let Some(target_id) = revise_target {
+        if budget_left && compiled.retry_spans.contains_key(&node_id) {
+            let target_step = state.steps.get_mut(target_id).expect("target step exists");
+            target_step.retry_base = target_step.attempts.len() as u32;
+            send_back(compiled, state, &node_id, target_id, error, &mut effects);
+            return Ok(effects);
+        }
+    }
+
+    // 4. Explicit failure route, else terminal failure.
     if let Some(edge) = compiled.outgoing_for(&node_id, EdgeCondition::OnFailure) {
         let target = edge.target.clone();
         activate(
@@ -893,6 +1015,38 @@ fn fail(
     };
     state.failed_step = Some(node_id);
     terminate_failed(state, error, effects)
+}
+
+/// Re-run `target_id` with `error` as feedback, resetting every step between
+/// it and `from` (the verifier or approval that sent the work back).
+fn send_back(
+    compiled: &CompiledOrchestration,
+    state: &mut OrchestrationRunState,
+    from: &OrchestrationNodeId,
+    target_id: &OrchestrationNodeId,
+    error: OrchestrationError,
+    effects: &mut Vec<OrchestrationEffect>,
+) {
+    for span_node in &compiled.retry_spans[from] {
+        let step = state.steps.get_mut(span_node).expect("span step exists");
+        step.status = StepStatus::Pending;
+        step.output = None;
+        if span_node != target_id {
+            step.checkpoint = None;
+        }
+    }
+    let target_step = state.steps.get_mut(target_id).expect("target step exists");
+    let next_attempt = target_step.attempts.len() as u32 + 1;
+    target_step.status = StepStatus::RetryScheduled;
+    target_step.feedback.push(error);
+    effects.push(OrchestrationEffect::Emit(
+        OrchestrationEvent::StepRetryScheduled {
+            node_id: target_id.clone(),
+            next_attempt,
+            triggered_by: from.clone(),
+        },
+    ));
+    settle(state);
 }
 
 fn activate(
@@ -988,6 +1142,95 @@ fn permission_resolved(
     )])
 }
 
+fn input_required(
+    compiled: &CompiledOrchestration,
+    state: &mut OrchestrationRunState,
+    node_id: OrchestrationNodeId,
+    attempt: u32,
+    request: InputRequest,
+) -> Result<Vec<OrchestrationEffect>, TransitionError> {
+    let step = active_attempt_mut(compiled, state, &node_id, attempt)?;
+    if step.pending_input.is_some() {
+        return Err(transition_error(
+            "input_pending",
+            format!("step {node_id} is already waiting for an answer"),
+        ));
+    }
+    if request.decisions.is_empty() {
+        return Err(transition_error(
+            "invalid_input_request",
+            "a question needs at least one possible answer",
+        ));
+    }
+    step.status = StepStatus::WaitingForInput;
+    step.pending_input = Some(request.clone());
+    settle(state);
+    Ok(vec![OrchestrationEffect::Emit(
+        OrchestrationEvent::InputRequested {
+            node_id,
+            attempt,
+            request: Box::new(request),
+        },
+    )])
+}
+
+fn input_resolved(
+    compiled: &CompiledOrchestration,
+    state: &mut OrchestrationRunState,
+    node_id: OrchestrationNodeId,
+    attempt: u32,
+    request_id: String,
+    response: InputResponse,
+) -> Result<Vec<OrchestrationEffect>, TransitionError> {
+    let step = active_attempt_mut(compiled, state, &node_id, attempt)?;
+    let Some(request) = step
+        .pending_input
+        .as_ref()
+        .filter(|request| request.id == request_id)
+    else {
+        return Err(transition_error(
+            "unknown_input",
+            format!("step {node_id} is not waiting on question {request_id}"),
+        ));
+    };
+    let Some(decision) = request
+        .decisions
+        .iter()
+        .find(|decision| decision.id == response.decision)
+    else {
+        return Err(transition_error(
+            "invalid_decision",
+            format!(
+                "{} is not one of the answers to question {request_id}",
+                response.decision
+            ),
+        ));
+    };
+    if decision.requires_text
+        && !matches!(response.text.as_deref(), Some(text) if !text.trim().is_empty())
+    {
+        return Err(transition_error(
+            "missing_text",
+            format!("the answer {} needs text", decision.id),
+        ));
+    }
+    step.pending_input = None;
+    step.status = if step.pending_permissions.is_empty() {
+        StepStatus::Running
+    } else {
+        StepStatus::WaitingForPermission
+    };
+    settle(state);
+    Ok(vec![OrchestrationEffect::Emit(
+        OrchestrationEvent::InputResolved {
+            node_id,
+            attempt,
+            request_id,
+            response: Box::new(response),
+        },
+    )])
+}
+
 fn retry(
     compiled: &CompiledOrchestration,
     state: &mut OrchestrationRunState,
@@ -1053,6 +1296,7 @@ fn abort(
             });
             step.status = StepStatus::Cancelled;
             step.pending_permissions.clear();
+            step.pending_input = None;
         }
     }
     terminate_failed(state, error, effects)
@@ -1069,7 +1313,9 @@ fn cancel(state: &mut OrchestrationRunState) -> Result<Vec<OrchestrationEffect>,
     let mut effects = Vec::new();
     for (node_id, step) in &mut state.steps {
         match step.status {
-            StepStatus::Running | StepStatus::WaitingForPermission => {
+            StepStatus::Running
+            | StepStatus::WaitingForPermission
+            | StepStatus::WaitingForInput => {
                 let attempt = step.attempts.last_mut().expect("active step has attempt");
                 attempt.status = AttemptStatus::Cancelled;
                 effects.push(OrchestrationEffect::CancelStep {
@@ -1078,6 +1324,7 @@ fn cancel(state: &mut OrchestrationRunState) -> Result<Vec<OrchestrationEffect>,
                 });
                 step.status = StepStatus::Cancelled;
                 step.pending_permissions.clear();
+                step.pending_input = None;
             }
             StepStatus::Ready | StepStatus::RetryScheduled => step.status = StepStatus::Cancelled,
             StepStatus::Pending => step.status = StepStatus::Skipped,
@@ -1119,9 +1366,10 @@ fn recover(
         effects.extend(cancellation_completed(state)?);
         return Ok(effects);
     }
-    // Input, verify, and output nodes are pure functions of persisted state,
-    // so an interrupted attempt is simply abandoned and the step re-admitted.
-    // Only agent attempts have side effects of unknown extent.
+    // Input, verify, approval and output nodes are pure functions of
+    // persisted state, so an interrupted attempt is simply abandoned and the
+    // step re-admitted (an unanswered approval is asked again). Only agent
+    // attempts have side effects of unknown extent.
     let (indeterminate, replayable): (Vec<_>, Vec<_>) = state
         .steps
         .iter()
@@ -1130,7 +1378,7 @@ fn recover(
         .partition(|id| {
             matches!(
                 compiled.node(id).map(|node| &node.kind),
-                Some(OrchestrationNodeKind::Agent(_))
+                Some(OrchestrationNodeKind::Agent(_) | OrchestrationNodeKind::Subflow(_))
             )
         });
     for node_id in &replayable {
@@ -1139,6 +1387,7 @@ fn recover(
         attempt.status = AttemptStatus::Cancelled;
         step.status = StepStatus::Ready;
         step.pending_permissions.clear();
+        step.pending_input = None;
         effects.push(OrchestrationEffect::Emit(OrchestrationEvent::StepReady {
             node_id: node_id.clone(),
         }));
@@ -1166,6 +1415,7 @@ fn recover(
         step.status = StepStatus::Failed;
         step.error = Some(error.clone());
         step.pending_permissions.clear();
+        step.pending_input = None;
     }
     terminate_failed(state, error, effects)
 }
@@ -1177,6 +1427,7 @@ fn settle(state: &mut OrchestrationRunState) {
     }
     state.status = match state.active_step().map(|(_, step)| step.status) {
         Some(StepStatus::WaitingForPermission) => OrchestrationStatus::WaitingForPermission,
+        Some(StepStatus::WaitingForInput) => OrchestrationStatus::WaitingForInput,
         Some(_) => OrchestrationStatus::Running,
         None if state.paused => OrchestrationStatus::Paused,
         None => OrchestrationStatus::Ready,

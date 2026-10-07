@@ -345,6 +345,7 @@ async fn orchestration_steps_run_under_the_profile_they_name() {
                     revision: 1,
                 },
                 input: json!({ "request": "review it" }),
+                options: Default::default(),
             },
             CancellationToken::new(),
         )
@@ -395,6 +396,7 @@ async fn orchestration_rejects_steps_naming_unknown_profiles_before_running() {
                 revision: 1,
             },
             input: json!({ "request": "x" }),
+            options: Default::default(),
         })
         .await
         .err()
@@ -516,6 +518,7 @@ async fn a_workflow_step_that_never_passes_its_gate_fails_the_step() {
                     revision: 1,
                 },
                 input: json!({ "request": "change something" }),
+                options: Default::default(),
             },
             CancellationToken::new(),
         )

@@ -10,6 +10,7 @@ mod runner;
 mod schema;
 pub(crate) mod steps;
 mod store;
+mod subflow;
 
 pub use runner::{
     ControlError, CorrelatedAgentEvent, OrchestrationHandle, OrchestrationRunOutput,
@@ -21,13 +22,14 @@ pub use schema::{
 };
 pub use steps::{
     AgentExecutionError, AgentStepExecutor, AgentStepOutput, AgentStepRequest, ArtifactResolver,
-    PermissionResolution, ReferenceArtifactResolver, StepContext, StepSignal,
-    WorkspaceArtifactResolver,
+    InputAnswer, PermissionResolution, ReferenceArtifactResolver, StepContext, StepSignal,
+    SubflowExecutor, SubflowRequest, WorkspaceArtifactResolver, CHANGES_REQUESTED,
 };
 pub use store::{
     FileOrchestrationStore, InMemoryOrchestrationStore, OrchestrationEventEnvelope,
     OrchestrationSnapshot, OrchestrationStore, OrchestrationStoreError,
 };
+pub use subflow::drive_child;
 
 #[cfg(test)]
 mod tests;

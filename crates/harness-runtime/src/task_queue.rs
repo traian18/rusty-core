@@ -1,11 +1,13 @@
 //! A persisted, serial task queue. Every task gets fresh builder and reviewer
 //! sessions; a retry retains completed tasks, never just a prose handoff.
-use crate::orchestration::{BasicSchemaValidator, SchemaValidator};
+use crate::orchestration::{BasicSchemaValidator, SchemaValidator, SubflowRequest};
 use crate::{
     orchestration::{AgentExecutionError, AgentStepOutput, AgentStepRequest, StepContext},
     session_agent_executor::IsolatedSessionAgentExecutor,
 };
-use harness_core::orchestration::StructuredOutputMode;
+use harness_core::orchestration::{
+    InputDecision, InputRequest, StructuredOutputMode, TaskFailurePolicy,
+};
 use harness_protocol::{ids::AgentId, usage::AgentUsageMetrics};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,6 +34,10 @@ struct Task {
     criterion_ids: Vec<String>,
     depends_on: Vec<String>,
     instructions: String,
+    /// The queue's named flow that does this task, instead of the builder
+    /// and reviewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flow: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -44,10 +50,15 @@ struct Plan {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Progress {
     plan: Option<Plan>,
+    /// Accepted tasks, and tasks the user chose to skip (`skipped: true`).
     completed: Vec<Value>,
     current: Option<Value>,
     #[serde(default)]
     handled_rejections: usize,
+    /// A final verification rejection no planned task could be matched to,
+    /// fixed by one repair task after the planned ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_repair: Option<String>,
 }
 
 fn invalid(message: impl Into<String>) -> AgentExecutionError {
@@ -293,6 +304,55 @@ fn review_complete(task: &Task, result: &Value) -> bool {
         })
 }
 
+/// Why a task could not be completed, as the user is told.
+enum TaskOutcome {
+    Accepted,
+    Failed(String),
+}
+
+/// What happens after a task failed.
+enum AfterFailure {
+    Retry(Option<String>),
+    Skip,
+    RevisePlan(String),
+}
+
+/// Loose id comparison (`C-1`, `c1` and `C1` are one), as in [`canonicalize`].
+fn id_key(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The criteria a downstream verification found unmet: the `- ID [status]`
+/// lines of its "Focus on these unmet criteria" section (criteria left for
+/// manual checks are listed elsewhere and are not reopened), or an older
+/// `<criteria>[...]</criteria>` JSON list.
+fn unmet_criteria(message: &str) -> HashSet<String> {
+    if let Some(results) = message
+        .split_once("<criteria>")
+        .and_then(|(_, v)| v.split_once("</criteria>"))
+        .and_then(|(json, _)| serde_json::from_str::<Vec<Value>>(json).ok())
+    {
+        return results
+            .into_iter()
+            .filter(|r| r["status"] != "pass")
+            .filter_map(|r| r["id"].as_str().map(id_key))
+            .collect();
+    }
+    let Some((_, section)) = message.split_once("Focus on these unmet criteria:") else {
+        return HashSet::new();
+    };
+    section
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .filter_map(|line| line.split_once(" [").map(|(id, _)| id_key(id)))
+        .collect()
+}
+
 impl IsolatedSessionAgentExecutor {
     pub(crate) async fn execute_tasks(
         &self,
@@ -306,6 +366,20 @@ impl IsolatedSessionAgentExecutor {
             .pointer(&queue.plan_pointer)
             .ok_or_else(|| invalid("task plan is missing"))?;
         let plan = plan(source)?;
+        for task in &plan.tasks {
+            if let Some(name) = task
+                .flow
+                .as_deref()
+                .filter(|name| !queue.flows.contains_key(*name))
+            {
+                let offered: Vec<&str> = queue.flows.keys().map(String::as_str).collect();
+                return Err(invalid(format!(
+                    "task {} names the flow {name:?}, which this step does not offer (it offers: {})",
+                    task.id,
+                    if offered.is_empty() { "none".into() } else { offered.join(", ") }
+                )));
+            }
+        }
         let mut progress: Progress = match request.checkpoint.clone() {
             Some(value) => serde_json::from_value(value)
                 .map_err(|e| invalid(format!("invalid checkpoint: {e}")))?,
@@ -318,14 +392,19 @@ impl IsolatedSessionAgentExecutor {
             return Err(invalid("checkpoint does not match the task plan"));
         }
         for (task, done) in plan.tasks.iter().zip(&progress.completed) {
-            if done["task_id"] != task.id || !review_complete(task, &done["review"]) {
+            let settled = done["skipped"] == true
+                || done["flow"].is_string()
+                || review_complete(task, &done["review"]);
+            if done["task_id"] != task.id || !settled {
                 return Err(invalid(
                     "checkpoint contains unverified or out-of-order tasks",
                 ));
             }
         }
         // A downstream acceptance rejection may invalidate any previously accepted
-        // task. Re-inspect the queue instead of blindly declaring it complete.
+        // task. Re-inspect the queue instead of blindly declaring it complete:
+        // reopen from the first task owning an unmet criterion, or, when none
+        // can be matched, keep the accepted tasks and run one repair task.
         let rejections: Vec<_> = request
             .feedback
             .iter()
@@ -336,144 +415,404 @@ impl IsolatedSessionAgentExecutor {
             .filter(|_| rejections.len() > progress.handled_rejections)
         {
             progress.handled_rejections = rejections.len();
-            let results = rejection
-                .message
-                .split_once("<criteria>")
-                .and_then(|(_, v)| v.split_once("</criteria>"))
-                .and_then(|(json, _)| serde_json::from_str::<Vec<Value>>(json).ok());
-            let failed: HashSet<String> = results
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|r| r["status"] != "pass")
-                .filter_map(|r| r["id"].as_str().map(str::to_owned))
-                .collect();
-            let reopen = plan
-                .tasks
-                .iter()
-                .position(|t| t.criterion_ids.iter().any(|id| failed.contains(id)))
-                .unwrap_or(0);
-            progress.completed.truncate(reopen);
-            progress.current = Some(json!({"rejection":rejection.message}));
+            let failed = unmet_criteria(&rejection.message);
+            let reopen = plan.tasks.iter().position(|t| {
+                t.criterion_ids
+                    .iter()
+                    .any(|id| failed.contains(&id_key(id)))
+            });
+            match reopen {
+                Some(at) => {
+                    progress.completed.truncate(at);
+                    progress.current = Some(json!({"rejection":rejection.message}));
+                }
+                None => {
+                    progress.pending_repair = Some(rejection.message.clone());
+                    progress.current = None;
+                }
+            }
         }
         context
             .checkpoint(serde_json::to_value(&progress).unwrap())
             .await?;
-        for task in plan.tasks.iter().skip(progress.completed.len()) {
-            let mut accepted = false;
-            for repair in 0..=queue.max_repairs {
-                if context.cancellation.is_cancelled() {
-                    return Err(AgentExecutionError::new(
-                        "cancelled",
-                        "task queue cancelled",
-                    ));
-                }
-                let mut child = request.clone();
-                child.task_queue = None;
-                child.checkpoint = None;
-                child.structured_output = StructuredOutputMode::HostValidated;
-                child.output_schema = result_schema(false);
-                child.input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
-                // Preserve preparation outputs (diagnosis, architecture, baseline,
-                // audit) in addition to the task-specific contract.
-                if let Some(fields) = request.input.as_object() {
-                    for (name, value) in fields {
-                        child
-                            .input
-                            .as_object_mut()
-                            .unwrap()
-                            .entry(name.clone())
-                            .or_insert_with(|| value.clone());
+        let mut questions = 0;
+        let mut index = progress.completed.len();
+        let repair = progress.pending_repair.clone().map(|message| Task {
+            id: "final-repair".into(),
+            requirement_ids: Vec::new(),
+            criterion_ids: Vec::new(),
+            depends_on: Vec::new(),
+            flow: None,
+            instructions: format!(
+                "Fix what the final verification of the completed tasks found:\n{message}"
+            ),
+        });
+        loop {
+            // Past the planned tasks only the repair task can still be due.
+            let planned = index < plan.tasks.len();
+            let task = match plan.tasks.get(index) {
+                Some(task) => task,
+                None => match &repair {
+                    Some(task) if progress.pending_repair.is_some() => task,
+                    _ => break,
+                },
+            };
+            let mut guidance: Option<String> = None;
+            loop {
+                let reason = match self
+                    .run_task(
+                        &request,
+                        &plan,
+                        task,
+                        &mut progress,
+                        context,
+                        usage,
+                        guidance.as_deref(),
+                        planned,
+                    )
+                    .await?
+                {
+                    TaskOutcome::Accepted => break,
+                    TaskOutcome::Failed(reason) => reason,
+                };
+                questions += 1;
+                match self
+                    .after_failure(&request, task, &reason, questions, context)
+                    .await?
+                {
+                    AfterFailure::Retry(notes) => guidance = notes,
+                    AfterFailure::Skip => {
+                        if !planned {
+                            progress.pending_repair = None;
+                        } else {
+                            progress
+                                .completed
+                                .push(json!({"task_id":task.id,"skipped":true,"reason":reason}));
+                        }
+                        progress.current = None;
+                        context
+                            .checkpoint(serde_json::to_value(&progress).unwrap())
+                            .await?;
+                        break;
+                    }
+                    AfterFailure::RevisePlan(changes) => {
+                        return Err(AgentExecutionError::retryable(
+                            crate::orchestration::CHANGES_REQUESTED,
+                            changes,
+                            harness_core::orchestration::RetryReason::ChangesRequested,
+                        ));
                     }
                 }
-                child.instructions = format!("{}\nImplement only workflow_input.task. Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
-                let built = self
-                    .execute_once(child.clone(), context, usage)
-                    .await?
-                    .value;
-                BasicSchemaValidator
-                    .validate(&child.output_schema, &built)
-                    .map_err(|e| AgentExecutionError::new("invalid_task_result", e.to_string()))?;
-                progress.current = Some(json!({"task_id":task.id,"build":built,"repair":repair}));
-                context
-                    .checkpoint(serde_json::to_value(&progress).unwrap())
-                    .await?;
-                let status = built["status"].as_str().unwrap_or("invalid");
-                if status == "checkpoint" || status == "needs_repair" {
-                    continue;
-                }
-                // A check that cannot run here (no network, a missing tool) does
-                // not stop the work: the reviewer judges the code that was
-                // written, and the final validation reports what did not run.
-                if status != "complete" && status != "blocked_environment" {
-                    return Err(AgentExecutionError::new(
-                        format!("task_{status}"),
-                        format!(
-                            "Task {}: {}. Completed tasks are checkpointed.",
-                            task.id, built["summary"]
-                        ),
-                    ));
-                }
-                child.profile = Some(queue.review_profile.clone());
-                child.instructions = queue.review_instructions.clone();
-                child.output_schema = result_schema(true);
-                child.input["build"] = built;
-                // Reviewer never gets a mutating tool, even if a user supplies a
-                // permissive profile. Checks run in the dedicated validation step.
-                child.tools.retain(|t| {
-                    matches!(
-                        t.as_str(),
-                        "read_file"
-                            | "search_codebase"
-                            | "list_files"
-                            | "project_info"
-                            | "report_progress"
-                            | "ask_user_question"
-                            | "open_document"
-                            | "read_workflow_context"
-                    )
-                });
-                let reviewed = self
-                    .execute_once(child.clone(), context, usage)
-                    .await?
-                    .value;
-                BasicSchemaValidator
-                    .validate(&child.output_schema, &reviewed)
-                    .map_err(|e| AgentExecutionError::new("invalid_task_review", e.to_string()))?;
-                progress.current.as_mut().unwrap()["review"] = reviewed.clone();
-                if review_complete(task, &reviewed) {
-                    progress.completed.push(json!({"task_id":task.id,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
-                    progress.current = None;
-                    accepted = true;
-                }
-                context
-                    .checkpoint(serde_json::to_value(&progress).unwrap())
-                    .await?;
-                if accepted {
-                    break;
-                }
-                if matches!(
-                    reviewed["status"].as_str(),
-                    Some("blocked_environment" | "blocked_user" | "checkpoint")
-                ) {
-                    return Err(AgentExecutionError::new(
-                        "task_blocked",
-                        format!("Task {}: {}", task.id, reviewed["summary"]),
-                    ));
-                }
             }
-            if !accepted {
+            if !planned {
+                // The repair task ran (or was skipped): the queue is done.
+                progress.pending_repair = None;
+                context
+                    .checkpoint(serde_json::to_value(&progress).unwrap())
+                    .await?;
+                break;
+            }
+            index += 1;
+        }
+        let skipped = progress
+            .completed
+            .iter()
+            .filter(|done| done["skipped"] == true)
+            .count();
+        let summary = if skipped == 0 {
+            format!(
+                "Implemented and inspected {} tasks. Final validation remains required.",
+                plan.tasks.len()
+            )
+        } else {
+            format!(
+                "Implemented and inspected {} of {} tasks; {skipped} skipped at the user's request. Final validation remains required.",
+                plan.tasks.len() - skipped,
+                plan.tasks.len()
+            )
+        };
+        Ok(AgentStepOutput {
+            value: json!({"status":"implemented","summary":summary,"tasks":progress.completed}),
+        })
+    }
+
+    /// Builds and reviews one task, repairing up to `max_repairs` times, and
+    /// records it as completed when it is a planned task (`record`). A task
+    /// that cannot be completed is reported, not raised: what happens next is
+    /// the queue's failure policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_task(
+        &self,
+        request: &AgentStepRequest,
+        plan: &Plan,
+        task: &Task,
+        progress: &mut Progress,
+        context: &mut StepContext,
+        usage: &mut HashMap<AgentId, AgentUsageMetrics>,
+        guidance: Option<&str>,
+        record: bool,
+    ) -> Result<TaskOutcome, AgentExecutionError> {
+        let queue = request.task_queue.as_ref().expect("task queue");
+        if let Some(target) = task.flow.as_deref().and_then(|name| queue.flows.get(name)) {
+            return self
+                .run_task_flow(request, plan, task, target, progress, context, record)
+                .await;
+        }
+        for repair in 0..=queue.max_repairs {
+            if context.cancellation.is_cancelled() {
                 return Err(AgentExecutionError::new(
-                    "task_repairs_exhausted",
-                    format!(
-                        "Task {} needs further repair; completed tasks are checkpointed",
-                        task.id
-                    ),
+                    "cancelled",
+                    "task queue cancelled",
                 ));
             }
+            let mut child = request.clone();
+            child.task_queue = None;
+            child.checkpoint = None;
+            child.structured_output = StructuredOutputMode::HostValidated;
+            child.output_schema = result_schema(false);
+            child.input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
+            // Preserve preparation outputs (diagnosis, architecture, baseline,
+            // audit) in addition to the task-specific contract.
+            if let Some(fields) = request.input.as_object() {
+                for (name, value) in fields {
+                    child
+                        .input
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            child.instructions = format!("{}\nImplement only workflow_input.task. Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
+            if let Some(guidance) = guidance {
+                // The user's own words, given when they chose to try again.
+                child.instructions.push_str(&format!(
+                    "\n\nThe user asked you to try this task again with this guidance:\n{guidance}"
+                ));
+            }
+            let built = self
+                .execute_once(child.clone(), context, usage)
+                .await?
+                .value;
+            BasicSchemaValidator
+                .validate(&child.output_schema, &built)
+                .map_err(|e| AgentExecutionError::new("invalid_task_result", e.to_string()))?;
+            progress.current = Some(json!({"task_id":task.id,"build":built,"repair":repair}));
+            context
+                .checkpoint(serde_json::to_value(&*progress).unwrap())
+                .await?;
+            let status = built["status"].as_str().unwrap_or("invalid");
+            if status == "checkpoint" || status == "needs_repair" {
+                continue;
+            }
+            // A check that cannot run here (no network, a missing tool) does
+            // not stop the work: the reviewer judges the code that was
+            // written, and the final validation reports what did not run.
+            if status != "complete" && status != "blocked_environment" {
+                let why = if status == "blocked_user" {
+                    "it needs something from you"
+                } else {
+                    "the builder could not finish it"
+                };
+                return Ok(TaskOutcome::Failed(format!(
+                    "Task {} stopped because {why}: {}",
+                    task.id,
+                    built["summary"].as_str().unwrap_or("no summary")
+                )));
+            }
+            child.profile = Some(queue.review_profile.clone());
+            child.instructions = queue.review_instructions.clone();
+            child.output_schema = result_schema(true);
+            child.input["build"] = built;
+            // Reviewer never gets a mutating tool, even if a user supplies a
+            // permissive profile. Checks run in the dedicated validation step.
+            child.tools.retain(|t| {
+                matches!(
+                    t.as_str(),
+                    "read_file"
+                        | "search_codebase"
+                        | "list_files"
+                        | "project_info"
+                        | "report_progress"
+                        | "ask_user_question"
+                        | "open_document"
+                        | "read_workflow_context"
+                )
+            });
+            let reviewed = self
+                .execute_once(child.clone(), context, usage)
+                .await?
+                .value;
+            BasicSchemaValidator
+                .validate(&child.output_schema, &reviewed)
+                .map_err(|e| AgentExecutionError::new("invalid_task_review", e.to_string()))?;
+            progress.current.as_mut().unwrap()["review"] = reviewed.clone();
+            let accepted = review_complete(task, &reviewed);
+            if accepted && record {
+                progress.completed.push(json!({"task_id":task.id,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
+            }
+            if accepted {
+                progress.current = None;
+            }
+            context
+                .checkpoint(serde_json::to_value(&*progress).unwrap())
+                .await?;
+            if accepted {
+                return Ok(TaskOutcome::Accepted);
+            }
+            if matches!(
+                reviewed["status"].as_str(),
+                Some("blocked_environment" | "blocked_user" | "checkpoint")
+            ) {
+                return Ok(TaskOutcome::Failed(format!(
+                    "The review of task {} could not finish: {}",
+                    task.id,
+                    reviewed["summary"].as_str().unwrap_or("no summary")
+                )));
+            }
         }
-        Ok(AgentStepOutput {
-            value: json!({"status":"implemented","summary":format!("Implemented and inspected {} tasks. Final validation remains required.",plan.tasks.len()),"tasks":progress.completed}),
-        })
+        Ok(TaskOutcome::Failed(format!(
+            "Task {} still needs repair after {} attempts; completed tasks are checkpointed",
+            task.id,
+            queue.max_repairs + 1
+        )))
+    }
+
+    /// Does `task` by running one of the queue's flows. The flow judges its
+    /// own result, so there is no separate review; a flow that fails fails
+    /// the task, which the failure policy then handles.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_task_flow(
+        &self,
+        request: &AgentStepRequest,
+        plan: &Plan,
+        task: &Task,
+        target: &harness_core::orchestration::SubflowTarget,
+        progress: &mut Progress,
+        context: &mut StepContext,
+        record: bool,
+    ) -> Result<TaskOutcome, AgentExecutionError> {
+        let subflows = self.subflows.as_ref().ok_or_else(|| {
+            AgentExecutionError::new(
+                "subflows_unavailable",
+                "this host cannot run flows inside flows",
+            )
+        })?;
+        let mut input = json!({
+            "request": request.input.get("request"),
+            "context": request.input.get("context"),
+            "requirements": plan.requirements,
+            "task": task,
+            "completed_tasks": progress.completed,
+        });
+        if let Some(fields) = request.input.as_object() {
+            for (name, value) in fields {
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(name.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        let result = subflows
+            .execute(
+                SubflowRequest {
+                    run_id: request.run_id.clone(),
+                    node_id: harness_core::orchestration::OrchestrationNodeId::new(format!(
+                        "{}.{}",
+                        request.node_id, task.id
+                    )),
+                    attempt: request.attempt,
+                    target: target.clone(),
+                    input,
+                    depth: request.subflow_depth,
+                    options: request.run_options.clone(),
+                },
+                context,
+            )
+            .await;
+        match result {
+            Ok(output) => {
+                if record {
+                    progress.completed.push(json!({
+                        "task_id": task.id,
+                        "flow": task.flow,
+                        "result": output,
+                    }));
+                }
+                progress.current = None;
+                context
+                    .checkpoint(serde_json::to_value(&*progress).unwrap())
+                    .await?;
+                Ok(TaskOutcome::Accepted)
+            }
+            // Stopping the run is not a failed task.
+            Err(error) if error.code == "cancelled" => Err(error),
+            Err(error) => Ok(TaskOutcome::Failed(format!(
+                "Task {} could not be done by the flow {}: {}",
+                task.id,
+                task.flow.as_deref().unwrap_or(""),
+                error.message
+            ))),
+        }
+    }
+
+    /// The queue's failure policy: stop, skip, or ask the user what to do.
+    async fn after_failure(
+        &self,
+        request: &AgentStepRequest,
+        task: &Task,
+        reason: &str,
+        question: usize,
+        context: &mut StepContext,
+    ) -> Result<AfterFailure, AgentExecutionError> {
+        let queue = request.task_queue.as_ref().expect("task queue");
+        match queue.on_task_failure {
+            TaskFailurePolicy::Stop => {
+                return Err(AgentExecutionError::new("task_failed", reason));
+            }
+            TaskFailurePolicy::Skip => return Ok(AfterFailure::Skip),
+            TaskFailurePolicy::Ask => {}
+        }
+        let decision = |id: &str, label: &str, requires_text: bool| InputDecision {
+            id: id.into(),
+            label: label.into(),
+            requires_text,
+        };
+        let mut decisions = vec![
+            decision("retry", "Try again", false),
+            decision("skip", "Skip this task", false),
+        ];
+        if request.plan_revisable {
+            decisions.push(decision("revise_plan", "Revise the plan", true));
+        }
+        decisions.push(decision("stop", "Stop", false));
+        let response = context
+            .ask(InputRequest {
+                id: format!(
+                    "{}:{}:{}:{question}",
+                    request.node_id, request.attempt, task.id
+                ),
+                kind: "task_failure".into(),
+                prompt: format!(
+                    "Task {} could not be completed. Try it again (your notes guide the next try), skip it, {}or stop the workflow.",
+                    task.id,
+                    if request.plan_revisable { "revise the plan, " } else { "" }
+                ),
+                subject: json!({"task": format!("{}: {}", task.id, task.instructions), "problem": reason}),
+                decisions,
+            })
+            .await?;
+        let notes = response.text.filter(|text| !text.trim().is_empty());
+        match response.decision.as_str() {
+            "retry" => Ok(AfterFailure::Retry(notes)),
+            "skip" => Ok(AfterFailure::Skip),
+            "revise_plan" => Ok(AfterFailure::RevisePlan(notes.unwrap_or_default())),
+            _ => Err(AgentExecutionError::new(
+                "task_stopped",
+                format!("{reason}. Stopped at your request; completed tasks are checkpointed."),
+            )),
+        }
     }
 }
 
@@ -554,5 +893,21 @@ mod tests {
             &task,
             &json!({"status":"complete","criteria":[{"id":"C1","evidence":"src/a.rs:12 implements the behavior"}]})
         ));
+    }
+
+    #[test]
+    fn unmet_criteria_come_from_the_repair_focus_and_skip_manual_checks() {
+        let message = "Verification did not pass: criteria:/check/criteria: not met: C-2 [fail]\n\nFocus on these unmet criteria:\n- C-2 [fail]: Button does nothing.\n- c3 [unverified]: no test\n\nLeft for the user to check by hand; do not try to fix these:\n- C4 [manual]: needs a phone\n\nReview summary: close";
+        let unmet = unmet_criteria(message);
+        assert_eq!(
+            unmet,
+            ["c2".to_string(), "c3".to_string()].into_iter().collect()
+        );
+        let legacy = r#"rejected <criteria>[{"id":"C1","status":"fail"},{"id":"C2","status":"pass"}]</criteria>"#;
+        assert_eq!(
+            unmet_criteria(legacy),
+            ["c1".to_string()].into_iter().collect()
+        );
+        assert!(unmet_criteria("no criteria here").is_empty());
     }
 }

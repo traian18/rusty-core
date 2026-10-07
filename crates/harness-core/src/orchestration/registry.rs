@@ -14,6 +14,9 @@ pub enum DefinitionRef {
     },
     /// The highest published revision of `id`.
     LatestPublished(OrchestrationDefinitionId),
+    /// The highest revision of `id` that is not deprecated; a draft counts
+    /// when the registry allows drafts.
+    Latest(OrchestrationDefinitionId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -103,6 +106,13 @@ impl DefinitionRegistry {
                 .rev()
                 .map(|(_, compiled)| compiled)
                 .find(|compiled| compiled.definition.status == DefinitionStatus::Published)
+                .ok_or_else(|| RegistryError::NotFound(id.to_string()))?,
+            DefinitionRef::Latest(id) => self
+                .revisions
+                .range((id.clone(), 0)..=(id.clone(), u64::MAX))
+                .rev()
+                .map(|(_, compiled)| compiled)
+                .find(|compiled| compiled.definition.status != DefinitionStatus::Deprecated)
                 .ok_or_else(|| RegistryError::NotFound(id.to_string()))?,
         };
         if compiled.definition.status == DefinitionStatus::Draft && !self.allow_drafts {

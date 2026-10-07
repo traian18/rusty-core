@@ -9,6 +9,7 @@ mod default;
 mod definition;
 mod registry;
 mod state;
+mod task_plan;
 
 pub use compiler::{
     compile, CompiledOrchestration, DefinitionIssue, DefinitionValidationError,
@@ -18,6 +19,9 @@ pub use default::default_orchestration_definition;
 pub use definition::*;
 pub use registry::{DefinitionRef, DefinitionRegistry, RegistryError};
 pub use state::*;
+pub use task_plan::{
+    is_task_plan_schema, task_plan_schema, TASK_PLAN_SCHEMA_ID, TASK_PLAN_SCHEMA_REVISION,
+};
 
 #[cfg(test)]
 mod tests;

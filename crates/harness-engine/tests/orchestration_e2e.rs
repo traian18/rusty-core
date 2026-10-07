@@ -141,6 +141,7 @@ async fn registered_definitions_run_by_exact_revision() {
                     revision: 1,
                 },
                 input: json!({ "request": "Review the change" }),
+                options: Default::default(),
             },
             CancellationToken::new(),
         )
@@ -254,4 +255,146 @@ async fn json_workflows_run_steps_under_draft_workspace_profiles() {
         OrchestrationConfig::default().register_json(json!({ "id": "broken" })),
         Err(HarnessError::OrchestrationDefinition(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Subflows
+// ---------------------------------------------------------------------------
+
+/// input → sub (runs `target` on the request) → output.
+fn calling(id: &str, target: Value) -> Value {
+    json!({
+        "schema_version": 1, "id": id, "revision": 1, "name": id,
+        "nodes": [
+            { "id": "input", "name": "Input", "type": "input", "config": {} },
+            { "id": "sub", "name": "Gather", "type": "subflow", "config": { "target": target },
+              "input_bindings": [{ "target": "request", "source": { "type": "run_input", "pointer": "/request" } }] },
+            { "id": "output", "name": "Output", "type": "output",
+              "config": { "source": { "type": "node_output", "node_id": "sub", "pointer": "" }, "strict": false } }
+        ],
+        "edges": [
+            { "id": "a", "source": "input", "target": "sub", "condition": "on_success" },
+            { "id": "b", "source": "sub", "target": "output", "condition": "on_success" }
+        ]
+    })
+}
+
+fn flow(id: &str) -> Value {
+    json!({ "type": "flow", "id": id })
+}
+
+async fn start_flow(
+    config: &OrchestrationConfig,
+    session: &harness_engine::SessionHandle,
+    id: &str,
+) -> Result<harness_runtime::orchestration::OrchestrationHandle, HarnessError> {
+    let _ = config;
+    session
+        .start_orchestration(OrchestrationRequest::exact(
+            format!("{id}-run"),
+            id,
+            1,
+            json!({ "request": "look into it" }),
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn a_subflow_runs_a_registered_flow_and_its_result_is_the_nodes() {
+    let config = OrchestrationConfig::default();
+    let mut research = default_orchestration_definition();
+    research.id = OrchestrationDefinitionId::from("team.research");
+    config.register(research).unwrap();
+    config
+        .register_json(calling("parent", flow("team.research")))
+        .unwrap();
+    let harness = harness_with(config.clone()).await;
+    let session = session(&harness).await;
+
+    let output = start_flow(&config, &session, "parent")
+        .await
+        .expect("starts")
+        .wait()
+        .await
+        .expect("finishes");
+    assert_eq!(
+        output.result.status,
+        OrchestrationOutcome::Completed,
+        "{:?}",
+        output.result
+    );
+    assert_eq!(output.result.output, Some(report()));
+}
+
+#[tokio::test]
+async fn a_subflow_can_run_a_single_step() {
+    let config = OrchestrationConfig::default();
+    let step = json!({ "type": "step", "instructions": "Find where the sessions are stored." });
+    config.register_json(calling("stepper", step)).unwrap();
+    let harness = harness_with(config.clone()).await;
+    let session = session(&harness).await;
+
+    let output = start_flow(&config, &session, "stepper")
+        .await
+        .expect("starts")
+        .wait()
+        .await
+        .expect("finishes");
+    assert_eq!(
+        output.result.status,
+        OrchestrationOutcome::Completed,
+        "{:?}",
+        output.result
+    );
+    assert_eq!(output.result.output, Some(json!(report().to_string())));
+}
+
+#[tokio::test]
+async fn a_run_that_cannot_reach_its_subflows_does_not_start() {
+    let config = OrchestrationConfig::default();
+    config
+        .register_json(calling("lost", flow("no.such.flow")))
+        .unwrap();
+    // a → b → a
+    config.register_json(calling("a", flow("b"))).unwrap();
+    config.register_json(calling("b", flow("a"))).unwrap();
+    // l1 → l2 → l3 → l4 → default: one level too deep.
+    config.register_json(calling("l1", flow("l2"))).unwrap();
+    config.register_json(calling("l2", flow("l3"))).unwrap();
+    config.register_json(calling("l3", flow("l4"))).unwrap();
+    config
+        .register_json(calling("l4", flow("rusty.default")))
+        .unwrap();
+    let harness = harness_with(config.clone()).await;
+    let session = session(&harness).await;
+
+    for (id, expected) in [
+        ("lost", "no.such.flow"),
+        ("a", "runs itself"),
+        ("l1", "levels deep"),
+    ] {
+        let error = start_flow(&config, &session, id).await.err().expect(id);
+        assert!(
+            matches!(&error, HarnessError::OrchestrationDefinition(message) if message.contains(expected)),
+            "{id}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_subflow_of_an_unknown_profile_is_refused_before_it_runs() {
+    let config = OrchestrationConfig::default();
+    let step =
+        json!({ "type": "step", "instructions": "Look.", "profile": { "id": "no-such-profile" } });
+    config.register_json(calling("profiled", step)).unwrap();
+    let harness = harness_with(config.clone()).await;
+    let session = session(&harness).await;
+    let error = start_flow(&config, &session, "profiled")
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(&error, HarnessError::OrchestrationDefinition(message) if message.contains("no-such-profile")),
+        "{error:?}"
+    );
 }

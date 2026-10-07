@@ -102,6 +102,8 @@ pub enum OrchestrationNodeKind {
     Input(InputNodeConfig),
     Agent(AgentNodeConfig),
     Verify(VerifyNodeConfig),
+    Approval(ApprovalNodeConfig),
+    Subflow(SubflowNodeConfig),
     Output(OutputNodeConfig),
 }
 
@@ -111,9 +113,193 @@ impl OrchestrationNodeKind {
             Self::Input(_) => "input",
             Self::Agent(_) => "agent",
             Self::Verify(_) => "verify",
+            Self::Approval(_) => "approval",
+            Self::Subflow(_) => "subflow",
             Self::Output(_) => "output",
         }
     }
+}
+
+/// Runs another flow, or a single step, as part of this one: to gather
+/// extra information with research, fix a bug found on the way, and so on.
+/// The node's input bindings become the child's run input and the child's
+/// result becomes the node's output. The child runs with the same tools,
+/// model and permissions as this run; its permission requests and questions
+/// to the user surface here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubflowNodeConfig {
+    pub target: SubflowTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SubflowTarget {
+    /// A saved flow, by definition id (the latest revision unless one is given).
+    Flow {
+        id: OrchestrationDefinitionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+    },
+    /// One step: an agent following `instructions` under `profile`, run as a
+    /// flow of its own. Everything bound to the node is its input.
+    Step {
+        instructions: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<crate::behavior::ProfileRef>,
+        #[serde(default = "inherit_tools")]
+        tools: ToolScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+}
+
+const fn inherit_tools() -> ToolScope {
+    ToolScope::Inherit
+}
+
+/// How deeply flows may call flows: a flow run on its own is level 0.
+pub const MAX_SUBFLOW_DEPTH: u32 = 3;
+
+impl SubflowTarget {
+    /// The one-step flow a `Step` target runs, with `inputs` as the names of
+    /// the values bound to the calling node. `None` for a `Flow` target.
+    pub fn step_definition(
+        &self,
+        node: &OrchestrationNodeId,
+        inputs: &[String],
+    ) -> Option<OrchestrationDefinition> {
+        let Self::Step {
+            instructions,
+            profile,
+            tools,
+            model,
+        } = self
+        else {
+            return None;
+        };
+        let id = OrchestrationNodeId::from("step");
+        let input = OrchestrationNodeId::from("input");
+        let output = OrchestrationNodeId::from("output");
+        let node_input = |name: &str| InputBinding {
+            target: name.to_owned(),
+            source: OutputBinding::RunInput {
+                pointer: format!("/{name}"),
+            },
+        };
+        let edge = |source: &OrchestrationNodeId, target: &OrchestrationNodeId| OrchestrationEdge {
+            id: OrchestrationEdgeId::new(format!("{source}-{target}")),
+            source: source.clone(),
+            target: target.clone(),
+            condition: EdgeCondition::OnSuccess,
+            metadata: Value::Null,
+        };
+        let plain = |id: &OrchestrationNodeId, name: &str, kind| OrchestrationNode {
+            id: id.clone(),
+            name: name.into(),
+            kind,
+            input_bindings: Vec::new(),
+            output_schema: None,
+            retry: RetryPolicy::default(),
+            timeout_ms: None,
+            metadata: Value::Null,
+        };
+        let mut agent = plain(
+            &id,
+            "Step",
+            OrchestrationNodeKind::Agent(AgentNodeConfig {
+                instructions: instructions.clone(),
+                task_queue: None,
+                tools: tools.clone(),
+                context_mode: AgentContextMode::IsolatedChild,
+                model: model.clone(),
+                structured_output: StructuredOutputMode::Text,
+                profile: profile.clone(),
+            }),
+        );
+        agent.input_bindings = inputs.iter().map(|name| node_input(name)).collect();
+        agent.output_schema = Some(SchemaReference::Inline {
+            name: "step".into(),
+            schema: serde_json::json!({"type": "string"}),
+        });
+        Some(OrchestrationDefinition {
+            schema_version: ORCHESTRATION_SCHEMA_VERSION,
+            id: OrchestrationDefinitionId::new(format!("subflow.step.{node}")),
+            revision: 1,
+            name: format!("Step {node}"),
+            description: None,
+            status: DefinitionStatus::Published,
+            input_schema: None,
+            output_contract: OutputContract::default(),
+            nodes: vec![
+                plain(
+                    &input,
+                    "Input",
+                    OrchestrationNodeKind::Input(InputNodeConfig::default()),
+                ),
+                agent,
+                plain(
+                    &output,
+                    "Output",
+                    OrchestrationNodeKind::Output(OutputNodeConfig {
+                        source: OutputBinding::NodeOutput {
+                            node_id: id.clone(),
+                            pointer: String::new(),
+                        },
+                        strict: false,
+                    }),
+                ),
+            ],
+            edges: vec![edge(&input, &id), edge(&id, &output)],
+            policies: OrchestrationPolicies::default(),
+            metadata: Value::Null,
+        })
+    }
+}
+
+/// Pauses the run until the user reviews `subject` and approves it, asks for
+/// changes, or rejects it. Requested changes go back to `revise_target` with
+/// the user's notes, the same way a failed verification goes back to its
+/// `retry_target`; the steps in between run again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalNodeConfig {
+    /// What the user reviews, usually the output of the step before.
+    pub subject: OutputBinding,
+    /// Shown above the subject; empty uses a generic question.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    /// The upstream agent step that requested changes go back to. Omitted,
+    /// it is the step that produced the subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revise_target: Option<OrchestrationNodeId>,
+    /// How many times the user may ask for changes; after that the step only
+    /// offers approve or reject.
+    #[serde(default = "default_max_revisions")]
+    pub max_revisions: u32,
+    /// Whether a run started with auto-approve passes this step without
+    /// asking. A step that must always be seen by a person sets it false.
+    #[serde(default = "default_true")]
+    pub allow_auto_approve: bool,
+    /// Pass without asking when the subject has nothing at this pointer
+    /// (missing, null, or an empty string, array or object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_if_empty: Option<String>,
+}
+
+impl ApprovalNodeConfig {
+    /// Where requested changes go: the explicit target, else the subject's producer.
+    pub fn revise_target(&self) -> Option<&OrchestrationNodeId> {
+        self.revise_target.as_ref().or(match &self.subject {
+            OutputBinding::NodeOutput { node_id, .. } => Some(node_id),
+            OutputBinding::RunInput { .. } => None,
+        })
+    }
+}
+
+/// Upper bound on an approval's `max_revisions`.
+pub const MAX_REVISIONS: u32 = 10;
+
+const fn default_max_revisions() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -122,13 +308,74 @@ pub struct InputNodeConfig {
     pub defaults: BTreeMap<String, Value>,
 }
 
+/// Runs a plan's tasks one at a time, each in a fresh builder session
+/// followed by a read-only review, checkpointing every accepted task. The
+/// step's own output is the list of completed tasks (always an object,
+/// whatever the step's response format).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskQueueConfig {
-    /// Pointer to a typed requirement/task plan in the bound input.
+    /// Pointer to a typed requirement/task plan in the bound input; its first
+    /// segment names the input binding the plan comes from.
     pub plan_pointer: String,
     pub review_profile: crate::behavior::ProfileRef,
     pub review_instructions: String,
     pub max_repairs: u32,
+    /// What happens when a task cannot be completed: its repairs ran out, or
+    /// it needs something only the user can give.
+    #[serde(default)]
+    pub on_task_failure: TaskFailurePolicy,
+    /// Named flows a planned task may run instead of the builder and
+    /// reviewer, by setting its `flow` to the name: gathering more
+    /// information by research, fixing a bug found on the way, and so on. A
+    /// flow judges its own result; a failed one fails the task.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub flows: BTreeMap<String, SubflowTarget>,
+}
+
+impl TaskQueueConfig {
+    /// The input binding the plan is read from.
+    pub fn plan_binding(&self) -> Option<&str> {
+        self.plan_pointer
+            .strip_prefix('/')?
+            .split('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFailurePolicy {
+    /// Ask the user: try again (with their notes), skip the task, revise the
+    /// plan, or stop.
+    #[default]
+    Ask,
+    /// End the step; completed tasks stay checkpointed for a continuation.
+    Stop,
+    /// Record the task as skipped and go on with the next one.
+    Skip,
+}
+
+impl OrchestrationNode {
+    /// The step that produced a task queue's plan, when the plan is bound
+    /// from a step's output. Asking to revise the plan re-runs that step.
+    pub fn task_plan_source(&self) -> Option<&OrchestrationNodeId> {
+        let OrchestrationNodeKind::Agent(AgentNodeConfig {
+            task_queue: Some(queue),
+            ..
+        }) = &self.kind
+        else {
+            return None;
+        };
+        let target = queue.plan_binding()?;
+        self.input_bindings
+            .iter()
+            .find(|binding| binding.target == target)
+            .and_then(|binding| match &binding.source {
+                OutputBinding::NodeOutput { node_id, .. } => Some(node_id),
+                OutputBinding::RunInput { .. } => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +475,34 @@ pub enum VerificationCheck {
     /// through the host's artifact resolver (e.g. files exist in the
     /// workspace), rather than trusting the model's claim.
     ArtifactsResolvable { pointer: String },
+    /// Judges the `{id, status, evidence, how_to_test?}` array at `pointer`
+    /// criterion by criterion instead of trusting a free-text verdict. Passes
+    /// when it is non-empty and no criterion has a `block_on` status. A
+    /// `defer` status (by default `manual`: only a person can check it) lets
+    /// the work move on and is reported as a manual check for the user, never
+    /// sent back to the producer. Any other non-`pass` status blocks. With
+    /// `plan_pointer`, every acceptance criterion of that task plan must be
+    /// answered too; one nobody reported blocks as `missing`.
+    Criteria {
+        pointer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_pointer: Option<String>,
+        #[serde(default = "default_block_on")]
+        block_on: Vec<String>,
+        #[serde(default = "default_defer")]
+        defer: Vec<String>,
+        /// More deferred criteria than this blocks; omitted, any number may be deferred.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_deferred: Option<u32>,
+    },
+}
+
+fn default_block_on() -> Vec<String> {
+    vec!["fail".into()]
+}
+
+fn default_defer() -> Vec<String> {
+    vec!["manual".into()]
 }
 
 impl VerificationCheck {
@@ -238,6 +513,7 @@ impl VerificationCheck {
             Self::RequiredStatus { pointer, .. } => format!("required_status:{pointer}"),
             Self::ArtifactExists { pointer } => format!("artifact_exists:{pointer}"),
             Self::ArtifactsResolvable { pointer } => format!("artifacts_resolvable:{pointer}"),
+            Self::Criteria { pointer, .. } => format!("criteria:{pointer}"),
         }
     }
 }
@@ -340,6 +616,9 @@ pub enum RetryReason {
     ToolTimeout,
     InvalidStructuredOutput,
     VerificationFailed,
+    /// The user reviewed a result and asked for changes. Raised by approval
+    /// steps; never needs to be listed in a target's `retry_on`.
+    ChangesRequested,
 }
 
 /// Upper bound on any node's `retry.max_attempts`.

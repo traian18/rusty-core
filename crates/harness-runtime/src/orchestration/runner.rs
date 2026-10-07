@@ -14,10 +14,11 @@ use std::{
 
 use harness_core::orchestration::{
     apply, check_restorable, error_codes, ready_steps, AttemptDetails, CompiledOrchestration,
-    DelegatedRunRef, OrchestrationCommand, OrchestrationDefinitionId, OrchestrationEffect,
-    OrchestrationError, OrchestrationNode, OrchestrationNodeId, OrchestrationNodeKind,
-    OrchestrationResult, OrchestrationRunId, OrchestrationRunState, OrchestrationStatus,
-    RetryReason, StepStatus, ToolScope, TransitionError, UsageSummary,
+    DelegatedRunRef, InputResponse, OrchestrationCommand, OrchestrationDefinitionId,
+    OrchestrationEffect, OrchestrationError, OrchestrationNode, OrchestrationNodeId,
+    OrchestrationNodeKind, OrchestrationResult, OrchestrationRunId, OrchestrationRunState,
+    OrchestrationStatus, RetryReason, RunOptions, StepStatus, ToolScope, TransitionError,
+    UsageSummary,
 };
 use harness_protocol::{commands::PermissionDecision, events::AgentEventEnvelope};
 use serde_json::Value;
@@ -32,9 +33,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
     schema::{BasicSchemaValidator, InMemorySchemaResolver, SchemaResolver, SchemaValidator},
     steps::{
-        execute_input, execute_verify, resolve_binding, resolve_inputs, AgentStepExecutor,
-        AgentStepRequest, ArtifactResolver, PermissionResolution, ReferenceArtifactResolver,
-        StepContext, StepSignal, Validation,
+        execute_approval, execute_input, execute_verify, resolve_binding, resolve_inputs,
+        AgentStepExecutor, AgentStepRequest, ArtifactResolver, InputAnswer, PermissionResolution,
+        ReferenceArtifactResolver, StepContext, StepSignal, SubflowExecutor, SubflowRequest,
+        Validation, CHANGES_REQUESTED,
     },
     store::{
         OrchestrationEventEnvelope, OrchestrationSnapshot, OrchestrationStore,
@@ -160,6 +162,11 @@ enum Control {
         decision: PermissionDecision,
         reply: oneshot::Sender<Result<(), ControlError>>,
     },
+    ResolveInput {
+        request_id: String,
+        response: InputResponse,
+        reply: oneshot::Sender<Result<(), ControlError>>,
+    },
 }
 
 /// Control and observation handle for one running orchestration.
@@ -226,6 +233,23 @@ impl OrchestrationHandle {
         .await
     }
 
+    /// Answer the question the active step asked (an `InputRequested`
+    /// event). An answer that is not one of the offered decisions, or lacks
+    /// required text, is rejected and the step keeps waiting.
+    pub async fn resolve_input(
+        &self,
+        request_id: impl Into<String>,
+        response: InputResponse,
+    ) -> Result<(), ControlError> {
+        let request_id = request_id.into();
+        self.request(|reply| Control::ResolveInput {
+            request_id,
+            response,
+            reply,
+        })
+        .await
+    }
+
     async fn request(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<(), ControlError>>) -> Control,
@@ -259,6 +283,10 @@ pub struct OrchestrationRunner {
     artifacts: Arc<dyn ArtifactResolver>,
     store: Option<Arc<dyn OrchestrationStore>>,
     available_tools: Option<Arc<Vec<String>>>,
+    options: RunOptions,
+    subflows: Option<Arc<dyn SubflowExecutor>>,
+    /// How deep this run is in a chain of flows calling flows.
+    depth: u32,
 }
 
 impl OrchestrationRunner {
@@ -271,7 +299,29 @@ impl OrchestrationRunner {
             artifacts: Arc::new(ReferenceArtifactResolver),
             store: None,
             available_tools: None,
+            options: RunOptions::default(),
+            subflows: None,
+            depth: 0,
         }
+    }
+
+    /// Lets `subflow` nodes run other flows (without it they fail).
+    pub fn with_subflows(mut self, subflows: Arc<dyn SubflowExecutor>) -> Self {
+        self.subflows = Some(subflows);
+        self
+    }
+
+    /// Marks this run as the child of a run `depth - 1` levels from the top.
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Options for runs this runner starts (a resumed or retried run keeps
+    /// the options it was started with).
+    pub fn with_options(mut self, options: RunOptions) -> Self {
+        self.options = options;
+        self
     }
 
     pub fn with_schemas(mut self, schemas: Arc<dyn SchemaResolver>) -> Self {
@@ -318,7 +368,8 @@ impl OrchestrationRunner {
         input: Value,
     ) -> Result<OrchestrationHandle, OrchestrationRuntimeError> {
         self.check_tool_references()?;
-        let state = OrchestrationRunState::new(run_id, &self.compiled);
+        let mut state = OrchestrationRunState::new(run_id, &self.compiled);
+        state.options = self.options.clone();
         Ok(self.spawn(
             state,
             0,
@@ -412,6 +463,7 @@ impl OrchestrationRunner {
                 step.status = StepStatus::Pending;
                 step.output = None;
                 step.pending_permissions.clear();
+                step.pending_input = None;
                 if span_node != &target_id {
                     step.checkpoint = None;
                 }
@@ -432,6 +484,7 @@ impl OrchestrationRunner {
         )));
         step.status = StepStatus::Ready;
         step.pending_permissions.clear();
+        step.pending_input = None;
         for step in state.steps.values_mut() {
             if step.status == StepStatus::Skipped {
                 step.status = StepStatus::Pending;
@@ -459,7 +512,8 @@ impl OrchestrationRunner {
         cancellation: CancellationToken,
     ) -> Result<OrchestrationRunOutput, OrchestrationRuntimeError> {
         self.check_tool_references()?;
-        let state = OrchestrationRunState::new(run_id, &self.compiled);
+        let mut state = OrchestrationRunState::new(run_id, &self.compiled);
+        state.options = self.options.clone();
         self.spawn(
             state,
             0,
@@ -517,6 +571,8 @@ impl OrchestrationRunner {
             last_sequence,
             elapsed_before_ms,
             started: Instant::now(),
+            waited: Duration::ZERO,
+            waiting_since: None,
             log: Vec::new(),
             updates: updates.clone(),
             state_tx,
@@ -551,6 +607,7 @@ struct ActiveStep {
     signals: mpsc::UnboundedReceiver<StepSignal>,
     signals_open: bool,
     permissions: mpsc::UnboundedSender<PermissionResolution>,
+    answers: mpsc::UnboundedSender<InputAnswer>,
     delegated: Option<DelegatedRunRef>,
     usage: UsageSummary,
     started_at_ms: u64,
@@ -597,6 +654,10 @@ struct RunLoop {
     last_sequence: u64,
     elapsed_before_ms: u64,
     started: Instant,
+    /// Time this invocation spent waiting for the user to answer a question;
+    /// it does not count against the elapsed budget.
+    waited: Duration,
+    waiting_since: Option<Instant>,
     log: Vec<OrchestrationEventEnvelope>,
     updates: broadcast::Sender<OrchestrationUpdate>,
     state_tx: watch::Sender<OrchestrationRunState>,
@@ -744,14 +805,12 @@ impl RunLoop {
 
     /// When the active attempt becomes stale, if the watchdog applies: a
     /// limit is set, a step is running and not already cancelled, and it is
-    /// neither paused nor waiting on a person's permission decision.
+    /// neither paused nor waiting on a person's permission decision or answer.
     fn stall_deadline(&self) -> Option<Instant> {
         let limit = self.runner.compiled.definition.policies.stall_timeout_ms?;
         let active = self.active.as_ref().filter(|active| !active.stalled)?;
-        if self.state.paused
-            || !self.state.steps[&active.node_id]
-                .pending_permissions
-                .is_empty()
+        let step = &self.state.steps[&active.node_id];
+        if self.state.paused || !step.pending_permissions.is_empty() || step.pending_input.is_some()
         {
             return None;
         }
@@ -767,14 +826,35 @@ impl RunLoop {
         active.token.cancel();
     }
 
+    /// Run time so far, leaving out time spent waiting for the user.
     fn elapsed_ms(&self) -> u64 {
-        self.elapsed_before_ms + self.started.elapsed().as_millis() as u64
+        let waiting = self
+            .waiting_since
+            .map_or(Duration::ZERO, |since| since.elapsed());
+        let working = self.started.elapsed().saturating_sub(self.waited + waiting);
+        self.elapsed_before_ms + working.as_millis() as u64
     }
 
     fn deadline(&self) -> Option<Instant> {
         let limit = self.runner.compiled.definition.policies.max_elapsed_ms?;
-        let remaining = limit.saturating_sub(self.elapsed_before_ms);
-        Some(self.started + Duration::from_millis(remaining))
+        if self.waiting_since.is_some() {
+            return None;
+        }
+        let remaining = limit.saturating_sub(self.elapsed_ms());
+        Some(Instant::now() + Duration::from_millis(remaining))
+    }
+
+    /// Start or stop the clock that excludes waiting for the user.
+    fn track_input_wait(&mut self) {
+        let waiting = self.state.status == OrchestrationStatus::WaitingForInput;
+        match (waiting, self.waiting_since) {
+            (true, None) => self.waiting_since = Some(Instant::now()),
+            (false, Some(since)) => {
+                self.waited += since.elapsed();
+                self.waiting_since = None;
+            }
+            _ => {}
+        }
     }
 
     fn elapsed_exhausted(&self) -> Option<OrchestrationError> {
@@ -799,6 +879,7 @@ impl RunLoop {
     async fn try_apply(&mut self, command: OrchestrationCommand) -> Result<(), ApplyError> {
         let effects =
             apply(&self.runner.compiled, &mut self.state, command).map_err(ApplyError::Rejected)?;
+        self.track_input_wait();
 
         let timestamp_ms = now_ms();
         let mut sequence = self.last_sequence;
@@ -872,7 +953,8 @@ impl RunLoop {
         let token = self.cancellation.child_token();
         let (signals_tx, signals) = mpsc::unbounded_channel();
         let (permissions, permissions_rx) = mpsc::unbounded_channel();
-        let context = StepContext::new(token.clone(), signals_tx, permissions_rx);
+        let (answers, answers_rx) = mpsc::unbounded_channel();
+        let context = StepContext::new(token.clone(), signals_tx, permissions_rx, answers_rx);
         let job = StepJob {
             runner: self.runner.clone(),
             state: self.state.clone(),
@@ -887,6 +969,7 @@ impl RunLoop {
             signals,
             signals_open: true,
             permissions,
+            answers,
             delegated: None,
             usage: UsageSummary::default(),
             started_at_ms: now_ms(),
@@ -985,6 +1068,20 @@ impl RunLoop {
                     Err(ApplyError::Fatal(error)) => return Err(error),
                 }
             }
+            StepSignal::InputRequested(request) => {
+                let command = OrchestrationCommand::InputRequired {
+                    node_id: active.node_id.clone(),
+                    attempt: active.attempt,
+                    request,
+                };
+                match self.try_apply(command).await {
+                    Ok(()) => {}
+                    Err(ApplyError::Rejected(error)) => {
+                        tracing::warn!(code = error.code, %error, "ignored question")
+                    }
+                    Err(ApplyError::Fatal(error)) => return Err(error),
+                }
+            }
         }
         Ok(())
     }
@@ -1032,6 +1129,56 @@ impl RunLoop {
                     ))),
                 };
                 (command, reply)
+            }
+            Control::ResolveInput {
+                request_id,
+                response,
+                reply,
+            } => {
+                let Some(active) = &self.active else {
+                    let _ = reply.send(Err(ControlError::Rejected(format!(
+                        "no active step is waiting on question {request_id}"
+                    ))));
+                    return Ok(());
+                };
+                let (node_id, attempt) = (active.node_id.clone(), active.attempt);
+                // The reducer checks the answer is one that was offered
+                // before the waiting step acts on it.
+                let outcome = match self
+                    .try_apply(OrchestrationCommand::InputResolved {
+                        node_id,
+                        attempt,
+                        request_id: request_id.clone(),
+                        response: response.clone(),
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        let delivered = self.active.as_ref().is_some_and(|active| {
+                            active
+                                .answers
+                                .send(InputAnswer {
+                                    request_id,
+                                    response,
+                                })
+                                .is_ok()
+                        });
+                        if delivered {
+                            Ok(())
+                        } else {
+                            Err(ControlError::Rejected(
+                                "the attempt awaiting this answer has ended".into(),
+                            ))
+                        }
+                    }
+                    Err(ApplyError::Rejected(error)) => Err(ControlError::Rejected(error.message)),
+                    Err(ApplyError::Fatal(error)) => {
+                        let _ = reply.send(Err(ControlError::Rejected(error.to_string())));
+                        return Err(error);
+                    }
+                };
+                let _ = reply.send(outcome);
+                return Ok(());
             }
         };
         let outcome = match command {
@@ -1099,7 +1246,9 @@ impl RunLoop {
                 StepSignal::Checkpoint { committed, .. } => {
                     let _ = committed.send(Err("attempt ended before checkpoint commit".into()));
                 }
-                StepSignal::Agent(_) | StepSignal::PermissionRequested { .. } => {}
+                StepSignal::Agent(_)
+                | StepSignal::PermissionRequested { .. }
+                | StepSignal::InputRequested(_) => {}
             }
         }
         // Cancelled or aborted while running: the reducer already recorded
@@ -1197,7 +1346,7 @@ impl StepJob {
 
     async fn execute(
         &self,
-        context: StepContext,
+        mut context: StepContext,
         details: &mut AttemptDetails,
     ) -> Result<Value, OrchestrationError> {
         let runner = &self.runner;
@@ -1218,9 +1367,29 @@ impl StepJob {
                 Ok(input)
             }
             OrchestrationNodeKind::Agent(config) => {
-                let input = resolve_inputs(&self.state, &self.node.input_bindings)?;
+                let step = &self.state.steps[&self.node.id];
+                let mut input = resolve_inputs(&self.state, &self.node.input_bindings)?;
+                // Asked to change its result, a step revises what it produced
+                // instead of starting over.
+                if step
+                    .feedback
+                    .iter()
+                    .any(|item| item.code == CHANGES_REQUESTED)
+                {
+                    let previous = step.attempts.iter().rev().find_map(|attempt| {
+                        attempt.output.clone().filter(|_| {
+                            attempt.status == harness_core::orchestration::AttemptStatus::Succeeded
+                        })
+                    });
+                    if let (Some(previous), Some(fields)) = (previous, input.as_object_mut()) {
+                        fields.insert("previous_result".into(), previous);
+                    }
+                }
                 details.input = Some(input.clone());
-                let schema = if config.structured_output
+                // A task queue builds its own result: the tasks it completed.
+                let schema = if config.task_queue.is_some() {
+                    serde_json::json!({ "type": "object" })
+                } else if config.structured_output
                     == harness_core::orchestration::StructuredOutputMode::Text
                 {
                     serde_json::json!({ "type": "string" })
@@ -1263,6 +1432,10 @@ impl StepJob {
                     context_mode: config.context_mode,
                     profile: config.profile.clone(),
                     feedback: self.state.steps[&self.node.id].feedback.clone(),
+                    plan_revisable: runner.compiled.retry_spans.contains_key(&self.node.id)
+                        && self.node.task_plan_source().is_some(),
+                    subflow_depth: runner.depth + 1,
+                    run_options: self.state.options.clone(),
                 };
                 let output = runner.agent.execute(request, context).await?;
                 validation.check(
@@ -1292,6 +1465,34 @@ impl StepJob {
                 .await;
                 details.evidence = evidence;
                 result
+            }
+            OrchestrationNodeKind::Subflow(config) => {
+                let input = resolve_inputs(&self.state, &self.node.input_bindings)?;
+                details.input = Some(input.clone());
+                let executor = runner.subflows.as_ref().ok_or_else(|| {
+                    OrchestrationError::new(
+                        "subflows_unavailable",
+                        "this host cannot run flows inside flows",
+                    )
+                })?;
+                Ok(executor
+                    .execute(
+                        SubflowRequest {
+                            run_id: self.state.run_id.clone(),
+                            node_id: self.node.id.clone(),
+                            attempt: self.attempt,
+                            target: config.target.clone(),
+                            input,
+                            depth: runner.depth + 1,
+                            options: self.state.options.clone(),
+                        },
+                        &mut context,
+                    )
+                    .await?)
+            }
+            OrchestrationNodeKind::Approval(config) => {
+                details.input = resolve_binding(&self.state, &config.subject).ok();
+                execute_approval(&self.state, &self.node, config, self.attempt, &mut context).await
             }
             OrchestrationNodeKind::Output(config) => {
                 let value = resolve_binding(&self.state, &config.source)?;

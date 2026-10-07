@@ -10,10 +10,10 @@ use std::{
 use async_trait::async_trait;
 use harness_core::orchestration::{
     apply, compile, default_orchestration_definition, error_codes, AttemptDetails,
-    CompiledOrchestration, DelegatedRunRef, OrchestrationCommand, OrchestrationDefinition,
-    OrchestrationEvent, OrchestrationNodeId, OrchestrationNodeKind, OrchestrationOutcome,
-    OrchestrationRunId, OrchestrationRunState, OrchestrationStatus, RetryReason, StepStatus,
-    ToolScope,
+    CompiledOrchestration, DelegatedRunRef, InputRequest, InputResponse, OrchestrationCommand,
+    OrchestrationDefinition, OrchestrationEvent, OrchestrationNodeId, OrchestrationNodeKind,
+    OrchestrationOutcome, OrchestrationRunId, OrchestrationRunState, OrchestrationStatus,
+    Responder, RetryReason, RunOptions, SchemaReference, StepStatus, ToolScope, VerificationCheck,
 };
 use harness_protocol::commands::PermissionDecision;
 use serde_json::{json, Value};
@@ -268,6 +268,85 @@ async fn verification_failure_reruns_the_agent_with_the_issues() {
     let verify = &output.state.steps[&node("verify")];
     assert_eq!(verify.attempts.len(), 2);
     assert!(!verify.attempts[0].details.evidence.iter().all(|e| e.passed));
+}
+
+/// The default flow, judged criterion by criterion instead of by a status.
+fn criteria_definition() -> OrchestrationDefinition {
+    let mut definition = default_orchestration_definition();
+    let open = SchemaReference::Inline {
+        name: "report".into(),
+        schema: json!({"type": "object"}),
+    };
+    definition.output_contract.schema = open.clone();
+    for node in &mut definition.nodes {
+        match &mut node.kind {
+            OrchestrationNodeKind::Agent(_) => node.output_schema = Some(open.clone()),
+            OrchestrationNodeKind::Verify(config) => {
+                config.checks = vec![VerificationCheck::Criteria {
+                    pointer: "/report/criteria".into(),
+                    plan_pointer: None,
+                    block_on: vec!["fail".into()],
+                    defer: vec!["manual".into()],
+                    max_deferred: None,
+                }];
+            }
+            _ => {}
+        }
+    }
+    definition
+}
+
+fn judged(first: &str, second: &str) -> Value {
+    json!({"summary": "done", "criteria": [
+        {"id": "C1", "status": first, "evidence": "unit test"},
+        {"id": "C2", "status": second, "evidence": "needs a phone", "how_to_test": "Tap Share on iOS."}
+    ]})
+}
+
+#[tokio::test]
+async fn manual_only_criteria_pass_the_gate_and_are_reported() {
+    let agent = ScriptedAgent::new(vec![ok(judged("pass", "manual"))]);
+    let output = OrchestrationRunner::new(compiled(criteria_definition()), agent.clone())
+        .with_available_tools(Vec::<String>::new())
+        .run(run_id("criteria-manual"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(agent.requests().len(), 1, "nothing was sent back");
+    let gate = output.state.steps[&node("verify")].output.as_ref().unwrap();
+    assert_eq!(
+        gate["manual_checks"],
+        json!([{"id": "C2", "how_to_test": "Tap Share on iOS.", "evidence": "needs a phone"}])
+    );
+}
+
+#[tokio::test]
+async fn failed_criteria_go_back_without_the_manual_ones() {
+    let agent = ScriptedAgent::new(vec![
+        ok(judged("fail", "manual")),
+        ok(judged("pass", "manual")),
+    ]);
+    let output = OrchestrationRunner::new(compiled(criteria_definition()), agent.clone())
+        .with_available_tools(Vec::<String>::new())
+        .run(run_id("criteria-repair"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(
+        output.state.steps[&node("verify")].output.as_ref().unwrap()["manual_checks"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let requests = agent.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback = &requests[1].feedback[0].message;
+    let (unmet, manual) = feedback
+        .split_once("Left for the user to check by hand")
+        .expect("manual criteria are listed apart");
+    assert!(unmet.contains("C1 [fail]"), "{feedback}");
+    assert!(!unmet.contains("C2"), "{feedback}");
+    assert!(manual.contains("C2 [manual]"), "{feedback}");
 }
 
 #[tokio::test]
@@ -1018,6 +1097,8 @@ mod isolated_session {
                     },
                     review_instructions: "Inspect the task criteria.".into(),
                     max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
                 });
                 config.structured_output = StructuredOutputMode::HostValidated;
                 n.output_schema = Some(definition.output_contract.schema.clone());
@@ -1227,6 +1308,370 @@ mod isolated_session {
             assert!(prompt_of(&request).contains("plain Markdown, not JSON"));
         }
     }
+
+    /// The default flow running a two-task plan from the run input as a
+    /// task queue with `policy`, answered by `replies` in order.
+    fn queue_runner(
+        replies: Vec<Value>,
+        policy: harness_core::orchestration::TaskFailurePolicy,
+    ) -> (OrchestrationRunner, Arc<Mutex<Vec<ExecutionRequest>>>) {
+        queue_runner_with(replies, policy, Default::default(), None)
+    }
+
+    fn queue_runner_with(
+        replies: Vec<Value>,
+        policy: harness_core::orchestration::TaskFailurePolicy,
+        flows: std::collections::BTreeMap<String, harness_core::orchestration::SubflowTarget>,
+        subflows: Option<Arc<dyn SubflowExecutor>>,
+    ) -> (OrchestrationRunner, Arc<Mutex<Vec<ExecutionRequest>>>) {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskQueueConfig},
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(QueueBackend {
+                requests: requests.clone(),
+                replies: Mutex::new(replies.into()),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        ));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: ProfileRef {
+                        id: "rusty.default".into(),
+                        revision: None,
+                    },
+                    review_instructions: "Inspect the task criteria.".into(),
+                    max_repairs: 0,
+                    on_task_failure: policy,
+                    flows: flows.clone(),
+                });
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let mut executor = IsolatedSessionAgentExecutor::new(parent)
+            .with_profiles(Arc::new(ProfileRegistry::new()));
+        if let Some(subflows) = subflows {
+            executor = executor.with_subflows(subflows);
+        }
+        let runner = OrchestrationRunner::new(compiled(definition), Arc::new(executor))
+            .with_available_tools(Vec::<String>::new());
+        (runner, requests)
+    }
+
+    /// Answers every flow a task asks for with `outcome`, and keeps the requests.
+    struct StubFlows {
+        outcome: Result<Value, AgentExecutionError>,
+        requests: Mutex<Vec<SubflowRequest>>,
+    }
+
+    #[async_trait]
+    impl SubflowExecutor for StubFlows {
+        async fn execute(
+            &self,
+            request: SubflowRequest,
+            _: &mut StepContext,
+        ) -> Result<Value, AgentExecutionError> {
+            self.requests.lock().unwrap().push(request);
+            self.outcome.clone()
+        }
+    }
+
+    fn research_flow(
+    ) -> std::collections::BTreeMap<String, harness_core::orchestration::SubflowTarget> {
+        [(
+            "research".to_owned(),
+            harness_core::orchestration::SubflowTarget::Flow {
+                id: "team.research".into(),
+                revision: None,
+            },
+        )]
+        .into()
+    }
+
+    fn plan_with_flow(flow: &str) -> Value {
+        let mut plan = two_tasks();
+        plan["plan"]["tasks"][0]["flow"] = json!(flow);
+        plan
+    }
+
+    #[tokio::test]
+    async fn a_task_that_names_a_flow_runs_it_instead_of_building() {
+        let stub = Arc::new(StubFlows {
+            outcome: Ok(json!("found: sessions live in store.rs")),
+            requests: Mutex::default(),
+        });
+        // Only task 2 is built and reviewed.
+        let (runner, requests) = queue_runner_with(
+            vec![built(), reviewed("C2")],
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+            research_flow(),
+            Some(stub.clone()),
+        );
+        let output = runner
+            .run(
+                run_id("queue-flow"),
+                plan_with_flow("research"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "no builder or reviewer for task 1"
+        );
+        let flows = stub.requests.lock().unwrap();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].node_id.as_str(), "execute.T1");
+        assert_eq!(flows[0].input["task"]["id"], "T1");
+        assert_eq!(flows[0].input["request"], "two changes");
+        assert_eq!(flows[0].depth, 1);
+        let report = output.result.output.unwrap();
+        assert_eq!(report["tasks"][0]["flow"], "research");
+        assert_eq!(
+            report["tasks"][0]["result"],
+            "found: sessions live in store.rs"
+        );
+        assert_eq!(report["tasks"][1]["task_id"], "T2");
+    }
+
+    #[tokio::test]
+    async fn a_failed_flow_is_a_failed_task() {
+        let stub = Arc::new(StubFlows {
+            outcome: Err(AgentExecutionError::new("subflow_failed", "no network")),
+            requests: Mutex::default(),
+        });
+        let (runner, _) = queue_runner_with(
+            vec![built(), reviewed("C2")],
+            harness_core::orchestration::TaskFailurePolicy::Skip,
+            research_flow(),
+            Some(stub),
+        );
+        let output = runner
+            .run(
+                run_id("queue-flow-fail"),
+                plan_with_flow("research"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        let report = output.result.output.unwrap();
+        assert_eq!(report["tasks"][0]["skipped"], true);
+        assert!(report["tasks"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no network"));
+    }
+
+    #[tokio::test]
+    async fn a_task_naming_a_flow_the_step_does_not_offer_is_refused() {
+        let (runner, requests) =
+            queue_runner(vec![], harness_core::orchestration::TaskFailurePolicy::Ask);
+        let output = runner
+            .run(
+                run_id("queue-unknown-flow"),
+                plan_with_flow("deploy"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.state.status, OrchestrationStatus::Failed);
+        let error = output.result.error.unwrap();
+        assert_eq!(error.code, "invalid_task_plan");
+        assert!(
+            error.message.contains("\"deploy\"") && error.message.contains("none"),
+            "{}",
+            error.message
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    fn two_tasks() -> Value {
+        json!({"request":"two changes","plan":{"status":"ready","summary":"two tasks","requirements":[{"id":"R1","text":"both changes","criteria":[{"id":"C1","text":"first"},{"id":"C2","text":"second"}]}],"tasks":[{"id":"T1","instructions":"first","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]},{"id":"T2","instructions":"second","requirement_ids":["R1"],"criterion_ids":["C2"],"depends_on":["T1"]}]}})
+    }
+
+    fn built() -> Value {
+        json!({"status":"complete","summary":"implemented"})
+    }
+
+    fn reviewed(id: &str) -> Value {
+        json!({"status":"complete","summary":"inspected","criteria":[{"id":id,"evidence":"file.rs:12"}]})
+    }
+
+    fn blocked() -> Value {
+        json!({"status":"blocked_user","summary":"needs the staging API key"})
+    }
+
+    async fn task_question(
+        handle: &OrchestrationHandle,
+    ) -> harness_core::orchestration::InputRequest {
+        let mut watch = handle.watch();
+        wait_until(&mut watch, |state| {
+            state.status == OrchestrationStatus::WaitingForInput
+        })
+        .await;
+        handle.snapshot().steps[&node("execute")]
+            .pending_input
+            .clone()
+            .expect("the queue asked")
+    }
+
+    fn answer(decision: &str, text: Option<&str>) -> harness_core::orchestration::InputResponse {
+        harness_core::orchestration::InputResponse {
+            decision: decision.into(),
+            text: text.map(str::to_owned),
+            by: harness_core::orchestration::Responder::User,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_asks_and_is_retried_with_the_users_guidance() {
+        let (runner, requests) = queue_runner(
+            vec![built(), reviewed("C1"), blocked(), built(), reviewed("C2")],
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+        );
+        let handle = runner.start(run_id("queue-ask"), two_tasks()).unwrap();
+        let question = task_question(&handle).await;
+        assert_eq!(question.kind, "task_failure");
+        assert!(question.subject["problem"]
+            .as_str()
+            .unwrap()
+            .contains("needs the staging API key"));
+        let offered: Vec<_> = question.decisions.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            offered,
+            ["retry", "skip", "stop"],
+            "the plan comes from the run input, so it cannot be revised"
+        );
+        handle
+            .resolve_input(
+                &question.id,
+                answer("retry", Some("the key is in .env.staging")),
+            )
+            .await
+            .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 5);
+        assert!(prompt_of(&sent[3]).contains("the key is in .env.staging"));
+        assert!(!prompt_of(&sent[2]).contains("the key is in .env.staging"));
+    }
+
+    #[tokio::test]
+    async fn a_skipped_task_is_recorded_and_the_queue_goes_on() {
+        let (runner, _) = queue_runner(
+            vec![blocked(), built(), reviewed("C2")],
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+        );
+        let handle = runner.start(run_id("queue-skip"), two_tasks()).unwrap();
+        let question = task_question(&handle).await;
+        handle
+            .resolve_input(&question.id, answer("skip", None))
+            .await
+            .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        let report = output.result.output.unwrap();
+        assert_eq!(report["tasks"][0]["task_id"], "T1");
+        assert_eq!(report["tasks"][0]["skipped"], true);
+        assert_eq!(report["tasks"][1]["task_id"], "T2");
+        assert!(report["summary"].as_str().unwrap().contains("1 skipped"));
+    }
+
+    #[tokio::test]
+    async fn stopping_after_a_failed_task_keeps_the_accepted_ones() {
+        let (runner, _) = queue_runner(
+            vec![built(), reviewed("C1"), blocked()],
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+        );
+        let handle = runner.start(run_id("queue-stop"), two_tasks()).unwrap();
+        let question = task_question(&handle).await;
+        handle
+            .resolve_input(&question.id, answer("stop", None))
+            .await
+            .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(output.state.status, OrchestrationStatus::Failed);
+        assert_eq!(output.result.error.unwrap().code, "task_stopped");
+        let checkpoint = output.state.steps[&node("execute")]
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(checkpoint["completed"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_skip_policy_skips_without_asking() {
+        let (runner, _) = queue_runner(
+            vec![blocked(), built(), reviewed("C2")],
+            harness_core::orchestration::TaskFailurePolicy::Skip,
+        );
+        let output = runner
+            .run(
+                run_id("queue-auto-skip"),
+                two_tasks(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        assert!(!event_kinds(&output)
+            .iter()
+            .any(|event| matches!(event, OrchestrationEvent::InputRequested { .. })));
+        assert_eq!(output.result.output.unwrap()["tasks"][0]["skipped"], true);
+    }
 }
 
 #[tokio::test]
@@ -1375,4 +1820,555 @@ fn acceptance_rejects_missing_and_failed_requirements_but_not_renamed_ids() {
         {"id":"1","status":"pass","evidence":"observed behavior"},
         {"id":"2","status":"fail","evidence":"defect"}
     ])));
+}
+
+// ---------------------------------------------------------------------------
+// Approval
+// ---------------------------------------------------------------------------
+
+/// input → plan → approve (reviews the plan) → build → output.
+fn approval_definition(approval: Value) -> OrchestrationDefinition {
+    let mut config = json!({"subject": {"type": "node_output", "node_id": "plan", "pointer": ""}});
+    for (key, value) in approval.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    let text_agent = |id: &str, bindings: Value| {
+        json!({"id": id, "name": id, "type": "agent",
+            "config": {"instructions": format!("Do {id}"), "structured_output": "text"},
+            "input_bindings": bindings,
+            "retry": {"max_attempts": 2, "retry_on": ["backend_rate_limited"]}})
+    };
+    serde_json::from_value(json!({
+        "schema_version": 1, "id": "approve.flow", "revision": 1, "name": "Approve",
+        "nodes": [
+            {"id": "input", "name": "Input", "type": "input", "config": {}},
+            text_agent("plan", json!([{"target": "request", "source": {"type": "run_input", "pointer": "/request"}}])),
+            {"id": "approve", "name": "Plan approval", "type": "approval", "config": config},
+            text_agent("build", json!([
+                {"target": "plan", "source": {"type": "node_output", "node_id": "plan", "pointer": ""}},
+                {"target": "notes", "source": {"type": "node_output", "node_id": "approve", "pointer": "/notes"}}
+            ])),
+            {"id": "output", "name": "Output", "type": "output",
+             "config": {"source": {"type": "node_output", "node_id": "build", "pointer": ""}, "strict": false}}
+        ],
+        "edges": [
+            {"id": "e1", "source": "input", "target": "plan", "condition": "on_success"},
+            {"id": "e2", "source": "plan", "target": "approve", "condition": "on_success"},
+            {"id": "e3", "source": "approve", "target": "build", "condition": "on_success"},
+            {"id": "e4", "source": "build", "target": "output", "condition": "on_success"}
+        ]
+    }))
+    .expect("approval definition")
+}
+
+fn approval_runner(agent: Arc<ScriptedAgent>, approval: Value) -> OrchestrationRunner {
+    OrchestrationRunner::new(compiled(approval_definition(approval)), agent)
+        .with_available_tools(Vec::<String>::new())
+}
+
+fn answer(decision: &str, text: Option<&str>) -> InputResponse {
+    InputResponse {
+        decision: decision.into(),
+        text: text.map(str::to_owned),
+        by: Responder::User,
+    }
+}
+
+async fn waiting_question(handle: &OrchestrationHandle) -> InputRequest {
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    handle.snapshot().steps[&node("approve")]
+        .pending_input
+        .clone()
+        .expect("the approval asked")
+}
+
+#[tokio::test]
+async fn approval_waits_for_the_user_and_passes_their_notes_on() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan v1")), ok(json!("built"))]);
+    let handle = approval_runner(agent.clone(), json!({}))
+        .start(run_id("approve-ok"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    assert_eq!(question.kind, "approval");
+    assert_eq!(question.subject, json!("plan v1"));
+    let offered: Vec<_> = question.decisions.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(offered, ["approve", "request_changes", "reject"]);
+    assert_eq!(agent.requests().len(), 1, "build waits for the answer");
+
+    handle
+        .resolve_input(&question.id, answer("approve", Some("also add tests")))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(output.result.output, Some(json!("built")));
+    let approval = output.state.steps[&node("approve")]
+        .output
+        .as_ref()
+        .unwrap();
+    assert_eq!(approval["decision"], "approved");
+    assert_eq!(approval["by"], "user");
+    assert_eq!(agent.requests()[1].input["notes"], "also add tests");
+    let kinds = event_kinds(&output);
+    assert!(kinds
+        .iter()
+        .any(|event| matches!(event, OrchestrationEvent::InputRequested { .. })));
+    assert!(kinds.iter().any(|event| matches!(
+        event,
+        OrchestrationEvent::InputResolved { response, .. } if response.decision == "approve"
+    )));
+}
+
+#[tokio::test]
+async fn requested_changes_rerun_the_producer_with_the_users_words() {
+    let agent = ScriptedAgent::new(vec![
+        ok(json!("plan v1")),
+        ok(json!("plan v2")),
+        ok(json!("built")),
+    ]);
+    let handle = approval_runner(agent.clone(), json!({}))
+        .start(run_id("approve-revise"), input())
+        .unwrap();
+    let first = waiting_question(&handle).await;
+    handle
+        .resolve_input(&first.id, answer("request_changes", Some("split step 2")))
+        .await
+        .unwrap();
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.steps[&node("approve")].attempts.len() == 2
+            && state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    let second = handle.snapshot().steps[&node("approve")]
+        .pending_input
+        .clone()
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.subject, json!("plan v2"));
+    handle
+        .resolve_input(&second.id, answer("approve", None))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+
+    let requests = agent.requests();
+    assert_eq!(requests.len(), 3);
+    let revised = &requests[1];
+    assert_eq!(revised.node_id, node("plan"));
+    assert_eq!(revised.input["previous_result"], "plan v1");
+    let change = revised.feedback.last().unwrap();
+    assert_eq!(change.code, CHANGES_REQUESTED);
+    assert_eq!(change.message, "split step 2");
+    assert!(event_kinds(&output).iter().any(|event| matches!(
+        event,
+        OrchestrationEvent::StepRetryScheduled { node_id, triggered_by, .. }
+            if node_id == &node("plan") && triggered_by == &node("approve")
+    )));
+}
+
+#[tokio::test]
+async fn revisions_do_not_use_up_the_producers_own_retries() {
+    let rate_limited = || {
+        Behavior::Return(Err(AgentExecutionError::retryable(
+            "BACKEND_ERROR",
+            "RateLimited",
+            RetryReason::BackendRateLimited,
+        )))
+    };
+    // plan allows 2 attempts; after a revision it still gets its retry.
+    let agent = ScriptedAgent::new(vec![
+        ok(json!("plan v1")),
+        rate_limited(),
+        ok(json!("plan v2")),
+        ok(json!("built")),
+    ]);
+    let handle = approval_runner(agent.clone(), json!({}))
+        .start(run_id("approve-budget"), input())
+        .unwrap();
+    let first = waiting_question(&handle).await;
+    handle
+        .resolve_input(&first.id, answer("request_changes", Some("more detail")))
+        .await
+        .unwrap();
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.steps[&node("approve")].attempts.len() == 2
+            && state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    let second = handle.snapshot().steps[&node("approve")]
+        .pending_input
+        .clone()
+        .unwrap();
+    handle
+        .resolve_input(&second.id, answer("approve", None))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(output.state.steps[&node("plan")].attempts.len(), 3);
+}
+
+#[tokio::test]
+async fn answers_that_were_not_offered_are_refused_and_the_step_keeps_waiting() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let handle = approval_runner(agent, json!({"max_revisions": 0}))
+        .start(run_id("approve-invalid"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    let offered: Vec<_> = question.decisions.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(offered, ["approve", "reject"], "no revisions left to offer");
+    for (bad, text) in [("request_changes", Some("x")), ("maybe", None)] {
+        let error = handle
+            .resolve_input(&question.id, answer(bad, text))
+            .await
+            .expect_err("not offered");
+        assert!(matches!(error, ControlError::Rejected(_)), "{error:?}");
+    }
+    assert!(handle
+        .resolve_input("other-question", answer("approve", None))
+        .await
+        .is_err());
+    assert_eq!(
+        handle.snapshot().status,
+        OrchestrationStatus::WaitingForInput
+    );
+    handle
+        .resolve_input(&question.id, answer("approve", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.wait().await.unwrap().state.status,
+        OrchestrationStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn changes_need_text() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let handle = approval_runner(agent, json!({}))
+        .start(run_id("approve-text"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    assert!(handle
+        .resolve_input(&question.id, answer("request_changes", Some("  ")))
+        .await
+        .is_err());
+    handle
+        .resolve_input(&question.id, answer("approve", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.wait().await.unwrap().state.status,
+        OrchestrationStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn rejecting_stops_the_run() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan"))]);
+    let handle = approval_runner(agent.clone(), json!({}))
+        .start(run_id("approve-reject"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    handle
+        .resolve_input(&question.id, answer("reject", Some("wrong approach")))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Failed);
+    let error = output.result.error.unwrap();
+    assert_eq!(error.code, "approval_rejected");
+    assert!(error.message.contains("wrong approach"));
+    assert_eq!(agent.requests().len(), 1, "build never ran");
+}
+
+#[tokio::test]
+async fn auto_approve_passes_unless_the_step_requires_a_person() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let output = approval_runner(agent, json!({}))
+        .with_options(RunOptions { auto_approve: true })
+        .run(run_id("approve-auto"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    let approval = output.state.steps[&node("approve")]
+        .output
+        .as_ref()
+        .unwrap();
+    assert_eq!(approval["decision"], "approved");
+    assert_eq!(approval["by"], "auto");
+    assert!(output.state.options.auto_approve, "kept with the run");
+
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let handle = approval_runner(agent, json!({"allow_auto_approve": false}))
+        .with_options(RunOptions { auto_approve: true })
+        .start(run_id("approve-person"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    handle
+        .resolve_input(&question.id, answer("approve", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.wait().await.unwrap().state.status,
+        OrchestrationStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn nothing_to_review_skips_the_question() {
+    let agent = ScriptedAgent::new(vec![ok(json!("")), ok(json!("built"))]);
+    let output = approval_runner(agent, json!({"skip_if_empty": ""}))
+        .run(run_id("approve-skip"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(
+        output.state.steps[&node("approve")]
+            .output
+            .as_ref()
+            .unwrap()["decision"],
+        "skipped"
+    );
+}
+
+#[tokio::test]
+async fn a_subject_that_is_not_there_is_nothing_to_review() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let subject = json!({"type": "node_output", "node_id": "plan", "pointer": "/manual_checks"});
+    let output = approval_runner(agent, json!({"subject": subject, "skip_if_empty": ""}))
+        .run(run_id("approve-absent"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(
+        output.state.steps[&node("approve")]
+            .output
+            .as_ref()
+            .unwrap()["decision"],
+        "skipped"
+    );
+}
+
+#[tokio::test]
+async fn waiting_for_an_answer_is_not_a_stall_and_does_not_use_the_time_budget() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let mut definition = approval_definition(json!({}));
+    definition.policies.stall_timeout_ms = Some(30);
+    definition.policies.max_elapsed_ms = Some(2_000);
+    let handle = OrchestrationRunner::new(compiled(definition), agent)
+        .with_available_tools(Vec::<String>::new())
+        .start(run_id("approve-wait"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        handle.snapshot().status,
+        OrchestrationStatus::WaitingForInput
+    );
+    handle
+        .resolve_input(&question.id, answer("approve", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.wait().await.unwrap().state.status,
+        OrchestrationStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn cancelling_while_waiting_ends_the_run() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan"))]);
+    let handle = approval_runner(agent, json!({}))
+        .start(run_id("approve-cancel"), input())
+        .unwrap();
+    waiting_question(&handle).await;
+    handle.cancel();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Cancelled);
+    assert!(output.state.steps[&node("approve")].pending_input.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Subflows
+
+/// Runs every subflow as `child`, with scripted agents, the way the engine
+/// runs a real one.
+struct TestSubflows {
+    child: Arc<CompiledOrchestration>,
+    agent: Arc<ScriptedAgent>,
+    requests: Mutex<Vec<SubflowRequest>>,
+}
+
+#[async_trait]
+impl SubflowExecutor for TestSubflows {
+    async fn execute(
+        &self,
+        request: SubflowRequest,
+        context: &mut StepContext,
+    ) -> Result<Value, AgentExecutionError> {
+        self.requests.lock().unwrap().push(request.clone());
+        let handle = OrchestrationRunner::new(self.child.clone(), self.agent.clone())
+            .with_available_tools(Vec::<String>::new())
+            .with_options(request.options)
+            .with_depth(request.depth)
+            .start(
+                OrchestrationRunId::new(format!("{}-child", request.run_id)),
+                request.input,
+            )
+            .map_err(|error| AgentExecutionError::new("subflow_failed", error.to_string()))?;
+        drive_child(handle, context, request.node_id.as_str()).await
+    }
+}
+
+/// input → sub (runs the `child` flow on the request) → output.
+fn subflow_runner(
+    child: OrchestrationDefinition,
+    agent: Arc<ScriptedAgent>,
+) -> (OrchestrationRunner, Arc<TestSubflows>) {
+    let parent: OrchestrationDefinition = serde_json::from_value(json!({
+        "schema_version": 1, "id": "parent.flow", "revision": 1, "name": "Parent",
+        "nodes": [
+            {"id": "input", "name": "Input", "type": "input", "config": {}},
+            {"id": "sub", "name": "Gather", "type": "subflow",
+             "config": {"target": {"type": "flow", "id": child.id.as_str()}},
+             "input_bindings": [{"target": "request", "source": {"type": "run_input", "pointer": "/request"}}]},
+            {"id": "output", "name": "Output", "type": "output",
+             "config": {"source": {"type": "node_output", "node_id": "sub", "pointer": ""}, "strict": false}}
+        ],
+        "edges": [
+            {"id": "e1", "source": "input", "target": "sub", "condition": "on_success"},
+            {"id": "e2", "source": "sub", "target": "output", "condition": "on_success"}
+        ]
+    }))
+    .unwrap();
+    let executor = Arc::new(TestSubflows {
+        child: compiled(child),
+        agent: agent.clone(),
+        requests: Mutex::default(),
+    });
+    let runner = OrchestrationRunner::new(compiled(parent), agent)
+        .with_available_tools(Vec::<String>::new())
+        .with_subflows(executor.clone());
+    (runner, executor)
+}
+
+#[tokio::test]
+async fn a_subflow_runs_another_flow_and_its_output_is_the_nodes() {
+    let agent = ScriptedAgent::new(vec![ok(json!("researched")), ok(json!("built"))]);
+    let (runner, executor) = subflow_runner(approval_definition(json!({})), agent.clone());
+    let output = runner
+        .with_options(RunOptions { auto_approve: true })
+        .run(run_id("sub-ok"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        output.state.status,
+        OrchestrationStatus::Completed,
+        "{:?}",
+        output.result
+    );
+    assert_eq!(output.result.output, Some(json!("built")));
+    let requests = executor.requests.lock().unwrap();
+    assert_eq!(requests[0].input, json!({"request": "do the work"}));
+    assert_eq!(requests[0].depth, 1);
+    assert!(
+        requests[0].options.auto_approve,
+        "the child follows the run's options"
+    );
+}
+
+#[tokio::test]
+async fn a_childs_question_is_asked_through_the_parent() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan")), ok(json!("built"))]);
+    let (runner, _) = subflow_runner(approval_definition(json!({})), agent);
+    let handle = runner.start(run_id("sub-ask"), input()).unwrap();
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    let question = handle.snapshot().steps[&node("sub")]
+        .pending_input
+        .clone()
+        .expect("the parent step asks for the child");
+    assert_eq!(question.kind, "approval");
+    assert_eq!(question.id, "sub/approve:1");
+    assert_eq!(question.subject, json!("plan"));
+    handle
+        .resolve_input(&question.id, answer("approve", None))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(
+        output.state.status,
+        OrchestrationStatus::Completed,
+        "{:?}",
+        output.result
+    );
+    assert_eq!(output.result.output, Some(json!("built")));
+}
+
+#[tokio::test]
+async fn cancelling_the_parent_cancels_the_child() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan"))]);
+    let (runner, _) = subflow_runner(approval_definition(json!({})), agent);
+    let handle = runner.start(run_id("sub-cancel"), input()).unwrap();
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    handle.cancel();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn a_failing_child_fails_the_node_with_its_reason() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan"))]);
+    let (runner, _) = subflow_runner(approval_definition(json!({})), agent);
+    let handle = runner.start(run_id("sub-fail"), input()).unwrap();
+    let mut watch = handle.watch();
+    wait_until(&mut watch, |state| {
+        state.status == OrchestrationStatus::WaitingForInput
+    })
+    .await;
+    let question = handle.snapshot().steps[&node("sub")]
+        .pending_input
+        .clone()
+        .unwrap();
+    handle
+        .resolve_input(&question.id, answer("reject", Some("wrong approach")))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Failed);
+    let error = output.result.error.unwrap();
+    assert_eq!(error.code, "subflow_failed");
+    assert!(
+        error.message.contains("wrong approach"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn without_a_host_for_subflows_the_node_fails_clearly() {
+    let agent = ScriptedAgent::new(Vec::new());
+    let (runner, _) = subflow_runner(approval_definition(json!({})), agent.clone());
+    let bare = OrchestrationRunner::new(runner.compiled().clone(), agent)
+        .with_available_tools(Vec::<String>::new());
+    let output = bare
+        .run(run_id("sub-bare"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(output.result.error.unwrap().code, "subflows_unavailable");
 }
