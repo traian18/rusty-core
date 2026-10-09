@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_runs_after_context_truncation() {
+    async fn tool_pairs_survive_context_truncation() {
         use crate::providers::{StaticSystemPromptProvider, TruncatingCompactionProvider};
         use harness_protocol::{
             ids::{MessageId, Timestamp, ToolCallId},
@@ -232,10 +232,16 @@ mod tests {
             .await
             .unwrap();
         let seen = backend.seen.lock().unwrap();
-        assert!(seen[0]
-            .messages
+        // The pair-safe cut keeps the ToolUse with its ToolResult, so nothing
+        // is orphaned and the result's content reaches the backend intact.
+        let blocks: Vec<_> = seen[0].messages.iter().flat_map(|m| &m.content).collect();
+        assert!(blocks
             .iter()
-            .all(|message| message.role != MessageRole::Tool));
-        assert!(seen[0].messages.iter().flat_map(|m| &m.content).any(|b| matches!(b, ContentBlock::Text { text } if text.contains("important retained file contents"))));
+            .any(|b| matches!(b, ContentBlock::ToolUse { call } if call.id == id)));
+        assert!(blocks.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { call_id, result }
+                if *call_id == id && result.output_preview.contains("important retained file contents")
+        )));
     }
 }

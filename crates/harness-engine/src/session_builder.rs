@@ -26,6 +26,9 @@ pub use harness_tool_mcp::{McpServerConfig, McpTransportConfig};
 // ---------------------------------------------------------------------------
 
 /// Errors raised while configuring or operating a session.
+type ContextProviderFactory =
+    Box<dyn FnOnce(Arc<dyn ExecutionBackend>) -> Arc<dyn harness_context::ContextProvider> + Send>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
     #[error(
@@ -89,6 +92,9 @@ pub struct SessionBuilder {
     /// Optional context assembly/compaction provider — see
     /// [`context_provider`](Self::context_provider).
     context_provider: Option<Arc<dyn harness_context::ContextProvider>>,
+    /// Like `context_provider`, but built from the session's resolved
+    /// backend — see [`context_provider_with_backend`](Self::context_provider_with_backend).
+    context_factory: Option<ContextProviderFactory>,
     /// Session-level default execution params (model, max_tokens,
     /// temperature, reasoning, ...) applied immediately after the session
     /// starts — see [`execution_params`](Self::execution_params).
@@ -135,6 +141,7 @@ impl SessionBuilder {
             root_toolset: None,
             session_manager: None,
             context_provider: None,
+            context_factory: None,
             execution_params: None,
             mcp_servers: Vec::new(),
             optional_mcp_servers: Default::default(),
@@ -169,6 +176,7 @@ impl SessionBuilder {
             root_toolset: None,
             session_manager: Some(session_manager),
             context_provider: None,
+            context_factory: None,
             execution_params: None,
             mcp_servers: Vec::new(),
             optional_mcp_servers: Default::default(),
@@ -359,6 +367,22 @@ impl SessionBuilder {
     /// rather than a change to `harness-core`.
     pub fn context_provider(mut self, provider: Arc<dyn harness_context::ContextProvider>) -> Self {
         self.context_provider = Some(provider);
+        self
+    }
+
+    /// Install a context provider that needs the session's own backend, such
+    /// as a summarizer making model calls on the same provider. `factory` runs
+    /// once in [`start`](Self::start) with the resolved backend (before any
+    /// context wrapping, so its calls are not themselves compacted) and its
+    /// provider runs after any provider set with
+    /// [`context_provider`](Self::context_provider).
+    pub fn context_provider_with_backend(
+        mut self,
+        factory: impl FnOnce(Arc<dyn ExecutionBackend>) -> Arc<dyn harness_context::ContextProvider>
+            + Send
+            + 'static,
+    ) -> Self {
+        self.context_factory = Some(Box::new(factory));
         self
     }
 
@@ -572,7 +596,17 @@ impl SessionBuilder {
         // so that a compaction provider (which sizes a token budget) sees
         // the prompt that will actually ship rather than one still missing
         // the skill catalog.
-        let context_provider = match (skills_provider, self.context_provider) {
+        let factory_provider = self.context_factory.map(|factory| factory(backend.clone()));
+        let caller_provider = match (self.context_provider, factory_provider) {
+            (Some(first), Some(second)) => {
+                Some(Arc::new(harness_context::ChainedContextProvider::new(vec![
+                    first, second,
+                ]))
+                    as Arc<dyn harness_context::ContextProvider>)
+            }
+            (only, None) | (None, only) => only,
+        };
+        let context_provider = match (skills_provider, caller_provider) {
             (Some(skills), Some(caller)) => {
                 Some(Arc::new(harness_context::ChainedContextProvider::new(vec![
                     skills, caller,

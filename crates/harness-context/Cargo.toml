@@ -8,11 +8,17 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# Ships a reqwest transport for the JEV Decisions API (OpenRouter).
+jev-http = ["dep:reqwest"]
+
 [dependencies]
 async-trait = { workspace = true }
 harness-protocol = { path = "../harness-protocol" }
 harness-runtime = { path = "../harness-runtime" }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]

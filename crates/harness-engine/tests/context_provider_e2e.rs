@@ -118,3 +118,40 @@ async fn context_provider_rewrites_the_request_the_backend_sees() {
     );
     assert_eq!(seen[0].system_prompt, "project instructions");
 }
+
+#[tokio::test]
+async fn backend_aware_provider_gets_the_session_backend_and_runs_after_the_plain_one() {
+    let backend = Arc::new(RecordingBackend {
+        seen: Mutex::new(Vec::new()),
+    });
+    let received = Arc::new(Mutex::new(None::<String>));
+    let received_in_factory = received.clone();
+
+    let handle = Harness::new()
+        .session()
+        .backend(backend.clone())
+        .tools(Arc::new(NoTools))
+        .context_provider(Arc::new(StaticSystemPromptProvider::new("first")))
+        .context_provider_with_backend(move |session_backend| {
+            *received_in_factory.lock().unwrap() = Some(session_backend.descriptor().name);
+            Arc::new(StaticSystemPromptProvider::new("second")) as Arc<dyn ContextProvider>
+        })
+        .start()
+        .await
+        .expect("SessionBuilder::start() should succeed");
+    handle.send("hi").await.expect("send");
+
+    for _ in 0..50 {
+        if !backend.seen.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(received.lock().unwrap().as_deref(), Some("recording"));
+    // Each static provider prepends, so the later one ends up in front.
+    assert_eq!(
+        backend.seen.lock().unwrap()[0].system_prompt,
+        "second\n\nfirst"
+    );
+}

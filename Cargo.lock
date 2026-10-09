@@ -894,6 +894,8 @@ dependencies = [
  "async-trait",
  "harness-protocol",
  "harness-runtime",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

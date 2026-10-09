@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use harness_protocol::backend::ExecutionRequest;
-use harness_protocol::ids::{MessageId, Timestamp};
-use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
+use harness_protocol::ids::MessageId;
+use harness_protocol::messages::{AgentMessage, ContentBlock};
 use harness_runtime::traits::Workspace;
 
+use crate::compaction::{drop_prefix, elide_tool_results, truncation_note, Retention};
 use crate::policy::{ContextDecision, ContextPolicy, TokenEstimate};
 use crate::provider::ContextProvider;
 
@@ -123,6 +124,7 @@ pub struct TruncatingCompactionProvider {
     inner: Arc<dyn ContextProvider>,
     max_chars: usize,
     keep_recent: usize,
+    retention: Retention,
 }
 
 impl TruncatingCompactionProvider {
@@ -131,9 +133,25 @@ impl TruncatingCompactionProvider {
             inner,
             max_chars,
             keep_recent,
+            retention: Retention::default(),
         }
     }
+
+    /// Messages that must survive compaction regardless of age.
+    pub fn with_pinned_messages(mut self, ids: impl IntoIterator<Item = MessageId>) -> Self {
+        self.retention.pinned.extend(ids);
+        self
+    }
+
+    /// Also keep the first user message (the original task) verbatim.
+    pub fn with_anchor_first_user_message(mut self, anchor: bool) -> Self {
+        self.retention.anchor_first_user = anchor;
+        self
+    }
 }
+
+/// Rough size of one image in the character budget (~1.5k tokens).
+const IMAGE_CHARS: usize = 6_000;
 
 fn message_char_len(message: &AgentMessage) -> usize {
     message
@@ -142,20 +160,12 @@ fn message_char_len(message: &AgentMessage) -> usize {
         .map(|block| match block {
             ContentBlock::Text { text } => text.len(),
             ContentBlock::ToolResult { result, .. } => result.output_preview.len(),
-            ContentBlock::ToolUse { .. } | ContentBlock::Image { .. } => 0,
+            // Arguments can be large (a whole file for a write), and the
+            // model is sent them on every later turn.
+            ContentBlock::ToolUse { call } => call.name.len() + call.arguments.to_string().len(),
+            ContentBlock::Image { .. } => IMAGE_CHARS,
         })
         .sum()
-}
-
-fn truncation_note(dropped: usize) -> AgentMessage {
-    AgentMessage {
-        id: MessageId::new(),
-        role: MessageRole::System,
-        content: vec![ContentBlock::Text {
-            text: format!("[earlier conversation truncated — {dropped} message(s) omitted]"),
-        }],
-        created_at: Timestamp::now(),
-    }
 }
 
 #[async_trait]
@@ -168,16 +178,24 @@ impl ContextProvider for TruncatingCompactionProvider {
         let mut request = self.inner.assemble(request, workspace).await;
 
         let total_chars: usize = request.messages.iter().map(message_char_len).sum();
-        if total_chars <= self.max_chars || request.messages.len() <= self.keep_recent {
+        if total_chars <= self.max_chars {
             return request;
         }
 
-        let keep_from = request.messages.len() - self.keep_recent;
-        let dropped = keep_from;
-        let mut compacted = Vec::with_capacity(self.keep_recent + 1);
-        compacted.push(truncation_note(dropped));
-        compacted.extend(request.messages.split_off(keep_from));
-        request.messages = compacted;
+        // Tier 1: shrink old tool output before discarding any turn.
+        elide_tool_results(&mut request.messages, self.keep_recent, &self.retention);
+        let total_chars: usize = request.messages.iter().map(message_char_len).sum();
+        if total_chars <= self.max_chars {
+            return request;
+        }
+
+        // Tier 2: drop the oldest turns at a tool-pair-safe cut.
+        drop_prefix(
+            &mut request.messages,
+            self.keep_recent,
+            &self.retention,
+            truncation_note,
+        );
         request
     }
 }
@@ -235,6 +253,7 @@ pub struct PolicyDrivenCompactionProvider {
     keep_recent: usize,
     /// Fallback raw character cap used only when `context_window` is `None`.
     fallback_max_chars: usize,
+    retention: Retention,
     last_compaction: Mutex<Option<CompactionRecord>>,
     compaction_count: AtomicU64,
 }
@@ -245,7 +264,7 @@ pub struct PolicyDrivenCompactionProvider {
 /// this errs toward compacting a little early rather than a little late.
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 
-fn estimate_tokens(request: &ExecutionRequest) -> TokenEstimate {
+pub(crate) fn estimate_tokens(request: &ExecutionRequest) -> TokenEstimate {
     let system_chars = request.system_prompt.len();
     let message_chars: usize = request.messages.iter().map(message_char_len).sum();
     let total_chars = system_chars.saturating_add(message_chars);
@@ -266,6 +285,7 @@ impl PolicyDrivenCompactionProvider {
             context_window,
             keep_recent,
             fallback_max_chars,
+            retention: Retention::default(),
             last_compaction: Mutex::new(None),
             compaction_count: AtomicU64::new(0),
         }
@@ -288,16 +308,38 @@ impl PolicyDrivenCompactionProvider {
         self.compaction_count.load(Ordering::Relaxed)
     }
 
+    /// Messages that must survive compaction regardless of age.
+    pub fn with_pinned_messages(mut self, ids: impl IntoIterator<Item = MessageId>) -> Self {
+        self.retention.pinned.extend(ids);
+        self
+    }
+
+    /// Also keep the first user message (the original task) verbatim.
+    pub fn with_anchor_first_user_message(mut self, anchor: bool) -> Self {
+        self.retention.anchor_first_user = anchor;
+        self
+    }
+
+    fn record(&self, tokens: usize, exact: bool, pressure_percent: u16, kept_messages: usize) {
+        *self
+            .last_compaction
+            .lock()
+            .expect("last_compaction mutex poisoned") = Some(CompactionRecord {
+            projected_input_tokens: tokens as u64,
+            exact,
+            pressure_percent,
+            kept_messages,
+        });
+        self.compaction_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn compact_to(&self, mut request: ExecutionRequest, keep: usize) -> ExecutionRequest {
-        if request.messages.len() <= keep {
-            return request;
-        }
-        let keep_from = request.messages.len() - keep;
-        let dropped = keep_from;
-        let mut compacted = Vec::with_capacity(keep + 1);
-        compacted.push(truncation_note(dropped));
-        compacted.extend(request.messages.split_off(keep_from));
-        request.messages = compacted;
+        drop_prefix(
+            &mut request.messages,
+            keep,
+            &self.retention,
+            truncation_note,
+        );
         request
     }
 }
@@ -309,15 +351,29 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
         request: ExecutionRequest,
         workspace: &dyn Workspace,
     ) -> ExecutionRequest {
-        let request = self.inner.assemble(request, workspace).await;
+        let mut request = self.inner.assemble(request, workspace).await;
 
         let Some(context_window) = self.context_window else {
             // Unknown window: no policy-based sizing is possible, but we
             // still don't want a genuinely unbounded payload — fall back to
             // the flat character cap rather than skip compaction entirely.
             let total_chars: usize = request.messages.iter().map(message_char_len).sum();
-            if total_chars <= self.fallback_max_chars || request.messages.len() <= self.keep_recent
-            {
+            if total_chars <= self.fallback_max_chars {
+                return request;
+            }
+            if elide_tool_results(&mut request.messages, self.keep_recent, &self.retention) > 0 {
+                let after: usize = request.messages.iter().map(message_char_len).sum();
+                if after <= self.fallback_max_chars {
+                    self.record(
+                        total_chars / APPROX_CHARS_PER_TOKEN,
+                        false,
+                        0,
+                        request.messages.len(),
+                    );
+                    return request;
+                }
+            }
+            if request.messages.len() <= self.keep_recent {
                 return request;
             }
             let kept = self.keep_recent;
@@ -351,6 +407,21 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
             ContextDecision::CompactBeforeRequest { budget } => {
                 let target_tokens = self.policy.target_tokens(budget.input_budget, false);
                 let target_chars = (target_tokens as usize).saturating_mul(APPROX_CHARS_PER_TOKEN);
+                // Tier 1: elide bulky old tool output; if that alone reaches
+                // the target, no turn needs to be dropped.
+                if elide_tool_results(&mut request.messages, self.keep_recent, &self.retention) > 0
+                {
+                    let after: usize = request.messages.iter().map(message_char_len).sum();
+                    if after <= target_chars {
+                        self.record(
+                            projected_input.tokens as usize,
+                            projected_input.exact,
+                            budget.pressure_percent,
+                            request.messages.len(),
+                        );
+                        return request;
+                    }
+                }
                 // Keep dropping trailing-but-oldest messages (beyond
                 // `keep_recent`) until under the target, same mechanics as
                 // `TruncatingCompactionProvider`, just budgeted from the
@@ -414,7 +485,10 @@ impl ContextProvider for ChainedContextProvider {
 mod tests {
     use super::*;
 
-    use harness_protocol::ids::{RequestId, RunId};
+    use harness_protocol::ids::ToolCallId;
+    use harness_protocol::ids::{RequestId, RunId, Timestamp};
+    use harness_protocol::messages::MessageRole;
+    use harness_protocol::tools::{ToolCall, ToolResultSummary};
     use harness_runtime::workspace::FakeWorkspace;
 
     fn empty_request() -> ExecutionRequest {
@@ -632,5 +706,151 @@ mod tests {
         // Each StaticSystemPromptProvider prepends, so "second" (applied
         // last) ends up in front of "first".
         assert_eq!(result.system_prompt, "second\n\nfirst");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tiered compaction: elision, pair-safe cuts, pinning
+    // -----------------------------------------------------------------------
+
+    fn tool_pair(name: &str, output: &str) -> (AgentMessage, AgentMessage, ToolCallId) {
+        let id = ToolCallId::new();
+        let call = AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                call: ToolCall {
+                    id,
+                    name: name.to_string(),
+                    arguments: serde_json::Value::Null,
+                },
+            }],
+            created_at: Timestamp::now(),
+        };
+        let result = AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                call_id: id,
+                result: ToolResultSummary {
+                    has_error: false,
+                    output_preview: output.to_string(),
+                },
+            }],
+            created_at: Timestamp::now(),
+        };
+        (call, result, id)
+    }
+
+    fn has_result(messages: &[AgentMessage], id: ToolCallId) -> bool {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::ToolResult { call_id, .. } if *call_id == id))
+    }
+
+    fn has_use(messages: &[AgentMessage], id: ToolCallId) -> bool {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::ToolUse { call } if call.id == id))
+    }
+
+    #[tokio::test]
+    async fn elision_alone_avoids_dropping_turns() {
+        let base = Arc::new(StaticSystemPromptProvider::new("noop"));
+        let provider = TruncatingCompactionProvider::new(base, 2_000, 2);
+        let (call, result, id) = tool_pair("read_file", &"x".repeat(5_000));
+        let mut request = empty_request();
+        request.messages = vec![
+            text_message(MessageRole::User, "task"),
+            call,
+            result,
+            text_message(MessageRole::Assistant, "ok"),
+            text_message(MessageRole::User, "next"),
+        ];
+        let out = provider.assemble(request, &FakeWorkspace::new()).await;
+        assert_eq!(out.messages.len(), 5, "no turn should be dropped");
+        let ContentBlock::ToolResult { result, .. } = &out.messages[2].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(result.output_preview.contains("read_file result elided"));
+        assert!(has_use(&out.messages, id));
+    }
+
+    #[tokio::test]
+    async fn cut_never_orphans_a_tool_result() {
+        let base = Arc::new(StaticSystemPromptProvider::new("noop"));
+        // keep_recent = 1 would cut between the ToolUse and its ToolResult.
+        let provider = TruncatingCompactionProvider::new(base, 10, 1);
+        let (call, result, id) = tool_pair("grep", "short");
+        let mut request = empty_request();
+        request.messages = vec![
+            text_message(MessageRole::User, "a long first message to exceed budget"),
+            call,
+            result,
+        ];
+        let out = provider.assemble(request, &FakeWorkspace::new()).await;
+        assert!(has_result(&out.messages, id));
+        assert!(
+            has_use(&out.messages, id),
+            "ToolUse must travel with its result"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_and_anchored_messages_survive() {
+        let base = Arc::new(StaticSystemPromptProvider::new("noop"));
+        let pinned = text_message(MessageRole::Assistant, "the plan: do X then Y");
+        let pinned_id = pinned.id;
+        let provider = TruncatingCompactionProvider::new(base, 10, 1)
+            .with_pinned_messages([pinned_id])
+            .with_anchor_first_user_message(true);
+        let mut request = empty_request();
+        request.messages = vec![
+            text_message(MessageRole::User, "original task description"),
+            text_message(MessageRole::Assistant, "filler filler filler"),
+            pinned,
+            text_message(MessageRole::Assistant, "more filler filler"),
+            text_message(MessageRole::User, "latest"),
+        ];
+        let out = provider.assemble(request, &FakeWorkspace::new()).await;
+        let ids: Vec<_> = out.messages.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&pinned_id));
+        assert!(matches!(
+            &out.messages[0].content[0],
+            ContentBlock::Text { text } if text == "original task description"
+        ));
+        // anchor, pinned, note, latest
+        assert_eq!(out.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn tool_call_arguments_count_towards_the_budget() {
+        let base = Arc::new(StaticSystemPromptProvider::new("noop"));
+        let provider = TruncatingCompactionProvider::new(base, 1_000, 2);
+        let write = AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({ "path": "a.rs", "content": "x".repeat(5_000) }),
+                },
+            }],
+            created_at: Timestamp::now(),
+        };
+        let mut request = empty_request();
+        request.messages = vec![
+            text_message(MessageRole::User, "task"),
+            write,
+            text_message(MessageRole::User, "next"),
+            text_message(MessageRole::Assistant, "done"),
+        ];
+        let out = provider.assemble(request, &FakeWorkspace::new()).await;
+        assert!(
+            out.messages.len() < 4,
+            "a 5k-char write must push the history over a 1k budget"
+        );
     }
 }
