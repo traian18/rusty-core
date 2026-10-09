@@ -1324,21 +1324,17 @@ mod isolated_session {
         flows: std::collections::BTreeMap<String, harness_core::orchestration::SubflowTarget>,
         subflows: Option<Arc<dyn SubflowExecutor>>,
     ) -> (OrchestrationRunner, Arc<Mutex<Vec<ExecutionRequest>>>) {
+        queue_runner_for(queue_definition(policy, flows), replies, subflows)
+    }
+
+    fn queue_definition(
+        policy: harness_core::orchestration::TaskFailurePolicy,
+        flows: std::collections::BTreeMap<String, harness_core::orchestration::SubflowTarget>,
+    ) -> OrchestrationDefinition {
         use harness_core::{
-            behavior::{ProfileRef, ProfileRegistry},
+            behavior::ProfileRef,
             orchestration::{InputBinding, OutputBinding, TaskQueueConfig},
         };
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let parent = Arc::new(SessionRuntime::new(
-            SessionId::new(),
-            Arc::new(QueueBackend {
-                requests: requests.clone(),
-                replies: Mutex::new(replies.into()),
-            }),
-            Arc::new(FakeToolRegistry::new()),
-            Arc::new(FakeWorkspace::new()),
-            Arc::new(NoopSink),
-        ));
         let mut definition = default_orchestration_definition();
         definition.input_schema = None;
         definition.output_contract.schema = SchemaReference::Inline {
@@ -1372,6 +1368,26 @@ mod isolated_session {
                 }];
             }
         }
+        definition
+    }
+
+    fn queue_runner_for(
+        definition: OrchestrationDefinition,
+        replies: Vec<Value>,
+        subflows: Option<Arc<dyn SubflowExecutor>>,
+    ) -> (OrchestrationRunner, Arc<Mutex<Vec<ExecutionRequest>>>) {
+        use harness_core::behavior::ProfileRegistry;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(QueueBackend {
+                requests: requests.clone(),
+                replies: Mutex::new(replies.into()),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        ));
         let mut executor = IsolatedSessionAgentExecutor::new(parent)
             .with_profiles(Arc::new(ProfileRegistry::new()));
         if let Some(subflows) = subflows {
@@ -1672,6 +1688,101 @@ mod isolated_session {
             .any(|event| matches!(event, OrchestrationEvent::InputRequested { .. })));
         assert_eq!(output.result.output.unwrap()["tasks"][0]["skipped"], true);
     }
+
+    /// The user tries the finished work by hand and asks for changes: the
+    /// accepted tasks stay, one repair task makes the changes, and the
+    /// queue's result lists it so the steps after it can check it.
+    #[tokio::test]
+    async fn changes_the_user_asks_for_after_trying_the_result_run_as_a_repair_task() {
+        let mut definition = queue_definition(
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+            Default::default(),
+        );
+        definition.nodes.insert(
+            3,
+            serde_json::from_value(json!({
+                "id": "confirm", "name": "Manual checks", "type": "approval",
+                "config": {"subject": {"type": "node_output", "node_id": "execute", "pointer": ""}}
+            }))
+            .unwrap(),
+        );
+        for edge in &mut definition.edges {
+            if edge.source == node("verify") {
+                edge.target = node("confirm");
+            }
+        }
+        definition.edges.push(
+            serde_json::from_value(json!({"id": "confirm-output", "source": "confirm", "target": "output", "condition": "on_success"}))
+                .unwrap(),
+        );
+        let (runner, requests) = queue_runner_for(
+            definition,
+            vec![
+                built(),
+                reviewed("C1"),
+                built(),
+                reviewed("C2"),
+                json!({"status":"complete","summary":"the button now saves"}),
+                json!({"status":"complete","summary":"inspected the fix","criteria":[]}),
+            ],
+            None,
+        );
+        let handle = runner.start(run_id("queue-confirm"), two_tasks()).unwrap();
+        let mut watch = handle.watch();
+        wait_until(&mut watch, |state| {
+            state.status == OrchestrationStatus::WaitingForInput
+        })
+        .await;
+        let question = handle.snapshot().steps[&node("confirm")]
+            .pending_input
+            .clone()
+            .unwrap();
+        handle
+            .resolve_input(
+                &question.id,
+                answer("request_changes", Some("the save button does nothing")),
+            )
+            .await
+            .unwrap();
+        let mut watch = handle.watch();
+        wait_until(&mut watch, |state| {
+            state.steps[&node("confirm")].attempts.len() == 2
+                && state.status == OrchestrationStatus::WaitingForInput
+        })
+        .await;
+        let again = handle.snapshot().steps[&node("confirm")]
+            .pending_input
+            .clone()
+            .unwrap();
+        handle
+            .resolve_input(&again.id, answer("approve", None))
+            .await
+            .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 6, "two tasks, then one repair and its review");
+        let repair = prompt_of(&sent[4]);
+        assert!(repair.contains("the save button does nothing"), "{repair}");
+        // The reviewer reviews the repair; it is not told to make changes itself.
+        assert!(!prompt_of(&sent[5]).contains("asked for changes. Revise"));
+        let report = output.result.output.unwrap();
+        assert_eq!(report["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(report["repairs"][0]["task_id"], "final-repair");
+        assert!(report["repairs"][0]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("the save button does nothing"));
+        assert!(report["summary"]
+            .as_str()
+            .unwrap()
+            .contains("1 repair task"));
+    }
 }
 
 #[tokio::test]
@@ -1970,6 +2081,63 @@ async fn requested_changes_rerun_the_producer_with_the_users_words() {
         OrchestrationEvent::StepRetryScheduled { node_id, triggered_by, .. }
             if node_id == &node("plan") && triggered_by == &node("approve")
     )));
+}
+
+#[tokio::test]
+async fn approving_with_notes_revises_the_result_and_does_not_ask_again() {
+    let agent = ScriptedAgent::new(vec![
+        ok(json!("plan v1")),
+        ok(json!("plan v2")),
+        ok(json!("built")),
+    ]);
+    let handle = approval_runner(agent.clone(), json!({"revise_on_notes": true}))
+        .start(run_id("approve-notes"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    handle
+        .resolve_input(&question.id, answer("approve", Some("drop step 3")))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    let requests = agent.requests();
+    assert_eq!(requests.len(), 3, "plan, revised plan, build");
+    let revised = &requests[1];
+    assert_eq!(revised.node_id, node("plan"));
+    assert_eq!(revised.input["previous_result"], "plan v1");
+    let change = revised.feedback.last().unwrap();
+    assert_eq!(change.code, CHANGES_APPROVED);
+    assert_eq!(change.message, "drop step 3");
+    // Build works from the revised plan, with the notes still passed on.
+    assert_eq!(requests[2].input["plan"], "plan v2");
+    assert_eq!(requests[2].input["notes"], "drop step 3");
+    let approval = output.state.steps[&node("approve")]
+        .output
+        .as_ref()
+        .unwrap();
+    assert_eq!(approval["decision"], "approved");
+    assert_eq!(approval["subject"], "plan v2");
+    let asked = event_kinds(&output)
+        .iter()
+        .filter(|event| matches!(event, OrchestrationEvent::InputRequested { .. }))
+        .count();
+    assert_eq!(asked, 1, "the revised plan is not put to the user again");
+}
+
+#[tokio::test]
+async fn approving_without_notes_never_revises() {
+    let agent = ScriptedAgent::new(vec![ok(json!("plan v1")), ok(json!("built"))]);
+    let handle = approval_runner(agent.clone(), json!({"revise_on_notes": true}))
+        .start(run_id("approve-plain"), input())
+        .unwrap();
+    let question = waiting_question(&handle).await;
+    handle
+        .resolve_input(&question.id, answer("approve", Some("  ")))
+        .await
+        .unwrap();
+    let output = handle.wait().await.unwrap();
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    assert_eq!(agent.requests().len(), 2);
 }
 
 #[tokio::test]

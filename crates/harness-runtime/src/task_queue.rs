@@ -1,6 +1,6 @@
 //! A persisted, serial task queue. Every task gets fresh builder and reviewer
 //! sessions; a retry retains completed tasks, never just a prose handoff.
-use crate::orchestration::{BasicSchemaValidator, SchemaValidator, SubflowRequest};
+use crate::orchestration::{is_user_change, BasicSchemaValidator, SchemaValidator, SubflowRequest};
 use crate::{
     orchestration::{AgentExecutionError, AgentStepOutput, AgentStepRequest, StepContext},
     session_agent_executor::IsolatedSessionAgentExecutor,
@@ -55,10 +55,18 @@ struct Progress {
     current: Option<Value>,
     #[serde(default)]
     handled_rejections: usize,
-    /// A final verification rejection no planned task could be matched to,
-    /// fixed by one repair task after the planned ones.
+    /// What one repair task after the planned ones must fix: a final
+    /// verification rejection no planned task could be matched to, or the
+    /// changes the user asked for after trying the result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_repair: Option<String>,
+    /// How many of the user's change requests were already turned into a repair.
+    #[serde(default)]
+    handled_changes: usize,
+    /// Repair tasks that were accepted, so the steps after this one can see
+    /// what was fixed after the planned tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    repairs: Vec<Value>,
 }
 
 fn invalid(message: impl Into<String>) -> AgentExecutionError {
@@ -204,6 +212,31 @@ fn canonicalize(value: &Value) -> Value {
     value
 }
 
+/// A planner sometimes writes a task's instructions on its `flow:` line. A
+/// flow value that is not an offered name and contains whitespace is prose:
+/// it becomes the instructions when those are empty, and is dropped otherwise.
+fn unmix_flows(value: &Value, offered: &dyn Fn(&str) -> bool) -> Value {
+    let mut value = value.clone();
+    for task in value["tasks"].as_array_mut().into_iter().flatten() {
+        let Some(flow) = task["flow"].as_str().map(|f| f.trim().to_owned()) else {
+            continue;
+        };
+        if flow.is_empty() || offered(&flow) || !flow.contains(char::is_whitespace) {
+            continue;
+        }
+        if task["instructions"]
+            .as_str()
+            .map_or(true, |i| i.trim().is_empty())
+        {
+            task["instructions"] = Value::String(flow);
+        }
+        if let Some(fields) = task.as_object_mut() {
+            fields.remove("flow");
+        }
+    }
+    value
+}
+
 fn plan(value: &Value) -> Result<Plan, AgentExecutionError> {
     let value = canonicalize(value);
     let plan: Plan = serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -238,8 +271,13 @@ fn plan(value: &Value) -> Result<Plan, AgentExecutionError> {
     let mut tasks = HashSet::new();
     let mut covered = HashSet::new();
     for t in &plan.tasks {
+        if t.instructions.trim().is_empty() {
+            return Err(invalid(format!(
+                "task {} has empty instructions: write them as the task's body, not on the flow line",
+                t.id
+            )));
+        }
         if t.id.trim().is_empty()
-            || t.instructions.trim().is_empty()
             || tasks.contains(t.id.as_str())
             || t.criterion_ids.is_empty()
             || t.requirement_ids.is_empty()
@@ -365,7 +403,7 @@ impl IsolatedSessionAgentExecutor {
             .input
             .pointer(&queue.plan_pointer)
             .ok_or_else(|| invalid("task plan is missing"))?;
-        let plan = plan(source)?;
+        let plan = plan(&unmix_flows(source, &|name| queue.flows.contains_key(name)))?;
         for task in &plan.tasks {
             if let Some(name) = task
                 .flow
@@ -427,10 +465,34 @@ impl IsolatedSessionAgentExecutor {
                     progress.current = Some(json!({"rejection":rejection.message}));
                 }
                 None => {
-                    progress.pending_repair = Some(rejection.message.clone());
+                    progress.pending_repair = Some(format!(
+                        "Fix what the final verification of the completed tasks found:\n{}",
+                        rejection.message
+                    ));
                     progress.current = None;
                 }
             }
+        }
+        // The user tried the result and asked for changes: the accepted
+        // tasks stay, and one repair task makes the changes after them.
+        let changes: Vec<_> = request
+            .feedback
+            .iter()
+            .filter(|f| is_user_change(&f.code))
+            .collect();
+        if let Some(change) = changes
+            .last()
+            .filter(|_| changes.len() > progress.handled_changes)
+        {
+            progress.handled_changes = changes.len();
+            let asked = format!(
+                "The user tried the result and asked for these changes; make them and keep everything else as it is:\n{}",
+                change.message
+            );
+            progress.pending_repair = Some(match progress.pending_repair.take() {
+                Some(earlier) => format!("{earlier}\n\n{asked}"),
+                None => asked,
+            });
         }
         context
             .checkpoint(serde_json::to_value(&progress).unwrap())
@@ -443,9 +505,7 @@ impl IsolatedSessionAgentExecutor {
             criterion_ids: Vec::new(),
             depends_on: Vec::new(),
             flow: None,
-            instructions: format!(
-                "Fix what the final verification of the completed tasks found:\n{message}"
-            ),
+            instructions: message,
         });
         loop {
             // Past the planned tasks only the repair task can still be due.
@@ -519,21 +579,28 @@ impl IsolatedSessionAgentExecutor {
             .iter()
             .filter(|done| done["skipped"] == true)
             .count();
-        let summary = if skipped == 0 {
-            format!(
-                "Implemented and inspected {} tasks. Final validation remains required.",
-                plan.tasks.len()
-            )
+        let mut summary = if skipped == 0 {
+            format!("Implemented and inspected {} tasks.", plan.tasks.len())
         } else {
             format!(
-                "Implemented and inspected {} of {} tasks; {skipped} skipped at the user's request. Final validation remains required.",
+                "Implemented and inspected {} of {} tasks; {skipped} skipped at the user's request.",
                 plan.tasks.len() - skipped,
                 plan.tasks.len()
             )
         };
-        Ok(AgentStepOutput {
-            value: json!({"status":"implemented","summary":summary,"tasks":progress.completed}),
-        })
+        if !progress.repairs.is_empty() {
+            summary.push_str(&format!(
+                " {} repair task(s) ran after them; see repairs.",
+                progress.repairs.len()
+            ));
+        }
+        summary.push_str(" Final validation remains required.");
+        let mut value =
+            json!({"status":"implemented","summary":summary,"tasks":progress.completed});
+        if !progress.repairs.is_empty() {
+            value["repairs"] = Value::Array(progress.repairs.clone());
+        }
+        Ok(AgentStepOutput { value })
     }
 
     /// Builds and reviews one task, repairing up to `max_repairs` times, and
@@ -568,6 +635,9 @@ impl IsolatedSessionAgentExecutor {
             let mut child = request.clone();
             child.task_queue = None;
             child.checkpoint = None;
+            // The user's change requests are the repair task's instructions,
+            // not something every task and reviewer should act on.
+            child.feedback.retain(|f| !is_user_change(&f.code));
             child.structured_output = StructuredOutputMode::HostValidated;
             child.output_schema = result_schema(false);
             child.input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
@@ -650,6 +720,8 @@ impl IsolatedSessionAgentExecutor {
             let accepted = review_complete(task, &reviewed);
             if accepted && record {
                 progress.completed.push(json!({"task_id":task.id,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
+            } else if accepted {
+                progress.repairs.push(json!({"task_id":task.id,"instructions":task.instructions,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
             }
             if accepted {
                 progress.current = None;

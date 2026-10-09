@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_core::orchestration::{
-    AgentContextMode, ApprovalNodeConfig, DelegatedRunRef, Evidence, InputBinding, InputDecision,
-    InputNodeConfig, InputRequest, InputResponse, OrchestrationError, OrchestrationNode,
-    OrchestrationNodeId, OrchestrationRunId, OrchestrationRunState, OutputBinding, Responder,
-    RetryReason, StructuredOutputMode, UsageSummary, VerificationCheck, VerifyNodeConfig,
+    AgentContextMode, ApprovalNodeConfig, AttemptStatus, DelegatedRunRef, Evidence, InputBinding,
+    InputDecision, InputNodeConfig, InputRequest, InputResponse, OrchestrationError,
+    OrchestrationNode, OrchestrationNodeId, OrchestrationRunId, OrchestrationRunState,
+    OutputBinding, Responder, RetryReason, StructuredOutputMode, UsageSummary, VerificationCheck,
+    VerifyNodeConfig,
 };
 use harness_protocol::{commands::PermissionDecision, events::AgentEventEnvelope};
 use serde_json::{json, Map, Value};
@@ -632,6 +633,20 @@ pub(crate) async fn execute_approval(
             return Ok(outcome("skipped", Responder::Auto, None));
         }
     }
+    // The user approved the previous result with notes, and the subject has
+    // since been revised to include them: that approval stands.
+    let approved_with_notes = state.steps.get(&node.id).and_then(|step| {
+        step.attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.status != AttemptStatus::Running)
+            .and_then(|attempt| attempt.error.as_ref())
+            .filter(|error| error.code == CHANGES_APPROVED)
+            .map(|error| error.message.clone())
+    });
+    if let Some(notes) = approved_with_notes {
+        return Ok(outcome("approved", Responder::User, Some(notes)));
+    }
     if state.options.auto_approve && config.allow_auto_approve {
         return Ok(outcome("approved", Responder::Auto, None));
     }
@@ -661,6 +676,18 @@ pub(crate) async fn execute_approval(
         .await?;
     let notes = response.text.clone().filter(|text| !text.trim().is_empty());
     match response.decision.as_str() {
+        "approve"
+            if config.revise_on_notes
+                && notes.is_some()
+                && config.revise_target().is_some()
+                && attempt <= config.max_revisions =>
+        {
+            Err(OrchestrationError::retryable(
+                CHANGES_APPROVED,
+                notes.unwrap_or_default(),
+                RetryReason::ChangesRequested,
+            ))
+        }
         "approve" => Ok(outcome("approved", response.by, notes)),
         "request_changes" => Err(OrchestrationError::retryable(
             CHANGES_REQUESTED,
@@ -680,6 +707,17 @@ pub(crate) async fn execute_approval(
 /// Feedback code for changes a user asked for at an approval step. Its
 /// message is the user's own request, not model output.
 pub const CHANGES_REQUESTED: &str = "changes_requested";
+
+/// Feedback code for notes a user gave while approving, at a step that
+/// revises on notes: the changes are made like requested ones, and the
+/// approval then stands without asking again.
+pub const CHANGES_APPROVED: &str = "changes_approved";
+
+/// Whether feedback with this code is the user's own request for changes
+/// (an instruction to the revised step), not a rejection reason.
+pub fn is_user_change(code: &str) -> bool {
+    code == CHANGES_REQUESTED || code == CHANGES_APPROVED
+}
 
 struct JudgedCriteria {
     passed: bool,

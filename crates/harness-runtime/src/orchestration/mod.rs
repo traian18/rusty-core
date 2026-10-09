@@ -21,9 +21,10 @@ pub use schema::{
     SchemaValidationError, SchemaValidator,
 };
 pub use steps::{
-    AgentExecutionError, AgentStepExecutor, AgentStepOutput, AgentStepRequest, ArtifactResolver,
-    InputAnswer, PermissionResolution, ReferenceArtifactResolver, StepContext, StepSignal,
-    SubflowExecutor, SubflowRequest, WorkspaceArtifactResolver, CHANGES_REQUESTED,
+    is_user_change, AgentExecutionError, AgentStepExecutor, AgentStepOutput, AgentStepRequest,
+    ArtifactResolver, InputAnswer, PermissionResolution, ReferenceArtifactResolver, StepContext,
+    StepSignal, SubflowExecutor, SubflowRequest, WorkspaceArtifactResolver, CHANGES_APPROVED,
+    CHANGES_REQUESTED,
 };
 pub use store::{
     FileOrchestrationStore, InMemoryOrchestrationStore, OrchestrationEventEnvelope,

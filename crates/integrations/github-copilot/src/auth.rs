@@ -15,16 +15,22 @@ pub struct CopilotAuth {
     path: Option<PathBuf>,
     host: String,
 }
+/// A token ready to send, or Rusty's own expiring credential that has to be
+/// refreshed (asynchronously) first.
+enum LoadedToken {
+    Ready(String),
+    Refresh(PathBuf),
+}
 impl CopilotAuth {
     pub fn new(path: Option<PathBuf>, host: String) -> Self {
         Self { path, host }
     }
-    fn load_token(&self) -> Result<String, ModelError> {
+    fn load_token(&self) -> Result<LoadedToken, ModelError> {
         if self.path.is_none() {
             for name in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
                 if let Ok(token) = std::env::var(name) {
                     if !token.is_empty() {
-                        return Ok(token);
+                        return Ok(LoadedToken::Ready(token));
                     }
                 }
             }
@@ -52,12 +58,16 @@ impl CopilotAuth {
         let value: Value = serde_json::from_str(&data)
             .map_err(|_| error("Invalid Copilot credential configuration."))?;
         if value["format"] == crate::credentials::CREDENTIAL_FORMAT {
-            return crate::credentials::load_token(&path, &self.host)
-                .map_err(|message| error(&message));
+            return match crate::credentials::load_token(&path, &self.host)
+                .map_err(|message| error(&message))?
+            {
+                Some(token) => Ok(LoadedToken::Ready(token)),
+                None => Ok(LoadedToken::Refresh(path)),
+            };
         }
         let (account, token) = selected_credential(&value, &self.host)?;
         if let Some(token) = token {
-            return Ok(token);
+            return Ok(LoadedToken::Ready(token));
         }
         #[cfg(target_os = "macos")]
         if self.path.is_none() {
@@ -65,6 +75,7 @@ impl CopilotAuth {
                 security_framework::passwords::get_generic_password("copilot-cli", &account)
             {
                 return String::from_utf8(token)
+                    .map(LoadedToken::Ready)
                     .map_err(|_| error("Invalid Copilot keychain token."));
             }
         }
@@ -144,9 +155,15 @@ impl InferenceAuth for CopilotAuth {
             path: self.path.clone(),
             host: self.host.clone(),
         };
-        let token = tokio::task::spawn_blocking(move || auth.load_token())
+        let token = match tokio::task::spawn_blocking(move || auth.load_token())
             .await
-            .map_err(|_| error("Cannot read Copilot credentials."))??;
+            .map_err(|_| error("Cannot read Copilot credentials."))??
+        {
+            LoadedToken::Ready(token) => token,
+            LoadedToken::Refresh(path) => crate::credentials::refresh_token(&path, &self.host)
+                .await
+                .map_err(|message| error(&message))?,
+        };
         let mut headers = HeaderMap::new();
         let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| error("Invalid Copilot token."))?;

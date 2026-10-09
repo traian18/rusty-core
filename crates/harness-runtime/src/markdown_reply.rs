@@ -105,7 +105,16 @@ fn hint(schema: &Value) -> String {
         match schema.get("type").and_then(Value::as_str) {
             Some("integer") | Some("number") => "<number>".into(),
             Some("boolean") => "<true or false>".into(),
-            _ => "<text>".into(),
+            // An optional field says so, so it is not mistaken for the body.
+            _ => match schema.get("description").and_then(Value::as_str) {
+                Some(d) if d.starts_with("Optional") => {
+                    format!(
+                        "<{}; a short name only, leave this line out if none>",
+                        d.trim_end_matches('.')
+                    )
+                }
+                _ => "<text>".into(),
+            },
         }
     } else {
         values.join(" | ")

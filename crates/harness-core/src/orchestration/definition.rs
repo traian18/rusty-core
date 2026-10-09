@@ -283,6 +283,11 @@ pub struct ApprovalNodeConfig {
     /// (missing, null, or an empty string, array or object).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_if_empty: Option<String>,
+    /// Approving with notes sends the notes to `revise_target` as changes to
+    /// make, and the revised result then passes this step without asking
+    /// again. Off, notes given with an approval are only passed on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revise_on_notes: bool,
 }
 
 impl ApprovalNodeConfig {

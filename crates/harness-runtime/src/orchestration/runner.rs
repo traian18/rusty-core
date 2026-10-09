@@ -33,10 +33,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
     schema::{BasicSchemaValidator, InMemorySchemaResolver, SchemaResolver, SchemaValidator},
     steps::{
-        execute_approval, execute_input, execute_verify, resolve_binding, resolve_inputs,
-        AgentStepExecutor, AgentStepRequest, ArtifactResolver, InputAnswer, PermissionResolution,
-        ReferenceArtifactResolver, StepContext, StepSignal, SubflowExecutor, SubflowRequest,
-        Validation, CHANGES_REQUESTED,
+        execute_approval, execute_input, execute_verify, is_user_change, resolve_binding,
+        resolve_inputs, AgentStepExecutor, AgentStepRequest, ArtifactResolver, InputAnswer,
+        PermissionResolution, ReferenceArtifactResolver, StepContext, StepSignal, SubflowExecutor,
+        SubflowRequest, Validation,
     },
     store::{
         OrchestrationEventEnvelope, OrchestrationSnapshot, OrchestrationStore,
@@ -1371,11 +1371,7 @@ impl StepJob {
                 let mut input = resolve_inputs(&self.state, &self.node.input_bindings)?;
                 // Asked to change its result, a step revises what it produced
                 // instead of starting over.
-                if step
-                    .feedback
-                    .iter()
-                    .any(|item| item.code == CHANGES_REQUESTED)
-                {
+                if step.feedback.iter().any(|item| is_user_change(&item.code)) {
                     let previous = step.attempts.iter().rev().find_map(|attempt| {
                         attempt.output.clone().filter(|_| {
                             attempt.status == harness_core::orchestration::AttemptStatus::Succeeded

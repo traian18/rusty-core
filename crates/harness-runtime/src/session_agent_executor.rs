@@ -26,8 +26,8 @@ use tokio::sync::broadcast;
 use crate::{
     markdown_reply,
     orchestration::{
-        AgentExecutionError, AgentStepExecutor, AgentStepOutput, AgentStepRequest, StepContext,
-        StepSignal, CHANGES_REQUESTED,
+        is_user_change, AgentExecutionError, AgentStepExecutor, AgentStepOutput, AgentStepRequest,
+        StepContext, StepSignal,
     },
     scoped_tools::{ScopedExecutionBackend, ScopedToolRegistry},
     session_runtime::{SessionCommand, SessionRuntime},
@@ -180,7 +180,7 @@ impl IsolatedSessionAgentExecutor {
         // instructions; everything else is a rejection reason produced by a
         // check or a model, and stays data.
         let from_user = |item: &&OrchestrationError| {
-            item.code == "USER_CONTINUATION" || item.code == CHANGES_REQUESTED
+            item.code == "USER_CONTINUATION" || is_user_change(&item.code)
         };
         let rejections: Vec<_> = request
             .feedback
@@ -203,7 +203,7 @@ impl IsolatedSessionAgentExecutor {
             .feedback
             .iter()
             .rev()
-            .find(|item| item.code == CHANGES_REQUESTED)
+            .find(|item| is_user_change(&item.code))
         {
             prompt.push_str(&format!(
                 "\n\nThe user reviewed this step's previous result (workflow_input.previous_result) and asked for changes. Revise that result: make these changes and keep everything they did not ask to change.\n\nRequested changes:\n{}",
