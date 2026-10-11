@@ -236,7 +236,7 @@ where
                 }
                 let id = incoming.id.clone().unwrap_or(Value::Null);
 
-                let response = dispatch(handler, config, &incoming, conn_cancel).await;
+                let response = answer_one_request(handler, config, &incoming, conn_cancel).await;
                 send(out_tx, match response {
                     Ok(result) => wire::Response::ok(id, result),
                     Err((code, message)) => wire::Response::error(id, code, message),
@@ -248,7 +248,7 @@ where
 
 type DispatchError = (i64, String);
 
-async fn dispatch(
+async fn answer_one_request(
     handler: &Arc<dyn RpcHandler>,
     config: &McpServeConfig,
     incoming: &wire::Incoming,

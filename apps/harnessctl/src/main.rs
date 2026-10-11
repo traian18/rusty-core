@@ -247,7 +247,7 @@ fn known_tool_specs() -> Vec<(&'static str, &'static str, PermissionMode)> {
             PermissionMode::Allow,
         ),
         (
-            "web.fetch",
+            "web_fetch",
             "Fetch a URL over HTTP(S) and return its text content.",
             PermissionMode::Ask,
         ),

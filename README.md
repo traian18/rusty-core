@@ -6,12 +6,17 @@ The repository is a Cargo workspace of small crates with explicit responsibility
 
 This README covers what the engine does, how it works, every integration and tool it ships with, and the three ways to use it: **embedding the crates in a Rust application**, **talking to a `harnessd` daemon over a socket/stdio/WebSocket** (directly or via an SDK), or **running one of the ready-made apps** (`harness`, `harnessd` + `harnessctl`).
 
+New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where each feature starts and which function does the next step.
+
 ## Contents
 
 - [Capabilities at a glance](#capabilities-at-a-glance)
 - [How it works](#how-it-works) — layered architecture, sessions/agents/runs, the event model, durability and resume, protocol capabilities, provider resilience
 - [Integrations](#integrations) — every model backend, its config shape, and where it's wired up
 - [Tools](#tools) — everything an agent can call, including subagent delegation, MCP (both directions), and skills
+- [Behavior profiles](#behavior-profiles) — per-agent instructions, tool scope, rules and completion gates
+- [Workflows](#workflows-orchestration) — deterministic orchestration graphs and the task queue
+- [Context management](#context-management-and-compaction) — prompt assembly and keeping long conversations inside the window
 - [Workspace layout](#workspace-layout)
 - [Quick start](#quick-start-run-it-and-make-a-real-request)
 - [Running the standalone TUI](#running-the-standalone-tui)
@@ -30,10 +35,13 @@ This README covers what the engine does, how it works, every integration and too
 - **Multi-session, multi-agent runtime** — `harness-runtime` runs any number of sessions concurrently (each with a root agent that can spawn child agents), with a shared scheduler, resource manager, and per-backend rate limiting.
 - **Streaming event model** — every observable occurrence is an `AgentEventEnvelope` carrying routing metadata (`session_id`, `agent_id`, `parent_agent_id`, `run_id`) and two monotonic sequence numbers for exact ordering. Subscribers get a live push stream; reconnecting clients can **resume from a sequence number without gaps or duplicates**.
 - **Durable session persistence** — every durable event is written to a `SessionStore` (JSONL or WAL-mode SQLite) as it happens, plus periodic state snapshots. Sessions survive daemon restarts and can be restored via `Harness::restore_session`. Raw streaming deltas stay ephemeral by design (see [Durability](#durability-and-resume)).
-- **Seven pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and Claude, Codex, and Copilot subscription inference APIs. All tools execute through the harness. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is currently wired up.
+- **Pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and the ChatGPT (Codex) and GitHub Copilot subscription inference APIs; seven integration crates in all, six registered by `harnessd`. They only return proposed tool calls: every tool executes through the harness. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is wired up.
 - **Built-in resilience** — every HTTP model call goes through retry with exponential backoff + jitter, a shared deadline across attempts, and a circuit breaker. Settings are configurable per provider (see [Provider resilience](#provider-resilience)).
-- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), and model-initiated subagent delegation (`agent.spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
-- **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire).
+- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), skill loading, and model-initiated subagent delegation (`agent_spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio or HTTP; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
+- **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire). A session's `execution_policy` (application skill grants intersected with harness-owned mode limits) can only narrow what is allowed, never widen it.
+- **Behavior profiles** — every agent runs under a profile: its instructions, tool scope, limits, rules that inject context or deny or ask on matching tool calls, and a completion gate that checks the work before the agent may finish (see [Behavior profiles](#behavior-profiles)).
+- **Workflows** — deterministic orchestration graphs of input, agent, verify, approval, subflow and output steps, with retries, send-back edges and a persisted task queue (see [Workflows](#workflows-orchestration)).
+- **Context management** — project instructions and workspace orientation are injected per request, and long conversations are kept inside the model's window by tiered compaction, optionally with a background summary (see [Context management](#context-management-and-compaction)).
 - **Hierarchical cancellation** — a root `CancellationToken` fans out to every session, agent, backend request, and tool call; cancelling anywhere propagates and is idempotent.
 - **Three wire transports, one RPC contract** — Unix domain socket (length-prefixed JSON), WebSocket, and stdio (newline-delimited JSON) all frame the same `RpcRequestBody`/`RpcResponseBody` types, with a mandatory `Hello` protocol-version handshake on every connection.
 - **MCP in both directions** — consume any MCP server's tools over stdio or HTTP, and expose the engine itself as an MCP server so Claude Desktop/Cursor/VS Code can drive it (see [MCP server mode](#mcp-server-mode)).
@@ -56,10 +64,10 @@ The workspace is split into five layers, each depending only on the ones below i
 │ Transports    ipc · websocket · stdio · mcp (server mode)      │
 │               (one RPC contract: harness_protocol::rpc)        │
 ├────────────────────────────────────────────────────────────────┤
-│ Integrations  anthropic · openai · openai-compatible · gemini  │
-│               · codex · github-copilot                         │
+│ Integrations  anthropic · openai · openai-responses · gemini   │
+│               · openai-compatible · codex · github-copilot     │
 │ Tools         filesystem · shell · git · web · mcp · skills    │
-│               · agent.spawn                                     │
+│               · agent_spawn                                     │
 ├────────────────────────────────────────────────────────────────┤
 │ Engine        harness-engine (public Harness/SessionBuilder)   │
 │               harness-runtime (async orchestration)            │
@@ -73,17 +81,17 @@ The workspace is split into five layers, each depending only on the ones below i
 ```
 
 - **`harness-protocol`** — pure serializable types only (no runtime, no I/O policy): requests/responses, events, commands, ids, usage, tools. This is the contract every transport and every wire client speaks. Versioned wire schemas are published as JSON Schema in [`schema/`](schema) (`protocol-v1.schema.json`, `protocol-v2.schema.json`).
-- **`harness-core`** — the `Agent` domain entity. All transitions are deterministic functions of current state + input; the integration test suite in `harness-core/tests/transitions.rs` pins this behavior.
-- **`harness-runtime`** — the async layer: `SessionRuntime` (per-session event bus + command loop), `AgentRunner` (dispatches backend/tool/permission effects), `AgentSupervisor` (enforces capability non-escalation on every spawned child), `SessionManager` (multi-session lifecycle), cancellation tree, permissions module, scheduler and resource manager.
+- **`harness-core`** — the `Agent` domain entity, behavior profiles and the orchestration (workflow) compiler and reducer. All transitions are deterministic functions of current state + input; the integration test suite in `harness-core/tests/transitions.rs` pins this behavior.
+- **`harness-runtime`** — the async layer: `SessionRuntime` (per-session event bus + command loop), `AgentRunner` (dispatches backend/tool/permission effects), `AgentSupervisor` (enforces capability non-escalation on every spawned child), `SessionManager` (multi-session lifecycle), cancellation tree, permissions module, scheduler and resource manager, plus the workflow runner, the persisted task queue and the completion-gate evaluators.
 - **`harness-engine`** — the public, stable API (`Harness`, `SessionBuilder`, `SessionHandle`) that composes the runtime and the integration/tool registries. **This is the crate third-party Rust applications depend on.**
 - **`harness-model` + `harness-generic-backend`** — the provider-neutral `ModelClient` trait and the `GenericModelBackend` adapter that adds retry/backoff/circuit-breaking on top of any client.
-- **`harness-context`** — a backend decorator that injects the system prompt / workspace summary and truncates the transcript when it grows too large.
+- **`harness-context`** — a backend decorator that injects the system prompt / workspace summary and keeps the transcript inside the model's window (see [Context management](#context-management-and-compaction)).
 - **`harness-session-store`** — the `SessionStore` trait with `JsonlSessionStore` and `SqliteSessionStore` implementations.
 - **`harness-extension-api`** — the semver-stable surface for third-party tools and backends (see [Extending the harness](#extending-the-harness)).
 
 ### Sessions, agents, and runs
 
-A **session** is a workspace-bound conversation. Creating one resolves an integration name (e.g. `"anthropic"`) plus a provider-specific JSON config into a live backend, assembles a toolset, and starts a `SessionRuntime`. Each session owns one **root agent** which may spawn **child agents** (a tree, `parent_agent_id` on every envelope) — either from Rust orchestration code or, as of the `agent.spawn` tool, from the model itself. A **run** is one unit of work triggered by a prompt; it streams through `Idle → PreparingContext → WaitingForBackend/Executing → … → Completed/Failed/Cancelled`, with intermediate states observed as events.
+A **session** is a workspace-bound conversation. Creating one resolves an integration name (e.g. `"anthropic"`) plus a provider-specific JSON config into a live backend, assembles a toolset, and starts a `SessionRuntime`. Each session owns one **root agent** which may spawn **child agents** (a tree, `parent_agent_id` on every envelope) — either from Rust orchestration code or, with the `agent_spawn` tool, from the model itself. A **run** is one unit of work triggered by a prompt; it streams through `Idle → PreparingContext → WaitingForBackend/Executing → … → Completed/Failed/Cancelled`, with intermediate states observed as events.
 
 ### The event model
 
@@ -104,7 +112,7 @@ pub struct AgentEventEnvelope {
 }
 ```
 
-The two sequence numbers are the **ordering primitives** — never rely on timestamps alone when multiple agents run concurrently. There are 17 `AgentEvent` variants covering state transitions, run lifecycle, streaming text/reasoning deltas, tool calls, permission requests, usage updates, child-agent lifecycle, errors, and outcomes.
+The two sequence numbers are the **ordering primitives** — never rely on timestamps alone when multiple agents run concurrently. There are 23 `AgentEvent` variants covering state transitions, run lifecycle, streaming text/reasoning deltas, tool calls, permission requests, usage updates, child-agent lifecycle, behavior-profile activity (`BehaviorRuleFired`, `ContextInjected`, `ToolCallDenied`, `ProfileChanged`, `CompletionGateEvaluated`), errors, and outcomes.
 
 ### Durability and resume
 
@@ -137,6 +145,9 @@ Every `Hello` handshake response carries a `ProtocolCapabilities` struct so a cl
 | `event_gap_signals` | `true` | a client is told explicitly if it fell behind the broadcast buffer, rather than silently missing events |
 | `durable_idempotency` | **`false`** | admission history (which command IDs were already accepted) is **not** persisted — it resets on daemon restart |
 | `pause_resume` | `true` | `Mutate { Pause }` stops the active run recoverably; `Resume` continues it |
+| `execution_policy` | `true` | a session can be created with an `execution_policy` that narrows its tools and MCP access |
+| `configure_execution` | `true` | model and execution parameters can be changed on a running session |
+| `behavior_profiles` | `true` | agents run under behavior profiles and may emit the profile events above |
 
 Treat the `false` row as a real constraint, not roadmap trivia: a client that retries a mutation across a daemon restart using the same command ID cannot rely on the daemon recognizing it as a duplicate.
 
@@ -175,7 +186,7 @@ Model integrations use direct inference APIs. They return proposed function call
 | `codex` | `harness-integration-codex` | HTTP (ChatGPT Responses) | Codex OAuth credential store | ✅ | ✅ |
 | `github-copilot` | `harness-integration-github-copilot` | HTTP (Copilot model APIs) | Copilot token environment/configuration/Keychain | ✅ | ✅ |
 
-All six integrations are registered in both `harnessd` and the standalone TUI, so every backend is reachable over the daemon/`harnessctl` path as well as in-process.
+All six are registered in `harnessd`, so every one is reachable over the daemon/`harnessctl` path. The standalone TUI registers four (`anthropic`, `openai`, `codex`, `github-copilot`). A seventh crate, `harness-integration-openai-responses` (the OpenAI Responses API), is not registered on its own: it is the transport the `codex` adapter builds on, and `github-copilot` uses it for the models that need it.
 
 ### Config shapes
 
@@ -217,7 +228,7 @@ neutral field rather than something left to `provider_options`:
 | `openai`, `openai-compatible` | native `response_format` (`json_object` / `json_schema`) |
 | `gemini` | `generationConfig.responseMimeType` + `responseSchema` |
 | `anthropic` | **emulated** — no `response_format` exists in the Messages API, so the harness declares a single-purpose tool whose input schema *is* the requested schema, forces `tool_choice` onto it, and surfaces the resulting tool-call input as assistant text |
-| `codex`, `github-copilot` | **unsupported** — these drive a CLI that owns its own output |
+| `codex`, `github-copilot` | **unsupported** — the subscription Responses/Messages paths do not map it yet, so a non-`Text` format is rejected before any call |
 
 The Anthropic emulation is invisible to callers: the synthetic tool never
 appears as a tool call, and its input streams back as ordinary text deltas.
@@ -241,7 +252,7 @@ parse. Advertised as `BackendCapabilities::structured_output`.
 
 ## Tools
 
-An agent's toolset is assembled explicitly per session (`--tools ...` on the CLI, or `.toolset(...)` when embedding) — a session has **no tools by default**. Ten tools ship in the workspace:
+An agent's toolset is assembled explicitly per session (`--tools ...` on the CLI, or `.toolset(...)` when embedding) — a session has **no tools by default**. Twelve tools ship in the workspace:
 
 | Tool ID | Crate | What it does | Mutates / executes? |
 |---|---|---|:---:|
@@ -253,20 +264,22 @@ An agent's toolset is assembled explicitly per session (`--tools ...` on the CLI
 | `git.diff` | `harness-tool-git` | `git diff` | no |
 | `git.log` | `harness-tool-git` | `git log` | no |
 | `git.show` | `harness-tool-git` | `git show` | no |
-| `web.fetch` | `harness-tool-web` | Fetch a URL, with a built-in SSRF guard (blocks loopback, link-local, cloud-metadata, and RFC1918 targets by default — see `crates/tools/web/src/ssrf.rs`) | no |
-| `agent.spawn` | `harness-runtime` (not a separate crate) | Model-facing subagent delegation (see below) | spawns a child agent |
+| `web_fetch` | `harness-tool-web` | Fetch a URL, with a built-in SSRF guard (blocks loopback, link-local, cloud-metadata, and RFC1918 targets by default — see `crates/tools/web/src/ssrf.rs`) | no |
+| `skill.load` | `harness-tool-skills` | One skill's full instructions and the files it bundles (see [Skills](#skills)) | no |
+| `skill.read` | `harness-tool-skills` | One file bundled with a skill | no |
+| `agent_spawn` | `harness-runtime` (not a separate crate) | Model-facing subagent delegation (see below) | spawns a child agent |
 
-Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay tool calls through this registry — `codex`/`github-copilot` manage tools internally via their own CLI, so `--tools` has no observable effect on those two.
+Every integration relays tool calls through this registry: backends only propose calls, and the harness authorizes and runs them, so `--tools` and permission gating apply to all of them.
 
-### `agent.spawn` — model-initiated subagent delegation
+### `agent_spawn` — model-initiated subagent delegation
 
-`agent.spawn` lets the model itself delegate a subtask to a child agent, through the exact same `AgentSupervisor`-enforced path that Rust-orchestrated spawning already uses — a model can never use this tool to grant a child more than the supervisor would allow via any other spawn path. Arguments:
+`agent_spawn` lets the model itself delegate a subtask to a child agent, through the exact same `AgentSupervisor`-enforced path that Rust-orchestrated spawning already uses — a model can never use this tool to grant a child more than the supervisor would allow via any other spawn path. Arguments:
 
 | Field | Default | Notes |
 |---|---|---|
 | `task` (required) | — | becomes the child's first prompt |
 | `role` | none | system-prompt framing, e.g. `"code reviewer"` |
-| `tools` | a conservative read-only subset of the parent's own tools (`fs.read`, `workspace.search`, `git.*`, `web.fetch`) | never more than the parent actually has, delegatable and enabled — mutating tools (`fs.edit`, `shell.exec`) must be requested explicitly by name |
+| `tools` | a conservative read-only subset of the parent's own tools (`fs.read`, `workspace.search`, `git.*`, `web_fetch`) | never more than the parent actually has, delegatable and enabled — mutating tools (`fs.edit`, `shell.exec`) must be requested explicitly by name |
 | `workspace` | `"read_only"` | `"inherit"` \| `"read_only"` \| `"snapshot"` \| `"new_worktree"` |
 | `mode` | `"await"` | `"await"` blocks until the child finishes and folds its result into the tool call's result; `"concurrent"` returns immediately for fire-and-forget work |
 | `budget` | inherits the parent's own budget | a model may only tighten limits, never loosen them |
@@ -274,7 +287,7 @@ Only `anthropic`/`openai`/`gemini`/`openai-compatible` sessions actually relay t
 
 ### MCP servers
 
-Beyond the ten built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
+Beyond the built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
 
 - **Two transports**, behind one internal trait so everything above the client is written once:
   - **stdio** — spawn a local process, newline-delimited JSON over its pipes.
@@ -431,21 +444,67 @@ Architecturally, skills add **no new seams**. The catalog reaches the model thro
 
 ---
 
+## Behavior profiles
+
+Every agent runs under a **behavior profile**: a versioned JSON document that decides what the agent is told, which tools it may use, how its loop is bounded, and what must be true before it may finish. Unless a host chooses one, a session runs under the built-in, behavior-neutral `rusty.default`, so a host that never touches profiles sees no change. The document format is published as [`schema/behavior-profile-v1.schema.json`](schema/behavior-profile-v1.schema.json).
+
+| Part | What it controls |
+|---|---|
+| `instructions` | The text added to the agent's system prompt |
+| `tools`, `tool_overrides` | Which tools the agent may use, with per-tool overrides |
+| `execution` | An overlay on the session's execution settings |
+| `limits` | Bounds on the agent's loop: maximum model requests and tool calls per run (the last request is sent with no tools, so the model must answer in text) |
+| `rules` | Triggers on a tool name, its arguments, a result containing some text, or the turn count; each can **inject context**, **deny** the call, or **ask** the user |
+| `completion_gate` | Checks run when the agent proposes a final answer: a tool is run or a model is asked. A failed check sends the agent back to revise, up to `max_continuations` (default 3). When checks still fail the run completes and `CompletionGateEvaluated` reports `passed: false`, unless `on_exhausted` says otherwise; workflow steps treat an unpassed gate as a failed attempt |
+
+The deterministic half (when a gate must run, what a rule decides) lives in `harness-core::behavior`; the I/O half (running a tool or asking a model for a verdict) is the completion-gate evaluators in `harness-runtime`. Profile activity is visible as events: `BehaviorRuleFired`, `ContextInjected`, `ToolCallDenied`, `ProfileChanged`, `CompletionGateEvaluated`.
+
+Profiles come from the host's registry (`Harness::profiles()`) or from `<workspace>/.rusty/profiles/*.json`, loaded with `SessionBuilder::workspace_profiles(root)` and chosen with `SessionBuilder::profile(...)`. Shell-command evaluators are opt-in (`allow_command_evaluators`, and `trust_workspace_commands` for a workspace's own profiles). Editors can check documents that may not even parse yet with `harness_engine::validation::validate_profile`, which never fails: every problem comes back as an issue.
+
+---
+
+## Workflows (orchestration)
+
+A **workflow** is a deterministic graph that decides which steps run, in what order, what each step may use, and what must be checked. The graph, its compiler and the run-state reducer are pure (`harness-core::orchestration`); `harness-runtime` executes the steps and feeds outcomes back.
+
+- **Steps (nodes):** `input`, `agent`, `verify`, `approval`, `subflow` and `output`. An agent step runs in its own isolated session that shares the parent's backend, workspace and tools, under the behavior profile it names.
+- **Edges and bindings:** edges carry a condition (success or failure); input and output bindings and output contracts say what flows between steps.
+- **Retries and send-back:** a retry policy per step, plus failure edges that send work back to an earlier step with the findings.
+- **Policies:** limits such as `max_total_attempts` and `stall_timeout_ms` bound a whole run.
+- **Task queue:** a persisted, serial queue for planned work. Every task gets fresh builder and reviewer sessions, and a retry keeps completed tasks rather than a prose handoff.
+- **Embedding:** orchestration is opt-in (`HarnessBuilder::orchestration`) and additive; direct sessions never go through it. `Harness::run_orchestration` runs a definition, and `harness_engine::validation::validate_orchestration` checks a raw JSON document the same never-fails way as profiles.
+
+---
+
+## Context management and compaction
+
+Before each model request, a **context provider** may rewrite the outgoing `system_prompt` and `messages`: inject project instructions, add workspace orientation, add the skill catalog, and keep the conversation inside the model's window. Canonical conversation history is never changed, only the view sent to the backend. Providers are installed with `SessionBuilder::context_provider`, or `context_provider_with_backend` for one that needs the session's own backend (a summarizer making model calls).
+
+Compaction is driven by `ContextPolicy` against the model's real window: 90% of the window is considered safe, minus 8,192 tokens held back for output. A background summary is scheduled at 70% pressure, compaction runs before the request at 85%, and the target after compaction is 55% (45% for recovery from a provider rejection). Tokens are estimated from characters, counting text, tool results, tool-call arguments and images. It works in tiers, cheapest first:
+
+1. **Elide** old tool output to a short stub that names the tool and size.
+2. **Drop** the oldest turns, only at cut points that keep every tool call with its result. The opening request and pinned messages are kept.
+3. **Summarize** (optional): `SummarizingCompactionProvider` writes an incremental summary of aged-out history in the background, one per conversation, and applies it on a later request, so no request ever waits for a model call. If the summarizer fails, tiers 1 and 2 cover the request.
+
+An optional `ImportanceJudge` can rate each old message as essential (kept word for word), useful (summarized) or disposable (dropped). `JevImportanceJudge` does this with the JEV Decisions API; the `jev-http` feature of `harness-context` adds an OpenRouter transport. Without a judge nothing leaves the process.
+
+---
+
 ## Workspace layout
+
+Every crate and app has its own `README.md` explaining why it exists, what is in it, and what it depends on and is used by.
 
 | Area | Crates | What it does |
 |---|---|---|
 | Core | `harness-protocol`, `harness-core`, `harness-runtime`, `harness-engine` | Wire types, the deterministic agent state machine, async orchestration, and the public `Harness`/`SessionBuilder` API |
-| Context | `harness-context` | Injects a system prompt / workspace summary and truncates the transcript when it grows too large |
+| Context | `harness-context` | Injects a system prompt / workspace summary and keeps the transcript within the model's window: trims old tool output, drops the oldest turns at tool-pair-safe cuts, and optionally replaces them with a background summary guided by JEV importance ratings |
 | Skills | `harness-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
-| Model backends | `crates/integrations/{anthropic,openai,openai-compatible,gemini}` | Direct HTTP API clients |
+| Model backends | `crates/integrations/{anthropic,openai,openai-responses,openai-compatible,gemini}` | Direct HTTP API clients |
 | Subscription inference | `crates/integrations/{codex,github-copilot}` | Authenticate model API requests; the harness owns tools and context |
-| Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web.fetch`, an MCP client, `skill.load`/`skill.read` (`agent.spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
+| Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web_fetch`, an MCP client, `skill.load`/`skill.read` (`agent_spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
 | Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
 | SDKs | `sdk/rust`, `sdk/typescript` | Application-agnostic client facades — see [SDKs](#sdks) |
-
-The full development specification lives in [rust-agent-harness-development-spec.md](rust-agent-harness-development-spec.md).
 
 ---
 
@@ -514,14 +573,14 @@ Same as above with `--integration anthropic` (reads `ANTHROPIC_API_KEY`, or pass
 --config-json '{"base_url":"http://localhost:11434/v1","model":"llama3"}'
 ```
 
-See [Integrations](#integrations) for the complete config reference across all seven backends.
+See [Integrations](#integrations) for the complete config reference across all the backends.
 
 ### Enabling tools
 
 By default a created session has no tools — useful for testing raw model plumbing, not for testing what the harness can actually *do*. Point `--workspace` at a real directory (ideally a git repo, to exercise `git.*`) and add:
 
 ```console
---tools fs.read,fs.edit,workspace.search,shell.exec,git.status,git.diff,git.log,git.show,web.fetch,agent.spawn
+--tools fs.read,fs.edit,workspace.search,shell.exec,git.status,git.diff,git.log,git.show,web_fetch
 ```
 
 or just `--all-tools` for the full set. Run `harnessctl session create --help` for the exact list — it's kept in sync with what the harness can actually build. Note: the `codex`/`github-copilot` backends manage tools internally via their own CLI and never relay tool calls to the harness's registry, so `--tools` only does something observable with `anthropic`/`openai`/`gemini`/`openai-compatible`.
@@ -550,7 +609,7 @@ Type a prompt, press Enter, watch it stream in the activity pane. `y`/`n` approv
 
 ## Running the standalone TUI
 
-`apps/harness` runs the engine in-process — no daemon required — and currently registers all seven integrations, including `github-copilot`. Full walkthrough (provider setup, keyboard shortcuts, session storage, troubleshooting) lives in [`apps/harness/README.md`](apps/harness/README.md); the short version:
+`apps/harness` runs the engine in-process — no daemon required — and registers four integrations: `anthropic`, `openai`, `codex` and `github-copilot` (use `harnessd` to reach the others). Full walkthrough (provider setup, keyboard shortcuts, session storage, troubleshooting) lives in [`apps/harness/README.md`](apps/harness/README.md); the short version:
 
 ```console
 cargo run -p harness                              # provider picker, defaults to Anthropic
@@ -677,7 +736,7 @@ cargo test --workspace --all-targets       # run the full test suite
 cargo fmt --all -- --check                 # formatting (stable toolchain — see rust-toolchain.toml)
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps            # RUSTDOCFLAGS="-D warnings" in CI
-cargo run -p xtask -- check-deps           # enforces the layered dependency direction above
+cargo run --manifest-path xtask/Cargo.toml -- check-deps   # enforces the layered dependency direction above
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchain (`stable`, MSRV `1.78`, `beta`) test matrix, a separate TypeScript SDK build+test job, and `cargo-deny` for license/advisory/supply-chain checks (`deny.toml`).

@@ -392,7 +392,11 @@ fn unmet_criteria(message: &str) -> HashSet<String> {
 }
 
 impl IsolatedSessionAgentExecutor {
-    pub(crate) async fn execute_tasks(
+    /// Runs a step that carries a task queue: executes the planned tasks one at
+    /// a time, each with fresh builder and reviewer sessions, and returns the
+    /// combined output. Chosen by the executor when the step has a
+    /// task queue; every other step goes through `run_single_agent_step`.
+    pub(crate) async fn run_planned_task_queue(
         &self,
         request: AgentStepRequest,
         context: &mut StepContext,
@@ -661,7 +665,7 @@ impl IsolatedSessionAgentExecutor {
                 ));
             }
             let built = self
-                .execute_once(child.clone(), context, usage)
+                .run_single_agent_step(child.clone(), context, usage)
                 .await?
                 .value;
             BasicSchemaValidator
@@ -710,7 +714,7 @@ impl IsolatedSessionAgentExecutor {
                 )
             });
             let reviewed = self
-                .execute_once(child.clone(), context, usage)
+                .run_single_agent_step(child.clone(), context, usage)
                 .await?
                 .value;
             BasicSchemaValidator

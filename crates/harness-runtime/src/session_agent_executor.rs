@@ -320,14 +320,21 @@ impl AgentStepExecutor for IsolatedSessionAgentExecutor {
     ) -> Result<AgentStepOutput, AgentExecutionError> {
         let mut usage = HashMap::new();
         if request.task_queue.is_some() {
-            return self.execute_tasks(request, &mut context, &mut usage).await;
+            return self
+                .run_planned_task_queue(request, &mut context, &mut usage)
+                .await;
         }
-        self.execute_once(request, &mut context, &mut usage).await
+        self.run_single_agent_step(request, &mut context, &mut usage)
+            .await
     }
 }
 
 impl IsolatedSessionAgentExecutor {
-    pub(crate) async fn execute_once(
+    /// Runs one workflow agent step to completion in its own isolated session
+    /// (or in the shared session, depending on the step's context mode) and
+    /// returns its output. Called once per step, and once per task by the
+    /// task queue.
+    pub(crate) async fn run_single_agent_step(
         &self,
         request: AgentStepRequest,
         context: &mut StepContext,

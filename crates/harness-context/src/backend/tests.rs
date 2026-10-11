@@ -1,0 +1,170 @@
+use super::*;
+
+use std::sync::Mutex;
+
+use harness_protocol::ids::{BackendId, RequestId, RunId};
+use harness_protocol::usage::{Cost, ModelUsage};
+use harness_runtime::workspace::FakeWorkspace;
+
+struct RecordingProvider {
+    received_prompt: Mutex<Option<String>>,
+    rewritten_prompt: String,
+}
+
+#[async_trait]
+impl ContextProvider for RecordingProvider {
+    async fn assemble(
+        &self,
+        mut request: ExecutionRequest,
+        _workspace: &dyn Workspace,
+    ) -> ExecutionRequest {
+        *self.received_prompt.lock().unwrap() = Some(request.system_prompt.clone());
+        request.system_prompt = self.rewritten_prompt.clone();
+        request
+    }
+}
+
+/// Records every request it receives and returns a canned success —
+/// exists purely to prove `ContextAssemblingBackend` hands the *rewritten*
+/// request to the inner backend, not the original.
+struct RecordingBackend {
+    seen: Mutex<Vec<ExecutionRequest>>,
+}
+
+#[async_trait]
+impl ExecutionBackend for RecordingBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            id: BackendId::new(),
+            name: "recording".to_string(),
+            description: "test double".to_string(),
+            capabilities: BackendCapabilities::default(),
+        }
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    async fn execute(
+        &self,
+        request: ExecutionRequest,
+        _sink: broadcast::Sender<ExecutionEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        self.seen.lock().unwrap().push(request.clone());
+        Ok(ExecutionResult {
+            request_id: request.request_id,
+            usage: ModelUsage::default(),
+            cost: Cost::default(),
+            finish_reason: "end_turn".to_string(),
+        })
+    }
+}
+
+fn request(system_prompt: &str) -> ExecutionRequest {
+    ExecutionRequest {
+        request_id: RequestId::new(),
+        run_id: RunId::new(),
+        system_prompt: system_prompt.to_string(),
+        messages: vec![],
+        tools: vec![],
+        extended_thinking: false,
+        params: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn provider_rewrites_request_before_inner_backend_sees_it() {
+    let provider = Arc::new(RecordingProvider {
+        received_prompt: Mutex::new(None),
+        rewritten_prompt: "assembled prompt".to_string(),
+    });
+    let backend = Arc::new(RecordingBackend {
+        seen: Mutex::new(Vec::new()),
+    });
+    let wrapped = ContextAssemblingBackend::new(
+        backend.clone(),
+        provider.clone(),
+        Arc::new(FakeWorkspace::new()),
+    );
+
+    let (tx, _rx) = broadcast::channel(16);
+    wrapped
+        .execute(request("original prompt"), tx, CancellationToken::new())
+        .await
+        .expect("execute should succeed");
+
+    assert_eq!(
+        *provider.received_prompt.lock().unwrap(),
+        Some("original prompt".to_string())
+    );
+    let seen = backend.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].system_prompt, "assembled prompt");
+}
+
+#[tokio::test]
+async fn tool_pairs_survive_context_truncation() {
+    use crate::providers::{StaticSystemPromptProvider, TruncatingCompactionProvider};
+    use harness_protocol::{
+        ids::{MessageId, Timestamp, ToolCallId},
+        messages::{AgentMessage, ContentBlock, MessageRole},
+        tools::{ToolCall, ToolResultSummary},
+    };
+    let id = ToolCallId::new();
+    let mut request = request("system");
+    request.messages = vec![
+        AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                call: ToolCall {
+                    id,
+                    name: "read".into(),
+                    arguments: Default::default(),
+                },
+            }],
+            created_at: Timestamp::now(),
+        },
+        AgentMessage {
+            id: MessageId::new(),
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                call_id: id,
+                result: ToolResultSummary {
+                    has_error: false,
+                    output_preview: "important retained file contents".into(),
+                },
+            }],
+            created_at: Timestamp::now(),
+        },
+    ];
+    let backend = Arc::new(RecordingBackend {
+        seen: Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(TruncatingCompactionProvider::new(
+        Arc::new(StaticSystemPromptProvider::new("system")),
+        1,
+        1,
+    ));
+    let wrapped =
+        ContextAssemblingBackend::new(backend.clone(), provider, Arc::new(FakeWorkspace::new()));
+    let (tx, _) = broadcast::channel(16);
+    wrapped
+        .execute(request, tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let seen = backend.seen.lock().unwrap();
+    // The pair-safe cut keeps the ToolUse with its ToolResult, so nothing
+    // is orphaned and the result's content reaches the backend intact.
+    let blocks: Vec<_> = seen[0].messages.iter().flat_map(|m| &m.content).collect();
+    assert!(blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { call } if call.id == id)));
+    assert!(blocks.iter().any(|b| matches!(
+        b,
+        ContentBlock::ToolResult { call_id, result }
+            if *call_id == id && result.output_preview.contains("important retained file contents")
+    )));
+}
