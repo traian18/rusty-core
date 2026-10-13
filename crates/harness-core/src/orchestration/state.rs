@@ -263,6 +263,44 @@ pub struct AttemptDetails {
     pub usage: UsageSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+    /// What an agent attempt did, read from its tool calls.
+    #[serde(default, skip_serializing_if = "StepActions::is_empty")]
+    pub actions: StepActions,
+}
+
+/// What an agent attempt did, recorded from its tool calls rather than from
+/// what the model says it did. A later attempt at the same step, and the
+/// steps after it, read it to pick up where the work stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepActions {
+    /// Files it wrote or edited, in the order first touched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_changed: Vec<String>,
+    /// Files it read, in the order first read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_read: Vec<String>,
+    /// Commands and project checks it ran, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CommandRun>,
+    /// Questions it sent out for research.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub research: Vec<String>,
+    /// Tool calls that returned an error.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tool_errors: u32,
+}
+
+impl StepActions {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRun {
+    /// The command line, or the check's name (`test`, `typecheck`, ...).
+    pub command: String,
+    pub failed: bool,
 }
 
 /// Correlation to the session/agent/run that executed a delegated attempt.

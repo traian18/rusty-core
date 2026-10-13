@@ -31,6 +31,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    journal,
     schema::{BasicSchemaValidator, InMemorySchemaResolver, SchemaResolver, SchemaValidator},
     steps::{
         execute_approval, execute_input, execute_verify, is_user_change, resolve_binding,
@@ -616,6 +617,8 @@ struct ActiveStep {
     /// Set when the watchdog cancelled the attempt, so its outcome is
     /// reported as a retryable stall rather than a plain cancellation.
     stalled: bool,
+    /// What the attempt's tool calls did.
+    actions: journal::ActionRecorder,
 }
 
 struct StepExecution {
@@ -975,6 +978,7 @@ impl RunLoop {
             started_at_ms: now_ms(),
             last_activity: Instant::now(),
             stalled: false,
+            actions: Default::default(),
         });
     }
 
@@ -1046,6 +1050,7 @@ impl RunLoop {
                 }
             }
             StepSignal::Agent(envelope) => {
+                active.actions.observe(&envelope.event);
                 let correlation = self.correlation(self.active.as_ref().expect("active"));
                 let _ =
                     self.updates
@@ -1246,9 +1251,8 @@ impl RunLoop {
                 StepSignal::Checkpoint { committed, .. } => {
                     let _ = committed.send(Err("attempt ended before checkpoint commit".into()));
                 }
-                StepSignal::Agent(_)
-                | StepSignal::PermissionRequested { .. }
-                | StepSignal::InputRequested(_) => {}
+                StepSignal::Agent(envelope) => active.actions.observe(&envelope.event),
+                StepSignal::PermissionRequested { .. } | StepSignal::InputRequested(_) => {}
             }
         }
         // Cancelled or aborted while running: the reducer already recorded
@@ -1285,6 +1289,7 @@ impl RunLoop {
         details.ended_at_ms = Some(now_ms());
         details.delegated = active.delegated;
         details.usage = active.usage;
+        details.actions = active.actions.finish();
         let command = match execution.result {
             Ok(output) => OrchestrationCommand::StepSucceeded {
                 node_id: active.node_id,
@@ -1413,6 +1418,14 @@ impl StepJob {
                         })?,
                 };
                 details.tools = Some(tools.clone());
+                // A step asked to change its result already has it as
+                // `previous_result`; any other re-run picks up where it was.
+                let previous_attempt =
+                    (!step.feedback.iter().any(|item| is_user_change(&item.code)))
+                        .then(|| journal::previous_attempt(step))
+                        .flatten();
+                let journal =
+                    journal::journal(definition, &self.state, &self.node, &config.context_access);
                 let request = AgentStepRequest {
                     task_queue: config.task_queue.clone(),
                     checkpoint: self.state.steps[&self.node.id].checkpoint.clone(),
@@ -1432,6 +1445,9 @@ impl StepJob {
                         && self.node.task_plan_source().is_some(),
                     subflow_depth: runner.depth + 1,
                     run_options: self.state.options.clone(),
+                    previous_attempt,
+                    journal,
+                    research: definition.policies.research.clone().unwrap_or_default(),
                 };
                 let output = runner.agent.execute(request, context).await?;
                 validation.check(

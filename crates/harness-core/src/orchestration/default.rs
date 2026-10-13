@@ -62,6 +62,7 @@ pub fn default_orchestration_definition() -> OrchestrationDefinition {
                     model: None,
                     structured_output: StructuredOutputMode::Require,
                     profile: None,
+                    context_access: Default::default(),
                 }),
                 input_bindings: vec![InputBinding {
                     target: "request".into(),

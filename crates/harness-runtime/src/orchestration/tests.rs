@@ -35,6 +35,8 @@ enum Behavior {
     /// Block until cancelled and record that cancellation arrived.
     AwaitCancel(Arc<AtomicBool>),
     ExhaustUsage,
+    /// Report these tool calls (name, arguments) as done, then return `Value`.
+    Tools(Vec<(&'static str, Value)>, Value),
 }
 
 #[derive(Default)]
@@ -102,6 +104,45 @@ impl AgentStepExecutor for ScriptedAgent {
             }
             Behavior::Gate(gate, value) => {
                 gate.notified().await;
+                value
+            }
+            Behavior::Tools(calls, value) => {
+                use harness_protocol::{
+                    events::{AgentEvent, AgentEventEnvelope, EventVisibility},
+                    ids::{AgentId, EventId, SessionId, Timestamp, ToolCallId},
+                    tools::{ToolCall, ToolResultSummary},
+                };
+                let envelope = |event| {
+                    Box::new(AgentEventEnvelope {
+                        event_id: EventId::new(),
+                        session_id: SessionId::new(),
+                        agent_id: AgentId::new(),
+                        parent_agent_id: None,
+                        run_id: None,
+                        agent_sequence: 0,
+                        session_sequence: None,
+                        timestamp: Timestamp::now(),
+                        visibility: EventVisibility::User,
+                        event,
+                    })
+                };
+                for (name, arguments) in calls {
+                    let id = ToolCallId::new();
+                    context.signal(StepSignal::Agent(envelope(AgentEvent::ToolCallRequested {
+                        call: ToolCall {
+                            id,
+                            name: name.into(),
+                            arguments,
+                        },
+                    })));
+                    context.signal(StepSignal::Agent(envelope(AgentEvent::ToolCallCompleted {
+                        call_id: id,
+                        result: ToolResultSummary {
+                            has_error: false,
+                            output_preview: String::new(),
+                        },
+                    })));
+                }
                 value
             }
             Behavior::AwaitCancel(flag) => {
@@ -268,6 +309,95 @@ async fn verification_failure_reruns_the_agent_with_the_issues() {
     let verify = &output.state.steps[&node("verify")];
     assert_eq!(verify.attempts.len(), 2);
     assert!(!verify.attempts[0].details.evidence.iter().all(|e| e.passed));
+}
+
+#[tokio::test]
+async fn a_rerun_step_picks_up_from_what_its_previous_attempt_did() {
+    let agent = ScriptedAgent::new(vec![
+        Behavior::Tools(
+            vec![
+                ("fs.edit", json!({ "path": "src/parser.rs" })),
+                ("run_command", json!({ "command": "cargo test" })),
+            ],
+            report("blocked"),
+        ),
+        ok(report("completed")),
+    ]);
+    let output = runner(agent.clone())
+        .run(run_id("rerun-context"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(output.state.status, OrchestrationStatus::Completed);
+    let requests = agent.requests();
+    assert!(requests[0].previous_attempt.is_none());
+    let previous = requests[1]
+        .previous_attempt
+        .as_deref()
+        .expect("previous attempt");
+    assert!(previous.starts_with("Attempt 1 finished"), "{previous}");
+    assert!(previous.contains("- Changed: src/parser.rs"), "{previous}");
+    assert!(previous.contains("`cargo test` (passed)"), "{previous}");
+    assert!(
+        previous.contains("blocked"),
+        "the result it handed on: {previous}"
+    );
+    let agent_step = &output.state.steps[&node("execute")];
+    assert_eq!(
+        agent_step.attempts[0].details.actions.files_changed,
+        vec!["src/parser.rs"]
+    );
+    // The default flow's step sees only its own inputs.
+    assert!(requests.iter().all(|request| request.journal.is_none()));
+}
+
+#[tokio::test]
+async fn a_step_with_access_to_all_steps_is_shown_their_records() {
+    let mut definition = default_orchestration_definition();
+    for node in &mut definition.nodes {
+        if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
+            config.context_access = harness_core::orchestration::ContextAccess::All;
+        }
+    }
+    let agent = ScriptedAgent::new(vec![ok(report("blocked")), ok(report("completed"))]);
+    OrchestrationRunner::new(compiled(definition), agent.clone())
+        .with_available_tools(["fs.read".to_string(), "fs.edit".to_string()])
+        .run(run_id("journal"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = agent.requests();
+    assert!(
+        requests[0].journal.is_none(),
+        "nothing ran before the first attempt"
+    );
+    let journal = requests[1].journal.as_deref().expect("journal");
+    assert!(
+        journal.contains("Rejected:"),
+        "the verifier's rejection: {journal}"
+    );
+}
+
+#[test]
+fn context_access_may_only_name_other_steps_of_the_flow() {
+    let mut definition = default_orchestration_definition();
+    for node in &mut definition.nodes {
+        if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
+            config.context_access = harness_core::orchestration::ContextAccess::Steps(vec![
+                node.id.clone(),
+                "nope".into(),
+            ]);
+        }
+    }
+    let error = compile(definition).expect_err("invalid access");
+    assert_eq!(
+        error
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "invalid_context_access")
+            .count(),
+        2
+    );
 }
 
 /// The default flow, judged criterion by criterion instead of by a status.
@@ -1270,6 +1400,177 @@ mod isolated_session {
 
     fn prompt_of(request: &ExecutionRequest) -> String {
         serde_json::to_string(&request.messages).unwrap()
+    }
+
+    /// Answers each model turn with the next scripted reply: a tool call, or
+    /// a final text.
+    enum Turn {
+        Tool(&'static str, Value),
+        Text(&'static str),
+    }
+
+    struct ScriptBackend {
+        turns: Mutex<VecDeque<Turn>>,
+        requests: Arc<Mutex<Vec<ExecutionRequest>>>,
+    }
+
+    #[async_trait]
+    impl ExecutionBackend for ScriptBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            FakeBackend::new().descriptor()
+        }
+        fn capabilities(&self) -> BackendCapabilities {
+            FakeBackend::new().capabilities()
+        }
+        async fn execute(
+            &self,
+            request: ExecutionRequest,
+            sink: broadcast::Sender<ExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ExecutionResult, ExecutionError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let turn = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected model call");
+            let request_id = request.request_id;
+            let (event, finish) = match turn {
+                Turn::Tool(name, arguments) => (
+                    ExecutionEvent::ToolCallRequested {
+                        request_id,
+                        call: harness_protocol::tools::ToolCall {
+                            id: harness_protocol::ids::ToolCallId::new(),
+                            name: name.into(),
+                            arguments,
+                        },
+                    },
+                    "tool_use",
+                ),
+                Turn::Text(text) => (
+                    ExecutionEvent::TextDelta {
+                        request_id,
+                        delta: text.into(),
+                    },
+                    "end_turn",
+                ),
+            };
+            let result = ExecutionResult {
+                request_id,
+                usage: ModelUsage::default(),
+                cost: Cost::default(),
+                finish_reason: finish.into(),
+            };
+            FakeBackend::new()
+                .with_events(vec![
+                    event,
+                    ExecutionEvent::Completed {
+                        request_id,
+                        result: result.clone(),
+                    },
+                ])
+                .with_result(result)
+                .execute(request, sink, cancel)
+                .await
+        }
+    }
+
+    /// A step that may read can send a question to a research step; the
+    /// findings come back as the tool's result, and the research runs with
+    /// the asking step's read tools only.
+    #[tokio::test]
+    async fn a_step_that_may_read_can_ask_for_research_and_gets_the_findings() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let backend = ScriptBackend {
+            turns: Mutex::new(VecDeque::from([
+                Turn::Tool(
+                    "request_research",
+                    json!({ "question": "Where are sessions stored?", "why": "to fix logout" }),
+                ),
+                Turn::Text("Fixed logout; sessions live in store.rs."),
+            ])),
+            requests: requests.clone(),
+        };
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(backend),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        ));
+        let flows = Arc::new(StubFlows {
+            outcome: Ok(json!("## Answer\nIn src/store.rs:42.")),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let mut definition = default_orchestration_definition();
+        for node in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
+                config.structured_output = StructuredOutputMode::Text;
+                config.tools = ToolScope::AllowList(vec!["read_file".into(), "fs.edit".into()]);
+                node.output_schema = None;
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut node.kind {
+                config.checks = vec![VerificationCheck::ArtifactExists {
+                    pointer: "/report".into(),
+                }];
+            }
+        }
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "text".into(),
+            schema: json!({"type": "string"}),
+        };
+        let output = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(IsolatedSessionAgentExecutor::new(parent).with_subflows(flows.clone())),
+        )
+        .with_available_tools(["read_file".to_string(), "fs.edit".to_string()])
+        .run(run_id("research"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output.result.status,
+            OrchestrationOutcome::Completed,
+            "{:?}",
+            output.result
+        );
+        let asked = flows.requests.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].node_id, node("execute.research1"));
+        assert_eq!(asked[0].input["question"], "Where are sessions stored?");
+        assert_eq!(asked[0].input["why"], "to fix logout");
+        match &asked[0].target {
+            harness_core::orchestration::SubflowTarget::Step { tools, .. } => {
+                // Reading (and what reading admits), never the step's edit tool.
+                assert_eq!(
+                    tools,
+                    &ToolScope::AllowList(vec!["read_file".into(), "project_info".into()])
+                )
+            }
+            other => panic!("research runs as a step: {other:?}"),
+        }
+        let sent = requests.lock().unwrap().clone();
+        assert!(
+            prompt_of(&sent[0]).contains("call request_research"),
+            "the step is told it can ask"
+        );
+        assert!(
+            sent[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "request_research"),
+            "the tool is offered"
+        );
+        assert!(
+            prompt_of(&sent[1]).contains("In src/store.rs:42."),
+            "the findings come back as the tool result"
+        );
+        let actions = &output.state.steps[&node("execute")].attempts[0]
+            .details
+            .actions;
+        assert_eq!(actions.research, vec!["Where are sessions stored?"]);
     }
 
     /// A native schema rides on every request of a step, tool-calling turns

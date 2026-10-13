@@ -6,6 +6,7 @@
 //! [`crate::session_agent_executor`]), validates structured boundaries,
 //! persists every transition, and feeds outcomes back into the reducer.
 
+pub(crate) mod journal;
 mod runner;
 mod schema;
 pub(crate) mod steps;

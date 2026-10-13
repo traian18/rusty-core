@@ -214,6 +214,7 @@ impl SubflowTarget {
                 model: model.clone(),
                 structured_output: StructuredOutputMode::Text,
                 profile: profile.clone(),
+                context_access: ContextAccess::Own,
             }),
         );
         agent.input_bindings = inputs.iter().map(|name| node_input(name)).collect();
@@ -402,6 +403,40 @@ pub struct AgentNodeConfig {
     /// step runs under the parent session's active profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::behavior::ProfileRef>,
+    /// Which other steps' records (what they did and handed off) this step
+    /// is shown, besides the inputs bound to it.
+    #[serde(default, skip_serializing_if = "ContextAccess::is_own")]
+    pub context_access: ContextAccess,
+}
+
+/// Which records of the run's other steps an agent step sees. A step always
+/// sees its bound inputs and its own earlier attempts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAccess {
+    /// Only its inputs: a plan or research step judges the request afresh.
+    #[default]
+    Own,
+    /// Every step that ran before it: a builder repairing its work needs to
+    /// know what was done and tried.
+    All,
+    /// The named steps: a verifier sees the work it judges.
+    Steps(Vec<OrchestrationNodeId>),
+}
+
+impl ContextAccess {
+    pub fn is_own(&self) -> bool {
+        matches!(self, Self::Own)
+    }
+
+    /// Whether the record of `step` is shown.
+    pub fn includes(&self, step: &OrchestrationNodeId) -> bool {
+        match self {
+            Self::Own => false,
+            Self::All => true,
+            Self::Steps(steps) => steps.contains(step),
+        }
+    }
 }
 
 /// Which tools an agent step may see and execute.
@@ -653,6 +688,36 @@ pub struct OrchestrationPolicies {
     pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+    /// On-demand research for agent steps; omitted, the defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<ResearchPolicy>,
+}
+
+/// An agent step that needs information its inputs do not hold may send the
+/// question to a read-only research step, which runs on the spot (with the
+/// asking step's read tools, never more) and returns its findings. Every
+/// step that may read files can ask, whether or not the flow declares it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResearchPolicy {
+    /// Questions one attempt may send; 0 turns research off.
+    #[serde(default = "default_research_per_attempt")]
+    pub max_per_attempt: u32,
+    /// The profile research runs under; omitted, the session's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::behavior::ProfileRef>,
+}
+
+impl Default for ResearchPolicy {
+    fn default() -> Self {
+        Self {
+            max_per_attempt: default_research_per_attempt(),
+            profile: None,
+        }
+    }
+}
+
+const fn default_research_per_attempt() -> u32 {
+    2
 }
 
 const fn default_true() -> bool {

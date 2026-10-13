@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::definition::{
-    AgentNodeConfig, EdgeCondition, OrchestrationDefinition, OrchestrationDefinitionId,
-    OrchestrationEdge, OrchestrationNode, OrchestrationNodeId, OrchestrationNodeKind,
-    OutputBinding, RetryReason, SchemaReference, StructuredOutputMode, SubflowTarget, ToolScope,
-    VerificationCheck, MAX_REVISIONS, MAX_STEP_ATTEMPTS, ORCHESTRATION_SCHEMA_VERSION,
+    AgentNodeConfig, ContextAccess, EdgeCondition, OrchestrationDefinition,
+    OrchestrationDefinitionId, OrchestrationEdge, OrchestrationNode, OrchestrationNodeId,
+    OrchestrationNodeKind, OutputBinding, RetryReason, SchemaReference, StructuredOutputMode,
+    SubflowTarget, ToolScope, VerificationCheck, MAX_REVISIONS, MAX_STEP_ATTEMPTS,
+    ORCHESTRATION_SCHEMA_VERSION,
 };
 use super::task_plan::{is_task_plan_schema, TASK_PLAN_SCHEMA_ID, TASK_PLAN_SCHEMA_REVISION};
 
@@ -244,6 +245,26 @@ pub fn compile(
                 "duplicate_node_id",
                 format!("duplicate node id {}", node.id),
             );
+        }
+    }
+
+    for (index, node) in definition.nodes.iter().enumerate() {
+        let OrchestrationNodeKind::Agent(AgentNodeConfig {
+            context_access: ContextAccess::Steps(steps),
+            ..
+        }) = &node.kind
+        else {
+            continue;
+        };
+        for step in steps {
+            if step == &node.id || !nodes.contains_key(step) {
+                issue(
+                    &mut issues,
+                    format!("nodes[{index}].config.context_access"),
+                    "invalid_context_access",
+                    format!("context_access names {step}, which is not another step of this flow"),
+                );
+            }
         }
     }
 

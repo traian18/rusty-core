@@ -29,8 +29,13 @@ const ALIASES: &[(&str, &str)] = &[
     ("install_dependencies", "run_command"),
 ];
 
-/// `(tool, the tool whose grant admits it)`.
-const GRANTED_WITH: &[(&str, &str)] = &[("project_info", "read_file")];
+/// `(tool, the tool whose grant admits it)`. `request_research` sends a
+/// question to a read-only research step inside a workflow: a step that may
+/// read may ask for it.
+const GRANTED_WITH: &[(&str, &str)] = &[
+    ("project_info", "read_file"),
+    ("request_research", "read_file"),
+];
 
 /// The tool `name` follows in rules, history, allow-lists and permissions,
 /// when `name` is an alias.
@@ -94,6 +99,7 @@ mod tests {
         assert_eq!(granted_by("edit_file"), Some("write_file"));
         assert_eq!(granted_by("run_check"), Some("run_command"));
         assert_eq!(granted_by("project_info"), Some("read_file"));
+        assert_eq!(granted_by("request_research"), Some("read_file"));
         assert_eq!(granted_by("read_file"), None);
         assert_eq!(granted_by("run_command"), None);
     }
@@ -113,7 +119,8 @@ mod tests {
                 "edit_file",
                 "run_check",
                 "install_dependencies",
-                "project_info"
+                "project_info",
+                "request_research"
             ])
         );
         assert_eq!(
@@ -127,7 +134,13 @@ mod tests {
     fn scoping_to_a_tool_scopes_what_it_admits_in_once() {
         assert_eq!(
             with_aliases(&names(&["read_file", "write_file"])),
-            names(&["read_file", "write_file", "edit_file", "project_info"])
+            names(&[
+                "read_file",
+                "write_file",
+                "edit_file",
+                "project_info",
+                "request_research"
+            ])
         );
         assert_eq!(
             with_aliases(&names(&["write_file", "edit_file"])),
@@ -141,7 +154,7 @@ mod tests {
         );
         assert_eq!(
             with_aliases(&names(&["read_file"])),
-            names(&["read_file", "project_info"]),
+            names(&["read_file", "project_info", "request_research"]),
             "reading does not admit edit_file"
         );
         assert_eq!(

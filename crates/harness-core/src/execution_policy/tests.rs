@@ -148,3 +148,19 @@ fn decide_is_allowed_without_any_grant_in_every_mode() {
         assert!(allows_tool(&policy, "decide"));
     }
 }
+
+#[test]
+fn save_workflow_needs_its_own_grant_and_an_execute_session() {
+    let mut policy = ExecutionPolicy {
+        mode: ExecutionMode::Execute,
+        enabled_tools: vec!["write_file".into()],
+        allowed_mcp_servers: vec![],
+    };
+    assert!(!allows_tool(&policy, "save_workflow"));
+    policy.enabled_tools.push("save_workflow".into());
+    assert!(allows_tool(&policy, "save_workflow"));
+    policy.mode = ExecutionMode::Plan;
+    assert!(!allows_tool(&policy, "save_workflow"));
+    policy.mode = ExecutionMode::Virtual;
+    assert!(!allows_tool(&policy, "save_workflow"));
+}

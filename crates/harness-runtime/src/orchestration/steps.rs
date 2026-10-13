@@ -56,6 +56,14 @@ pub struct AgentStepRequest {
     /// the flows a task queue runs.
     pub subflow_depth: u32,
     pub run_options: harness_core::orchestration::RunOptions,
+    /// What this step's previous attempt did and handed on, when it runs
+    /// again. Untrusted data, like `input`.
+    pub previous_attempt: Option<String>,
+    /// The records of the other steps its `context_access` lets it see.
+    /// Untrusted data, like `input`.
+    pub journal: Option<String>,
+    /// Whether, and how, the step may ask for research.
+    pub research: harness_core::orchestration::ResearchPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
