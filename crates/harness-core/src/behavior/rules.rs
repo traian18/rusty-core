@@ -338,15 +338,12 @@ fn arg_matches(arg: &ArgMatch, arguments: &Value) -> bool {
     };
     arg.glob
         .as_deref()
-        .map_or(true, |pattern| glob_match(pattern, &text))
+        .is_none_or(|pattern| glob_match(pattern, &text))
         && arg
             .contains
             .as_deref()
-            .map_or(true, |needle| text.contains(needle))
-        && arg
-            .equals
-            .as_ref()
-            .map_or(true, |expected| value == expected)
+            .is_none_or(|needle| text.contains(needle))
+        && arg.equals.as_ref().is_none_or(|expected| value == expected)
 }
 
 /// `*` matches within a `/`-separated segment, `**` across segments, `?`

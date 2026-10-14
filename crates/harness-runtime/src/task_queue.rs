@@ -230,7 +230,7 @@ fn unmix_flows(value: &Value, offered: &dyn Fn(&str) -> bool) -> Value {
         }
         if task["instructions"]
             .as_str()
-            .map_or(true, |i| i.trim().is_empty())
+            .is_none_or(|i| i.trim().is_empty())
         {
             task["instructions"] = Value::String(flow);
         }

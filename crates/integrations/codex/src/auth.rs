@@ -68,7 +68,7 @@ impl CodexAuth {
             .and_then(Value::as_str)
             .unwrap_or("");
         let expires = claims(access).and_then(|v| v.get("exp").and_then(Value::as_u64));
-        if access.is_empty() || expires.map_or(true, |exp| exp <= now + 60) {
+        if access.is_empty() || expires.is_none_or(|exp| exp <= now + 60) {
             let refresh = credentials
                 .pointer("/tokens/refresh_token")
                 .and_then(Value::as_str)

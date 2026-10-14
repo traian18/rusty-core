@@ -388,9 +388,9 @@ impl Comparison {
     }
 
     pub fn holds(&self, value: u32) -> bool {
-        self.eq.map_or(true, |eq| value == eq)
-            && self.gte.map_or(true, |gte| value >= gte)
-            && self.lte.map_or(true, |lte| value <= lte)
+        self.eq.is_none_or(|eq| value == eq)
+            && self.gte.is_none_or(|gte| value >= gte)
+            && self.lte.is_none_or(|lte| value <= lte)
     }
 }
 

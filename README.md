@@ -739,7 +739,7 @@ cargo doc --workspace --no-deps            # RUSTDOCFLAGS="-D warnings" in CI
 cargo run --manifest-path xtask/Cargo.toml -- check-deps   # enforces the layered dependency direction above
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchain (`stable`, MSRV `1.78`, `beta`) test matrix, a separate TypeScript SDK build+test job, and `cargo-deny` for license/advisory/supply-chain checks (`deny.toml`).
+CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchain (`stable`, MSRV `1.90`, `beta`) test matrix, a separate TypeScript SDK build+test job, and `cargo-deny` for license/advisory/supply-chain checks (`deny.toml`).
 
 ---
 

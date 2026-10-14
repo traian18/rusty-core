@@ -55,7 +55,7 @@ jobs:
         # unconditionally, so this workspace does not currently build on
         # Windows. See README.md's Platform support note.
         os: [ubuntu-latest, macos-latest]
-        toolchain: [stable, "1.78", beta]
+        toolchain: [stable, "1.90", beta]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

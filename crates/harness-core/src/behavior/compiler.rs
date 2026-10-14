@@ -422,7 +422,7 @@ fn validate_gate(gate: &CompletionGate, issue: &mut impl FnMut(&str, &'static st
                 if check
                     .feedback
                     .as_deref()
-                    .map_or(true, |text| text.trim().is_empty())
+                    .is_none_or(|text| text.trim().is_empty())
                 {
                     issue(
                         &format!("{path}.feedback"),

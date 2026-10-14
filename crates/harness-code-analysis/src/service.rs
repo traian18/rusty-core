@@ -118,7 +118,7 @@ impl CallGraph for DefaultCallGraph {
                 request
                     .language
                     .as_ref()
-                    .map_or(true, |language| language == &item.language)
+                    .is_none_or(|language| language == &item.language)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -440,7 +440,7 @@ fn resolve_target(
     let lookup = imported.map_or(call.name.as_str(), |item| item.imported.as_str());
     let candidates = by_name.get(lookup).map(Vec::as_slice).unwrap_or_default();
     let filtered = candidates.iter().filter(|(candidate, _)| {
-        imported.map_or(true, |item| module_matches(&item.module, candidate))
+        imported.is_none_or(|item| module_matches(&item.module, candidate))
     });
     let count = filtered.clone().count();
     match (count, unique(filtered)) {

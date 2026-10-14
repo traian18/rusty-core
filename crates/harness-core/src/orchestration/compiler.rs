@@ -1018,7 +1018,7 @@ fn validate_schema_value(
         }
     }
     if let Some(values) = object.get("enum") {
-        if !values.as_array().is_some_and(|values| !values.is_empty()) {
+        if values.as_array().is_none_or(|values| values.is_empty()) {
             issue(
                 issues,
                 format!("{path}.enum"),

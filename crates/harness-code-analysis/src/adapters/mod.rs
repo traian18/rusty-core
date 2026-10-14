@@ -192,17 +192,19 @@ impl LanguageAdapter for TreeSitterAdapter {
 
 fn grammar(language: &LanguageId, path: &str) -> Language {
     match language {
-        LanguageId::JavaScript => tree_sitter_javascript::language(),
-        LanguageId::TypeScript if path.ends_with(".tsx") => tree_sitter_typescript::language_tsx(),
-        LanguageId::TypeScript => tree_sitter_typescript::language_typescript(),
-        LanguageId::Python => tree_sitter_python::language(),
-        LanguageId::Java => tree_sitter_java::language(),
-        LanguageId::CSharp => tree_sitter_c_sharp::language(),
-        LanguageId::Go => tree_sitter_go::language(),
-        LanguageId::Rust => tree_sitter_rust::language(),
-        LanguageId::Php => tree_sitter_php::language_php_only(),
-        LanguageId::Cpp => tree_sitter_cpp::language(),
-        LanguageId::Ruby => tree_sitter_ruby::language(),
+        LanguageId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        LanguageId::TypeScript if path.ends_with(".tsx") => {
+            tree_sitter_typescript::LANGUAGE_TSX.into()
+        }
+        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        LanguageId::Python => tree_sitter_python::LANGUAGE.into(),
+        LanguageId::Java => tree_sitter_java::LANGUAGE.into(),
+        LanguageId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        LanguageId::Go => tree_sitter_go::LANGUAGE.into(),
+        LanguageId::Rust => tree_sitter_rust::LANGUAGE.into(),
+        LanguageId::Php => tree_sitter_php::LANGUAGE_PHP_ONLY.into(),
+        LanguageId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        LanguageId::Ruby => tree_sitter_ruby::LANGUAGE.into(),
     }
 }
 

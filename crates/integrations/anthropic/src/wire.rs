@@ -629,7 +629,7 @@ impl AnthropicSseParser {
                             .get("input")
                             .filter(|input| {
                                 !input.is_null()
-                                    && input.as_object().map_or(true, |object| !object.is_empty())
+                                    && input.as_object().is_none_or(|object| !object.is_empty())
                             })
                             .map(ToString::to_string);
                         return Ok(initial.map(|delta| ModelEvent::TextDelta { delta }));
@@ -646,7 +646,7 @@ impl AnthropicSseParser {
                         .get("input")
                         .filter(|input| {
                             !input.is_null()
-                                && input.as_object().map_or(true, |object| !object.is_empty())
+                                && input.as_object().is_none_or(|object| !object.is_empty())
                         })
                         .map(ToString::to_string)
                         .unwrap_or_default();

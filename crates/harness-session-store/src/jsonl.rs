@@ -241,7 +241,7 @@ impl SessionStore for JsonlSessionStore {
             events.retain(|event| {
                 event
                     .session_sequence
-                    .map_or(true, |seq| seq > snap.session_sequence)
+                    .is_none_or(|seq| seq > snap.session_sequence)
             });
         }
 
