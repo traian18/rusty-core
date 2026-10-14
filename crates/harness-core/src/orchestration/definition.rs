@@ -325,6 +325,11 @@ pub struct TaskQueueConfig {
     pub plan_pointer: String,
     pub review_profile: crate::behavior::ProfileRef,
     pub review_instructions: String,
+    /// When set, a read-only planner turns each task into a detailed step
+    /// plan before it is built; the builder and the reviewer work from it.
+    /// The plan the queue reads can then stay general.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_planner: Option<TaskPlannerConfig>,
     pub max_repairs: u32,
     /// What happens when a task cannot be completed: its repairs ran out, or
     /// it needs something only the user can give.
@@ -338,7 +343,21 @@ pub struct TaskQueueConfig {
     pub flows: BTreeMap<String, SubflowTarget>,
 }
 
+/// The step that plans one task of a queue in detail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskPlannerConfig {
+    pub profile: crate::behavior::ProfileRef,
+    pub instructions: String,
+}
+
 impl TaskQueueConfig {
+    /// The profiles the queue's own sessions run under: the reviewer's and,
+    /// when there is one, the task planner's.
+    pub fn profiles(&self) -> impl Iterator<Item = &crate::behavior::ProfileRef> {
+        std::iter::once(&self.review_profile)
+            .chain(self.task_planner.as_ref().map(|planner| &planner.profile))
+    }
+
     /// The input binding the plan is read from.
     pub fn plan_binding(&self) -> Option<&str> {
         self.plan_pointer

@@ -67,6 +67,10 @@ struct Progress {
     /// what was fixed after the planned tasks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     repairs: Vec<Value>,
+    /// The task planner's detailed plan for the task in progress
+    /// (`{task_id, plan}`), kept across its repairs and a resumed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_plan: Option<Value>,
 }
 
 fn invalid(message: impl Into<String>) -> AgentExecutionError {
@@ -391,6 +395,41 @@ fn unmet_criteria(message: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Tools a session that must not change anything keeps: the task planner
+/// and the reviewer.
+fn is_read_only(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file"
+            | "search_codebase"
+            | "list_files"
+            | "project_info"
+            | "report_progress"
+            | "ask_user_question"
+            | "open_document"
+            | "read_workflow_context"
+            | "web_search"
+            | "web_extract"
+    )
+}
+
+/// What a task's planner and builder are given: the task-specific contract,
+/// plus the preparation outputs (diagnosis, architecture, baseline, audit)
+/// the step was bound.
+fn task_input(request: &AgentStepRequest, plan: &Plan, task: &Task, progress: &Progress) -> Value {
+    let mut input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
+    if let Some(fields) = request.input.as_object() {
+        for (name, value) in fields {
+            input
+                .as_object_mut()
+                .unwrap()
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    input
+}
+
 impl IsolatedSessionAgentExecutor {
     /// Runs a step that carries a task queue: executes the planned tasks one at
     /// a time, each with fresh builder and reviewer sessions, and returns the
@@ -554,6 +593,7 @@ impl IsolatedSessionAgentExecutor {
                                 .push(json!({"task_id":task.id,"skipped":true,"reason":reason}));
                         }
                         progress.current = None;
+                        progress.step_plan = None;
                         context
                             .checkpoint(serde_json::to_value(&progress).unwrap())
                             .await?;
@@ -629,6 +669,9 @@ impl IsolatedSessionAgentExecutor {
                 .run_task_flow(request, plan, task, target, progress, context, record)
                 .await;
         }
+        let step_plan = self
+            .plan_task(request, plan, task, progress, context, usage, guidance)
+            .await?;
         for repair in 0..=queue.max_repairs {
             if context.cancellation.is_cancelled() {
                 return Err(AgentExecutionError::new(
@@ -644,20 +687,16 @@ impl IsolatedSessionAgentExecutor {
             child.feedback.retain(|f| !is_user_change(&f.code));
             child.structured_output = StructuredOutputMode::HostValidated;
             child.output_schema = result_schema(false);
-            child.input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
-            // Preserve preparation outputs (diagnosis, architecture, baseline,
-            // audit) in addition to the task-specific contract.
-            if let Some(fields) = request.input.as_object() {
-                for (name, value) in fields {
-                    child
-                        .input
-                        .as_object_mut()
-                        .unwrap()
-                        .entry(name.clone())
-                        .or_insert_with(|| value.clone());
-                }
+            child.input = task_input(request, plan, task, progress);
+            if let Some(step_plan) = &step_plan {
+                child.input["step_plan"] = Value::String(step_plan.clone());
             }
-            child.instructions = format!("{}\nImplement only workflow_input.task. Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
+            let follow = if step_plan.is_some() {
+                " Follow workflow_input.step_plan, the detailed plan for this task; where the code proves it wrong, do the smallest thing that meets the criteria and say what you did differently."
+            } else {
+                ""
+            };
+            child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
             if let Some(guidance) = guidance {
                 // The user's own words, given when they chose to try again.
                 child.instructions.push_str(&format!(
@@ -700,19 +739,7 @@ impl IsolatedSessionAgentExecutor {
             child.input["build"] = built;
             // Reviewer never gets a mutating tool, even if a user supplies a
             // permissive profile. Checks run in the dedicated validation step.
-            child.tools.retain(|t| {
-                matches!(
-                    t.as_str(),
-                    "read_file"
-                        | "search_codebase"
-                        | "list_files"
-                        | "project_info"
-                        | "report_progress"
-                        | "ask_user_question"
-                        | "open_document"
-                        | "read_workflow_context"
-                )
-            });
+            child.tools.retain(|t| is_read_only(t));
             let reviewed = self
                 .run_single_agent_step(child.clone(), context, usage)
                 .await?
@@ -729,6 +756,7 @@ impl IsolatedSessionAgentExecutor {
             }
             if accepted {
                 progress.current = None;
+                progress.step_plan = None;
             }
             context
                 .checkpoint(serde_json::to_value(&*progress).unwrap())
@@ -752,6 +780,69 @@ impl IsolatedSessionAgentExecutor {
             task.id,
             queue.max_repairs + 1
         )))
+    }
+
+    /// The task planner's detailed plan for `task`, when the queue has a
+    /// planner: the one already made for it (kept across repairs and a
+    /// resumed run), or a new one. The user's guidance for another try asks
+    /// for a new plan that takes it into account.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_task(
+        &self,
+        request: &AgentStepRequest,
+        plan: &Plan,
+        task: &Task,
+        progress: &mut Progress,
+        context: &mut StepContext,
+        usage: &mut HashMap<AgentId, AgentUsageMetrics>,
+        guidance: Option<&str>,
+    ) -> Result<Option<String>, AgentExecutionError> {
+        let queue = request.task_queue.as_ref().expect("task queue");
+        let Some(planner) = &queue.task_planner else {
+            return Ok(None);
+        };
+        let kept = progress
+            .step_plan
+            .as_ref()
+            .filter(|kept| kept["task_id"] == task.id.as_str() && guidance.is_none())
+            .and_then(|kept| kept["plan"].as_str());
+        if let Some(kept) = kept {
+            return Ok(Some(kept.to_owned()));
+        }
+        let mut child = request.clone();
+        child.task_queue = None;
+        child.checkpoint = None;
+        child.feedback.retain(|f| !is_user_change(&f.code));
+        child.profile = Some(planner.profile.clone());
+        child.instructions = planner.instructions.clone();
+        if let Some(guidance) = guidance {
+            child.instructions.push_str(&format!(
+                "\n\nThe task failed before, and the user asked for another try with this guidance; plan for it:\n{guidance}"
+            ));
+        }
+        child.structured_output = StructuredOutputMode::Text;
+        child.output_schema = json!({"type":"string"});
+        child.input = task_input(request, plan, task, progress);
+        child.tools.retain(|t| is_read_only(t));
+        let planned = self
+            .run_single_agent_step(child, context, usage)
+            .await?
+            .value;
+        let planned = match planned {
+            Value::String(text) => text,
+            other => crate::markdown_reply::render_input(&other),
+        };
+        if planned.trim().is_empty() {
+            return Err(AgentExecutionError::new(
+                "invalid_task_result",
+                format!("the planner returned no plan for task {}", task.id),
+            ));
+        }
+        progress.step_plan = Some(json!({"task_id":task.id,"plan":planned}));
+        context
+            .checkpoint(serde_json::to_value(&*progress).unwrap())
+            .await?;
+        Ok(Some(planned))
     }
 
     /// Does `task` by running one of the queue's flows. The flow judges its

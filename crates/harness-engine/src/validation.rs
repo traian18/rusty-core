@@ -104,8 +104,13 @@ pub fn validate_orchestration(document: &Value, profiles: &[Value]) -> Vec<Issue
                 .task_queue
                 .as_ref()
                 .map(|queue| (&queue.review_profile, "task_queue.review_profile"));
+            let planner = config
+                .task_queue
+                .as_ref()
+                .and_then(|queue| queue.task_planner.as_ref())
+                .map(|planner| (&planner.profile, "task_queue.task_planner.profile"));
             let step = config.profile.as_ref().map(|profile| (profile, "profile"));
-            for (reference, field) in step.into_iter().chain(reviewer) {
+            for (reference, field) in step.into_iter().chain(reviewer).chain(planner) {
                 if registry.resolve(reference).is_err() {
                     issues.push(Issue::warning(
                         format!("nodes.{}.config.{field}", node.id),
@@ -114,6 +119,22 @@ pub fn validate_orchestration(document: &Value, profiles: &[Value]) -> Vec<Issue
                     ));
                 }
             }
+        }
+    }
+    // Research runs on demand, mid-step: a profile that does not resolve
+    // fails every question the run asks.
+    if let Some(reference) = definition
+        .policies
+        .research
+        .as_ref()
+        .and_then(|research| research.profile.as_ref())
+    {
+        if registry.resolve(reference).is_err() {
+            issues.push(Issue::warning(
+                "policies.research.profile",
+                "unknown_profile",
+                format!("no profile {reference} in this workspace"),
+            ));
         }
     }
     issues

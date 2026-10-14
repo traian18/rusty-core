@@ -654,11 +654,15 @@ fn parse_items(name: &str, items: &Value, body: &str, level: usize) -> Vec<Value
 fn split_title(title: &str) -> (Option<String>, String) {
     let mut rest = title.trim();
     for prefix in ["requirement", "criterion", "criteria", "task", "step"] {
-        if rest.len() > prefix.len()
-            && rest[..prefix.len()].eq_ignore_ascii_case(prefix)
-            && rest[prefix.len()..].starts_with(' ')
-        {
-            rest = rest[prefix.len()..].trim_start();
+        // `get` rather than indexing: the cut may fall inside a character
+        // (`R1 — Title`).
+        let after = rest
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .and_then(|_| rest.get(prefix.len()..))
+            .filter(|tail| tail.starts_with(' '));
+        if let Some(tail) = after {
+            rest = tail.trim_start();
             break;
         }
     }

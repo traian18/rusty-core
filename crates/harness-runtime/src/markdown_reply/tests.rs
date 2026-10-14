@@ -151,3 +151,17 @@ fn the_template_names_every_section() {
     }
     assert!(!text.contains("JSON Schema"));
 }
+
+#[test]
+fn a_dash_after_an_item_id_is_read_without_panicking() {
+    // `### R1 — Title` once cut a string inside the dash and lost every criterion.
+    let schema = json!({"type":"object","required":["criteria","summary"],"properties":{
+            "criteria":{"type":"array","items":{"type":"object","required":["id","status","evidence"],"properties":{
+                "id":{"type":"string"},"status":{"type":"string","enum":["pass","fail","manual"]},"evidence":{"type":"string"}}}},
+            "summary":{"type":"string"}}});
+    let reply = "## criteria\n### R1 — Contract-first architecture\nstatus: pass\n\nThe trait is in `api.rs:13`.\n\n### Task — étape\nstatus: fail\n\nMissing.\n\n## summary\nOne passes.";
+    let value = parse(&schema, reply).unwrap();
+    assert_eq!(value["criteria"][0]["id"], "R1");
+    assert_eq!(value["criteria"][0]["status"], "pass");
+    assert_eq!(value["criteria"][1]["status"], "fail");
+}

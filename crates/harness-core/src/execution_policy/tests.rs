@@ -164,3 +164,17 @@ fn save_workflow_needs_its_own_grant_and_an_execute_session() {
     policy.mode = ExecutionMode::Virtual;
     assert!(!allows_tool(&policy, "save_workflow"));
 }
+
+#[test]
+fn workflow_catalog_is_a_read_in_every_mode() {
+    let mut policy = ExecutionPolicy {
+        mode: ExecutionMode::Plan,
+        enabled_tools: vec![],
+        allowed_mcp_servers: vec![],
+    };
+    assert!(!allows_tool(&policy, "workflow_catalog"));
+    policy.enabled_tools.push("read_file".into());
+    assert!(allows_tool(&policy, "workflow_catalog"));
+    policy.mode = ExecutionMode::Execute;
+    assert!(allows_tool(&policy, "workflow_catalog"));
+}

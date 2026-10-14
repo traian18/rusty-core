@@ -22,7 +22,8 @@ use crate::providers::{
     ProviderKey,
 };
 use crate::session_builder::{HarnessError, SessionBuilder, SessionHandle};
-use crate::tool_factory::build_executor_for;
+use crate::tool_factory::build_executor_for_with_graph;
+use harness_code_analysis::CallGraph;
 
 /// Public entry point for registering integrations and creating sessions.
 pub struct Harness {
@@ -362,9 +363,33 @@ impl Harness {
         toolset: AgentToolset,
         workspace: Arc<dyn Workspace>,
     ) -> Result<SessionHandle, HarnessError> {
+        self.restore_session_with_optional_graph(id, toolset, workspace, None)
+            .await
+    }
+
+    /// Restore a session with an explicitly authorized shared call graph.
+    pub async fn restore_session_with_toolset_and_call_graph(
+        &self,
+        id: SessionId,
+        toolset: AgentToolset,
+        workspace: Arc<dyn Workspace>,
+        graph: Arc<dyn CallGraph>,
+    ) -> Result<SessionHandle, HarnessError> {
+        self.restore_session_with_optional_graph(id, toolset, workspace, Some(graph))
+            .await
+    }
+
+    async fn restore_session_with_optional_graph(
+        &self,
+        id: SessionId,
+        toolset: AgentToolset,
+        workspace: Arc<dyn Workspace>,
+        graph: Option<Arc<dyn CallGraph>>,
+    ) -> Result<SessionHandle, HarnessError> {
         let registry = SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor = build_executor_for(descriptor, workspace.clone());
+            let executor =
+                build_executor_for_with_graph(descriptor, workspace.clone(), graph.clone());
             let _ = registry.register(executor);
         }
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(registry);

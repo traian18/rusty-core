@@ -6,7 +6,8 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::backend::{discovered_capability, BroadcastEventSink, ToolAdvertisingBackend};
-use crate::tool_factory::build_executor_for;
+use crate::tool_factory::build_executor_for_with_graph;
+use harness_code_analysis::CallGraph;
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::events::AgentEventEnvelope;
 use harness_protocol::ids::{PermissionId, SessionId};
@@ -402,18 +403,36 @@ impl SessionBuilder {
     /// that filesystem tools (`fs.read`, `fs.edit`, `workspace.search`) will delegate to.
     /// Shell tools (`shell.exec`) ignore the workspace.
     pub fn toolset(
-        mut self,
+        self,
         toolset: AgentToolset,
         workspace: Arc<dyn harness_runtime::traits::Workspace>,
     ) -> Self {
-        // 1. Register all tool executors into the registry.
+        self.toolset_with_optional_graph(toolset, workspace, None)
+    }
+
+    /// Register a toolset with an explicitly authorized shared call graph.
+    pub fn toolset_with_call_graph(
+        self,
+        toolset: AgentToolset,
+        workspace: Arc<dyn harness_runtime::traits::Workspace>,
+        graph: Arc<dyn CallGraph>,
+    ) -> Self {
+        self.toolset_with_optional_graph(toolset, workspace, Some(graph))
+    }
+
+    fn toolset_with_optional_graph(
+        mut self,
+        toolset: AgentToolset,
+        workspace: Arc<dyn harness_runtime::traits::Workspace>,
+        graph: Option<Arc<dyn CallGraph>>,
+    ) -> Self {
         let registry = harness_runtime::traits::SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor = build_executor_for(descriptor, workspace.clone());
+            let executor =
+                build_executor_for_with_graph(descriptor, workspace.clone(), graph.clone());
             let _ = registry.register(executor);
         }
 
-        // 2. Wire the registry + toolset into the root Agent's capabilities.
         self.tool_registry = Some(Arc::new(registry));
         self.root_toolset = Some(toolset);
         self.workspace = Some(workspace);

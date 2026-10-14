@@ -10,6 +10,8 @@ members = [
     "crates/harness-tools",
     "crates/harness-context",
     "crates/harness-workspace",
+    "crates/harness-code-analysis",
+    "crates/tools/code-analysis",
     "crates/harness-session-store",
     "crates/harness-skills",
     "crates/harness-extension-api",
@@ -92,3 +94,14 @@ libc = "0.2"
 base64 = "0.22"
 zeroize = "1"
 metrics = "0.24"
+tree-sitter = "0.22"
+tree-sitter-javascript = "0.21"
+tree-sitter-typescript = "0.21"
+tree-sitter-python = "0.21"
+tree-sitter-java = "0.21"
+tree-sitter-c-sharp = "0.21"
+tree-sitter-go = "0.21"
+tree-sitter-rust = "0.21"
+tree-sitter-php = "0.22"
+tree-sitter-cpp = "0.22"
+tree-sitter-ruby = "0.21"

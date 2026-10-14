@@ -357,11 +357,8 @@ impl RunnerParts {
             let OrchestrationNodeKind::Agent(config) = &node.kind else {
                 continue;
             };
-            let reviewer = config
-                .task_queue
-                .as_ref()
-                .map(|queue| &queue.review_profile);
-            for reference in config.profile.iter().chain(reviewer) {
+            let queue = config.task_queue.iter().flat_map(|queue| queue.profiles());
+            for reference in config.profile.iter().chain(queue) {
                 let closure = self
                     .profiles
                     .resolve(reference)

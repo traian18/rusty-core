@@ -38,8 +38,11 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         "report_progress" | "ask_user_question" | "decide" => return true,
         "write_plan" => return policy.mode == ExecutionMode::Plan,
         // `project_info` is the IDE's project-detection tool: it only reads
-        // manifests, so it shares the `read_file` grant (in plan mode too).
-        "read_file" | "fs.read" | "open_document" | "project_info" | "request_research" => {
+        // manifests, so it shares the `read_file` grant (in plan mode too), as
+        // does the workflow-author's `workflow_catalog`, which only reads the
+        // workflows and profiles the workspace can use.
+        "read_file" | "fs.read" | "open_document" | "project_info" | "request_research"
+        | "workflow_catalog" => {
             "read_file"
         }
         // `edit_file` is the IDE's targeted patch tool: same grant as `write_file`.

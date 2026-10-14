@@ -16,6 +16,8 @@ harness-context = { path = "../harness-context" }
 harness-session-store = { path = "../harness-session-store", default-features = false }
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
+harness-code-analysis = { path = "../harness-code-analysis" }
+harness-tool-code-analysis = { path = "../tools/code-analysis" }
 harness-tool-filesystem = { path = "../tools/filesystem" }
 harness-tool-shell = { path = "../tools/shell" }
 harness-tool-git = { path = "../tools/git" }

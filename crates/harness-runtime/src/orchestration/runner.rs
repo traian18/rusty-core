@@ -453,7 +453,7 @@ impl OrchestrationRunner {
             .get_mut(&node_id)
             .and_then(|step| step.error.take());
         let resumed_node = if let Some(target_id) = repair_target {
-            // An explicit continuation grants the repair target another attempt after its
+            // An explicit continuation sends the work back to the repair target after its
             // automatic retries have run out. Clear downstream results so the
             // next review checks the repaired workspace, not stale output.
             for span_node in &self.compiled.retry_spans[&node_id] {
@@ -480,6 +480,10 @@ impl OrchestrationRunner {
         if let Some(error) = error {
             step.feedback.push(error);
         }
+        // The user chose to continue: the step's retries count afresh from
+        // here, so a rejected repair can be sent back again instead of
+        // failing the run after one more attempt.
+        step.retry_base = step.attempts.len() as u32;
         step.feedback.push(OrchestrationError::new("USER_CONTINUATION", format!(
             "Resume this step. Earlier successful steps and their outputs are retained. The failed attempt may have changed the workspace: inspect current state before repeating actions. User guidance: {guidance}"
         )));

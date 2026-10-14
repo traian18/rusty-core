@@ -529,6 +529,32 @@ async fn explicit_continuation_repairs_a_failed_verification_from_build() {
 }
 
 #[tokio::test]
+async fn a_continuation_gives_the_repair_target_its_retries_again() {
+    // Two attempts fail the run; after the user continues, a rejected repair
+    // is sent back again instead of failing the run after one more attempt.
+    let agent = ScriptedAgent::new(vec![
+        ok(report("blocked")),
+        ok(report("failed")),
+        ok(report("failed")),
+        ok(report("completed")),
+    ]);
+    let runner = runner(agent.clone());
+    let failed = runner
+        .run(run_id("budget-failed"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(failed.state.failed_step, Some(node("verify")));
+    let resumed = runner
+        .retry_failed(failed.state, run_id("budget-continued"), "continue".into())
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(resumed.state.status, OrchestrationStatus::Completed);
+    assert_eq!(agent.requests().len(), 4);
+}
+
+#[tokio::test]
 async fn unresolvable_artifacts_fail_verification() {
     struct Missing;
     #[async_trait]
@@ -1226,6 +1252,7 @@ mod isolated_session {
                         revision: None,
                     },
                     review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: None,
                     max_repairs: 2,
                     on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
                     flows: Default::default(),
@@ -1311,6 +1338,113 @@ mod isolated_session {
         );
         assert!(prompt_of(&sent[4]).contains("missing edge case"));
         assert!(prompt_of(&sent[5]).contains("access denied"));
+    }
+
+    #[tokio::test]
+    async fn a_task_planner_plans_each_task_once_and_its_plan_reaches_builder_and_reviewer() {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskPlannerConfig, TaskQueueConfig},
+        };
+        let profile = || ProfileRef {
+            id: "rusty.default".into(),
+            revision: None,
+        };
+        let built = json!({"status":"complete","summary":"implemented"});
+        let reviewed = |id: &str| json!({"status":"complete","summary":"inspected","criteria":[{"id":id,"evidence":"file.rs:12 implements it"}]});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(SessionId::new(), Arc::new(QueueBackend {
+            requests: requests.clone(),
+            replies: Mutex::new(vec![
+                json!("STEP-PLAN-T1: edit parser.rs"),
+                built.clone(),
+                json!({"status":"needs_repair","summary":"edge case missing","criteria":[]}),
+                built.clone(),
+                reviewed("C1"),
+                json!("STEP-PLAN-T2: edit lexer.rs"),
+                built,
+                reviewed("C2"),
+            ].into()),
+        }), Arc::new(FakeToolRegistry::new()), Arc::new(FakeWorkspace::new()), Arc::new(NoopSink)));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: profile(),
+                    review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: Some(TaskPlannerConfig {
+                        profile: profile(),
+                        instructions: "PLAN THIS TASK in detail.".into(),
+                    }),
+                    max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.output_schema = Some(definition.output_contract.schema.clone());
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"two changes","plan":{"status":"ready","summary":"two steps","requirements":[{"id":"R1","text":"both","criteria":[{"id":"C1","text":"first"},{"id":"C2","text":"second"}]}],"tasks":[{"id":"T1","instructions":"parser","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]},{"id":"T2","instructions":"lexer","requirement_ids":["R1"],"criterion_ids":["C2"],"depends_on":["T1"]}]}});
+        let finished = runner
+            .start(run_id("planned-queue"), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(
+            finished.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            finished.result
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            8,
+            "plan, build, review, repair, review per task"
+        );
+        assert!(prompt_of(&sent[0]).contains("PLAN THIS TASK"));
+        for at in [1, 2, 3, 4] {
+            assert!(
+                prompt_of(&sent[at]).contains("STEP-PLAN-T1"),
+                "request {at}"
+            );
+        }
+        assert!(prompt_of(&sent[3]).contains("edge case missing"));
+        assert!(prompt_of(&sent[5]).contains("PLAN THIS TASK"));
+        assert!(!prompt_of(&sent[6]).contains("STEP-PLAN-T1"));
+        assert!(prompt_of(&sent[6]).contains("STEP-PLAN-T2"));
+        let checkpoint = finished.state.steps[&node("execute")]
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert!(checkpoint.get("step_plan").is_none(), "{checkpoint}");
     }
 
     /// Runs the default workflow with its agent step in `mode`, against a
@@ -1651,6 +1785,7 @@ mod isolated_session {
                         revision: None,
                     },
                     review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: None,
                     max_repairs: 0,
                     on_task_failure: policy,
                     flows: flows.clone(),
