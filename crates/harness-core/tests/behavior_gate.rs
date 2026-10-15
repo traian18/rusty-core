@@ -700,3 +700,134 @@ fn evaluator_model_usage_is_counted_even_for_stale_verdicts() {
     });
     assert_eq!(agent.usage.records.len(), before + 2);
 }
+
+fn finished_gate(max_continuations: u32) -> Value {
+    json!({
+        "checks": [{
+            "id": "finished",
+            "require": { "final_status": ["done", "blocked"] },
+            "feedback": "Keep working until the plan is done.",
+            "waive_when_exhausted": true
+        }],
+        "max_continuations": max_continuations,
+        "on_exhausted": "fail"
+    })
+}
+
+#[test]
+fn an_answer_that_reports_work_left_is_sent_back_until_it_reports_done() {
+    let mut agent = agent(finished_gate(3), json!({}));
+    let run_id = start(&mut agent);
+
+    let effects = answer(
+        &mut agent,
+        run_id,
+        "Added the types.\n\n**Status:** Not done — the scanner and tests remain.",
+    );
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["finished".into()]))
+    );
+    assert!(continues(&effects));
+    assert!(last_user_text(&agent).contains("[finished] Keep working"));
+
+    let effects = answer(&mut agent, run_id, "Forgot the status line.");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["finished".into()])),
+        "an answer without a status is not done either"
+    );
+
+    let effects = answer(&mut agent, run_id, "Everything is in.\n\n## Status\nDone.");
+    assert_eq!(gate_event(&effects), Some((true, false, vec![])));
+    assert!(completed(&effects));
+}
+
+#[test]
+fn a_waivable_check_lets_the_answer_through_once_continuations_run_out() {
+    let mut agent = agent(finished_gate(1), json!({}));
+    let run_id = start(&mut agent);
+    answer(&mut agent, run_id, "Status: partial");
+
+    let effects = answer(&mut agent, run_id, "Status: still partial");
+    assert_eq!(
+        gate_event(&effects),
+        Some((true, false, vec!["finished".into()])),
+        "passed, listing the waived check"
+    );
+    assert!(completed(&effects));
+}
+
+#[test]
+fn a_waivable_check_does_not_excuse_one_that_is_not() {
+    let mut gate = finished_gate(1);
+    gate["checks"]
+        .as_array_mut()
+        .unwrap()
+        .push(tested_gate()["checks"][0].clone());
+    let mut agent = agent(gate, json!({}));
+    let run_id = start(&mut agent);
+    use_tool(&mut agent, run_id, "fs.edit");
+    answer(&mut agent, run_id, "Status: not done");
+
+    let effects = answer(&mut agent, run_id, "Status: not done");
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, false, vec!["finished".into(), "tested".into()]))
+    );
+    assert!(!completed(&effects));
+}
+
+#[test]
+fn the_final_status_is_read_from_the_last_status_line() {
+    use harness_core::behavior::final_status;
+    let cases = [
+        ("Status: done", "done"),
+        ("**Status:** Not done — tests remain", "not done"),
+        ("**Status**: `blocked` - needs an API key", "blocked"),
+        ("### Status\n\n- Done. All tasks implemented.", "done"),
+        ("status: partial (2 of 5 tasks)", "partial"),
+        (
+            "Status: done\n\nMore notes.\nStatus: incomplete: scanner missing",
+            "incomplete",
+        ),
+        ("Task 1 done.\nStatuses vary.", ""),
+        ("No status here.", ""),
+        ("## Status of the work\nall good", ""),
+        (
+            "## status\nblocked_user\n\n## summary\nNeeds a key.",
+            "blocked user",
+        ),
+        (
+            "{\"status\":\"checkpoint\",\"summary\":\"half\"}",
+            "checkpoint",
+        ),
+        (
+            "```json\n{\"status\": \"complete\", \"summary\": \"ok\"}\n```",
+            "complete",
+        ),
+        (
+            "{\n  \"summary\": \"ok\",\n  \"status\": \"complete\"\n}",
+            "complete",
+        ),
+    ];
+    for (answer, expected) in cases {
+        assert_eq!(final_status(answer), expected, "for {answer:?}");
+    }
+}
+
+#[test]
+fn final_status_patterns_cannot_be_empty() {
+    let profile = serde_json::from_value(json!({
+        "schema_version": 1, "id": "bad", "revision": 1, "name": "Bad",
+        "completion_gate": {
+            "checks": [{ "id": "x", "require": { "final_status": [""] }, "feedback": "f" }]
+        }
+    }))
+    .unwrap();
+    let error = harness_core::behavior::compile(profile).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("final_status patterns cannot be empty"),
+        "{error:?}"
+    );
+}

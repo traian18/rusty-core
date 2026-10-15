@@ -334,6 +334,7 @@ pub fn import_hooks(settings: &Value) -> Result<HooksImport, HarnessError> {
                             ErrorPolicy::Fail
                         },
                         metadata: serde_json::json!({ "imported_from": label }),
+                        waive_when_exhausted: false,
                     }),
                     None => import.skipped.push(format!(
                         "{label}: unsupported hook type or missing command/prompt"

@@ -795,6 +795,8 @@ impl Agent {
             return self.finish_success(summary, None);
         };
         self.state.behavior.run.gate_attempts += 1;
+        self.state.behavior.run.final_status =
+            Some(crate::behavior::final_status(&self.final_response_text()));
         let failures: Vec<(String, String)> = gate
             .checks
             .iter()
@@ -972,6 +974,18 @@ impl Agent {
         }
         let run = &self.state.behavior.run;
         let can_continue = run.gate_continuations < gate.max_continuations && !run.final_turn;
+        let waived = |id: &String| {
+            gate.checks
+                .iter()
+                .any(|check| &check.id == id && check.waive_when_exhausted)
+        };
+        if !can_continue && failed_checks.iter().all(waived) {
+            // Only checks that ask for more work are left: hand the answer
+            // over as it is, listing what was waived.
+            let mut effects = vec![evaluated(true, false)];
+            effects.extend(self.finish_success(summary, Some(true)));
+            return effects;
+        }
         if !can_continue {
             let mut effects = vec![evaluated(false, false)];
             match gate.on_exhausted.unwrap_or(OnExhausted::Accept) {

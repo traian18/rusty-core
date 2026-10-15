@@ -335,6 +335,15 @@ pub enum Condition {
     RepeatedCall(Comparison),
     /// The id of the profile active before this one (`ProfileEntered` only).
     ProfileEnteredFrom(NameMatch),
+    /// The status the model gave in its latest proposed final answer: the
+    /// value of its last `Status:` line (or the line under a `Status`
+    /// heading), lower-cased, without Markdown emphasis, cut at the first
+    /// separator (`—`, `–`, ` - `, `:`, `;`, `,`, `.`, `(`). So
+    /// `**Status:** Not done — tests remain` is `not done`. An answer without
+    /// a status line has the empty status, which no pattern matches. False
+    /// until the model has proposed a final answer in this run, so it is
+    /// meant for completion gates.
+    FinalStatus(NameMatch),
     All(Vec<Condition>),
     Any(Vec<Condition>),
     Not(Box<Condition>),
@@ -626,8 +635,18 @@ pub struct GateCheck {
     /// How an evaluator that cannot produce a verdict counts.
     #[serde(default)]
     pub error_policy: ErrorPolicy,
+    /// When the gate has no continuations left, stop holding the run back
+    /// on this check: if only waivable checks still fail, the run completes
+    /// as passed and the event lists them in `failed_checks`. For checks
+    /// that ask the model to keep working rather than guard correctness.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waive_when_exhausted: bool,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

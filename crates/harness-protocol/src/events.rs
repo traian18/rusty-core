@@ -262,7 +262,8 @@ pub enum AgentEvent {
         passed: bool,
         /// `true` when the rejection was sent back and the run continues.
         continuing: bool,
-        /// Ids of the checks that failed.
+        /// Ids of the checks that failed. With `passed: true` these are
+        /// checks waived because the gate ran out of continuations.
         failed_checks: Vec<String>,
     },
 

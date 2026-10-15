@@ -361,6 +361,15 @@ fn validate_condition(
                 issue,
             );
         }
+        Condition::FinalStatus(names) => {
+            if names.patterns().is_empty() || names.patterns().iter().any(|p| p.trim().is_empty()) {
+                issue(
+                    &format!("{path}.final_status"),
+                    "empty_match",
+                    "final_status patterns cannot be empty".into(),
+                );
+            }
+        }
         Condition::All(conditions) | Condition::Any(conditions) => {
             if conditions.is_empty() {
                 issue(
@@ -473,7 +482,8 @@ fn validate_gate_condition(
         | Condition::Calls(_)
         | Condition::TurnsSinceCall(_)
         | Condition::SinceLastCall(_)
-        | Condition::ToolOffered(_) => {}
+        | Condition::ToolOffered(_)
+        | Condition::FinalStatus(_) => {}
     }
     // The shared checks (comparisons, name patterns, empty combinators).
     validate_condition(condition, RuleEvent::BeforeModelRequest, path, issue);

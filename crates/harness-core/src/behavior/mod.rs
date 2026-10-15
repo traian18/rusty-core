@@ -22,8 +22,8 @@ pub use default::{
 pub use definition::*;
 pub use registry::{ProfileRegistry, ProfileRegistryError, ProfileSource};
 pub use rules::{
-    merge_patch, system_reminder, FiredRule, Injection, ResultRewrite, RuleOutcome, RuleStop,
-    ToolDecision, ToolEvent,
+    final_status, merge_patch, system_reminder, FiredRule, Injection, ResultRewrite, RuleOutcome,
+    RuleStop, ToolDecision, ToolEvent,
 };
 pub use state::{
     BehaviorRestoreError, BehaviorState, CallStreak, EnteredFrom, ExecutedCall, RunCounters,

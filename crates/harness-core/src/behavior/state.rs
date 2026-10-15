@@ -75,6 +75,10 @@ pub struct RunCounters {
     /// Times the gate sent a rejection back and the run continued.
     #[serde(default)]
     pub gate_continuations: u32,
+    /// The status line of the latest proposed final answer (see
+    /// `Condition::FinalStatus`); empty when it had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_status: Option<String>,
     /// Profile switches in this run. Carried across switches (which reset
     /// the other counters) and bounded by [`MAX_SWITCHES_PER_RUN`].
     #[serde(default)]
