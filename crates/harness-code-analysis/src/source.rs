@@ -1,5 +1,5 @@
-use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +13,13 @@ pub struct SourceFile {
     pub hash: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceDiscovery {
+    pub files: Vec<SourceFile>,
+    pub diagnostics: Vec<crate::Diagnostic>,
+    pub limits: Vec<String>,
+}
+
 #[async_trait]
 pub trait AnalysisSource: Send + Sync {
     async fn discover(
@@ -20,13 +27,43 @@ pub trait AnalysisSource: Send + Sync {
         root: &Path,
         max_files: usize,
         cancel: &CancellationToken,
-    ) -> Result<Vec<SourceFile>, CallGraphError>;
+    ) -> Result<SourceDiscovery, CallGraphError>;
 }
 
+/// Resource limits applied while discovering source.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    pub max_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_depth: usize,
+}
+
+impl Limits {
+    pub(crate) fn describe(&self, max_files: usize) -> Vec<String> {
+        vec![
+            format!("max_files={max_files}"),
+            format!("max_file_bytes={}", self.max_bytes),
+            format!("max_total_bytes={}", self.max_total_bytes),
+            format!("max_depth={}", self.max_depth),
+        ]
+    }
+}
+
+/// Test hook invoked with a root-relative path after a file was listed and before it is opened.
+pub type OpenHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Bounded filesystem source.
+///
+/// Containment and race resistance rely on directory-handle traversal (`openat` with
+/// `O_NOFOLLOW`), so discovery is implemented for Unix only. On other platforms (Windows is not
+/// supported for this feature) discovery refuses with an explicit error instead of scanning
+/// with weaker guarantees.
+#[derive(Clone)]
 pub struct FileSystemSource {
     max_bytes: usize,
     max_total_bytes: usize,
     max_depth: usize,
+    hook: Option<OpenHook>,
 }
 
 impl FileSystemSource {
@@ -35,77 +72,28 @@ impl FileSystemSource {
             max_bytes,
             max_total_bytes: max_bytes.saturating_mul(16),
             max_depth,
+            hook: None,
         }
     }
 
-    fn visit(
-        &self,
-        root: &Path,
-        dir: &Path,
-        depth: usize,
-        limit: usize,
-        cancel: &CancellationToken,
-        files: &mut Vec<SourceFile>,
-    ) -> Result<(), CallGraphError> {
-        if cancel.is_cancelled() {
-            return Err(CallGraphError::Cancelled);
+    /// Installs a hook run between listing and opening each file. Intended for race tests.
+    #[doc(hidden)]
+    pub fn with_open_hook(mut self, hook: OpenHook) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            max_bytes: self.max_bytes,
+            max_total_bytes: self.max_total_bytes,
+            max_depth: self.max_depth,
         }
-        if depth > self.max_depth {
-            return Err(CallGraphError::LimitExceeded(
-                "source traversal depth".into(),
-            ));
-        }
-        let entries =
-            std::fs::read_dir(dir).map_err(|e| CallGraphError::DependencyFailure(e.to_string()))?;
-        for entry in entries {
-            if files.len() >= limit {
-                return Err(CallGraphError::LimitExceeded("source file count".into()));
-            }
-            let entry = entry.map_err(|e| CallGraphError::DependencyFailure(e.to_string()))?;
-            let path = entry.path();
-            let before = std::fs::symlink_metadata(&path)
-                .map_err(|e| CallGraphError::DependencyFailure(e.to_string()))?;
-            if before.file_type().is_symlink() {
-                continue;
-            }
-            if before.is_dir() {
-                self.visit(root, &path, depth + 1, limit, cancel, files)?;
-                continue;
-            }
-            if !before.is_file() || !is_source(&path) {
-                continue;
-            }
-            if before.len() as usize > self.max_bytes {
-                return Err(CallGraphError::LimitExceeded(format!(
-                    "source file size: {}",
-                    path.display()
-                )));
-            }
-            let (bytes, opened) = read_without_following(&path)?;
-            let after = std::fs::symlink_metadata(&path)
-                .map_err(|e| CallGraphError::DependencyFailure(e.to_string()))?;
-            if !same_file_metadata(&before, &after)
-                || !same_file_metadata(&before, &opened)
-                || after.file_type().is_symlink()
-            {
-                return Err(CallGraphError::DependencyFailure(
-                    "source changed while it was being read".into(),
-                ));
-            }
-            let total_bytes = files.iter().map(|file| file.bytes.len()).sum::<usize>();
-            if total_bytes.saturating_add(bytes.len()) > self.max_total_bytes {
-                return Err(CallGraphError::LimitExceeded("total source bytes".into()));
-            }
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| CallGraphError::InvalidRequest("path escaped root".into()))?;
-            files.push(SourceFile {
-                path: relative.to_string_lossy().replace('\\', "/"),
-                hash: hash_bytes(&bytes),
-                bytes,
-            });
-        }
-        Ok(())
+    }
+
+    pub fn with_total_byte_limit(mut self, max_total_bytes: usize) -> Self {
+        self.max_total_bytes = max_total_bytes;
+        self
     }
 }
 
@@ -116,7 +104,7 @@ impl AnalysisSource for FileSystemSource {
         root: &Path,
         max_files: usize,
         cancel: &CancellationToken,
-    ) -> Result<Vec<SourceFile>, CallGraphError> {
+    ) -> Result<SourceDiscovery, CallGraphError> {
         if !root.is_absolute() {
             return Err(CallGraphError::InvalidRequest(
                 "root must be absolute".into(),
@@ -124,52 +112,51 @@ impl AnalysisSource for FileSystemSource {
         }
         let root = std::fs::canonicalize(root)
             .map_err(|e| CallGraphError::DependencyFailure(e.to_string()))?;
-        let mut files = Vec::new();
-        self.visit(&root, &root, 0, max_files, cancel, &mut files)?;
-        files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
+        let source = self.clone();
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || source.scan_blocking(&root, max_files, &cancel))
+            .await
+            .map_err(|error| {
+                CallGraphError::DependencyFailure(format!("scan task failed: {error}"))
+            })?
     }
 }
 
-fn read_without_following(path: &Path) -> Result<(Vec<u8>, std::fs::Metadata), CallGraphError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself instead of its target.
-        // The subsequent regular-file check rejects reparse points without traversing them.
-        options.custom_flags(0x0020_0000);
+impl FileSystemSource {
+    #[cfg(not(unix))]
+    fn scan_blocking(
+        &self,
+        _root: &Path,
+        _max_files: usize,
+        _cancel: &CancellationToken,
+    ) -> Result<SourceDiscovery, CallGraphError> {
+        Err(CallGraphError::DependencyFailure(
+            "filesystem call-graph analysis is only supported on Unix platforms".into(),
+        ))
     }
-    let mut file = options
-        .open(path)
-        .map_err(|error| CallGraphError::DependencyFailure(error.to_string()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| CallGraphError::DependencyFailure(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(CallGraphError::InvalidRequest(
-            "source is not a regular file".into(),
-        ));
+
+    #[cfg(unix)]
+    fn scan_blocking(
+        &self,
+        root: &Path,
+        max_files: usize,
+        cancel: &CancellationToken,
+    ) -> Result<SourceDiscovery, CallGraphError> {
+        crate::source_unix::scan(root, &self.limits(), max_files, cancel, self.hook.as_ref())
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| CallGraphError::DependencyFailure(error.to_string()))?;
-    Ok((bytes, metadata))
 }
 
-fn same_file_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    before.len() == after.len()
-        && before.modified().ok() == after.modified().ok()
-        && before.file_type() == after.file_type()
-}
-fn is_source(path: &Path) -> bool {
+pub(crate) fn is_source(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some(
             "js" | "jsx"
+                | "mjs"
+                | "cjs"
                 | "ts"
                 | "tsx"
+                | "mts"
+                | "cts"
                 | "py"
                 | "java"
                 | "cs"
@@ -179,18 +166,20 @@ fn is_source(path: &Path) -> bool {
                 | "c"
                 | "cc"
                 | "cpp"
+                | "cxx"
                 | "h"
+                | "hh"
                 | "hpp"
+                | "hxx"
                 | "rb"
         )
     )
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hash = 1469598103934665603u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    format!("{hash:016x}")
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

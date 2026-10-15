@@ -1,9 +1,20 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use crate::api::CallGraphError;
-use crate::model::{CallSite, CallableSymbol, Diagnostic, SnapshotId};
+use crate::model::{CallSite, CallableSymbol, Diagnostic, RefreshStats, SnapshotId, SymbolId};
 
+/// Lookup tables over one immutable generation.
+#[derive(Clone, Default)]
+pub(crate) struct GraphIndex {
+    pub(crate) callable_by_id: BTreeMap<SymbolId, usize>,
+    /// Call-site indices by owning callable.
+    pub(crate) by_caller: BTreeMap<SymbolId, Vec<usize>>,
+    /// Call-site indices by resolved target or possible candidate.
+    pub(crate) by_target: BTreeMap<SymbolId, Vec<usize>>,
+}
+
+/// An immutable, fully built call-graph generation.
 #[derive(Clone)]
 pub struct GraphSnapshot {
     pub(crate) id: SnapshotId,
@@ -13,9 +24,63 @@ pub struct GraphSnapshot {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) limits: Vec<String>,
     pub(crate) freshness: String,
+    pub(crate) generated_at_unix: u64,
+    pub(crate) stats: RefreshStats,
+    pub(crate) index: GraphIndex,
+}
+
+pub(crate) struct SnapshotParts {
+    pub id: SnapshotId,
+    pub callables: Vec<CallableSymbol>,
+    pub calls: Vec<CallSite>,
+    pub partial: bool,
+    pub diagnostics: Vec<Diagnostic>,
+    pub limits: Vec<String>,
+    pub freshness: String,
+    pub generated_at_unix: u64,
+    pub stats: RefreshStats,
 }
 
 impl GraphSnapshot {
+    pub(crate) fn new(parts: SnapshotParts) -> Self {
+        let mut index = GraphIndex::default();
+        for (position, callable) in parts.callables.iter().enumerate() {
+            index.callable_by_id.insert(callable.id.clone(), position);
+        }
+        for (position, call) in parts.calls.iter().enumerate() {
+            index
+                .by_caller
+                .entry(call.caller.clone())
+                .or_default()
+                .push(position);
+            for target in call.target.iter().chain(call.candidates.iter()) {
+                index
+                    .by_target
+                    .entry(target.clone())
+                    .or_default()
+                    .push(position);
+            }
+        }
+        Self {
+            id: parts.id,
+            callables: parts.callables,
+            calls: parts.calls,
+            partial: parts.partial,
+            diagnostics: parts.diagnostics,
+            limits: parts.limits,
+            freshness: parts.freshness,
+            generated_at_unix: parts.generated_at_unix,
+            stats: parts.stats,
+            index,
+        }
+    }
+
+    pub fn generated_at_unix(&self) -> u64 {
+        self.generated_at_unix
+    }
+    pub fn stats(&self) -> &RefreshStats {
+        &self.stats
+    }
     pub fn id(&self) -> &SnapshotId {
         &self.id
     }

@@ -26,6 +26,8 @@ async fn refresh_discovers_callables_and_queries_edges() {
     let callables = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(refreshed.snapshot.clone()),
                 language: None,
                 cursor: None,
@@ -46,6 +48,7 @@ async fn refresh_discovers_callables_and_queries_edges() {
     let calls = graph
         .calls_from(
             harness_code_analysis::CallsFromRequest {
+                resolutions: Vec::new(),
                 snapshot: refreshed.snapshot,
                 caller: caller.id.clone(),
                 cursor: None,
@@ -98,6 +101,8 @@ async fn refresh_keeps_previous_snapshot_until_retention_expires() {
     let old = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(first),
                 language: None,
                 cursor: None,
@@ -165,6 +170,8 @@ async fn publication_failure_keeps_staged_extraction_for_retry() {
     let callables = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(refreshed.snapshot.clone()),
                 language: None,
                 cursor: None,

@@ -1,19 +1,27 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::{AdapterRegistry, ExtractedFile};
+use crate::adapters::{
+    AdapterRegistry, ExtractedFile, Outcome, ProjectIndex, ResolutionContext, TargetRef,
+};
 use crate::api::{CallGraph, CallGraphError};
 use crate::builder::CallGraphBuilder;
 use crate::model::*;
-use crate::snapshot_repository::{GraphSnapshot, SnapshotRepository};
-use crate::source::{AnalysisSource, SourceFile};
+use crate::query::{self, metadata, DEPTH_LIMIT, PAGE_LIMIT};
+use crate::snapshot_repository::{GraphSnapshot, SnapshotParts, SnapshotRepository};
+use crate::source::{AnalysisSource, SourceDiscovery, SourceFile};
 
-const PAGE_LIMIT: u32 = 500;
-const DEPTH_LIMIT: u32 = 32;
+/// Upper bound on source files analysed by one refresh.
+const MAX_FILES: u32 = 10_000;
+/// Upper bound on cached per-file extraction results.
+const CACHE_LIMIT: usize = 20_000;
+/// Maximum candidate targets kept on one ambiguous call site.
+const CANDIDATE_LIMIT: usize = 8;
 
 type ExtractionCacheKey = (String, String, String);
 type ExtractionCache = BTreeMap<ExtractionCacheKey, Arc<ExtractedFile>>;
@@ -68,24 +76,52 @@ impl CallGraph for DefaultCallGraph {
         request: RefreshRequest,
         cancel: CancellationToken,
     ) -> Result<RefreshResponse, CallGraphError> {
-        let _guard = self.refresh_lock.lock().await;
-        self.staged_cache
-            .lock()
-            .map_err(|_| CallGraphError::DependencyFailure("staged cache lock poisoned".into()))?
-            .clear();
-        let max_files = request.max_files.unwrap_or(10_000).min(10_000) as usize;
-        let files = self.source.discover(&self.root, max_files, &cancel).await?;
-        let snapshot = self.build_snapshot(files, &cancel)?;
-        let staged = self.take_staged_cache()?;
+        let started = std::time::Instant::now();
+        let max_files = match request.max_files {
+            Some(0) => {
+                return Err(CallGraphError::InvalidRequest(
+                    "max_files must be at least 1".into(),
+                ))
+            }
+            Some(requested) => requested.min(MAX_FILES),
+            None => MAX_FILES,
+        } as usize;
+        // Refreshes are serialized; waiting for the lock is cancellable.
+        let _guard = cancel
+            .run_until_cancelled(self.refresh_lock.lock())
+            .await
+            .ok_or(CallGraphError::Cancelled)?;
+        check_cancelled(&cancel)?;
+        let discovery = self.source.discover(&self.root, max_files, &cancel).await?;
+        let (snapshot, live_keys) = self.build_snapshot(discovery, &cancel, started).await?;
         let response = RefreshResponse {
             snapshot: snapshot.id.clone(),
             metadata: metadata(&snapshot),
+            stats: snapshot.stats.clone(),
         };
+        let staged = self.take_staged_cache()?;
         if let Err(error) = self.snapshots.publish(snapshot) {
             self.restore_staged_cache(staged)?;
             return Err(error);
         }
-        self.commit_cache(staged)?;
+        self.commit_cache(staged, &live_keys)?;
+        tracing::info!(
+            refresh_duration_ms = started.elapsed().as_millis() as u64,
+            files = response.stats.files_discovered,
+            analyzed = response.stats.files_analyzed,
+            callables = response.stats.callables,
+            calls = response.stats.calls,
+            unresolved_calls = response.stats.unresolved,
+            cache_hits = response.stats.cache_hits,
+            cache_misses = response.stats.cache_misses,
+            limits_triggered = response.stats.limits_triggered,
+            partial = response.metadata.partial,
+            diagnostic_count = response.metadata.diagnostics.len(),
+            "call graph refresh published"
+        );
+        for (reason, count) in &response.stats.unresolved_by_reason {
+            tracing::debug!(reason = reason.as_str(), count, "unresolved call sites");
+        }
         Ok(response)
     }
 
@@ -105,26 +141,14 @@ impl CallGraph for DefaultCallGraph {
         cancel: CancellationToken,
     ) -> Result<CallableResponse, CallGraphError> {
         check_cancelled(&cancel)?;
+        query::validate_limit(request.limit)?;
         let snapshot_id = request
             .snapshot
             .clone()
             .or_else(|| self.current_id())
             .ok_or_else(|| CallGraphError::SnapshotNotFound(SnapshotId("current".into())))?;
         let snapshot = self.snapshot(&snapshot_id)?;
-        let items = snapshot
-            .callables
-            .iter()
-            .filter(|item| {
-                request
-                    .language
-                    .as_ref()
-                    .is_none_or(|language| language == &item.language)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(CallableResponse {
-            page: page(items, request.cursor, request.limit, &snapshot)?,
-        })
+        query::find_callables(&snapshot, &request)
     }
 
     async fn calls_from(
@@ -133,16 +157,9 @@ impl CallGraph for DefaultCallGraph {
         cancel: CancellationToken,
     ) -> Result<CallsResponse, CallGraphError> {
         check_cancelled(&cancel)?;
+        query::validate_limit(request.limit)?;
         let snapshot = self.snapshot(&request.snapshot)?;
-        let items = snapshot
-            .calls
-            .iter()
-            .filter(|call| call.caller == request.caller)
-            .cloned()
-            .collect();
-        Ok(CallsResponse {
-            page: page(items, request.cursor, request.limit, &snapshot)?,
-        })
+        query::calls_from(&snapshot, &request)
     }
 
     async fn calls_to(
@@ -151,16 +168,9 @@ impl CallGraph for DefaultCallGraph {
         cancel: CancellationToken,
     ) -> Result<CallsResponse, CallGraphError> {
         check_cancelled(&cancel)?;
+        query::validate_limit(request.limit)?;
         let snapshot = self.snapshot(&request.snapshot)?;
-        let items = snapshot
-            .calls
-            .iter()
-            .filter(|call| call.target.as_ref() == Some(&request.target))
-            .cloned()
-            .collect();
-        Ok(CallsResponse {
-            page: page(items, request.cursor, request.limit, &snapshot)?,
-        })
+        query::calls_to(&snapshot, &request)
     }
 
     async fn traverse(
@@ -169,38 +179,9 @@ impl CallGraph for DefaultCallGraph {
         cancel: CancellationToken,
     ) -> Result<TraversalResponse, CallGraphError> {
         check_cancelled(&cancel)?;
-        if request.depth > DEPTH_LIMIT {
-            return Err(CallGraphError::LimitExceeded("traversal depth".into()));
-        }
+        query::validate_limit(request.limit)?;
         let snapshot = self.snapshot(&request.snapshot)?;
-        let mut seen = BTreeSet::new();
-        let mut queue = request
-            .roots
-            .into_iter()
-            .map(|id| (id, 0))
-            .collect::<VecDeque<_>>();
-        let mut edges = Vec::new();
-        while let Some((id, depth)) = queue.pop_front() {
-            if !seen.insert(id.clone()) || depth > request.depth {
-                continue;
-            }
-            for call in snapshot.calls.iter().filter(|call| call.caller == id) {
-                edges.push(call.clone());
-                if let Some(target) = &call.target {
-                    queue.push_back((target.clone(), depth + 1));
-                }
-            }
-        }
-        let nodes = snapshot
-            .callables
-            .iter()
-            .filter(|node| seen.contains(&node.id))
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(TraversalResponse {
-            nodes: page(nodes, None, request.limit, &snapshot)?,
-            edges: page(edges, None, request.limit, &snapshot)?,
-        })
+        query::traverse(&snapshot, &request)
     }
 }
 
@@ -209,17 +190,31 @@ impl DefaultCallGraph {
         self.snapshots.current().map(|snapshot| snapshot.id.clone())
     }
 
-    fn build_snapshot(
+    async fn build_snapshot(
         &self,
-        files: Vec<SourceFile>,
+        discovery: SourceDiscovery,
         cancel: &CancellationToken,
-    ) -> Result<GraphSnapshot, CallGraphError> {
+        started: std::time::Instant,
+    ) -> Result<(GraphSnapshot, BTreeSet<ExtractionCacheKey>), CallGraphError> {
+        let SourceDiscovery {
+            files,
+            diagnostics: discovery_diagnostics,
+            limits: discovery_limits,
+        } = discovery;
+        let mut stats = RefreshStats {
+            files_discovered: files.len() as u32,
+            ..RefreshStats::default()
+        };
         let mut extracted = Vec::new();
-        let mut diagnostics = Vec::new();
-        let mut cache_hits = 0usize;
+        let mut diagnostics = discovery_diagnostics;
+        let mut live_keys = BTreeSet::new();
         for file in &files {
             check_cancelled(cancel)?;
+            // Parsing is synchronous; yield so other tasks and cancellation stay responsive.
+            tokio::task::yield_now().await;
+            stats.source_bytes += file.bytes.len() as u64;
             let Some(adapter) = self.adapters.adapter_for_path(&file.path) else {
+                stats.files_skipped += 1;
                 continue;
             };
             let text = match std::str::from_utf8(&file.bytes) {
@@ -229,69 +224,148 @@ impl DefaultCallGraph {
                         path: Some(file.path.clone()),
                         message: format!("invalid UTF-8 source: {error}"),
                     });
+                    stats.files_skipped += 1;
                     continue;
                 }
             };
             let key = (
                 file.path.clone(),
                 file.hash.clone(),
-                adapter.version().into(),
+                adapter.version().to_owned(),
             );
-            let cached = self
-                .extraction_cache
-                .lock()
-                .map_err(|_| {
+            // Facts staged by an earlier attempt that failed before publishing are reusable too.
+            let cached = {
+                let committed = self.extraction_cache.lock().map_err(|_| {
                     CallGraphError::DependencyFailure("extraction cache lock poisoned".into())
-                })?
-                .get(&key)
-                .cloned();
+                })?;
+                match committed.get(&key) {
+                    Some(facts) => Some(facts.clone()),
+                    None => self
+                        .staged_cache
+                        .lock()
+                        .map_err(|_| {
+                            CallGraphError::DependencyFailure("staged cache lock poisoned".into())
+                        })?
+                        .get(&key)
+                        .cloned(),
+                }
+            };
             let facts = if let Some(facts) = cached {
-                cache_hits += 1;
+                stats.cache_hits += 1;
                 facts
             } else {
-                let facts = Arc::new(adapter.extract(&file.path, text)?);
-                self.staged_cache
-                    .lock()
-                    .map_err(|_| {
-                        CallGraphError::DependencyFailure("staged cache lock poisoned".into())
-                    })?
-                    .insert(key, facts.clone());
-                facts
+                stats.cache_misses += 1;
+                match adapter.extract(&file.path, text) {
+                    Ok(facts) => {
+                        let facts = Arc::new(facts);
+                        self.staged_cache
+                            .lock()
+                            .map_err(|_| {
+                                CallGraphError::DependencyFailure(
+                                    "staged cache lock poisoned".into(),
+                                )
+                            })?
+                            .insert(key.clone(), facts.clone());
+                        facts
+                    }
+                    Err(CallGraphError::LimitExceeded(message))
+                    | Err(CallGraphError::InvalidRequest(message)) => {
+                        diagnostics.push(Diagnostic {
+                            path: Some(file.path.clone()),
+                            message: format!("analysis limit rejected the file: {message}"),
+                        });
+                        stats.files_skipped += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
+            live_keys.insert(key);
+            stats.files_analyzed += 1;
             diagnostics.extend(facts.diagnostics.clone());
             extracted.push((file.path.clone(), facts));
         }
+        check_cancelled(cancel)?;
+        tokio::task::yield_now().await;
         let (callables, calls) = self.resolve(&extracted);
         check_cancelled(cancel)?;
-        let id = SnapshotId(format!(
-            "snapshot-{}",
-            files
-                .iter()
-                .map(|file| file.hash.as_str())
-                .collect::<Vec<_>>()
-                .join("-")
+        stats.callables = callables.len() as u32;
+        stats.calls = calls.len() as u32;
+        for call in &calls {
+            match call.resolution {
+                Resolution::Resolved => stats.resolved += 1,
+                Resolution::Possible => stats.possible += 1,
+                Resolution::Unresolved => {
+                    stats.unresolved += 1;
+                    let reason = call
+                        .evidence
+                        .as_ref()
+                        .map_or("unknown", |evidence| evidence.rule_id.as_str());
+                    *stats
+                        .unresolved_by_reason
+                        .entry(reason.to_owned())
+                        .or_default() += 1;
+                }
+            }
+        }
+        stats.limits_triggered = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("limit"))
+            .count() as u32;
+        diagnostics.sort_by(|a, b| a.path.cmp(&b.path).then(a.message.cmp(&b.message)));
+        let partial = !diagnostics.is_empty();
+        stats.elapsed_ms = started.elapsed().as_millis() as u64;
+        let id = self.snapshot_identity(&files);
+        let mut limits = discovery_limits;
+        limits.push(format!(
+            "page_size<={PAGE_LIMIT}; candidates<={CANDIDATE_LIMIT}; traversal_depth<={DEPTH_LIMIT}; \
+             traversal_visits<={}; cache<={CACHE_LIMIT}",
+            query::VISIT_LIMIT
         ));
-        let partial = !diagnostics.is_empty() || extracted.len() != files.len();
-        tracing::info!(
-            files = files.len(),
-            callables = callables.len(),
-            calls = calls.len(),
-            cache_hits,
-            partial,
-            "call graph refresh completed"
-        );
-        let snapshot = GraphSnapshot {
+        let generated_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let snapshot = GraphSnapshot::new(SnapshotParts {
             id,
             callables,
             calls,
             partial,
             diagnostics,
-            limits: vec![
-                "file count, file size, total bytes, page size, candidates, cache, and traversal depth are bounded".into(),
-            ],
-            freshness: "fresh-after-refresh".into(),
-        };
-        Ok(snapshot)
+            limits,
+            freshness: "analysed bytes are identified by hash; edits after the refresh are not \
+                        reflected until the next refresh"
+                .into(),
+            generated_at_unix,
+            stats,
+        });
+        Ok((snapshot, live_keys))
+    }
+
+    /// Deterministic identity of the analysed inputs and the analysis rules.
+    fn snapshot_identity(&self, files: &[SourceFile]) -> SnapshotId {
+        let mut hasher = Sha256::new();
+        hasher.update(b"call-graph-snapshot-v2\0");
+        for capability in self.adapters.capabilities() {
+            hasher.update(format!("{:?}", capability.language).as_bytes());
+            hasher.update(b"\0");
+            hasher.update(capability.adapter_version.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(capability.resolver_version.as_bytes());
+            hasher.update(b"\0");
+        }
+        for file in files {
+            hasher.update(file.path.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(file.hash.as_bytes());
+            hasher.update(b"\0");
+        }
+        let digest = hasher.finalize();
+        let hex: String = digest
+            .iter()
+            .take(12)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        SnapshotId(format!("snap-{hex}"))
     }
 
     fn take_staged_cache(&self) -> Result<ExtractionCache, CallGraphError> {
@@ -308,15 +382,26 @@ impl DefaultCallGraph {
             .lock()
             .map_err(|_| CallGraphError::DependencyFailure("staged cache lock poisoned".into()))?;
         pending.extend(staged);
+        while pending.len() > CACHE_LIMIT {
+            let Some(key) = pending.keys().next().cloned() else {
+                break;
+            };
+            pending.remove(&key);
+        }
         Ok(())
     }
 
-    fn commit_cache(&self, staged: ExtractionCache) -> Result<(), CallGraphError> {
-        const CACHE_LIMIT: usize = 20_000;
+    /// Merges freshly extracted facts and drops entries no file of the workspace still uses.
+    fn commit_cache(
+        &self,
+        staged: ExtractionCache,
+        live: &BTreeSet<ExtractionCacheKey>,
+    ) -> Result<(), CallGraphError> {
         let mut cache = self.extraction_cache.lock().map_err(|_| {
             CallGraphError::DependencyFailure("extraction cache lock poisoned".into())
         })?;
         cache.extend(staged);
+        cache.retain(|key, _| live.contains(key));
         while cache.len() > CACHE_LIMIT {
             let Some(key) = cache.keys().next().cloned() else {
                 break;
@@ -331,23 +416,30 @@ impl DefaultCallGraph {
         files: &[(String, Arc<ExtractedFile>)],
     ) -> (Vec<CallableSymbol>, Vec<CallSite>) {
         let mut callables = Vec::new();
-        let mut by_name: BTreeMap<String, Vec<(String, SymbolId)>> = BTreeMap::new();
-        let mut owners = BTreeMap::new();
+        let mut ids: BTreeMap<(String, u32), SymbolId> = BTreeMap::new();
         for (path, file) in files {
             for fact in &file.callables {
-                let id = SymbolId(format!("{}:{}:{}", path, fact.start, fact.name));
-                let owner = fact
-                    .owner
-                    .as_ref()
-                    .map(|name| SymbolId(format!("{}:owner:{}", path, name)));
-                owners.insert((path.clone(), fact.name.clone()), id.clone());
-                by_name
-                    .entry(fact.name.clone())
-                    .or_default()
-                    .push((path.clone(), id.clone()));
+                ids.insert(
+                    (path.clone(), fact.key),
+                    SymbolId(format!("{}:{}:{}", path, fact.key, fact.name)),
+                );
+            }
+        }
+        for (path, file) in files {
+            for fact in &file.callables {
+                let id = ids[&(path.clone(), fact.key)].clone();
+                let owner = match fact.parent {
+                    Some(parent) => ids.get(&(path.clone(), parent)).cloned(),
+                    None => fact
+                        .container
+                        .as_ref()
+                        .map(|name| SymbolId(format!("{}:owner:{}", path, name))),
+                };
                 callables.push(CallableSymbol {
                     id,
                     name: fact.name.clone(),
+                    qualified_name: qualified_name(file, fact),
+                    kind: fact.kind,
                     language: file.language.clone(),
                     span: SourceSpan {
                         path: path.clone(),
@@ -363,33 +455,56 @@ impl DefaultCallGraph {
                 .path
                 .cmp(&right.span.path)
                 .then(left.span.start_byte.cmp(&right.span.start_byte))
+                .then(left.id.cmp(&right.id))
         });
+        let project = ProjectIndex::new(
+            files
+                .iter()
+                .map(|(path, file)| (path.as_str(), file.as_ref())),
+        );
         let mut calls = Vec::new();
         for (path, file) in files {
+            let adapter_version = self
+                .adapters
+                .adapter_for(&file.language)
+                .map(|adapter| adapter.version())
+                .unwrap_or("unknown");
+            let resolver = self.adapters.resolver_for(&file.language);
             for fact in &file.calls {
-                let Some(caller_name) = &fact.caller else {
+                let Some(caller) = ids.get(&(path.clone(), fact.caller)).cloned() else {
                     continue;
                 };
-                let Some(caller) = owners.get(&(path.clone(), caller_name.clone())).cloned() else {
-                    continue;
+                let ctx = ResolutionContext {
+                    path,
+                    file,
+                    project: &project,
+                    namespace: file
+                        .callable(fact.caller)
+                        .map_or("", |callable| callable.namespace.as_str()),
                 };
-                let (target, resolution, rule, explanation) =
-                    resolve_target(path, file, fact, &by_name, self.adapters.resolver());
-                calls.push(CallSite {
+                let outcome = match resolver {
+                    Some(resolver) => resolver.resolve(&ctx, fact),
+                    None => Outcome::Unresolved {
+                        rule: "no-resolver",
+                        explanation: "no resolver is registered for this language".into(),
+                    },
+                };
+                let version = match resolver {
+                    Some(resolver) => format!("{adapter_version}+{}", resolver.version()),
+                    None => adapter_version.to_owned(),
+                };
+                calls.push(call_site(
                     caller,
-                    span: SourceSpan {
+                    SourceSpan {
                         path: path.clone(),
                         start_byte: fact.start,
                         end_byte: fact.end,
                     },
-                    target,
-                    resolution,
-                    evidence: Some(Evidence {
-                        rule_id: rule.into(),
-                        adapter_version: "profile-1".into(),
-                        explanation: explanation.into(),
-                    }),
-                });
+                    outcome,
+                    &version,
+                    &ids,
+                    files,
+                ));
             }
         }
         calls.sort_by(|left, right| {
@@ -397,90 +512,149 @@ impl DefaultCallGraph {
                 .path
                 .cmp(&right.span.path)
                 .then(left.span.start_byte.cmp(&right.span.start_byte))
+                .then(left.caller.cmp(&right.caller))
         });
         (callables, calls)
     }
 }
 
-fn resolve_target(
-    path: &str,
-    file: &ExtractedFile,
-    call: &crate::adapters::CallFact,
-    by_name: &BTreeMap<String, Vec<(String, SymbolId)>>,
-    resolver: &dyn crate::adapters::LanguageResolver,
-) -> (Option<SymbolId>, Resolution, &'static str, &'static str) {
-    let local = by_name
-        .get(&call.name)
-        .and_then(|items| unique(items.iter().filter(|(candidate, _)| candidate == path)));
-    if let Some(target) = local {
-        return (
-            Some(target),
-            Resolution::Resolved,
-            "same-file-lexical",
-            "resolved to the unique same-file callable",
-        );
+fn qualified_name(file: &ExtractedFile, fact: &crate::adapters::CallableFact) -> String {
+    let mut parts = Vec::new();
+    if !fact.namespace.is_empty() {
+        parts.push(fact.namespace.clone());
     }
-    if call.qualifier.is_some() {
-        return (
-            None,
-            Resolution::Unresolved,
-            "dynamic-receiver",
-            "receiver type is not statically known",
-        );
+    if let Some(container) = &fact.container {
+        parts.push(container.clone());
     }
-    let imported = resolver.imported_name(file, &call.name);
-    if imported.is_none() {
-        return (
-            None,
-            Resolution::Unresolved,
-            "unimported-cross-file",
-            "cross-file symbols require a supported static import",
-        );
+    let mut chain = vec![fact.name.clone()];
+    let mut parent = fact.parent;
+    while let Some(key) = parent {
+        let Some(callable) = file.callable(key) else {
+            break;
+        };
+        chain.push(callable.name.clone());
+        parent = callable.parent;
     }
-    let lookup = imported.map_or(call.name.as_str(), |item| item.imported.as_str());
-    let candidates = by_name.get(lookup).map(Vec::as_slice).unwrap_or_default();
-    let filtered = candidates.iter().filter(|(candidate, _)| {
-        imported.is_none_or(|item| module_matches(&item.module, candidate))
-    });
-    let count = filtered.clone().count();
-    match (count, unique(filtered)) {
-        (1, Some(target)) => (
-            Some(target),
-            Resolution::Resolved,
-            "static-import",
-            "resolved through a unique static import or workspace symbol",
-        ),
-        (0, _) => (
-            None,
-            Resolution::Unresolved,
-            "unresolved-static",
-            "no supported static target was found",
-        ),
-        _ => (
-            None,
-            Resolution::Possible,
-            "ambiguous-static",
-            "multiple static targets remain possible",
-        ),
-    }
+    chain.reverse();
+    parts.extend(chain);
+    parts.join(".")
 }
 
-fn unique<'a>(mut items: impl Iterator<Item = &'a (String, SymbolId)>) -> Option<SymbolId> {
-    let first = items.next()?.1.clone();
-    items.next().is_none().then_some(first)
-}
-
-fn module_matches(module: &str, path: &str) -> bool {
-    let normalized = module.trim_start_matches('.').replace(['.', ':'], "/");
-    path.trim_end_matches(
-        Path::new(path)
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or(""),
-    )
-    .trim_end_matches('.')
-    .trim_end_matches('/')
-    .ends_with(normalized.trim_end_matches(['/', ';']))
+fn call_site(
+    caller: SymbolId,
+    span: SourceSpan,
+    outcome: Outcome,
+    version: &str,
+    ids: &BTreeMap<(String, u32), SymbolId>,
+    files: &[(String, Arc<ExtractedFile>)],
+) -> CallSite {
+    let definition_span = |target: &TargetRef| {
+        files
+            .iter()
+            .find(|(path, _)| *path == target.path)
+            .and_then(|(_, file)| file.callable(target.key))
+            .map(|callable| SourceSpan {
+                path: target.path.clone(),
+                start_byte: callable.start,
+                end_byte: callable.end,
+            })
+    };
+    let evidence = |rule: &str, explanation: String, span: Option<SourceSpan>| Evidence {
+        rule_id: rule.into(),
+        adapter_version: version.into(),
+        explanation,
+        span,
+    };
+    let site = |target, resolution, evidence, candidates, truncated, external| CallSite {
+        caller: caller.clone(),
+        span: span.clone(),
+        target,
+        resolution,
+        evidence: Some(evidence),
+        candidates,
+        candidates_truncated: truncated,
+        external,
+    };
+    match outcome {
+        Outcome::Resolved {
+            target,
+            rule,
+            explanation,
+            span: evidence_span,
+        } => match ids.get(&(target.path.clone(), target.key)) {
+            Some(id) => site(
+                Some(id.clone()),
+                Resolution::Resolved,
+                evidence(
+                    rule,
+                    explanation,
+                    evidence_span.or_else(|| definition_span(&target)),
+                ),
+                Vec::new(),
+                false,
+                None,
+            ),
+            None => site(
+                None,
+                Resolution::Unresolved,
+                evidence(
+                    "missing-target",
+                    "the resolver named a callable that is not in this snapshot".into(),
+                    Some(span.clone()),
+                ),
+                Vec::new(),
+                false,
+                None,
+            ),
+        },
+        Outcome::Possible {
+            targets,
+            rule,
+            explanation,
+            span: evidence_span,
+        } => {
+            let all: Vec<SymbolId> = targets
+                .iter()
+                .filter_map(|target| ids.get(&(target.path.clone(), target.key)).cloned())
+                .collect();
+            let truncated = all.len() > CANDIDATE_LIMIT;
+            let candidates = all.into_iter().take(CANDIDATE_LIMIT).collect();
+            let explanation = if truncated {
+                format!("{explanation} (candidate list truncated at {CANDIDATE_LIMIT})")
+            } else {
+                explanation
+            };
+            site(
+                None,
+                Resolution::Possible,
+                evidence(rule, explanation, evidence_span.or(Some(span.clone()))),
+                candidates,
+                truncated,
+                None,
+            )
+        }
+        Outcome::Unresolved { rule, explanation } => site(
+            None,
+            Resolution::Unresolved,
+            evidence(rule, explanation, Some(span.clone())),
+            Vec::new(),
+            false,
+            None,
+        ),
+        Outcome::External {
+            name,
+            rule,
+            explanation,
+            span: evidence_span,
+        } => site(
+            None,
+            Resolution::Unresolved,
+            evidence(rule, explanation, evidence_span.or(Some(span.clone()))),
+            Vec::new(),
+            false,
+            Some(name),
+        ),
+    }
 }
 
 fn check_cancelled(cancel: &CancellationToken) -> Result<(), CallGraphError> {
@@ -489,59 +663,4 @@ fn check_cancelled(cancel: &CancellationToken) -> Result<(), CallGraphError> {
     } else {
         Ok(())
     }
-}
-fn metadata(snapshot: &GraphSnapshot) -> QueryMetadata {
-    QueryMetadata {
-        snapshot: snapshot.id.clone(),
-        partial: snapshot.partial,
-        diagnostics: snapshot.diagnostics.clone(),
-        truncated: false,
-        limits: snapshot.limits.clone(),
-        freshness: snapshot.freshness.clone(),
-    }
-}
-fn page<T: Clone>(
-    items: Vec<T>,
-    cursor: Option<String>,
-    limit: u32,
-    snapshot: &GraphSnapshot,
-) -> Result<Page<T>, CallGraphError> {
-    let start = match cursor {
-        Some(cursor) => decode_cursor(&cursor, &snapshot.id)?,
-        None => 0,
-    };
-    if start > items.len() {
-        return Err(CallGraphError::InvalidRequest(
-            "cursor is out of range".into(),
-        ));
-    }
-    let limit = limit.clamp(1, PAGE_LIMIT) as usize;
-    let truncated = start + limit < items.len();
-    let next_cursor = truncated.then(|| encode_cursor(&snapshot.id, start + limit));
-    Ok(Page {
-        items: items.into_iter().skip(start).take(limit).collect(),
-        next_cursor,
-        metadata: QueryMetadata {
-            truncated,
-            ..metadata(snapshot)
-        },
-    })
-}
-
-fn encode_cursor(snapshot: &SnapshotId, offset: usize) -> String {
-    format!("{}:{offset}", snapshot.0)
-}
-
-fn decode_cursor(cursor: &str, snapshot: &SnapshotId) -> Result<usize, CallGraphError> {
-    let (cursor_snapshot, offset) = cursor
-        .rsplit_once(':')
-        .ok_or_else(|| CallGraphError::InvalidRequest("invalid cursor".into()))?;
-    if cursor_snapshot != snapshot.0 {
-        return Err(CallGraphError::InvalidRequest(
-            "cursor belongs to a different snapshot".into(),
-        ));
-    }
-    offset
-        .parse()
-        .map_err(|_| CallGraphError::InvalidRequest("invalid cursor".into()))
 }

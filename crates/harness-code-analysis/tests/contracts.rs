@@ -23,6 +23,8 @@ async fn resolves_unique_callable_across_files() {
     let callables = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(snapshot.clone()),
                 language: None,
                 cursor: None,
@@ -41,6 +43,7 @@ async fn resolves_unique_callable_across_files() {
     let calls = graph
         .calls_from(
             harness_code_analysis::CallsFromRequest {
+                resolutions: Vec::new(),
                 snapshot,
                 caller: caller.id.clone(),
                 cursor: None,
@@ -69,6 +72,8 @@ async fn cross_file_calls_require_static_imports() {
     let callables = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(snapshot.clone()),
                 language: None,
                 cursor: None,
@@ -87,6 +92,7 @@ async fn cross_file_calls_require_static_imports() {
     let calls = graph
         .calls_from(
             harness_code_analysis::CallsFromRequest {
+                resolutions: Vec::new(),
                 snapshot,
                 caller: caller.id.clone(),
                 cursor: None,
@@ -102,7 +108,7 @@ async fn cross_file_calls_require_static_imports() {
     );
     assert_eq!(
         calls.page.items[0].evidence.as_ref().unwrap().rule_id,
-        "unimported-cross-file"
+        "unresolved-name"
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -121,6 +127,8 @@ async fn cursors_are_bound_to_their_snapshot() {
     let page = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(first),
                 language: None,
                 cursor: None,
@@ -143,6 +151,8 @@ async fn cursors_are_bound_to_their_snapshot() {
     let error = graph
         .find_callables(
             FindCallablesRequest {
+                name: None,
+                path: None,
                 snapshot: Some(second),
                 language: None,
                 cursor: page.page.next_cursor,

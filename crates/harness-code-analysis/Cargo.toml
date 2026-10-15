@@ -8,11 +8,17 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[[bench]]
+name = "call_graph"
+path = "benches/call_graph.rs"
+harness = false
+
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio-util = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
+sha2 = "0.10"
 tracing = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-javascript = { workspace = true }
@@ -31,6 +37,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

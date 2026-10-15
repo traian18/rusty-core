@@ -12,7 +12,7 @@ pub struct CallGraphBuilder {
     source: Option<Arc<dyn AnalysisSource>>,
     snapshots: Option<Arc<dyn SnapshotRepository>>,
     adapters: Vec<Arc<dyn LanguageAdapter>>,
-    resolver: Option<Arc<dyn LanguageResolver>>,
+    resolvers: Vec<Arc<dyn LanguageResolver>>,
 }
 
 impl CallGraphBuilder {
@@ -22,7 +22,7 @@ impl CallGraphBuilder {
             source: None,
             snapshots: None,
             adapters: Vec::new(),
-            resolver: None,
+            resolvers: Vec::new(),
         }
     }
 
@@ -41,8 +41,9 @@ impl CallGraphBuilder {
         self
     }
 
+    /// Registers a resolver for the language it reports; languages without one stay unresolved.
     pub fn resolver(mut self, resolver: Arc<dyn LanguageResolver>) -> Self {
-        self.resolver = Some(resolver);
+        self.resolvers.push(resolver);
         self
     }
 
@@ -53,17 +54,13 @@ impl CallGraphBuilder {
             ));
         }
         let custom_adapters = !self.adapters.is_empty();
-        if !custom_adapters && self.resolver.is_some() {
+        if !custom_adapters && !self.resolvers.is_empty() {
             return Err(CallGraphError::InvalidRequest(
                 "a custom resolver requires custom adapters".into(),
             ));
         }
         let adapters = if custom_adapters {
-            AdapterRegistry::new(
-                self.adapters,
-                self.resolver
-                    .unwrap_or_else(|| Arc::new(crate::adapters::StaticResolver)),
-            )?
+            AdapterRegistry::new(self.adapters, self.resolvers)?
         } else {
             AdapterRegistry::builtin()
         };

@@ -109,4 +109,157 @@ mod tests {
         assert_eq!(unknown.descriptor().name, "custom.tool");
         assert_eq!(unknown.descriptor().description, "test");
     }
+
+    use harness_code_analysis::{
+        CallGraph, DefaultCallGraph, FindCallablesRequest, RefreshRequest, SnapshotId,
+    };
+    use harness_tools::{CancellationToken, ToolInput};
+
+    fn workspace_with_source(name: &str) -> (std::path::PathBuf, Arc<FsWorkspace>) {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.py"), "def a():\n    pass\ndef b():\n    a()\n").unwrap();
+        (root.clone(), Arc::new(FsWorkspace::new(root)))
+    }
+
+    #[tokio::test]
+    async fn graph_tools_without_a_graph_fail_closed_like_unknown_tools() {
+        let workspace = Arc::new(FsWorkspace::new(std::env::temp_dir()));
+        for name in [
+            "code_graph.refresh",
+            "code_graph.capabilities",
+            "code_graph.find_callables",
+            "code_graph.calls",
+            "code_graph.traverse",
+        ] {
+            let executor =
+                build_executor_for_with_graph(&descriptor(name), workspace.clone(), None);
+            let result = executor
+                .execute(
+                    ToolInput {
+                        arguments: serde_json::json!({}),
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "{name} must not run without an authorized graph"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn executors_built_separately_share_the_one_authorized_graph() {
+        let (root, workspace) = workspace_with_source("cg-share");
+        let graph: Arc<dyn CallGraph> = Arc::new(DefaultCallGraph::new(&root));
+        // Two executors, as two construction paths (new session / restored session) would build.
+        let refresh = build_executor_for_with_graph(
+            &descriptor("code_graph.refresh"),
+            workspace.clone(),
+            Some(graph.clone()),
+        );
+        let find = build_executor_for_with_graph(
+            &descriptor("code_graph.find_callables"),
+            workspace,
+            Some(graph),
+        );
+        let refreshed = refresh
+            .execute(
+                ToolInput {
+                    arguments: serde_json::json!({}),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!refreshed.is_error, "{}", refreshed.output);
+        let found = find
+            .execute(
+                ToolInput {
+                    arguments: serde_json::json!({"limit": 10}),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!found.is_error, "{}", found.output);
+        assert_eq!(
+            found.output["result"]["page"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn separate_contexts_sharing_a_root_stay_isolated() {
+        let (root, workspace) = workspace_with_source("cg-isolate");
+        let first: Arc<dyn CallGraph> = Arc::new(DefaultCallGraph::new(&root));
+        let second: Arc<dyn CallGraph> = Arc::new(DefaultCallGraph::new(&root));
+        let snapshot = first
+            .refresh(RefreshRequest::default(), CancellationToken::new())
+            .await
+            .unwrap()
+            .snapshot;
+        let tool = build_executor_for_with_graph(
+            &descriptor("code_graph.find_callables"),
+            workspace,
+            Some(second),
+        );
+        let result = tool
+            .execute(
+                ToolInput {
+                    arguments: serde_json::json!({"snapshot": snapshot.0, "limit": 5}),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.output["error"]["code"], "snapshot_not_found");
+        // The first context is unaffected.
+        let ok = first
+            .find_callables(
+                FindCallablesRequest {
+                    snapshot: Some(SnapshotId(snapshot.0.clone())),
+                    language: None,
+                    name: None,
+                    path: None,
+                    cursor: None,
+                    limit: 5,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(ok.is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_tools_are_unaffected_by_graph_availability() {
+        let workspace = Arc::new(FsWorkspace::new(std::env::temp_dir()));
+        let graph: Arc<dyn CallGraph> = Arc::new(DefaultCallGraph::new(std::env::temp_dir()));
+        for name in [
+            "fs.read",
+            "fs.edit",
+            "workspace.search",
+            "shell.exec",
+            "git.status",
+            "web_fetch",
+        ] {
+            let without = build_executor_for_with_graph(&descriptor(name), workspace.clone(), None);
+            let with = build_executor_for_with_graph(
+                &descriptor(name),
+                workspace.clone(),
+                Some(graph.clone()),
+            );
+            assert_eq!(without.descriptor().name, with.descriptor().name, "{name}");
+        }
+        let unknown =
+            build_executor_for_with_graph(&descriptor("custom.tool"), workspace, Some(graph));
+        assert_eq!(unknown.descriptor().name, "custom.tool");
+    }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use harness_code_analysis::{
     AnalysisSource, CallGraph, CallGraphBuilder, CallGraphError, LanguageAdapter,
-    LanguageCapabilities, LanguageId, LanguageResolver, SourceFile,
+    LanguageCapabilities, LanguageId, LanguageResolver, SourceDiscovery,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -17,8 +17,8 @@ impl AnalysisSource for EmptySource {
         _root: &Path,
         _max_files: usize,
         _cancel: &CancellationToken,
-    ) -> Result<Vec<SourceFile>, CallGraphError> {
-        Ok(Vec::new())
+    ) -> Result<SourceDiscovery, CallGraphError> {
+        Ok(SourceDiscovery::default())
     }
 }
 
@@ -36,6 +36,8 @@ impl LanguageAdapter for MinimalAdapter {
             language: LanguageId::Rust,
             supported: true,
             limitations: Vec::new(),
+            adapter_version: String::new(),
+            resolver_version: String::new(),
         }
     }
     fn extract(
@@ -43,25 +45,30 @@ impl LanguageAdapter for MinimalAdapter {
         _path: &str,
         _source: &str,
     ) -> Result<harness_code_analysis::ExtractedFile, CallGraphError> {
-        Ok(harness_code_analysis::ExtractedFile {
-            language: LanguageId::Rust,
-            callables: Vec::new(),
-            calls: Vec::new(),
-            imports: Vec::new(),
-            diagnostics: Vec::new(),
-        })
+        Ok(harness_code_analysis::ExtractedFile::empty(
+            LanguageId::Rust,
+        ))
     }
 }
 
 struct EmptyResolver;
 
 impl LanguageResolver for EmptyResolver {
-    fn imported_name<'a>(
+    fn language(&self) -> LanguageId {
+        LanguageId::Rust
+    }
+    fn version(&self) -> &'static str {
+        "empty-1"
+    }
+    fn resolve(
         &self,
-        _file: &'a harness_code_analysis::ExtractedFile,
-        _local: &str,
-    ) -> Option<&'a harness_code_analysis::ImportFact> {
-        None
+        _ctx: &harness_code_analysis::ResolutionContext<'_>,
+        _call: &harness_code_analysis::CallFact,
+    ) -> harness_code_analysis::Outcome {
+        harness_code_analysis::Outcome::Unresolved {
+            rule: "empty",
+            explanation: "substitute resolver".into(),
+        }
     }
 }
 
