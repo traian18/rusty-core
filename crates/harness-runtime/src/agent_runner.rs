@@ -941,7 +941,11 @@ impl AgentRunner {
         let commands = self.task.commands_tx.clone();
         let executor = self.tool_registry.get_executor(&name);
         let scheduler = self.scheduler.clone();
-        let tool_timeout = scheduler.tool_call_timeout();
+        let tool_timeout = executor
+            .as_ref()
+            .map_or(Some(scheduler.tool_call_timeout()), |executor| {
+                executor.call_timeout(&arguments, scheduler.tool_call_timeout())
+            });
 
         // M3: `shell.exec` (and any future tool with the same shape) forks a
         // real OS process, which is a heavier resource than "a tool call" in
@@ -983,16 +987,16 @@ impl AgentRunner {
             // Cancelling the token (not just dropping the future) lets the
             // executor reap what it started, e.g. a shell process group.
             let timeout_token = token.clone();
-            let outcome = match tokio::time::timeout(
-                tool_timeout,
-                harness_tools::with_tool_call(
-                    call_id.to_string(),
-                    session_id,
-                    executor.execute(input, token),
-                ),
-            )
-            .await
-            {
+            let execution = harness_tools::with_tool_call(
+                call_id.to_string(),
+                session_id,
+                executor.execute(input, token),
+            );
+            let timed = match tool_timeout {
+                Some(limit) => tokio::time::timeout(limit, execution).await,
+                None => Ok(execution.await),
+            };
+            let outcome = match timed {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     timeout_token.cancel();

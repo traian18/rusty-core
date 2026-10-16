@@ -1012,6 +1012,73 @@ async fn hung_tool_call_times_out_with_error_result() {
     }
 }
 
+/// A tool that asks for its own call limit is not cut off at the scheduler's
+/// default: a slow build or a question waiting on a person may take longer.
+#[tokio::test]
+async fn tool_can_ask_for_a_longer_call_limit_than_the_default() {
+    for (own_limit, expect_timeout) in [
+        (None, false),
+        (Some(Duration::from_secs(5)), false),
+        (Some(Duration::from_millis(50)), true),
+    ] {
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let mut agent = test_agent_with_ask_permission_tool(agent_id, session_id, "fs.slow");
+        for capability in agent.capabilities.tools.tools.values_mut() {
+            capability.policy.permission = harness_protocol::tools::PermissionMode::Allow;
+        }
+        let (task, _sender) = AgentTask::new(agent_id);
+        let mut registry = FakeToolRegistry::new();
+        registry.add_executor(Arc::new(
+            FakeToolExecutor::new(harness_tools::ToolDescriptor {
+                id: harness_tools::ToolId::new("fs.slow"),
+                name: "fs.slow".into(),
+                description: "fake slow tool".into(),
+                input_schema: serde_json::json!({}),
+            })
+            .taking(Duration::from_millis(300))
+            .with_call_timeout(own_limit),
+        ));
+        let scheduler = Arc::new(Scheduler::new(SchedulerConfig {
+            tool_call_timeout: Duration::from_millis(100),
+            ..SchedulerConfig::default()
+        }));
+        let live_state: LiveStateTable = Arc::new(Mutex::new(StdHashMap::new()));
+        let mut runner = AgentRunner::new(
+            agent,
+            task,
+            Arc::new(FakeBackend::new()),
+            Arc::new(registry),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+            CancellationToken::new(),
+            live_state,
+            scheduler,
+        );
+        let call_id = harness_protocol::ids::ToolCallId::new();
+        runner
+            .execute_tool(ToolRequest {
+                call: harness_protocol::tools::ToolCall {
+                    id: call_id,
+                    name: "fs.slow".into(),
+                    arguments: serde_json::json!({}),
+                },
+                permission: harness_protocol::tools::PermissionMode::Allow,
+            })
+            .await;
+        let command = tokio::time::timeout(Duration::from_secs(3), runner.task.commands.recv())
+            .await
+            .expect("the call resolves");
+        match (command, expect_timeout) {
+            (Some(AgentCommand::ToolCompleted { .. }), false) => {}
+            (Some(AgentCommand::ToolFailed { error, .. }), true) => {
+                assert!(matches!(error, harness_protocol::tools::ToolError::Timeout));
+            }
+            (other, _) => panic!("limit {own_limit:?}: unexpected {other:?}"),
+        }
+    }
+}
+
 /// M2: `AgentCommand::Cancel` is documented as cancelling only the
 /// *current run* (see `AgentCommand::Cancel`'s doc comment and RC-203's
 /// `multiple_follow_ups_are_fifo_and_survive_cancellation`). A follow-up

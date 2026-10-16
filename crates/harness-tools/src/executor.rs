@@ -5,6 +5,8 @@
 //! out of this crate prevents placeholder executors from being registered in
 //! production by mistake.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -156,6 +158,15 @@ pub enum ProgressPhase {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// How long the runtime lets one call run before cancelling it as timed
+    /// out. `default` is the scheduler's limit for ordinary tools; a tool that
+    /// legitimately runs longer (a build, a test suite) or waits on a person
+    /// returns a longer limit, or `None` for no limit (it is still cancelled
+    /// with its run).
+    fn call_timeout(&self, _arguments: &serde_json::Value, default: Duration) -> Option<Duration> {
+        Some(default)
+    }
 
     async fn execute(
         &self,

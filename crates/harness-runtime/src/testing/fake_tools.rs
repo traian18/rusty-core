@@ -16,6 +16,10 @@ pub struct FakeToolExecutor {
     /// returning immediately, simulating an in-flight tool call. Used to
     /// exercise mid-flight tool cancellation deterministically.
     block_until_cancelled: bool,
+    /// How long `execute` takes before returning its scripted result.
+    delay: std::time::Duration,
+    /// The call limit this tool asks for; `None` keeps the scheduler's.
+    call_timeout: Option<Option<std::time::Duration>>,
 }
 
 impl FakeToolExecutor {
@@ -24,7 +28,22 @@ impl FakeToolExecutor {
         Self {
             descriptor,
             block_until_cancelled: false,
+            delay: std::time::Duration::ZERO,
+            call_timeout: None,
         }
+    }
+
+    /// Builder method: take `delay` to return the scripted result.
+    pub fn taking(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Builder method: ask the runtime for this call limit (`None` = no
+    /// limit) instead of the scheduler's default.
+    pub fn with_call_timeout(mut self, limit: Option<std::time::Duration>) -> Self {
+        self.call_timeout = Some(limit);
+        self
     }
 
     /// Builder method: block until the cancellation token fires instead of
@@ -44,6 +63,14 @@ impl ToolExecutor for FakeToolExecutor {
         self.descriptor.clone()
     }
 
+    fn call_timeout(
+        &self,
+        _arguments: &serde_json::Value,
+        default: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.call_timeout.unwrap_or(Some(default))
+    }
+
     async fn execute(
         &self,
         _input: ToolInput,
@@ -54,6 +81,7 @@ impl ToolExecutor for FakeToolExecutor {
             return Err(ToolError::ExecutionFailed);
         }
 
+        tokio::time::sleep(self.delay).await;
         Ok(ToolResult {
             call_id: "fake-call-id".to_string(),
             output: serde_json::json!({"message": "fake result"}),
