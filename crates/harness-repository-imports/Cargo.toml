@@ -1,0 +1,28 @@
+[package]
+name = "harness-repository-imports"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bench]]
+name = "import_graph"
+path = "benches/import_graph.rs"
+harness = false
+
+[dependencies]
+harness-workspace = { path = "../harness-workspace" }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+libc = { workspace = true }

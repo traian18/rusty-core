@@ -4,6 +4,7 @@ use harness_code_analysis::CallGraph;
 use harness_tool_code_analysis::tool;
 use harness_tool_filesystem::{EditTool, ReadTool, SearchTool};
 use harness_tool_git::{GitDiffTool, GitLogTool, GitShowTool, GitStatusTool};
+use harness_tool_repository_intelligence::{is_repository_tool, RepositoryIntelligence};
 use harness_tool_shell::ExecTool;
 use harness_tool_web::FetchTool;
 
@@ -19,6 +20,31 @@ pub(crate) fn build_executor_for_with_graph(
     descriptor: &harness_protocol::tools::ToolDescriptor,
     workspace: Arc<dyn harness_runtime::traits::Workspace>,
     graph: Option<Arc<dyn CallGraph>>,
+) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
+    build_executor_with_context(descriptor, workspace, graph, None)
+}
+
+/// An executor that fails closed as an unknown tool, carrying the requested descriptor.
+fn unknown_tool(
+    descriptor: &harness_protocol::tools::ToolDescriptor,
+) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
+    Arc::new(harness_tools::UnknownTool {
+        descriptor: harness_tools::ToolDescriptor {
+            id: harness_tools::ToolId::new(&descriptor.name),
+            name: descriptor.name.clone(),
+            description: descriptor.description.clone(),
+            input_schema: descriptor.input_schema.clone(),
+        },
+    })
+}
+
+/// Builds the executor for `descriptor`. Graph-backed tools (`code_graph.*`, `repo_graph.*`,
+/// `repo_git.*`) exist only when their dependency was explicitly supplied.
+pub(crate) fn build_executor_with_context(
+    descriptor: &harness_protocol::tools::ToolDescriptor,
+    workspace: Arc<dyn harness_runtime::traits::Workspace>,
+    graph: Option<Arc<dyn CallGraph>>,
+    repository: Option<&RepositoryIntelligence>,
 ) -> Arc<dyn harness_runtime::traits::ToolExecutor> {
     match descriptor.name.as_str() {
         "fs.read" => Arc::new(ReadTool::new(workspace)),
@@ -38,17 +64,7 @@ pub(crate) fn build_executor_for_with_graph(
         | "code_graph.find_callables"
         | "code_graph.calls"
         | "code_graph.traverse" => graph.map_or_else(
-            || {
-                let tool_desc = harness_tools::ToolDescriptor {
-                    id: harness_tools::ToolId::new(&descriptor.name),
-                    name: descriptor.name.clone(),
-                    description: descriptor.description.clone(),
-                    input_schema: descriptor.input_schema.clone(),
-                };
-                Arc::new(harness_tools::UnknownTool {
-                    descriptor: tool_desc,
-                }) as Arc<dyn harness_runtime::traits::ToolExecutor>
-            },
+            || unknown_tool(descriptor),
             |graph| {
                 tool(
                     graph,
@@ -62,17 +78,10 @@ pub(crate) fn build_executor_for_with_graph(
                 )
             },
         ),
-        _ => {
-            let tool_desc = harness_tools::ToolDescriptor {
-                id: harness_tools::ToolId::new(&descriptor.name),
-                name: descriptor.name.clone(),
-                description: descriptor.description.clone(),
-                input_schema: descriptor.input_schema.clone(),
-            };
-            Arc::new(harness_tools::UnknownTool {
-                descriptor: tool_desc,
-            })
-        }
+        name if is_repository_tool(name) => repository
+            .and_then(|repository| repository.executor_for(name))
+            .unwrap_or_else(|| unknown_tool(descriptor)),
+        _ => unknown_tool(descriptor),
     }
 }
 

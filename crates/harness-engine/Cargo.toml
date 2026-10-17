@@ -17,6 +17,7 @@ harness-session-store = { path = "../harness-session-store", default-features = 
 harness-workspace = { path = "../harness-workspace" }
 harness-tools = { path = "../harness-tools" }
 harness-code-analysis = { path = "../harness-code-analysis" }
+harness-tool-repository-intelligence = { path = "../tools/repository-intelligence" }
 harness-tool-code-analysis = { path = "../tools/code-analysis" }
 harness-tool-filesystem = { path = "../tools/filesystem" }
 harness-tool-shell = { path = "../tools/shell" }
@@ -42,4 +43,7 @@ zeroize = { workspace = true }
 # integration tests (tests/real_tools_e2e.rs) actually use them.
 harness-runtime = { path = "../harness-runtime", features = ["testing"] }
 tempfile = "3"
+harness-repository-imports = { path = "../harness-repository-imports" }
+harness-git-analysis = { path = "../harness-git-analysis" }
+harness-findings = { path = "../harness-findings" }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

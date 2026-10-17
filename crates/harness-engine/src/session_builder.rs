@@ -6,7 +6,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::backend::{discovered_capability, BroadcastEventSink, ToolAdvertisingBackend};
-use crate::tool_factory::build_executor_for_with_graph;
+use crate::tool_factory::build_executor_with_context;
 use harness_code_analysis::CallGraph;
 use harness_protocol::commands::{PermissionDecision, UserInput};
 use harness_protocol::events::AgentEventEnvelope;
@@ -17,6 +17,7 @@ use harness_runtime::session_manager::{SessionManager, SessionManagerError};
 use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
 use harness_runtime::traits::{ExecutionBackend, ToolRegistry};
 use harness_runtime::{IntegrationError, IntegrationRegistry};
+use harness_tool_repository_intelligence::RepositoryIntelligence;
 
 pub use harness_skills::SkillsConfig;
 use harness_skills::{SkillCatalog, SkillsContextProvider};
@@ -407,7 +408,7 @@ impl SessionBuilder {
         toolset: AgentToolset,
         workspace: Arc<dyn harness_runtime::traits::Workspace>,
     ) -> Self {
-        self.toolset_with_optional_graph(toolset, workspace, None)
+        self.toolset_with_tools(toolset, workspace, None, None)
     }
 
     /// Register a toolset with an explicitly authorized shared call graph.
@@ -417,19 +418,39 @@ impl SessionBuilder {
         workspace: Arc<dyn harness_runtime::traits::Workspace>,
         graph: Arc<dyn CallGraph>,
     ) -> Self {
-        self.toolset_with_optional_graph(toolset, workspace, Some(graph))
+        self.toolset_with_tools(toolset, workspace, Some(graph), None)
     }
 
-    fn toolset_with_optional_graph(
+    /// Register a toolset with explicitly authorized repository intelligence.
+    ///
+    /// `repo_graph.*` tools exist only when `intelligence` carries a graph, and `repo_git.*`
+    /// tools only when it carries a Git analysis; any such tool in the toolset otherwise fails
+    /// closed as an unknown tool. Share one `intelligence` value only within one authorized
+    /// repository context.
+    pub fn toolset_with_repository_intelligence(
+        self,
+        toolset: AgentToolset,
+        workspace: Arc<dyn harness_runtime::traits::Workspace>,
+        intelligence: RepositoryIntelligence,
+    ) -> Self {
+        self.toolset_with_tools(toolset, workspace, None, Some(intelligence))
+    }
+
+    fn toolset_with_tools(
         mut self,
         toolset: AgentToolset,
         workspace: Arc<dyn harness_runtime::traits::Workspace>,
         graph: Option<Arc<dyn CallGraph>>,
+        repository: Option<RepositoryIntelligence>,
     ) -> Self {
         let registry = harness_runtime::traits::SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor =
-                build_executor_for_with_graph(descriptor, workspace.clone(), graph.clone());
+            let executor = build_executor_with_context(
+                descriptor,
+                workspace.clone(),
+                graph.clone(),
+                repository.as_ref(),
+            );
             let _ = registry.register(executor);
         }
 

@@ -1,0 +1,24 @@
+[package]
+name = "harness-context-repository"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-context = { path = "../harness-context" }
+harness-protocol = { path = "../harness-protocol" }
+harness-runtime = { path = "../harness-runtime" }
+harness-workspace = { path = "../harness-workspace" }
+harness-git-analysis = { path = "../harness-git-analysis" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+harness-repository-imports = { path = "../harness-repository-imports" }
+git2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-util = { workspace = true }

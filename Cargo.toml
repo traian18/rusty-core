@@ -10,6 +10,18 @@ members = [
     "crates/harness-tools",
     "crates/harness-context",
     "crates/harness-workspace",
+    "crates/harness-repository-imports",
+    "crates/harness-repository-frameworks",
+    "crates/harness-repository-imports-python",
+    "crates/harness-repository-imports-go",
+    "crates/harness-repository-imports-java",
+    "crates/harness-repository-imports-csharp",
+    "crates/harness-repository-imports-php",
+    "crates/harness-repository-imports-native",
+    "crates/harness-git-analysis",
+    "crates/harness-findings",
+    "crates/tools/repository-intelligence",
+    "crates/harness-context-repository",
     "crates/harness-code-analysis",
     "crates/tools/code-analysis",
     "crates/harness-session-store",
@@ -105,3 +117,6 @@ tree-sitter-rust = "0.23"
 tree-sitter-php = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
+toml = "1.1.8"
+sha2 = "0.10"
+tempfile = "3"

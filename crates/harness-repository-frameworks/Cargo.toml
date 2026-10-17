@@ -1,0 +1,32 @@
+[package]
+name = "harness-repository-frameworks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-workspace = { path = "../harness-workspace" }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-php = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+harness-repository-imports = { path = "../harness-repository-imports" }
+harness-repository-imports-python = { path = "../harness-repository-imports-python" }
+harness-repository-imports-go = { path = "../harness-repository-imports-go" }
+harness-repository-imports-java = { path = "../harness-repository-imports-java" }
+harness-repository-imports-csharp = { path = "../harness-repository-imports-csharp" }
+harness-repository-imports-php = { path = "../harness-repository-imports-php" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

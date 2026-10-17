@@ -22,8 +22,9 @@ use crate::providers::{
     ProviderKey,
 };
 use crate::session_builder::{HarnessError, SessionBuilder, SessionHandle};
-use crate::tool_factory::build_executor_for_with_graph;
+use crate::tool_factory::build_executor_with_context;
 use harness_code_analysis::CallGraph;
+use harness_tool_repository_intelligence::RepositoryIntelligence;
 
 /// Public entry point for registering integrations and creating sessions.
 pub struct Harness {
@@ -363,7 +364,19 @@ impl Harness {
         toolset: AgentToolset,
         workspace: Arc<dyn Workspace>,
     ) -> Result<SessionHandle, HarnessError> {
-        self.restore_session_with_optional_graph(id, toolset, workspace, None)
+        self.restore_session_with_tools(id, toolset, workspace, None, None)
+            .await
+    }
+
+    /// Restore a session with explicitly authorized repository intelligence.
+    pub async fn restore_session_with_toolset_and_repository_intelligence(
+        &self,
+        id: SessionId,
+        toolset: AgentToolset,
+        workspace: Arc<dyn Workspace>,
+        intelligence: RepositoryIntelligence,
+    ) -> Result<SessionHandle, HarnessError> {
+        self.restore_session_with_tools(id, toolset, workspace, None, Some(intelligence))
             .await
     }
 
@@ -375,21 +388,26 @@ impl Harness {
         workspace: Arc<dyn Workspace>,
         graph: Arc<dyn CallGraph>,
     ) -> Result<SessionHandle, HarnessError> {
-        self.restore_session_with_optional_graph(id, toolset, workspace, Some(graph))
+        self.restore_session_with_tools(id, toolset, workspace, Some(graph), None)
             .await
     }
 
-    async fn restore_session_with_optional_graph(
+    async fn restore_session_with_tools(
         &self,
         id: SessionId,
         toolset: AgentToolset,
         workspace: Arc<dyn Workspace>,
         graph: Option<Arc<dyn CallGraph>>,
+        repository: Option<RepositoryIntelligence>,
     ) -> Result<SessionHandle, HarnessError> {
         let registry = SimpleToolRegistry::new();
         for descriptor in toolset.enabled_descriptors() {
-            let executor =
-                build_executor_for_with_graph(descriptor, workspace.clone(), graph.clone());
+            let executor = build_executor_with_context(
+                descriptor,
+                workspace.clone(),
+                graph.clone(),
+                repository.as_ref(),
+            );
             let _ = registry.register(executor);
         }
         let tool_registry: Arc<dyn ToolRegistry> = Arc::new(registry);

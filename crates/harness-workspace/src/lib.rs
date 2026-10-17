@@ -2,7 +2,11 @@
 
 //! Abstract workspace operations and filesystem-backed workspace implementation.
 
+pub mod dependency_groups;
 pub mod filesystem;
+pub mod framework_relations;
+pub mod import_graph;
+pub mod repository_intelligence;
 pub mod workspace;
 pub mod worktree;
 
