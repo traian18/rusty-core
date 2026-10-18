@@ -49,6 +49,10 @@ pub(crate) struct GateContext {
     /// The agent's effective execution parameters (its model is the default
     /// for model evaluators).
     pub params: ExecutionParams,
+    /// The session of the agent being checked. Tool evaluators run scoped
+    /// to it, like the agent's own calls, so an executor serving several
+    /// sessions (an orchestration step and its parent) knows whose it is.
+    pub session_id: String,
 }
 
 /// Run every check in order and return one verdict per check, plus the
@@ -66,7 +70,12 @@ pub(crate) async fn evaluate(
                 message: format!("invalid evaluator: {error}"),
             },
             Ok(EvaluatorSpec::Tool { tool, args }) => {
-                run_tool(context, &tool, args, cancel.child_token()).await
+                harness_tools::with_tool_call(
+                    format!("gate-{}", check.id),
+                    context.session_id.clone(),
+                    run_tool(context, &tool, args, cancel.child_token()),
+                )
+                .await
             }
             Ok(EvaluatorSpec::Model {
                 instructions,

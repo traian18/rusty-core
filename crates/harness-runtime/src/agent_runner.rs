@@ -1166,6 +1166,7 @@ impl AgentRunner {
                 .behavior
                 .profile
                 .execution_params(&self.agent.state.execution_params),
+            session_id: self.agent.session_id.to_string(),
         };
         let commands = self.task.commands_tx.clone();
         tokio::spawn(async move {

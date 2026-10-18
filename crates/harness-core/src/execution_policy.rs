@@ -35,7 +35,8 @@ fn enabled(policy: &ExecutionPolicy, name: &str) -> bool {
 pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
     let permission = match name {
         // `decide` is advisory: the IDE asks a decision model and returns its pick.
-        "report_progress" | "ask_user_question" | "decide" => return true,
+        // `update_todos` only keeps the session's task list.
+        "report_progress" | "ask_user_question" | "decide" | "update_todos" => return true,
         "write_plan" => return policy.mode == ExecutionMode::Plan,
         // `project_info` is the IDE's project-detection tool: it only reads
         // manifests, so it shares the `read_file` grant (in plan mode too), as

@@ -808,6 +808,8 @@ mod completion_gate_e2e {
     struct FlakyTests {
         failures: usize,
         calls: AtomicUsize,
+        /// The session each call was scoped to.
+        sessions: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait]
@@ -826,6 +828,10 @@ mod completion_gate_e2e {
             _cancel: CancellationToken,
         ) -> Result<harness_tools::ToolResult, harness_tools::ToolError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.sessions
+                .lock()
+                .unwrap()
+                .push(harness_tools::current_tool_session_id());
             let failing = call < self.failures;
             Ok(harness_tools::ToolResult {
                 call_id: "test".into(),
@@ -928,6 +934,7 @@ mod completion_gate_e2e {
         let tests = Arc::new(FlakyTests {
             failures: 1,
             calls: AtomicUsize::new(0),
+            sessions: Default::default(),
         });
         let events = run_gated(
             backend.clone(),
@@ -946,6 +953,11 @@ mod completion_gate_e2e {
             ]
         );
         assert_eq!(tests.calls.load(Ordering::SeqCst), 2);
+        let sessions = tests.sessions.lock().unwrap();
+        assert!(
+            sessions.iter().all(|session| session.is_some()),
+            "the gate scopes its tool calls to the agent's session: {sessions:?}"
+        );
         let agent_requests = backend.agent_requests.lock().unwrap();
         assert_eq!(agent_requests.len(), 2);
         assert!(
@@ -1040,6 +1052,7 @@ mod completion_gate_e2e {
         let tests = Arc::new(FlakyTests {
             failures: 0,
             calls: AtomicUsize::new(0),
+            sessions: Default::default(),
         });
         let events = run_gated(
             backend,
