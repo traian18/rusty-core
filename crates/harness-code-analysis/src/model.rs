@@ -20,6 +20,7 @@ pub enum LanguageId {
     TypeScript,
     Python,
     Java,
+    Kotlin,
     CSharp,
     Go,
     Rust,

@@ -12,6 +12,7 @@ publish = false
 harness-workspace = { path = "../harness-workspace" }
 tree-sitter = { workspace = true }
 tree-sitter-java = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

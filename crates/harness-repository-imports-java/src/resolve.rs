@@ -1,4 +1,8 @@
-//! Static resolution of Java imports against the types defined in the repository.
+//! Static resolution of Java and Kotlin imports against the declarations in the repository.
+//!
+//! Java and Kotlin files are indexed together, so a Kotlin file importing a Java class (or the
+//! other way round) resolves like an import within one language. Kotlin also imports top-level
+//! functions, properties and type aliases, which its files declare as items.
 //!
 //! Java maps a package to a directory and a public type to a file, but the match is made on the
 //! `package` declaration, so any source layout works. Standard library packages are external; other
@@ -16,17 +20,23 @@ use harness_workspace::{
 
 use crate::extract::PACKAGE_ITEM;
 
-pub const RESOLVER_VERSION: u32 = 1;
-const RULES: [&str; 7] = [
+pub const RESOLVER_VERSION: u32 = 2;
+const PROFILES: [LanguageProfile; 2] = [LanguageProfile::Java, LanguageProfile::Kotlin];
+const RULES: [&str; 8] = [
     "java.type_by_package_declaration",
     "java.package_wildcard",
     "java.nested_type",
     "java.stdlib",
+    "kotlin.stdlib",
     "java.declared_dependency",
     "java.undeclared_external",
     "java.path_not_found",
 ];
 const STDLIB_PREFIXES: [&str; 6] = ["java.", "javax.", "jdk.", "sun.", "com.sun.", "org.w3c."];
+/// The Kotlin standard library, imported by default or explicitly.
+const KOTLIN_STDLIB_PREFIXES: [&str; 1] = ["kotlin."];
+/// Packages whose artifacts are published under a group id that does not prefix them.
+const GROUP_ALIASES: [(&str, &str); 1] = [("kotlinx.", "org.jetbrains.kotlinx")];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JavaImportResolver;
@@ -41,7 +51,7 @@ impl ImportResolver for JavaImportResolver {
     }
 
     fn profiles(&self) -> Vec<LanguageProfile> {
-        vec![LanguageProfile::Java]
+        PROFILES.to_vec()
     }
 
     fn rules(&self) -> Vec<&'static str> {
@@ -53,7 +63,9 @@ impl ImportResolver for JavaImportResolver {
             "references to types of the same package (no import is written, so no edge is made)",
             "classpath-only resolution, annotation processors and generated sources",
             "matching an import to a Maven or Gradle dependency is by group id prefix; starter or BOM artifacts whose packages differ from their group id may be reported as undeclared",
-            "Kotlin, Scala and Groovy sources",
+            "Scala and Groovy sources",
+            "Kotlin top-level functions called from Java through their generated `FileNameKt` class",
+            "Kotlin default imports (`kotlin.*`, `kotlin.collections.*`, ...) are implicit and make no edge",
         ]
     }
 
@@ -64,7 +76,7 @@ impl ImportResolver for JavaImportResolver {
         for unit in context
             .units
             .iter()
-            .filter(|u| u.profile == LanguageProfile::Java)
+            .filter(|u| PROFILES.contains(&u.profile))
         {
             let Some(package) = unit
                 .extracted
@@ -107,7 +119,7 @@ impl ImportResolver for JavaImportResolver {
             })
             .collect();
         let max = context.limits.max_candidates;
-        resolve_units(context, &[LanguageProfile::Java], |unit, fact| {
+        resolve_units(context, &PROFILES, |unit, fact| {
             decide(unit, fact, &types, &packages, &declared, max)
         })
     }
@@ -170,6 +182,17 @@ fn decide(
             return Decision::new(pick(files), "java.nested_type");
         }
     }
+    if KOTLIN_STDLIB_PREFIXES
+        .iter()
+        .any(|p| spelling.starts_with(p))
+    {
+        return Decision::new(
+            Resolution::DeclaredExternal {
+                package: format!("stdlib:{}", lead(spelling, 2)),
+            },
+            "kotlin.stdlib",
+        );
+    }
     if STDLIB_PREFIXES.iter().any(|p| spelling.starts_with(p)) {
         return Decision::new(
             Resolution::DeclaredExternal {
@@ -194,10 +217,18 @@ fn decide(
         .package
         .as_ref()
         .and_then(|p| declared.get(p.0.as_str()));
+    // `kotlinx.coroutines` is published as `org.jetbrains.kotlinx:kotlinx-coroutines-core`.
+    let aliased = GROUP_ALIASES
+        .iter()
+        .find(|(prefix, _)| spelling.starts_with(prefix))
+        .map(|(_, group)| *group);
     let matched = dependencies.and_then(|set| {
         set.iter()
             .filter_map(|coordinate| {
                 let group = coordinate.split(':').next()?;
+                if aliased == Some(group) {
+                    return Some((usize::MAX, *coordinate));
+                }
                 let shared = if spelling == group || spelling.starts_with(&format!("{group}.")) {
                     group.split('.').count()
                 } else if lead(spelling, 2) == lead(group, 2) && group.split('.').count() >= 2 {

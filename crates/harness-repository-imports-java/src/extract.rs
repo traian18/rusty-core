@@ -1,5 +1,6 @@
 //! Java import extraction: `import`, `import static` and wildcard imports, plus the file's
-//! package and top-level types so imports can be matched to the files that define them.
+//! package and top-level types so imports can be matched to the files that define them. Kotlin
+//! files go through the same adapter (see `kotlin`), so the two languages share one resolver.
 use harness_workspace::{
     import_graph::{
         ByteSpan, DeclaredItem, ExtractedFile, FactBuilder, ImportForm, ImportLimits, ItemKind,
@@ -9,7 +10,7 @@ use harness_workspace::{
 };
 use tree_sitter::Node;
 
-pub const ADAPTER_VERSION: u32 = 1;
+pub const ADAPTER_VERSION: u32 = 2;
 
 /// The item kind that stands for the file's `package` declaration (its name is the dotted package).
 pub const PACKAGE_ITEM: ItemKind = ItemKind::Module;
@@ -27,7 +28,18 @@ impl LanguageImportAdapter for JavaImportAdapter {
     }
 
     fn profile_for(&self, path: &RootRelativePath) -> Option<LanguageProfile> {
-        (path.as_path().extension()?.to_str()? == "java").then_some(LanguageProfile::Java)
+        // Gradle's `build.gradle.kts` and `settings.gradle.kts` are build configuration, read as
+        // manifests, not sources.
+        let gradle = path
+            .as_path()
+            .file_name()?
+            .to_str()?
+            .ends_with(".gradle.kts");
+        match path.as_path().extension()?.to_str()? {
+            "java" => Some(LanguageProfile::Java),
+            "kt" | "kts" if !gradle => Some(LanguageProfile::Kotlin),
+            _ => None,
+        }
     }
 
     fn forms(&self) -> Vec<ImportForm> {
@@ -41,6 +53,9 @@ impl LanguageImportAdapter for JavaImportAdapter {
         source: &str,
         limits: &ImportLimits,
     ) -> ExtractedFile {
+        if profile == LanguageProfile::Kotlin {
+            return crate::kotlin::extract(path, profile, source, limits);
+        }
         let mut out = ExtractedFile::default();
         let mut parser = tree_sitter::Parser::new();
         if parser

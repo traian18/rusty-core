@@ -121,7 +121,7 @@ fn ecosystem(profile: LanguageProfile) -> Ecosystem {
         LanguageProfile::TypeScript | LanguageProfile::JavaScript => Ecosystem::Npm,
         LanguageProfile::Python => Ecosystem::Python,
         LanguageProfile::Go => Ecosystem::Go,
-        LanguageProfile::Java => Ecosystem::Java,
+        LanguageProfile::Java | LanguageProfile::Kotlin => Ecosystem::Java,
         LanguageProfile::CSharp => Ecosystem::DotNet,
         LanguageProfile::Php => Ecosystem::Composer,
         LanguageProfile::C | LanguageProfile::Cpp => Ecosystem::Native,

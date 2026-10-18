@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 pub const DIAGRAM_OPEN: &str = "@@diagram:";
 pub const DIAGRAM_CLOSE: &str = "@@";
 
-const SOURCE_EXTENSIONS: [&str; 24] = [
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "cs", "php",
-    "c", "h", "cpp", "hpp", "rb", "json", "toml", "md", "yaml", "yml",
+const SOURCE_EXTENSIONS: [&str; 26] = [
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "kt", "kts",
+    "cs", "php", "c", "h", "cpp", "hpp", "rb", "json", "toml", "md", "yaml", "yml",
 ];
 
 pub struct Grounded {

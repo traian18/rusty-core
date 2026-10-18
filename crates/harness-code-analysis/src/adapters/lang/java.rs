@@ -309,16 +309,12 @@ fn ty_last_node(node: Node<'_>) -> Node<'_> {
 
 pub(crate) struct JavaScheme;
 
+/// Kotlin files of the package are visible too: both compile to the same JVM packages.
 fn package_files<'a>(
     ctx: &'a ResolutionContext<'_>,
     package: &'a str,
 ) -> impl Iterator<Item = &'a str> + 'a {
-    ctx.project
-        .files()
-        .filter(move |(_, file)| {
-            file.language == LanguageId::Java && file.package.as_deref() == Some(package)
-        })
-        .map(|(path, _)| path)
+    super::kotlin::jvm_package_files(ctx, package)
 }
 
 impl Scheme for JavaScheme {

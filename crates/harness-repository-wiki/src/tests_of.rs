@@ -32,7 +32,10 @@ pub fn is_test_file(path: &Path) -> bool {
         || name.starts_with("test_")
             && (name.ends_with(".py") || name.ends_with(".c") || name.ends_with(".cpp"))
         || name == "conftest.py"
-        || (name.ends_with(".java") || name.ends_with(".cs") || name.ends_with(".php"))
+        || (name.ends_with(".java")
+            || name.ends_with(".kt")
+            || name.ends_with(".cs")
+            || name.ends_with(".php"))
             && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT"))
 }
 
@@ -53,6 +56,7 @@ mod tests {
             "app/models_test.py",
             "app/conftest.py",
             "src/main/OrderServiceTest.java",
+            "src/test/kotlin/OrderServiceTest.kt",
             "Billing.Tests/InvoiceTests.cs",
             "app/UserTest.php",
             "native/parser_test.cpp",
@@ -65,6 +69,7 @@ mod tests {
             "pkg/handler.go",
             "app/models.py",
             "src/Latest.java",
+            "src/main/kotlin/Latest.kt",
             "app/contest.py",
             "docs/testing.md",
         ] {

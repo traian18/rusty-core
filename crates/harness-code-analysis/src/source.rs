@@ -159,6 +159,8 @@ pub(crate) fn is_source(path: &Path) -> bool {
                 | "cts"
                 | "py"
                 | "java"
+                | "kt"
+                | "kts"
                 | "cs"
                 | "go"
                 | "rs"

@@ -193,6 +193,115 @@ fn python_functions_and_class() {
     );
 }
 
+/// `(method_count, field_count, lcom4, max_method_ccn)`
+fn class_shape(file: &FileMetrics) -> (u32, u32, u32, u32) {
+    let class = &file.classes[0];
+    (
+        class.method_count,
+        class.field_count,
+        class.lcom4,
+        class.max_method_ccn,
+    )
+}
+
+#[test]
+fn kotlin_functions_and_class() {
+    let file = measure_file(&LanguageId::Kotlin, "sample.kt", &fixture("sample.kt")).unwrap();
+    assert!(!file.partial);
+    let names: Vec<&str> = file
+        .functions
+        .iter()
+        .map(|f| f.qualified_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "classify",
+            "Account.deposit",
+            "Account.report",
+            "Account.describe",
+            "Account.toString",
+            "Account.constructor",
+            "Account.parse",
+            "total",
+            "filter callback",
+            "sumOf callback"
+        ]
+    );
+    // Same shape as the Rust `classify`: `else if` and `else` are flat, the loop and the `if`
+    // in it nest under the `else`.
+    assert_eq!(shape(function(&file, "classify")), (7, 10, 3, 1, 2, 14));
+    assert_eq!(function(&file, "classify").typed_params, 2);
+    assert_eq!(function(&file, "classify").primitive_params, 2);
+    // Two non-default `when` entries.
+    let describe = function(&file, "describe");
+    assert_eq!(
+        (describe.ccn, describe.cognitive, describe.max_nesting),
+        (3, 1, 1)
+    );
+    assert!(function(&file, "toString").inherited_signature);
+    assert!(function(&file, "constructor").constructor);
+    assert_eq!(function(&file, "constructor").params, 1);
+    assert_eq!(function(&file, "filter callback").params, 0);
+    assert_eq!(function(&file, "sumOf callback").params, 1);
+    // owner, balance (constructor properties) and history are fields, read without `this.`;
+    // a local `owner` in toString shadows the field. The companion's `parse` counts as a method.
+    assert_eq!(class_shape(&file), (6, 3, 1, 3));
+    assert_eq!(file.classes[0].name, "Account");
+}
+
+#[test]
+fn java_functions_and_class() {
+    let file = measure_file(&LanguageId::Java, "Sample.java", &fixture("Sample.java")).unwrap();
+    assert!(!file.partial);
+    let names: Vec<&str> = file
+        .functions
+        .iter()
+        .map(|f| f.qualified_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Account.Account",
+            "Account.deposit",
+            "Account.describe",
+            "Account.label",
+            "Account.toString",
+            "Account.parse",
+            "Account.positives",
+            "<lambda>"
+        ]
+    );
+    let deposit = function(&file, "deposit");
+    assert_eq!(
+        (
+            deposit.ccn,
+            deposit.cognitive,
+            deposit.max_nesting,
+            deposit.bumps
+        ),
+        (6, 9, 3, 1)
+    );
+    // Three non-default case labels.
+    let describe = function(&file, "describe");
+    assert_eq!(
+        (describe.ccn, describe.cognitive, describe.max_nesting),
+        (4, 1, 1)
+    );
+    assert_eq!(
+        (
+            function(&file, "parse").ccn,
+            function(&file, "parse").cognitive
+        ),
+        (2, 1)
+    );
+    assert!(function(&file, "Account").constructor);
+    assert!(function(&file, "toString").inherited_signature);
+    assert_eq!(function(&file, "<lambda>").params, 1);
+    // balance, history and owner; `this.owner = owner` reads the parameter, not the field.
+    assert_eq!(class_shape(&file), (7, 3, 1, 6));
+}
+
 #[test]
 fn a_class_split_in_two_has_lcom4_of_two() {
     let source = b"class Split:\n    def a(self):\n        return self.x\n    def b(self):\n        self.x = 1\n    def c(self):\n        return self.y\n    def d(self):\n        return self.c()\n    def helper(self):\n        return 1\n";
@@ -243,7 +352,7 @@ fn broken_files_are_partial_and_other_languages_unsupported() {
         measure_file(&LanguageId::Go, "x.go", b"package x"),
         Err(MetricsError::Unsupported(_))
     ));
-    assert!(metrics_supported(&LanguageId::Python) && !metrics_supported(&LanguageId::Java));
+    assert!(metrics_supported(&LanguageId::Python) && !metrics_supported(&LanguageId::Go));
 }
 
 #[test]

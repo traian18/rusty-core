@@ -143,13 +143,14 @@ struct Gradle {
 }
 
 const RUNTIME: [&str; 4] = ["implementation", "api", "runtimeOnly", "compile"];
-const DEVELOPMENT: [&str; 8] = [
+const DEVELOPMENT: [&str; 9] = [
     "testImplementation",
     "testRuntimeOnly",
     "testCompileOnly",
     "compileOnly",
     "annotationProcessor",
     "kapt",
+    "ksp",
     "developmentOnly",
     "testAnnotationProcessor",
 ];

@@ -28,6 +28,7 @@ pub enum LanguageProfile {
     Python,
     Go,
     Java,
+    Kotlin,
     #[serde(rename = "csharp")]
     CSharp,
     Php,

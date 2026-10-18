@@ -14,6 +14,8 @@ pub fn language_of(path: &str) -> Option<LanguageId> {
         "ts" | "tsx" | "mts" | "cts" => Some(LanguageId::TypeScript),
         "js" | "jsx" | "mjs" | "cjs" => Some(LanguageId::JavaScript),
         "py" => Some(LanguageId::Python),
+        "java" => Some(LanguageId::Java),
+        "kt" | "kts" => Some(LanguageId::Kotlin),
         _ => None,
     }
 }

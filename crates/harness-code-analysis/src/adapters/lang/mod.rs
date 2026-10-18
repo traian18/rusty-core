@@ -11,6 +11,7 @@ mod csharp;
 mod go;
 mod java;
 mod javascript;
+mod kotlin;
 mod php;
 mod python;
 mod ruby;
@@ -23,6 +24,7 @@ pub(crate) fn syntax_for(language: &LanguageId) -> Box<dyn Syntax> {
         LanguageId::TypeScript => Box::new(javascript::Js { typescript: true }),
         LanguageId::Python => Box::new(python::Python),
         LanguageId::Java => Box::new(java::Java),
+        LanguageId::Kotlin => Box::new(kotlin::Kotlin),
         LanguageId::Go => Box::new(go::Go),
         LanguageId::Rust => Box::new(rust::Rust),
         LanguageId::Php => Box::new(php::Php),
@@ -42,6 +44,7 @@ pub(crate) fn resolver_for(language: &LanguageId) -> Arc<dyn LanguageResolver> {
         }
         LanguageId::Python => Arc::new(SchemeResolver(python::PythonScheme)),
         LanguageId::Java => Arc::new(SchemeResolver(java::JavaScheme)),
+        LanguageId::Kotlin => Arc::new(SchemeResolver(kotlin::KotlinScheme)),
         LanguageId::Go => Arc::new(SchemeResolver(go::GoScheme)),
         LanguageId::Rust => Arc::new(SchemeResolver(rust::RustScheme)),
         LanguageId::Php => Arc::new(SchemeResolver(php::PhpScheme)),

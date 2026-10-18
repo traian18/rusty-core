@@ -37,6 +37,7 @@ fn external_name(edge: &ImportEdge) -> Option<String> {
         LanguageProfile::Python
         | LanguageProfile::Go
         | LanguageProfile::Java
+        | LanguageProfile::Kotlin
         | LanguageProfile::CSharp
         | LanguageProfile::Php
         | LanguageProfile::C

@@ -7,11 +7,12 @@ use harness_tools::{
 };
 use serde_json::json;
 
-const LANGUAGES: [&str; 10] = [
+const LANGUAGES: [&str; 11] = [
     "JavaScript",
     "TypeScript",
     "Python",
     "Java",
+    "Kotlin",
     "CSharp",
     "Go",
     "Rust",

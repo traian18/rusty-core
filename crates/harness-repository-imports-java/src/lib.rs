@@ -1,11 +1,13 @@
 #![warn(clippy::all)]
 
-//! Java import extraction, resolution and Maven/Gradle file reading for the repository graph.
+//! Java and Kotlin import extraction, resolution and Maven/Gradle file reading for the repository
+//! graph. Both JVM languages share one resolver, so imports between them resolve.
 //!
 //! Imports are matched to files by the `package` declaration and top-level types of each source
 //! file. Neither Maven nor Gradle is run.
 
 mod extract;
+mod kotlin;
 mod manifest;
 mod resolve;
 
@@ -18,7 +20,7 @@ pub use manifest::manifest_adapters;
 pub use resolve::JavaImportResolver;
 
 /// File extensions the language's sources use, to register with the repository builder.
-pub const SOURCE_EXTENSIONS: &[&str] = &["java"];
+pub const SOURCE_EXTENSIONS: &[&str] = &["java", "kt", "kts"];
 
 /// The adapter and resolver pair for `RepositoryGraphBuilder::import_support`.
 pub fn import_support() -> ImportSupport {

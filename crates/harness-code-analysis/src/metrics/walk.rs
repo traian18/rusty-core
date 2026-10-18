@@ -66,6 +66,7 @@ impl Counter<'_> {
             if self.skip(child) {
                 continue;
             }
+            let field = field.or_else(|| self.dialect.implicit_field(node, child));
             let at = match field {
                 Some(name) if HEADER_FIELDS.contains(&name) => depth,
                 Some("alternative") if chained => depth,
@@ -193,7 +194,7 @@ fn measure(
         bumps: 0,
         conditions: Vec::new(),
     };
-    if let Some(body) = node.child_by_field_name("body") {
+    if let Some(body) = dialect.body(node) {
         counter.visit(body, 0, false);
     }
     let name = dialect.function_name(node, source);

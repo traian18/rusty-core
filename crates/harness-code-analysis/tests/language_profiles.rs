@@ -13,6 +13,7 @@ async fn profiles_extract_all_supported_languages() {
         ("a.ts", "function typescript_call() {}\n"),
         ("a.py", "def python_call():\n    pass\n"),
         ("A.java", "class A { void javaCall() {} }\n"),
+        ("a.kt", "fun kotlinCall() {}\n"),
         ("A.cs", "class A { void csharpCall() {} }\n"),
         ("a.go", "func goCall() {}\n"),
         ("a.rs", "fn rust_call() {}\n"),
@@ -53,6 +54,7 @@ async fn profiles_extract_all_supported_languages() {
         LanguageId::TypeScript,
         LanguageId::Python,
         LanguageId::Java,
+        LanguageId::Kotlin,
         LanguageId::CSharp,
         LanguageId::Go,
         LanguageId::Rust,
@@ -70,7 +72,7 @@ async fn profiles_extract_all_supported_languages() {
         );
     }
     for path in [
-        "a.js", "a.ts", "a.py", "A.java", "A.cs", "a.go", "a.rs", "a.php", "a.cpp", "a.rb",
+        "a.js", "a.ts", "a.py", "A.java", "a.kt", "A.cs", "a.go", "a.rs", "a.php", "a.cpp", "a.rb",
     ] {
         let content = fs::read(root.join(path)).unwrap();
         for symbol in response
@@ -234,6 +236,11 @@ async fn repeated_call_sites_keep_distinct_exact_name_spans_for_all_profiles() {
         (
             "A.java",
             "class A { void target() {} void caller() { target(); target(); } }",
+            "target",
+        ),
+        (
+            "a.kt",
+            "class A {\n    fun target() {}\n    fun caller() {\n        target()\n        target()\n    }\n}\n",
             "target",
         ),
         (

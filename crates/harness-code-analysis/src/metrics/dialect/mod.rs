@@ -5,7 +5,10 @@ use tree_sitter::{Language, Node};
 use super::model::FunctionKind;
 use crate::model::LanguageId;
 
+mod java;
 mod javascript;
+mod kotlin;
+mod members;
 mod python;
 mod rust;
 
@@ -49,6 +52,15 @@ pub trait Dialect {
     }
     /// Kinds of statement blocks, for children that carry no field name.
     fn is_block(&self, node: Node<'_>) -> bool;
+    /// The node whose subtree is the function's body.
+    fn body<'t>(&self, function: Node<'t>) -> Option<Node<'t>> {
+        function.child_by_field_name("body")
+    }
+    /// The role of `child` in a control statement when the grammar gives it no field name
+    /// (Kotlin's `if` branches), spelled like the fields other grammars use.
+    fn implicit_field(&self, _statement: Node<'_>, _child: Node<'_>) -> Option<&'static str> {
+        None
+    }
     fn params(&self, function: Node<'_>, source: &[u8]) -> u32;
     /// How a method refers to its instance (`self`, `this`, or Python's first parameter).
     fn receiver(&self, method: Node<'_>, source: &[u8]) -> Option<String>;
@@ -88,6 +100,8 @@ pub fn for_language(language: &LanguageId) -> Option<Box<dyn Dialect>> {
         LanguageId::TypeScript => Some(Box::new(javascript::Js { typescript: true })),
         LanguageId::JavaScript => Some(Box::new(javascript::Js { typescript: false })),
         LanguageId::Python => Some(Box::new(python::Python)),
+        LanguageId::Java => Some(Box::new(java::Java)),
+        LanguageId::Kotlin => Some(Box::new(kotlin::Kotlin)),
         _ => None,
     }
 }

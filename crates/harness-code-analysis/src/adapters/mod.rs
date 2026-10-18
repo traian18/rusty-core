@@ -133,11 +133,12 @@ impl AdapterRegistry {
     }
 }
 
-pub(crate) const ALL_LANGUAGES: [LanguageId; 10] = [
+pub(crate) const ALL_LANGUAGES: [LanguageId; 11] = [
     LanguageId::JavaScript,
     LanguageId::TypeScript,
     LanguageId::Python,
     LanguageId::Java,
+    LanguageId::Kotlin,
     LanguageId::CSharp,
     LanguageId::Go,
     LanguageId::Rust,
@@ -180,6 +181,7 @@ pub(crate) fn language_for(path: &str) -> Option<LanguageId> {
         "ts" | "tsx" | "mts" | "cts" => LanguageId::TypeScript,
         "py" => LanguageId::Python,
         "java" => LanguageId::Java,
+        "kt" | "kts" => LanguageId::Kotlin,
         "cs" => LanguageId::CSharp,
         "go" => LanguageId::Go,
         "rs" => LanguageId::Rust,

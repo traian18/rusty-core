@@ -7,12 +7,13 @@ use harness_code_analysis::{CallGraph, DefaultCallGraph, LanguageId};
 fn every_scoped_language_reports_versioned_tested_capabilities() {
     let graph = DefaultCallGraph::new(std::env::temp_dir());
     let capabilities = graph.capabilities();
-    assert_eq!(capabilities.languages.len(), 10);
+    assert_eq!(capabilities.languages.len(), 11);
     for expected in [
         LanguageId::JavaScript,
         LanguageId::TypeScript,
         LanguageId::Python,
         LanguageId::Java,
+        LanguageId::Kotlin,
         LanguageId::CSharp,
         LanguageId::Go,
         LanguageId::Rust,
