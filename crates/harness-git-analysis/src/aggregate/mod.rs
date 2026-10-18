@@ -43,5 +43,9 @@ pub fn aggregate(
     for (commit, head_paths) in commits.iter().zip(&paths) {
         tally.add_commit(commit, head_paths, &exclusions);
     }
-    tally.finish(present_at_head)
+    let mut aggregation = tally.finish(present_at_head)?;
+    let (signals, summary) = crate::signals::compute(commits, &paths, &exclusions);
+    aggregation.index.signals = signals;
+    aggregation.index.signal_summary = summary;
+    Ok(aggregation)
 }

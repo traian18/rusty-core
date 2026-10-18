@@ -72,6 +72,11 @@ pub struct GitIndex {
     pub co_changes: Vec<CoChange>,
     /// Sorted by file.
     pub contributors: Vec<FileContributors>,
+    /// Sorted by file: windowed signals for code health (see `signals`).
+    #[serde(default)]
+    pub signals: Vec<crate::signals::FileSignals>,
+    #[serde(default)]
+    pub signal_summary: crate::signals::SignalSummary,
 }
 
 /// What the analysis covered and what it left out.

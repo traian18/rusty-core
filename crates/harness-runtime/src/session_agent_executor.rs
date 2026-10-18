@@ -58,6 +58,8 @@ const RESEARCH_TOOLS: &[&str] = &[
     "search_codebase",
     "workspace.search",
     "project_info",
+    "repo_context",
+    "repo_wiki",
     "web_search",
     "web_fetch",
     "web_extract",

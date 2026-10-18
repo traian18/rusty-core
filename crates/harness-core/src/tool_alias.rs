@@ -31,10 +31,14 @@ const ALIASES: &[(&str, &str)] = &[
 
 /// `(tool, the tool whose grant admits it)`. `request_research` sends a
 /// question to a read-only research step inside a workflow: a step that may
-/// read may ask for it.
+/// read may ask for it. `repo_context` answers questions about how files
+/// connect from the repository index and never changes anything, so any step
+/// that may read may use it; `repo_wiki` reads the documentation pages rendered from the same index.
 const GRANTED_WITH: &[(&str, &str)] = &[
     ("project_info", "read_file"),
     ("request_research", "read_file"),
+    ("repo_context", "read_file"),
+    ("repo_wiki", "read_file"),
 ];
 
 /// The tool `name` follows in rules, history, allow-lists and permissions,
@@ -100,6 +104,8 @@ mod tests {
         assert_eq!(granted_by("run_check"), Some("run_command"));
         assert_eq!(granted_by("project_info"), Some("read_file"));
         assert_eq!(granted_by("request_research"), Some("read_file"));
+        assert_eq!(granted_by("repo_context"), Some("read_file"));
+        assert_eq!(granted_by("repo_wiki"), Some("read_file"));
         assert_eq!(granted_by("read_file"), None);
         assert_eq!(granted_by("run_command"), None);
     }
@@ -120,7 +126,9 @@ mod tests {
                 "run_check",
                 "install_dependencies",
                 "project_info",
-                "request_research"
+                "request_research",
+                "repo_context",
+                "repo_wiki"
             ])
         );
         assert_eq!(
@@ -139,7 +147,9 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "project_info",
-                "request_research"
+                "request_research",
+                "repo_context",
+                "repo_wiki"
             ])
         );
         assert_eq!(
@@ -154,7 +164,13 @@ mod tests {
         );
         assert_eq!(
             with_aliases(&names(&["read_file"])),
-            names(&["read_file", "project_info", "request_research"]),
+            names(&[
+                "read_file",
+                "project_info",
+                "request_research",
+                "repo_context",
+                "repo_wiki"
+            ]),
             "reading does not admit edit_file"
         );
         assert_eq!(

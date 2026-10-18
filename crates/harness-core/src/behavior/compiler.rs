@@ -741,7 +741,7 @@ impl CompiledProfile {
     /// Whether the profile's scope lets the model see and call `tool`. An
     /// allow-list naming a tool also admits what that tool's grant covers (see
     /// [`crate::tool_alias`]): `write_file` brings `edit_file` with it, and
-    /// `read_file` brings `project_info`.
+    /// `read_file` brings `project_info` and `repo_context`.
     pub fn allows_tool(&self, tool: &str) -> bool {
         match &self.profile.tools {
             ToolScope::None => false,

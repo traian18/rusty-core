@@ -379,6 +379,10 @@ fn project_info_is_admitted_by_a_read_file_scope_and_permission() {
         "a read-only profile's allow-list names read_file, which admits project_info"
     );
     assert!(
+        analyze.allows_tool("repo_context") && analyze.allows_tool("repo_wiki"),
+        "so do repo_context and repo_wiki, which only read the repository index"
+    );
+    assert!(
         !analyze.allows_tool("edit_file"),
         "reading does not admit editing"
     );
@@ -394,7 +398,9 @@ fn project_info_is_admitted_by_a_read_file_scope_and_permission() {
 
     let mut no_reading = profile("p", 2);
     no_reading.tools = ToolScope::AllowList(vec!["list_files".into()]);
-    assert!(!compiled(no_reading).allows_tool("project_info"));
+    let no_reading = compiled(no_reading);
+    assert!(!no_reading.allows_tool("project_info"));
+    assert!(!no_reading.allows_tool("repo_context"));
 }
 
 #[test]

@@ -59,6 +59,7 @@ mod tests {
                 id: ContributorId("c".into()),
                 name: "c".into(),
             },
+            subject: String::new(),
             changes,
         }
     }

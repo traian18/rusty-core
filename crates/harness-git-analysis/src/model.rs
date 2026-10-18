@@ -54,6 +54,9 @@ pub struct CommitFact {
     /// Seconds since the Unix epoch, from the author signature.
     pub author_time: i64,
     pub contributor: Contributor,
+    /// The first line of the message.
+    #[serde(default)]
+    pub subject: String,
     /// Empty for merge commits, whose changes the merged commits already carry.
     pub changes: Vec<FileChange>,
 }
@@ -61,5 +64,10 @@ pub struct CommitFact {
 impl CommitFact {
     pub fn is_merge(&self) -> bool {
         self.parent_count > 1
+    }
+
+    /// Whether the subject says the commit fixes a bug ([`crate::is_fix_commit`]).
+    pub fn is_fix(&self) -> bool {
+        crate::fix_rule::is_fix_commit(&self.subject)
     }
 }

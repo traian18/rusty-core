@@ -1680,7 +1680,12 @@ mod isolated_session {
                 // Reading (and what reading admits), never the step's edit tool.
                 assert_eq!(
                     tools,
-                    &ToolScope::AllowList(vec!["read_file".into(), "project_info".into()])
+                    &ToolScope::AllowList(vec![
+                        "read_file".into(),
+                        "project_info".into(),
+                        "repo_context".into(),
+                        "repo_wiki".into()
+                    ])
                 )
             }
             other => panic!("research runs as a step: {other:?}"),

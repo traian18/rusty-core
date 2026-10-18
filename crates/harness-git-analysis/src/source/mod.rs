@@ -174,6 +174,7 @@ fn commit_fact(
         parent_count,
         author_time: author.when().seconds(),
         contributor,
+        subject: String::from_utf8_lossy(commit.summary_bytes().unwrap_or_default()).into_owned(),
         changes,
     })
 }

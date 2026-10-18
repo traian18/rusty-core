@@ -913,6 +913,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-code-health"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "harness-code-analysis",
+ "harness-git-analysis",
+ "harness-workspace",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harness-context"
 version = "0.3.0"
 dependencies = [
@@ -932,9 +948,11 @@ dependencies = [
  "async-trait",
  "git2",
  "harness-context",
+ "harness-findings",
  "harness-git-analysis",
  "harness-protocol",
  "harness-repository-imports",
+ "harness-repository-wiki",
  "harness-runtime",
  "harness-workspace",
  "tempfile",
@@ -1353,6 +1371,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-repository-wiki"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "harness-code-analysis",
+ "harness-code-health",
+ "harness-findings",
+ "harness-git-analysis",
+ "harness-repository-frameworks",
+ "harness-repository-imports",
+ "harness-workspace",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "harness-runtime"
 version = "0.3.0"
 dependencies = [
@@ -1480,6 +1518,7 @@ dependencies = [
  "harness-git-analysis",
  "harness-repository-frameworks",
  "harness-repository-imports",
+ "harness-repository-wiki",
  "harness-tools",
  "harness-workspace",
  "serde",

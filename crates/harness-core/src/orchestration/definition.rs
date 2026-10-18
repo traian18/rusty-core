@@ -1,59 +1,22 @@
+//! Workflow documents and node configurations.
+//!
+//! Graph bindings, identity, policies, and task queues are grouped in focused
+//! child modules and re-exported through the unchanged orchestration facade.
+
+mod bindings;
+mod identity;
+mod policies;
+mod task_queue;
+
+pub use bindings::*;
+pub use identity::*;
+pub use policies::*;
+pub use task_queue::*;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-pub const ORCHESTRATION_SCHEMA_VERSION: u32 = 1;
-
-macro_rules! string_id {
-    ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub String);
-
-        impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self::new(value)
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-    };
-}
-
-string_id!(OrchestrationDefinitionId);
-string_id!(OrchestrationNodeId);
-string_id!(OrchestrationEdgeId);
-string_id!(OrchestrationRunId);
-
-/// Publication state of a definition revision.
-///
-/// Published revisions are immutable; drafts only execute when the registry
-/// explicitly allows them (development mode).
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum DefinitionStatus {
-    Draft,
-    #[default]
-    Published,
-    Deprecated,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrchestrationDefinition {
@@ -314,95 +277,6 @@ pub struct InputNodeConfig {
     pub defaults: BTreeMap<String, Value>,
 }
 
-/// Runs a plan's tasks one at a time, each in a fresh builder session
-/// followed by a read-only review, checkpointing every accepted task. The
-/// step's own output is the list of completed tasks (always an object,
-/// whatever the step's response format).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskQueueConfig {
-    /// Pointer to a typed requirement/task plan in the bound input; its first
-    /// segment names the input binding the plan comes from.
-    pub plan_pointer: String,
-    pub review_profile: crate::behavior::ProfileRef,
-    pub review_instructions: String,
-    /// When set, a read-only planner turns each task into a detailed step
-    /// plan before it is built; the builder and the reviewer work from it.
-    /// The plan the queue reads can then stay general.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_planner: Option<TaskPlannerConfig>,
-    pub max_repairs: u32,
-    /// What happens when a task cannot be completed: its repairs ran out, or
-    /// it needs something only the user can give.
-    #[serde(default)]
-    pub on_task_failure: TaskFailurePolicy,
-    /// Named flows a planned task may run instead of the builder and
-    /// reviewer, by setting its `flow` to the name: gathering more
-    /// information by research, fixing a bug found on the way, and so on. A
-    /// flow judges its own result; a failed one fails the task.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub flows: BTreeMap<String, SubflowTarget>,
-}
-
-/// The step that plans one task of a queue in detail.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskPlannerConfig {
-    pub profile: crate::behavior::ProfileRef,
-    pub instructions: String,
-}
-
-impl TaskQueueConfig {
-    /// The profiles the queue's own sessions run under: the reviewer's and,
-    /// when there is one, the task planner's.
-    pub fn profiles(&self) -> impl Iterator<Item = &crate::behavior::ProfileRef> {
-        std::iter::once(&self.review_profile)
-            .chain(self.task_planner.as_ref().map(|planner| &planner.profile))
-    }
-
-    /// The input binding the plan is read from.
-    pub fn plan_binding(&self) -> Option<&str> {
-        self.plan_pointer
-            .strip_prefix('/')?
-            .split('/')
-            .next()
-            .filter(|segment| !segment.is_empty())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskFailurePolicy {
-    /// Ask the user: try again (with their notes), skip the task, revise the
-    /// plan, or stop.
-    #[default]
-    Ask,
-    /// End the step; completed tasks stay checkpointed for a continuation.
-    Stop,
-    /// Record the task as skipped and go on with the next one.
-    Skip,
-}
-
-impl OrchestrationNode {
-    /// The step that produced a task queue's plan, when the plan is bound
-    /// from a step's output. Asking to revise the plan re-runs that step.
-    pub fn task_plan_source(&self) -> Option<&OrchestrationNodeId> {
-        let OrchestrationNodeKind::Agent(AgentNodeConfig {
-            task_queue: Some(queue),
-            ..
-        }) = &self.kind
-        else {
-            return None;
-        };
-        let target = queue.plan_binding()?;
-        self.input_bindings
-            .iter()
-            .find(|binding| binding.target == target)
-            .and_then(|binding| match &binding.source {
-                OutputBinding::NodeOutput { node_id, .. } => Some(node_id),
-                OutputBinding::RunInput { .. } => None,
-            })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentNodeConfig {
     pub instructions: String,
@@ -582,161 +456,6 @@ pub struct OutputNodeConfig {
     pub source: OutputBinding,
     #[serde(default = "default_true")]
     pub strict: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OrchestrationEdge {
-    pub id: OrchestrationEdgeId,
-    pub source: OrchestrationNodeId,
-    pub target: OrchestrationNodeId,
-    pub condition: EdgeCondition,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeCondition {
-    OnSuccess,
-    OnFailure,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InputBinding {
-    pub target: String,
-    pub source: OutputBinding,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OutputBinding {
-    RunInput {
-        pointer: String,
-    },
-    NodeOutput {
-        node_id: OrchestrationNodeId,
-        pointer: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OutputContract {
-    pub schema: SchemaReference,
-    /// Which node produces the result; omitted, it is the output node's own
-    /// source (the usual case).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<OutputBinding>,
-    #[serde(default = "default_true")]
-    pub strict: bool,
-}
-
-impl Default for OutputContract {
-    /// A written result, taken from the output node and not schema-checked.
-    fn default() -> Self {
-        Self {
-            schema: SchemaReference::Inline {
-                name: "result".into(),
-                schema: serde_json::json!({"type": "string"}),
-            },
-            source: None,
-            strict: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SchemaReference {
-    Inline { name: String, schema: Value },
-    Registry { schema_id: String, revision: u64 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    #[serde(default)]
-    pub retry_on: Vec<RetryReason>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 1,
-            retry_on: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryReason {
-    BackendRateLimited,
-    BackendTimeout,
-    ToolTimeout,
-    InvalidStructuredOutput,
-    VerificationFailed,
-    /// The user reviewed a result and asked for changes. Raised by approval
-    /// steps; never needs to be listed in a target's `retry_on`.
-    ChangesRequested,
-}
-
-/// Upper bound on any node's `retry.max_attempts`.
-pub const MAX_STEP_ATTEMPTS: u32 = 10;
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct OrchestrationPolicies {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_steps: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_total_attempts: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_elapsed_ms: Option<u64>,
-    /// Longest an active step may go without any sign of life (agent event,
-    /// usage report, checkpoint) before the runner cancels the attempt and
-    /// fails it as retryable. Time spent waiting on a permission decision or
-    /// while paused does not count. Must exceed the longest legitimate silent
-    /// operation, e.g. a tool call (`tool_call_timeout`) or a model's first
-    /// event (`first_event_timeout`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stall_timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_model_requests: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cost_usd: Option<f64>,
-    /// On-demand research for agent steps; omitted, the defaults apply.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub research: Option<ResearchPolicy>,
-}
-
-/// An agent step that needs information its inputs do not hold may send the
-/// question to a read-only research step, which runs on the spot (with the
-/// asking step's read tools, never more) and returns its findings. Every
-/// step that may read files can ask, whether or not the flow declares it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResearchPolicy {
-    /// Questions one attempt may send; 0 turns research off.
-    #[serde(default = "default_research_per_attempt")]
-    pub max_per_attempt: u32,
-    /// The profile research runs under; omitted, the session's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<crate::behavior::ProfileRef>,
-}
-
-impl Default for ResearchPolicy {
-    fn default() -> Self {
-        Self {
-            max_per_attempt: default_research_per_attempt(),
-            profile: None,
-        }
-    }
-}
-
-const fn default_research_per_attempt() -> u32 {
-    2
 }
 
 const fn default_true() -> bool {

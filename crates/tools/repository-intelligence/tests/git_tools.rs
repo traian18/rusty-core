@@ -167,7 +167,7 @@ async fn toolsets_are_disabled_unless_their_dependency_is_supplied() {
     assert!(nothing.executor_for("repo_git.refresh").is_none());
 
     let graph_only = fixture.graph_only();
-    assert_eq!(graph_only.executors().len(), 9);
+    assert_eq!(graph_only.executors().len(), 11);
     assert!(
         graph_only.executor_for("repo_git.churn").is_none(),
         "Git needs its own opt-in"
@@ -184,7 +184,7 @@ async fn toolsets_are_disabled_unless_their_dependency_is_supplied() {
         .iter()
         .map(|e| e.descriptor().name)
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 16);
     assert!(names
         .iter()
         .all(|n| harness_tool_repository_intelligence::is_repository_tool(n)));

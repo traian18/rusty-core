@@ -24,6 +24,7 @@ mod model;
 mod service;
 mod snapshot_identity;
 mod snapshot_store;
+mod support;
 
 pub use contracts::{
     ManifestAdapter, ManifestInput, ManifestParse, RepositoryDiscovery, RepositoryGraph,
@@ -40,6 +41,10 @@ pub use model::{
 pub use service::{RepositoryGraphBuilder, RepositoryGraphService};
 pub use snapshot_identity::snapshot_id;
 pub use snapshot_store::InMemoryRepositorySnapshotRepository;
+pub use support::{
+    content_hash, ignored_directory, known_unsupported_language, known_unsupported_languages,
+    PathState,
+};
 
 pub use discovery::{read_contained_directory, read_contained_file, DirectoryEntry};
 

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 pub use contained_fs::{read_contained_directory, read_contained_file, DirectoryEntry};
+pub(super) use tree_walk::ignored_directory_in;
 use tree_walk::{scan_tree, TreeScan, DEFAULT_SOURCE_EXTENSIONS};
 
 use super::{

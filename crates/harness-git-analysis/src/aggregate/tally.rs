@@ -207,6 +207,7 @@ impl<'c> Tally<'c> {
                 churn,
                 co_changes,
                 contributors,
+                ..GitIndex::default()
             },
             counts: self.counts,
         })

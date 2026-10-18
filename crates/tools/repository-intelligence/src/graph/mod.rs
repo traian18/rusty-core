@@ -19,7 +19,11 @@ use crate::{
     operation::{OperationTool, Success},
 };
 
-pub(crate) const NAMES: [&str; 9] = [
+pub(crate) use overview::truncation_name;
+
+pub(crate) const NAMES: [&str; 11] = [
+    "repo_context",
+    "repo_wiki",
     "repo_graph.refresh",
     "repo_graph.capabilities",
     "repo_graph.overview",
@@ -36,6 +40,8 @@ pub(crate) const NAMES: [&str; 9] = [
 pub(crate) struct GraphContext {
     pub graph: Arc<dyn RepositoryGraph>,
     pub git: Option<Arc<dyn GitAnalysis>>,
+    /// Findings for `repo_context`'s findings section; absent unless that toolset was supplied.
+    pub findings: Option<Arc<dyn harness_findings::FindingsAnalysis>>,
 }
 
 impl GraphContext {
@@ -82,6 +88,8 @@ impl GraphContext {
 pub(crate) fn executor_for(name: &str, context: &GraphContext) -> Option<Arc<dyn ToolExecutor>> {
     let context = context.clone();
     Some(match name {
+        "repo_context" => OperationTool::executor(crate::context::RepoContext(context)),
+        "repo_wiki" => OperationTool::executor(crate::wiki::RepoWiki(context)),
         "repo_graph.refresh" => OperationTool::executor(refresh::Refresh(context)),
         "repo_graph.capabilities" => OperationTool::executor(capabilities::Capabilities(context)),
         "repo_graph.overview" => OperationTool::executor(overview::Overview(context)),

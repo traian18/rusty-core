@@ -1,6 +1,7 @@
 mod adapters;
 mod api;
 mod builder;
+pub mod metrics;
 mod model;
 mod query;
 mod service;

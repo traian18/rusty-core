@@ -13,11 +13,13 @@
 //! (`schema_version`, snapshot ids, component versions, `partial`, `truncation`, `result`) or
 //! a structured error with a stable code.
 mod args;
+mod context;
 mod failure;
 mod findings;
 mod git;
 mod graph;
 mod operation;
+mod wiki;
 
 use std::sync::Arc;
 
@@ -67,6 +69,7 @@ impl RepositoryIntelligence {
             let context = graph::GraphContext {
                 graph: graph.clone(),
                 git: self.git.clone(),
+                findings: self.findings.clone(),
             };
             if let Some(tool) = graph::executor_for(name, &context) {
                 return Some(tool);

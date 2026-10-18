@@ -188,6 +188,17 @@ impl TreeScanner<'_> {
     }
 }
 
+/// The ignored directory a path lies under, if any.
+pub fn ignored_directory_in(path: &std::path::Path) -> Option<&'static str> {
+    path.components().find_map(|component| {
+        let name = component.as_os_str().to_str()?;
+        IGNORED_DIRECTORIES
+            .iter()
+            .copied()
+            .find(|ignored| *ignored == name)
+    })
+}
+
 fn is_ignored_directory(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|name| IGNORED_DIRECTORIES.contains(&name))

@@ -123,14 +123,18 @@ fn project_info_follows_the_read_file_grant_in_every_mode() {
     ] {
         policy.mode = mode;
         assert!(allows_tool(&policy, "project_info"));
+        assert!(allows_tool(&policy, "repo_context"));
+        assert!(allows_tool(&policy, "repo_wiki"));
     }
     policy.enabled_tools = vec!["write_file".into()];
     assert!(
         !allows_tool(&policy, "project_info"),
         "writing does not grant reading"
     );
+    assert!(!allows_tool(&policy, "repo_context"));
     policy.enabled_tools.clear();
     assert!(!allows_tool(&policy, "project_info"));
+    assert!(!allows_tool(&policy, "repo_context"));
 }
 
 #[test]

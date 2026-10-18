@@ -450,6 +450,36 @@ impl RepositoryGraph for RepositoryGraphService {
         }
     }
 
+    fn classify(&self, path: &RootRelativePath) -> Option<crate::import_graph::LanguageProfile> {
+        self.imports
+            .supports()
+            .iter()
+            .find_map(|support| support.adapter.profile_for(path))
+    }
+
+    fn read_file(&self, path: &RootRelativePath, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+        super::read_contained_file(&self.root, path.as_path(), max_bytes)
+    }
+
+    fn path_state(&self, path: &RootRelativePath) -> super::PathState {
+        use super::PathState;
+        let relative = path.as_path();
+        match super::read_contained_directory(&self.root, relative) {
+            Ok(_) => return PathState::Directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return PathState::Missing
+            }
+            Err(_) => {}
+        }
+        match super::read_contained_file(&self.root, relative, self.limits.max_file_bytes) {
+            Ok(bytes) => PathState::File {
+                content_hash: super::content_hash(&bytes),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathState::Missing,
+            Err(_) => PathState::Unknown,
+        }
+    }
+
     fn dependencies(&self, query: &ImportQuery) -> Result<ImportPage, ImportQueryError> {
         self.query_imports(Direction::Dependencies, query)
     }

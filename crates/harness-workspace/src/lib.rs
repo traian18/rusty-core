@@ -4,6 +4,7 @@
 
 pub mod dependency_groups;
 pub mod filesystem;
+pub mod folder_tree;
 pub mod framework_relations;
 pub mod import_graph;
 pub mod repository_intelligence;

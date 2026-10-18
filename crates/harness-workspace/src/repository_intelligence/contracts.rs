@@ -52,6 +52,20 @@ pub trait RepositoryGraph: Send + Sync {
     fn import_capabilities(&self) -> ImportCapabilities {
         ImportCapabilities::default()
     }
+    /// The language profile the registered adapters read `path` with, or `None` when no adapter
+    /// handles it. This is the single source of truth for "is this file supported".
+    fn classify(&self, _path: &RootRelativePath) -> Option<crate::import_graph::LanguageProfile> {
+        None
+    }
+    /// What is on disk at `path` now, for telling a missing path from an unsupported or changed one.
+    fn path_state(&self, _path: &RootRelativePath) -> super::PathState {
+        super::PathState::Unknown
+    }
+    /// The contents of an indexed file, read without leaving the authorized root, so callers can
+    /// turn byte spans into line numbers. Graphs that cannot read the disk say so.
+    fn read_file(&self, _path: &RootRelativePath, _max_bytes: u64) -> std::io::Result<Vec<u8>> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
     /// Imports made by `query.file`, in source order.
     fn dependencies(&self, query: &ImportQuery) -> Result<ImportPage, ImportQueryError>;
     /// Imports that target `query.file` (optionally one item of it).

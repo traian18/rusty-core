@@ -404,6 +404,8 @@ fn is_read_only(tool: &str) -> bool {
             | "search_codebase"
             | "list_files"
             | "project_info"
+            | "repo_context"
+            | "repo_wiki"
             | "report_progress"
             | "ask_user_question"
             | "open_document"

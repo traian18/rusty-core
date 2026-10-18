@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 harness-workspace = { path = "../../harness-workspace" }
+harness-repository-wiki = { path = "../../harness-repository-wiki" }
 harness-git-analysis = { path = "../../harness-git-analysis" }
 harness-findings = { path = "../../harness-findings" }
 harness-tools = { path = "../../harness-tools" }

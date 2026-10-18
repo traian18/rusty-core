@@ -24,7 +24,7 @@ impl Operation for Capabilities {
     }
 
     fn description(&self) -> &'static str {
-        "Report supported manifest and language profiles, resolution rules, documented gaps, group kinds, framework adapters (what each reads and leaves alone, and where it applies) and query bounds."
+        "Report supported manifest and language profiles, the languages known to be unsupported, resolution rules, documented gaps, group kinds, framework adapters (what each reads and leaves alone, and where it applies) and query bounds."
     }
 
     fn schema(&self) -> Value {
@@ -64,6 +64,10 @@ impl Operation for Capabilities {
             "groups": groups,
             "frameworks": frameworks,
             "git_available": self.0.git.is_some(),
+            "unsupported_languages": harness_workspace::repository_intelligence::known_unsupported_languages()
+                .into_iter()
+                .map(|(extension, language)| json!({"extension": extension, "language": language}))
+                .collect::<Vec<_>>(),
         })))
     }
 }

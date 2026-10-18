@@ -65,7 +65,7 @@ impl Operation for Overview {
     }
 }
 
-pub(super) fn truncation_name(truncation: Truncation) -> Option<&'static str> {
+pub(crate) fn truncation_name(truncation: Truncation) -> Option<&'static str> {
     match truncation {
         Truncation::None => None,
         Truncation::DepthLimit => Some("depth_limit"),

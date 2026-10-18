@@ -35,6 +35,7 @@ fn commit(id: &str, time: i64, changes: Vec<FileChange>) -> CommitFact {
             id: ContributorId("c1".into()),
             name: "Carol".into(),
         },
+        subject: format!("commit {id}"),
         changes,
     }
 }

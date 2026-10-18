@@ -198,7 +198,7 @@ async fn errors_are_structured_and_the_toolset_is_opt_in() {
 
     // The three toolsets are independent opt-ins.
     assert!(fixture.all().executor_for("repo_findings.list").is_none());
-    assert_eq!(tools.executors().len(), 19);
+    assert_eq!(tools.executors().len(), 21);
     let only = RepositoryIntelligence::new().with_findings(fixture.findings());
     assert_eq!(only.executors().len(), 5);
     assert!(only.executor_for("repo_graph.refresh").is_none());

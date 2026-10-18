@@ -14,6 +14,8 @@ harness-protocol = { path = "../harness-protocol" }
 harness-runtime = { path = "../harness-runtime" }
 harness-workspace = { path = "../harness-workspace" }
 harness-git-analysis = { path = "../harness-git-analysis" }
+harness-findings = { path = "../harness-findings" }
+harness-repository-wiki = { path = "../harness-repository-wiki" }
 async-trait = { workspace = true }
 
 [dev-dependencies]
