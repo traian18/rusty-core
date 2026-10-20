@@ -25,6 +25,7 @@ members = [
     "crates/harness-context-repository",
     "crates/harness-code-analysis",
     "crates/harness-code-health",
+    "crates/harness-infra-analysis",
     "crates/tools/code-analysis",
     "crates/harness-session-store",
     "crates/harness-skills",
@@ -120,6 +121,9 @@ tree-sitter-rust = "0.23"
 tree-sitter-php = "0.23"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
+tree-sitter-hcl = "1.1"
+tree-sitter-yaml = "0.7"
+tree-sitter-bash = "0.25"
 toml = "1.1.8"
 sha2 = "0.10"
 tempfile = "3"

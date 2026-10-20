@@ -1,0 +1,22 @@
+[package]
+name = "harness-infra-analysis"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-code-analysis = { path = "../harness-code-analysis" }
+harness-code-health = { path = "../harness-code-health" }
+harness-git-analysis = { path = "../harness-git-analysis" }
+tree-sitter = { workspace = true }
+tree-sitter-hcl = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+tree-sitter-bash = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+harness-workspace = { path = "../harness-workspace" }
