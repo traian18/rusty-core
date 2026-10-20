@@ -91,7 +91,7 @@ fn health_of(
     evidence: &mut Evidence<'_>,
 ) -> (Option<f64>, Vec<String>) {
     let Some(language) = language_of(path) else {
-        return (None, Vec::new());
+        return infrastructure_health_of(path, signals, summary, evidence);
     };
     let Some(text) = evidence.read(path) else {
         return (None, Vec::new());
@@ -107,6 +107,50 @@ fn health_of(
         .with_history(signals, summary);
     let findings = detect_file(&context, &DetectorConfig::default());
     let score = score_file(&findings, &ScoringConfig::default());
+    let mut costly: Vec<_> = findings
+        .iter()
+        .map(|f| {
+            (
+                score.impacts.get(&f.id).copied().unwrap_or(0.0),
+                f.reason.clone(),
+            )
+        })
+        .collect();
+    costly.sort_by(|a, b| b.0.total_cmp(&a.0));
+    (
+        Some(score.defect.score),
+        costly.into_iter().take(2).map(|(_, r)| r).collect(),
+    )
+}
+
+/// Health of an infrastructure file (Terraform, a pipeline, a Dockerfile, ...): the rules that
+/// need one file, plus its Git history.
+fn infrastructure_health_of(
+    path: &str,
+    signals: &harness_git_analysis::FileSignals,
+    summary: &harness_git_analysis::SignalSummary,
+    evidence: &mut Evidence<'_>,
+) -> (Option<f64>, Vec<String>) {
+    use harness_infra_analysis::{
+        analyse, history_findings, scoring_config, InfraConfig, InfraContext,
+    };
+    if !harness_infra_analysis::is_candidate(path) {
+        return (None, Vec::new());
+    }
+    let Some(text) = evidence.read(path) else {
+        return (None, Vec::new());
+    };
+    let Some((_, mut findings)) = analyse(
+        path,
+        &text,
+        &InfraContext::default(),
+        &InfraConfig::default(),
+    ) else {
+        return (None, Vec::new());
+    };
+    let nloc = text.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+    findings.extend(history_findings(path, nloc, signals, summary));
+    let score = score_file(&findings, &scoring_config());
     let mut costly: Vec<_> = findings
         .iter()
         .map(|f| {

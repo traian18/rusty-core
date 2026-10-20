@@ -3,9 +3,18 @@
 use std::path::Path;
 
 pub const RULE: &str = "test-convention";
-pub const RULE_VERSION: u32 = 1;
+pub const RULE_VERSION: u32 = 2;
 
-const TEST_DIRECTORIES: [&str; 6] = ["tests", "test", "__tests__", "spec", "specs", "e2e"];
+const TEST_DIRECTORIES: [&str; 8] = [
+    "tests",
+    "test",
+    "__tests__",
+    "spec",
+    "specs",
+    "e2e",
+    "benches",
+    "benchmarks",
+];
 
 /// True when `path` follows a test naming or placement convention.
 pub fn is_test_file(path: &Path) -> bool {
@@ -21,6 +30,10 @@ pub fn is_test_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
+    // A module of tests kept in its own file (`mod tests;` in Rust).
+    if matches!(name, "tests.rs" | "test.rs") {
+        return true;
+    }
     let stem = name.split('.').next().unwrap_or(name);
     name.contains(".test.")
         || name.contains(".spec.")

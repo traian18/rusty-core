@@ -16,6 +16,11 @@ pub fn language_of(path: &str) -> Option<LanguageId> {
         "py" => Some(LanguageId::Python),
         "java" => Some(LanguageId::Java),
         "kt" | "kts" => Some(LanguageId::Kotlin),
+        "cs" => Some(LanguageId::CSharp),
+        "go" => Some(LanguageId::Go),
+        "php" => Some(LanguageId::Php),
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => Some(LanguageId::Cpp),
+        "rb" => Some(LanguageId::Ruby),
         _ => None,
     }
 }

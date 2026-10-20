@@ -14,6 +14,7 @@ harness-git-analysis = { path = "../harness-git-analysis" }
 harness-findings = { path = "../harness-findings" }
 harness-code-analysis = { path = "../harness-code-analysis" }
 harness-code-health = { path = "../harness-code-health" }
+harness-infra-analysis = { path = "../harness-infra-analysis" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
