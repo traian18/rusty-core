@@ -25,6 +25,10 @@ pub enum Category {
     Organizational,
     ErrorHandling,
     TestQuality,
+    /// How infrastructure files are written: pinning, hygiene, drift, duplication.
+    Infrastructure,
+    /// Exposure in infrastructure and pipeline files: open access, secrets, broad permissions.
+    Security,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

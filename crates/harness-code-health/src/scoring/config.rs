@@ -81,6 +81,12 @@ const CODE_SHAPE: [&str; 9] = [
     "primitive_obsession",
 ];
 
+/// Code quality beyond shape: errors that are swallowed, copied code.
+const QUALITY: [&str; 3] = ["duplicated_code", "swallowed_error", "panic_prone"];
+
+/// Tests around the code; they count toward defect risk, not toward how hard the code is to change.
+const TESTS: [&str; 3] = ["untested_code", "test_without_assertions", "skipped_tests"];
+
 const HISTORY: [&str; 7] = [
     "change_entropy",
     "ownership_risk",
@@ -114,6 +120,12 @@ impl Default for ScoringConfig {
             ("bumpy_road", 0.5),
             ("primitive_obsession", 0.5),
             ("knowledge_loss", 0.4),
+            ("duplicated_code", 1.0),
+            ("swallowed_error", 1.0),
+            ("panic_prone", 0.5),
+            ("untested_code", 1.0),
+            ("test_without_assertions", 0.5),
+            ("skipped_tests", 0.3),
         ];
         let defect_caps = [
             (Category::Organizational, 3.5),
@@ -123,6 +135,8 @@ impl Default for ScoringConfig {
             (Category::Duplication, 1.0),
             (Category::TestQuality, 0.5),
             (Category::ErrorHandling, 0.5),
+            (Category::Infrastructure, 3.0),
+            (Category::Security, 4.0),
         ];
         // In maintainability, length and tangled conditions are structure, not size.
         let maintainability_categories = [
@@ -134,11 +148,18 @@ impl Default for ScoringConfig {
             (Category::SizeAndComplexity, 2.0),
             (Category::Duplication, 2.0),
             (Category::ErrorHandling, 2.0),
+            (Category::Infrastructure, 4.0),
         ];
         Self {
             severity: SeverityDeductions::default(),
             defect: DimensionConfig {
-                detectors: [owned(&CODE_SHAPE), owned(&HISTORY)].concat(),
+                detectors: [
+                    owned(&CODE_SHAPE),
+                    owned(&QUALITY),
+                    owned(&TESTS),
+                    owned(&HISTORY),
+                ]
+                .concat(),
                 weights: defect_weights
                     .iter()
                     .map(|(k, v)| ((*k).to_owned(), *v))
@@ -147,7 +168,7 @@ impl Default for ScoringConfig {
                 caps: defect_caps.into_iter().collect(),
             },
             maintainability: DimensionConfig {
-                detectors: owned(&CODE_SHAPE),
+                detectors: [owned(&CODE_SHAPE), owned(&QUALITY)].concat(),
                 weights: BTreeMap::new(),
                 categories: maintainability_categories
                     .iter()

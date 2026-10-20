@@ -18,18 +18,21 @@ mod config;
 mod context;
 mod detector;
 pub mod detectors;
+pub mod duplication;
 mod model;
 pub mod rollup;
 pub mod scoring;
+pub mod trend;
 
 pub use config::{
     BrainMethodConfig, BumpyRoadConfig, ChangeEntropyConfig, ChurnRiskConfig,
     CoChangeScatterConfig, ComplexConditionalConfig, ComplexMethodConfig, DetectorConfig,
-    DeveloperCongestionConfig, GodClassConfig, KnowledgeLossConfig, LargeMethodConfig,
-    LowCohesionConfig, NestedComplexityConfig, OwnershipRiskConfig, PrimitiveObsessionConfig,
-    PriorDefectConfig,
+    DeveloperCongestionConfig, DuplicatedCodeConfig, GodClassConfig, KnowledgeLossConfig,
+    LargeMethodConfig, LowCohesionConfig, NestedComplexityConfig, OwnershipRiskConfig,
+    PanicProneConfig, PrimitiveObsessionConfig, PriorDefectConfig, SkippedTestsConfig,
+    SwallowedErrorConfig, TestWithoutAssertionsConfig, UntestedCodeConfig,
 };
-pub use context::FileContext;
+pub use context::{Duplicate, DuplicateSite, FileContext, TestLinks};
 pub use detector::Detector;
 pub use detectors::{detect_file, registry};
 pub use model::{Category, Finding, Severity};

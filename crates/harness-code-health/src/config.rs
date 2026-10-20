@@ -201,6 +201,117 @@ impl Default for LargeMethodConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct SwallowedErrorConfig {
+    /// Swallowed errors in one function that make it medium, then high.
+    pub medium: u32,
+    pub high: u32,
+}
+
+impl Default for SwallowedErrorConfig {
+    fn default() -> Self {
+        Self { medium: 2, high: 4 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PanicProneConfig {
+    /// Calls that abort instead of handling, in one function, that fire (low), then medium, high.
+    pub threshold: u32,
+    pub medium: u32,
+    pub high: u32,
+}
+
+impl Default for PanicProneConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 5,
+            medium: 10,
+            high: 20,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DuplicatedCodeConfig {
+    /// Functions smaller than this (lines of code, syntax nodes) are not compared.
+    pub min_nloc: u32,
+    pub min_nodes: u32,
+    pub medium_nloc: u32,
+    pub high_nloc: u32,
+    /// Places a function exists in (itself included) that raise the severity one step.
+    pub many_copies: u32,
+}
+
+impl Default for DuplicatedCodeConfig {
+    fn default() -> Self {
+        Self {
+            min_nloc: 6,
+            min_nodes: 40,
+            medium_nloc: 15,
+            high_nloc: 30,
+            many_copies: 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UntestedCodeConfig {
+    /// A file this big, or with this much branching in total, should have tests.
+    pub min_nloc: u32,
+    pub min_ccn: u32,
+    /// Silent when the repository has fewer test files than this: no tests is no signal.
+    pub min_repo_tests: u32,
+}
+
+impl Default for UntestedCodeConfig {
+    fn default() -> Self {
+        Self {
+            min_nloc: 50,
+            min_ccn: 20,
+            min_repo_tests: 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TestWithoutAssertionsConfig {
+    /// Tests shorter than this are smoke tests and are left alone.
+    pub min_nloc: u32,
+    pub medium_nloc: u32,
+}
+
+impl Default for TestWithoutAssertionsConfig {
+    fn default() -> Self {
+        Self {
+            min_nloc: 3,
+            medium_nloc: 10,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkippedTestsConfig {
+    /// Skipped or ignored tests in one file that fire (low), then medium.
+    pub threshold: u32,
+    pub medium: u32,
+}
+
+impl Default for SkippedTestsConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 3,
+            medium: 8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PrimitiveObsessionConfig {
     /// Parameters that fire (low); medium two above, high four above.
     pub threshold: u32,
@@ -239,6 +350,12 @@ pub struct DetectorConfig {
     pub developer_congestion: DeveloperCongestionConfig,
     pub knowledge_loss: KnowledgeLossConfig,
     pub co_change_scatter: CoChangeScatterConfig,
+    pub swallowed_error: SwallowedErrorConfig,
+    pub panic_prone: PanicProneConfig,
+    pub duplicated_code: DuplicatedCodeConfig,
+    pub untested_code: UntestedCodeConfig,
+    pub test_without_assertions: TestWithoutAssertionsConfig,
+    pub skipped_tests: SkippedTestsConfig,
     /// Detector ids switched off.
     pub disabled: BTreeSet<String>,
 }

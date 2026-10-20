@@ -3,17 +3,22 @@ mod brain_method;
 mod bumpy_road;
 mod complex_conditional;
 mod complex_method;
+mod duplicated_code;
+mod error_handling;
 mod god_class;
 mod history;
 mod large_method;
 mod low_cohesion;
 mod nested_complexity;
 mod primitive_obsession;
+mod tests_coverage;
 
 pub use brain_method::BrainMethod;
 pub use bumpy_road::BumpyRoad;
 pub use complex_conditional::ComplexConditional;
 pub use complex_method::ComplexMethod;
+pub use duplicated_code::DuplicatedCode;
+pub use error_handling::{PanicProne, SwallowedError};
 pub use god_class::GodClass;
 pub use history::{
     ChangeEntropy, ChurnRisk, CoChangeScatter, DeveloperCongestion, KnowledgeLoss, OwnershipRisk,
@@ -23,10 +28,12 @@ pub use large_method::LargeMethod;
 pub use low_cohesion::LowCohesion;
 pub use nested_complexity::NestedComplexity;
 pub use primitive_obsession::PrimitiveObsession;
+pub use tests_coverage::{SkippedTests, TestWithoutAssertions, UntestedCode};
 
 use crate::{config::DetectorConfig, context::FileContext, detector::Detector, model::Finding};
 
-/// Every detector: structural complexity, then size and complexity, then history.
+/// Every detector: structural complexity, then size and complexity, then error handling,
+/// duplication and tests, then history.
 pub fn registry() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(NestedComplexity),
@@ -38,6 +45,12 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(ComplexMethod),
         Box::new(LargeMethod),
         Box::new(PrimitiveObsession),
+        Box::new(SwallowedError),
+        Box::new(PanicProne),
+        Box::new(DuplicatedCode),
+        Box::new(UntestedCode),
+        Box::new(TestWithoutAssertions),
+        Box::new(SkippedTests),
         Box::new(ChangeEntropy),
         Box::new(OwnershipRisk),
         Box::new(ChurnRisk),

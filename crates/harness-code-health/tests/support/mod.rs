@@ -24,6 +24,7 @@ pub fn function(name: &str) -> FunctionMetrics {
         inherited_signature: false,
         conditions: Vec::new(),
         class: None,
+        ..Default::default()
     }
 }
 
@@ -57,6 +58,7 @@ pub fn file(functions: Vec<FunctionMetrics>, classes: Vec<ClassMetrics>, nloc: u
         partial: false,
         functions,
         classes,
+        skipped_tests: 0,
     }
 }
 
