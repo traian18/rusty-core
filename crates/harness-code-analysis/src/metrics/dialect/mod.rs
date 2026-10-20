@@ -5,11 +5,16 @@ use tree_sitter::{Language, Node};
 use super::model::FunctionKind;
 use crate::model::LanguageId;
 
+mod cpp;
+mod csharp;
+mod go;
 mod java;
 mod javascript;
 mod kotlin;
 mod members;
+mod php;
 mod python;
+mod ruby;
 mod rust;
 
 /// What a node contributes to complexity.
@@ -61,6 +66,15 @@ pub trait Dialect {
     fn implicit_field(&self, _statement: Node<'_>, _child: Node<'_>) -> Option<&'static str> {
         None
     }
+    /// The type a method belongs to when it is written outside the type's own node: a Go
+    /// receiver, C++'s `Type::method`.
+    fn owner_hint(&self, _function: Node<'_>, _source: &[u8]) -> Option<String> {
+        None
+    }
+    /// Whether methods named by `owner_hint` form a class when no node declares it.
+    fn synthesizes_classes(&self) -> bool {
+        false
+    }
     fn params(&self, function: Node<'_>, source: &[u8]) -> u32;
     /// How a method refers to its instance (`self`, `this`, or Python's first parameter).
     fn receiver(&self, method: Node<'_>, source: &[u8]) -> Option<String>;
@@ -102,7 +116,11 @@ pub fn for_language(language: &LanguageId) -> Option<Box<dyn Dialect>> {
         LanguageId::Python => Some(Box::new(python::Python)),
         LanguageId::Java => Some(Box::new(java::Java)),
         LanguageId::Kotlin => Some(Box::new(kotlin::Kotlin)),
-        _ => None,
+        LanguageId::Go => Some(Box::new(go::Go)),
+        LanguageId::CSharp => Some(Box::new(csharp::CSharp)),
+        LanguageId::Php => Some(Box::new(php::Php)),
+        LanguageId::Cpp => Some(Box::new(cpp::Cpp)),
+        LanguageId::Ruby => Some(Box::new(ruby::Ruby)),
     }
 }
 

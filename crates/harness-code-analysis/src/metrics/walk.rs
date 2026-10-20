@@ -7,9 +7,11 @@ use tree_sitter::Node;
 use super::{
     class::{members, ClassDraft},
     dialect::{Control, Dialect},
+    extras,
     lines::CodeLines,
     model::{ClassMetrics, Condition, FunctionKind, FunctionMetrics},
 };
+use crate::model::LanguageId;
 
 /// Fields whose subtree sits at the depth of the statement itself: conditions, loop headers,
 /// the value a `match` inspects, and the `else` of an `if`.
@@ -177,14 +179,27 @@ impl Counter<'_> {
     }
 }
 
+/// What every function and class is measured against.
+#[derive(Clone, Copy)]
+pub struct Env<'a> {
+    pub language: &'a LanguageId,
+    pub source: &'a [u8],
+    pub dialect: &'a dyn Dialect,
+    pub lines: &'a CodeLines,
+}
+
 fn measure(
+    env: &Env<'_>,
     node: Node<'_>,
-    source: &[u8],
-    dialect: &dyn Dialect,
-    lines: &CodeLines,
     kind: FunctionKind,
-    class: Option<(usize, &str)>,
+    class: Option<(Option<usize>, &str)>,
 ) -> FunctionMetrics {
+    let Env {
+        language,
+        source,
+        dialect,
+        lines,
+    } = *env;
     let mut counter = Counter {
         dialect,
         source,
@@ -201,6 +216,7 @@ fn measure(
     let method = kind == FunctionKind::Method;
     let (typed_params, primitive_params) = dialect.typed_params(node, source);
     let constructor = dialect.is_constructor(node, &name);
+    let extra = extras::scan(language, node, &name, source, dialect);
     FunctionMetrics {
         qualified_name: match class {
             Some((_, class_name)) if method => format!("{class_name}.{name}"),
@@ -221,20 +237,30 @@ fn measure(
         constructor,
         inherited_signature: dialect.inherited_signature(node, source),
         conditions: counter.conditions,
-        class: class.filter(|_| method).map(|(index, _)| index),
+        class: class.filter(|_| method).and_then(|(index, _)| index),
+        test: extra.test,
+        test_code: extra.test_code,
+        errors: extra.errors,
+        shape: extra.shape,
+        shape_nodes: extra.shape_nodes,
+        assertions: extra.assertions,
     }
 }
 
 /// Collects every function and class under `node`, in document order.
 pub fn collect(
+    env: &Env<'_>,
     node: Node<'_>,
-    source: &[u8],
-    dialect: &dyn Dialect,
-    lines: &CodeLines,
     class: Option<usize>,
     functions: &mut Vec<FunctionMetrics>,
     classes: &mut Vec<ClassDraft>,
 ) {
+    let Env {
+        source,
+        dialect,
+        lines,
+        ..
+    } = *env;
     let mut class = class;
     if dialect.is_class(node) {
         classes.push(ClassDraft {
@@ -254,15 +280,24 @@ pub fn collect(
         class = Some(classes.len() - 1);
     }
     if let Some(kind) = dialect.function_kind(node) {
-        let owner = class.filter(|_| kind == FunctionKind::Method);
-        let named = owner.map(|index| (index, classes[index].metrics.name.clone()));
+        let mut owner = class.filter(|_| kind == FunctionKind::Method);
+        let mut owner_name = owner.map(|index| classes[index].metrics.name.clone());
+        if owner.is_none() && kind == FunctionKind::Method {
+            // A method written outside its type: Go's receiver, C++'s `Type::method`.
+            if let Some(hint) = dialect.owner_hint(node, source) {
+                owner = classes.iter().position(|c| c.metrics.name == hint);
+                if owner.is_none() && dialect.synthesizes_classes() {
+                    classes.push(synthetic_class(hint.clone(), node, lines));
+                    owner = Some(classes.len() - 1);
+                }
+                owner_name = Some(hint);
+            }
+        }
         let metrics = measure(
+            env,
             node,
-            source,
-            dialect,
-            lines,
             kind,
-            named.as_ref().map(|(i, n)| (*i, n.as_str())),
+            owner_name.as_deref().map(|name| (owner, name)),
         );
         let index = functions.len();
         if let Some(owner) = owner {
@@ -270,6 +305,9 @@ pub fn collect(
                 .receiver(node, source)
                 .map(|receiver| members(node, source, dialect, &receiver))
                 .unwrap_or_default();
+            if dialect.synthesizes_classes() && !classes[owner].references.is_empty() {
+                grow_synthetic(&mut classes[owner].metrics, node, &metrics);
+            }
             classes[owner].metrics.methods.push(index);
             classes[owner].references.push((index, references));
         }
@@ -280,6 +318,30 @@ pub fn collect(
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
     for child in children {
-        collect(child, source, dialect, lines, class, functions, classes);
+        collect(env, child, class, functions, classes);
     }
+}
+
+/// A class with no node of its own, made from its first method; `grow_synthetic` stretches it.
+fn synthetic_class(name: String, method: Node<'_>, lines: &CodeLines) -> ClassDraft {
+    ClassDraft {
+        metrics: ClassMetrics {
+            name,
+            start_line: method.start_position().row as u32 + 1,
+            end_line: method.end_position().row as u32 + 1,
+            nloc: lines.count(method.start_position().row, method.end_position().row),
+            method_count: 0,
+            max_method_ccn: 0,
+            field_count: 0,
+            lcom4: 0,
+            methods: Vec::new(),
+        },
+        references: Vec::new(),
+    }
+}
+
+fn grow_synthetic(class: &mut ClassMetrics, method: Node<'_>, measured: &FunctionMetrics) {
+    class.start_line = class.start_line.min(method.start_position().row as u32 + 1);
+    class.end_line = class.end_line.max(method.end_position().row as u32 + 1);
+    class.nloc += measured.nloc;
 }

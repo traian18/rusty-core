@@ -27,15 +27,20 @@
 //! functions; its complexity never includes the functions nested inside it.
 mod class;
 mod dialect;
+mod extras;
 mod lines;
 mod model;
+mod smells;
 mod walk;
 
 pub use model::{
-    ClassMetrics, Condition, FileMetrics, FunctionKind, FunctionMetrics, MetricsError,
+    ClassMetrics, Condition, ErrorStats, FileMetrics, FunctionKind, FunctionMetrics, MetricsError,
 };
 
 use crate::model::LanguageId;
+
+/// Bumped when what a measurement holds changes, so saved measurements are not reused.
+pub const METRICS_VERSION: u32 = 3;
 
 /// Languages measured today.
 pub fn metrics_supported(language: &LanguageId) -> bool {
@@ -62,23 +67,46 @@ pub fn measure_file(
     let lines = lines::CodeLines::new(root, source, dialect.as_ref());
     let mut functions = Vec::new();
     let mut classes = Vec::new();
-    walk::collect(
-        root,
+    let env = walk::Env {
+        language,
         source,
-        dialect.as_ref(),
-        &lines,
-        None,
-        &mut functions,
-        &mut classes,
-    );
+        dialect: dialect.as_ref(),
+        lines: &lines,
+    };
+    walk::collect(&env, root, None, &mut functions, &mut classes);
     for class in &mut classes {
         class::finish(class, &functions);
     }
+    delegate_assertions(&mut functions, source);
     Ok(FileMetrics {
         language: language.clone(),
         nloc: lines.total(),
         partial: root.has_error(),
         functions,
         classes: classes.into_iter().map(|c| c.metrics).collect(),
+        skipped_tests: smells::count_skipped(&String::from_utf8_lossy(source)),
     })
+}
+
+/// A test that calls a helper which asserts (`attempt(...)`, `check_ok(...)`) asserts through it.
+fn delegate_assertions(functions: &mut [FunctionMetrics], source: &[u8]) {
+    let helpers: Vec<String> = functions
+        .iter()
+        .filter(|f| !f.test && f.assertions > 0 && !f.name.starts_with('<'))
+        .map(|f| format!("{}(", f.name))
+        .collect();
+    if helpers.is_empty() || functions.iter().all(|f| !f.test || f.assertions > 0) {
+        return;
+    }
+    let text = String::from_utf8_lossy(source);
+    let lines: Vec<&str> = text.lines().collect();
+    for f in functions.iter_mut().filter(|f| f.test && f.assertions == 0) {
+        let body = lines
+            .get(f.start_line as usize - 1..(f.end_line as usize).min(lines.len()))
+            .unwrap_or(&[])
+            .join("\n");
+        if helpers.iter().any(|h| body.contains(h.as_str())) {
+            f.assertions = 1;
+        }
+    }
 }

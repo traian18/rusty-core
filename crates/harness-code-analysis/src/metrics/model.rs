@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::LanguageId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FunctionKind {
+    #[default]
     Function,
     /// Declared in a class, `impl` or trait body.
     Method,
@@ -25,7 +26,23 @@ pub struct Condition {
     pub negated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// How a function handles failure, counted on its own body (nested functions count for
+/// themselves).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorStats {
+    /// A catch, except or rescue whose body does nothing.
+    pub empty_handlers: u32,
+    /// A catch-all handler (`except:`, `catch (Exception)`, `rescue Exception`, `catch (...)`)
+    /// that does not rethrow.
+    pub broad_handlers: u32,
+    /// Calls that abort or dump instead of handling: `unwrap`, `expect`, `panic!`, `!!`,
+    /// `printStackTrace`, `@`.
+    pub panics: u32,
+    /// A result thrown away on purpose: `let _ = f()`, `_ = f()`.
+    pub ignored_results: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionMetrics {
     /// The declared name, or for an anonymous function what it is assigned or passed to
     /// (`<anonymous>` when nothing names it).
@@ -53,6 +70,24 @@ pub struct FunctionMetrics {
     pub conditions: Vec<Condition>,
     /// Index into [`FileMetrics::classes`] for methods.
     pub class: Option<usize>,
+    /// A test by the language's convention (`#[test]`, `test_*`, `@Test`, an `it(...)` callback).
+    #[serde(default)]
+    pub test: bool,
+    /// A test, or support code that exists only for tests (a helper in a `#[cfg(test)]` module).
+    /// Failure-handling smells are not counted in it.
+    #[serde(default)]
+    pub test_code: bool,
+    #[serde(default)]
+    pub errors: ErrorStats,
+    /// Hash of the shape of the function's syntax tree: node kinds and nesting, not names or
+    /// literals, so renamed copies hash equal. Zero when the function is too small to compare.
+    #[serde(default)]
+    pub shape: u64,
+    #[serde(default)]
+    pub shape_nodes: u32,
+    /// Assertion-like calls in the function (and the attributes above it).
+    #[serde(default)]
+    pub assertions: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +117,9 @@ pub struct FileMetrics {
     /// In document order.
     pub functions: Vec<FunctionMetrics>,
     pub classes: Vec<ClassMetrics>,
+    /// Tests marked ignored, skipped or disabled.
+    #[serde(default)]
+    pub skipped_tests: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
