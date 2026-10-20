@@ -1,121 +1,25 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use harness_protocol::{
-    events::{AgentEvent, AgentEventEnvelope},
-    ids::{AgentId, EventId, MessageId, PermissionId, SessionId, ToolCallId},
+    events::AgentEventEnvelope,
+    ids::{AgentId, PermissionId, SessionId},
     messages::{AgentMessage, ContentBlock, MessageRole},
     usage::AgentUsageSnapshot,
 };
 
 use crate::{
-    model::{LogEntry, PermissionDisplayDecision, ToolCallState, TranscriptBlock},
+    model::{LogEntry, TranscriptBlock},
     providers::{fallback_options, ProviderOption, SessionSelection},
 };
 
-/// Caps the activity log's memory growth over a long-running session.
-/// Streaming text/reasoning deltas never reach the log (see `fold_event`),
-/// so in practice this bound is only ever approached by very long sessions
-/// with many state transitions, tool calls, or child agents — not by a
-/// single verbose run.
-const MAX_LOG_ENTRIES: usize = 500;
+mod activity_log;
+mod events;
+mod modal;
+mod runtime_events;
+mod transcript;
 
-/// Formats a one-line activity-log summary for `event`, or `None` for the
-/// two kinds excluded from the log. `AssistantTextDelta`/`ReasoningDelta`
-/// are the only exclusions — a single streamed response can produce
-/// hundreds of those, and their content is already visible, progressively,
-/// in the curated transcript (see `AppState::fold_event`'s own handling of
-/// them). Everything else is included, on purpose, even event kinds the
-/// curated transcript never renders at all (`BackendRequestStarted`,
-/// `PermissionRequested`, `UsageUpdated`) — that's the point of a raw log
-/// next to a curated one: it can't silently go stale the way a hand-picked
-/// `match` does when a new `AgentEvent` variant is added and nobody
-/// remembers to teach the transcript about it.
-fn log_summary(event: &AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::AssistantTextDelta { .. } | AgentEvent::ReasoningDelta { .. } => None,
-        AgentEvent::StateChanged { from, to } => Some(format!("state {from:?} → {to:?}")),
-        AgentEvent::RunStarted { run_id } => Some(format!("run started {run_id:?}")),
-        AgentEvent::BackendRequestStarted { request_id } => {
-            Some(format!("backend request started {request_id:?}"))
-        }
-        AgentEvent::AssistantMessageStarted { message_id } => {
-            Some(format!("assistant message started {message_id:?}"))
-        }
-        AgentEvent::AssistantMessageCompleted { message_id } => {
-            Some(format!("assistant message completed {message_id:?}"))
-        }
-        AgentEvent::ToolCallRequested { call } => Some(format!(
-            "tool call requested: {} {}",
-            call.name, call.arguments
-        )),
-        AgentEvent::ToolCallStarted { call_id } => Some(format!("tool call started {call_id:?}")),
-        AgentEvent::ToolCallProgress { call_id, progress } => Some(format!(
-            "tool call progress {call_id:?}: {} ({:.0}%)",
-            progress.status,
-            progress.fraction * 100.0
-        )),
-        AgentEvent::ToolCallCompleted { call_id, result } => Some(format!(
-            "tool call {} {call_id:?}: {}",
-            if result.has_error {
-                "failed"
-            } else {
-                "completed"
-            },
-            result.output_preview
-        )),
-        AgentEvent::PermissionRequested { request } => Some(format!(
-            "permission requested for {} ({:?})",
-            request.tool_call.name, request.id
-        )),
-        AgentEvent::UsageUpdated { usage } => Some(format!("usage updated: {usage:?}")),
-        AgentEvent::ChildAgentSpawned {
-            agent_id,
-            tool_call_id,
-        } => Some(match tool_call_id {
-            Some(call) => format!("child agent spawned {agent_id:?} by tool call {call:?}"),
-            None => format!("child agent spawned {agent_id:?}"),
-        }),
-        AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
-            Some(format!("child agent {agent_id:?} completed: {outcome:?}"))
-        }
-        AgentEvent::Failed { error } => Some(format!("FAILED [{}] {}", error.code, error.message)),
-        AgentEvent::Completed { outcome } => Some(format!("completed: {outcome:?}")),
-        AgentEvent::BehaviorRuleFired {
-            profile,
-            rule_id,
-            event,
-            action,
-        } => Some(format!(
-            "rule {rule_id} ({profile}) fired on {event}: {action}"
-        )),
-        AgentEvent::ContextInjected {
-            source,
-            placement,
-            chars,
-        } => Some(format!(
-            "context injected by {source} ({placement}, {chars} chars)"
-        )),
-        AgentEvent::ToolCallDenied {
-            call_id, reason, ..
-        } => Some(format!("tool call denied {call_id:?}: {reason}")),
-        AgentEvent::ProfileChanged { from, to } => Some(format!("profile {from} → {to}")),
-        AgentEvent::ModelRequestPrepared { .. } => Some("model request prepared".to_owned()),
-        AgentEvent::CompletionGateEvaluated {
-            attempt,
-            passed,
-            continuing,
-            failed_checks,
-        } => Some(format!(
-            "completion gate #{attempt}: {} {}",
-            if *passed { "passed" } else { "failed" },
-            if *continuing {
-                format!("(sent back: {})", failed_checks.join(", "))
-            } else {
-                String::new()
-            }
-        )),
-    }
-}
+pub use self::modal::{ModalResult, ModalState};
+use self::transcript::EventTranscript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -124,30 +28,6 @@ pub struct SessionEntry {
     pub provider: String,
     pub model: String,
     pub restorable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModalState {
-    Commands {
-        selected: usize,
-    },
-    Provider {
-        selected: usize,
-    },
-    Account {
-        provider: usize,
-    },
-    Model {
-        provider: usize,
-        selected: usize,
-        value: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModalResult {
-    None,
-    StartSession(SessionSelection),
 }
 
 #[derive(Default)]
@@ -171,11 +51,7 @@ pub struct AppState {
     pub context: Option<harness_engine::ContextInspection>,
     pub log: Vec<LogEntry>,
     pub log_open: bool,
-    seen_events: HashSet<EventId>,
-    messages: HashMap<MessageId, usize>,
-    tools: HashMap<ToolCallId, usize>,
-    permissions: HashMap<PermissionId, usize>,
-    children: HashMap<AgentId, usize>,
+    events: EventTranscript,
 }
 
 impl AppState {
@@ -215,6 +91,7 @@ impl AppState {
     }
 
     pub fn hydrate_messages(&mut self, agent_id: AgentId, messages: &[AgentMessage]) {
+        self.events.clear_indexes();
         self.transcript.clear();
         for message in messages {
             let text = message
@@ -335,71 +212,48 @@ impl AppState {
 
     pub fn confirm_modal(&mut self) -> ModalResult {
         match self.modal.take() {
-            Some(ModalState::Commands { selected: 0 }) => {
-                self.open_new_session();
-                ModalResult::None
-            }
-            Some(ModalState::Commands { selected: 1 }) => {
-                self.context_inspector_open = true;
-                ModalResult::None
-            }
-            Some(ModalState::Commands { selected: 2 }) => {
-                self.log_open = true;
-                ModalResult::None
-            }
-            Some(ModalState::Commands { .. }) => {
-                self.should_quit = true;
-                ModalResult::None
-            }
+            Some(ModalState::Commands { selected }) => self.confirm_command(selected),
             Some(ModalState::Provider { selected }) => {
                 self.modal = Some(ModalState::Account { provider: selected });
                 ModalResult::None
             }
-            Some(ModalState::Account { provider }) => {
-                let option = &self.providers[provider.min(self.providers.len() - 1)];
-                if !option.ready {
-                    self.error_banner = Some(option.health_message.clone());
-                    self.modal = Some(ModalState::Account { provider });
-                    return ModalResult::None;
-                }
-                let selected = option
-                    .models
-                    .iter()
-                    .position(|model| model == &option.default_model)
-                    .unwrap_or(0);
-                self.modal = Some(ModalState::Model {
-                    provider,
-                    selected,
-                    value: option.default_model.clone(),
-                });
+            Some(ModalState::Account { provider }) => self.confirm_account(provider),
+            Some(ModalState::Model {
+                provider, value, ..
+            }) => self.confirm_model(provider, value),
+            None => ModalResult::None,
+        }
+    }
+
+    fn confirm_command(&mut self, selected: usize) -> ModalResult {
+        match selected {
+            0 => self.open_new_session(),
+            1 => self.context_inspector_open = true,
+            2 => self.log_open = true,
+            _ => self.should_quit = true,
+        }
+        ModalResult::None
+    }
+
+    fn confirm_account(&mut self, provider: usize) -> ModalResult {
+        match modal::confirm_account(provider, &self.providers) {
+            Ok(next_modal) => self.modal = Some(next_modal),
+            Err(message) => {
+                self.error_banner = Some(message);
+                self.modal = Some(ModalState::Account { provider });
+            }
+        }
+        ModalResult::None
+    }
+
+    fn confirm_model(&mut self, provider: usize, value: String) -> ModalResult {
+        match modal::confirm_model(provider, value, &self.providers) {
+            Ok(selection) => ModalResult::StartSession(selection),
+            Err((modal, message)) => {
+                self.modal = Some(modal);
+                self.error_banner = Some(message);
                 ModalResult::None
             }
-            Some(ModalState::Model {
-                provider,
-                selected: _,
-                value,
-            }) => {
-                let provider_index = provider.min(self.providers.len() - 1);
-                let provider = &self.providers[provider_index];
-                let model = value.trim();
-                if model.is_empty() {
-                    self.modal = Some(ModalState::Model {
-                        provider: provider_index,
-                        selected: usize::MAX,
-                        value,
-                    });
-                    self.error_banner = Some("Model ID cannot be empty".to_owned());
-                    return ModalResult::None;
-                }
-                ModalResult::StartSession(SessionSelection {
-                    provider_id: provider.id.clone(),
-                    credential_profile: provider.credential_profile.clone(),
-                    integration: provider.integration.clone(),
-                    provider: provider.name.clone(),
-                    model: model.to_owned(),
-                })
-            }
-            None => ModalResult::None,
         }
     }
 
@@ -450,16 +304,12 @@ impl AppState {
     }
 
     pub fn resolve_permission(&mut self, id: PermissionId, approved: bool) {
-        self.pending_permissions.retain(|pending| *pending != id);
-        if let Some(index) = self.permissions.get(&id).copied() {
-            if let TranscriptBlock::Permission { decision, .. } = &mut self.transcript[index] {
-                *decision = Some(if approved {
-                    PermissionDisplayDecision::Approved
-                } else {
-                    PermissionDisplayDecision::Denied
-                });
-            }
-        }
+        self.events.resolve_permission(
+            &mut self.transcript,
+            &mut self.pending_permissions,
+            id,
+            approved,
+        );
     }
 
     pub fn scroll_up(&mut self, amount: u16) {
@@ -480,203 +330,59 @@ impl AppState {
     }
 
     pub fn fold_event(&mut self, envelope: AgentEventEnvelope) {
-        if !self.seen_events.insert(envelope.event_id) {
+        let agent_id = envelope.agent_id;
+        let event = envelope.event.clone();
+        if !self.events.mark_seen(envelope.event_id) {
             return;
         }
 
-        if let Some(text) = log_summary(&envelope.event) {
+        if let Some(text) = activity_log::log_summary(&event) {
             self.log.push(LogEntry {
                 sequence: envelope.agent_sequence,
                 text,
             });
-            if self.log.len() > MAX_LOG_ENTRIES {
-                let overflow = self.log.len() - MAX_LOG_ENTRIES;
+            if self.log.len() > 500 {
+                let overflow = self.log.len() - 500;
                 self.log.drain(..overflow);
             }
         }
 
-        let agent_id = envelope.agent_id;
-        match envelope.event {
-            AgentEvent::StateChanged { to, .. } => self.status = format!("{to:?}"),
-            AgentEvent::RunStarted { .. } => self.notice("Run started"),
-            AgentEvent::BackendRequestStarted { .. } => {}
-            AgentEvent::AssistantMessageStarted { message_id } => {
-                self.ensure_message(message_id, agent_id);
+        let Some(event) = self.events.fold_conversation_event(
+            &mut self.transcript,
+            &mut self.pending_permissions,
+            agent_id,
+            event.clone(),
+        ) else {
+            self.apply_event(events::fold_event(event));
+            if self.auto_follow {
+                self.follow_bottom();
             }
-            AgentEvent::AssistantTextDelta { message_id, delta } => {
-                let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { text, .. } = &mut self.transcript[index]
-                {
-                    text.push_str(&delta);
-                }
-            }
-            AgentEvent::ReasoningDelta { message_id, delta } => {
-                let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { reasoning, .. } =
-                    &mut self.transcript[index]
-                {
-                    reasoning.push_str(&delta);
-                }
-            }
-            AgentEvent::AssistantMessageCompleted { message_id } => {
-                let index = self.ensure_message(message_id, agent_id);
-                if let TranscriptBlock::AssistantMessage { complete, .. } =
-                    &mut self.transcript[index]
-                {
-                    *complete = true;
-                }
-            }
-            AgentEvent::ToolCallRequested { call } => {
-                let index = self.ensure_tool(call.id, agent_id, &call.name);
-                if let TranscriptBlock::ToolCall {
-                    name,
-                    arguments,
-                    state,
-                    ..
-                } = &mut self.transcript[index]
-                {
-                    *name = call.name;
-                    *arguments = call.arguments;
-                    *state = ToolCallState::Requested;
-                }
-            }
-            AgentEvent::ToolCallStarted { call_id } => {
-                let index = self.ensure_tool(call_id, agent_id, "tool");
-                if let TranscriptBlock::ToolCall { state, .. } = &mut self.transcript[index] {
-                    *state = ToolCallState::Running;
-                }
-            }
-            AgentEvent::ToolCallProgress { call_id, progress } => {
-                let index = self.ensure_tool(call_id, agent_id, "tool");
-                if let TranscriptBlock::ToolCall { state, .. } = &mut self.transcript[index] {
-                    *state = ToolCallState::Progress {
-                        status: progress.status,
-                        fraction: progress.fraction,
-                    };
-                }
-            }
-            AgentEvent::ToolCallCompleted { call_id, result } => {
-                let index = self.ensure_tool(call_id, agent_id, "tool");
-                if let TranscriptBlock::ToolCall { state, .. } = &mut self.transcript[index] {
-                    *state = if result.has_error {
-                        ToolCallState::Failed {
-                            preview: result.output_preview,
-                        }
-                    } else {
-                        ToolCallState::Succeeded {
-                            preview: result.output_preview,
-                        }
-                    };
-                }
-            }
-            AgentEvent::PermissionRequested { request } => {
-                if !self.permissions.contains_key(&request.id) {
-                    let index = self.transcript.len();
-                    self.permissions.insert(request.id, index);
-                    self.pending_permissions.push_back(request.id);
-                    self.transcript.push(TranscriptBlock::Permission {
-                        id: request.id,
-                        tool_call_id: request.tool_call.id,
-                        tool_name: request.tool_call.name,
-                        decision: None,
-                    });
-                }
-            }
-            AgentEvent::UsageUpdated { usage } => self.usage = Some(usage),
-            AgentEvent::ChildAgentSpawned { agent_id, .. } => {
-                self.ensure_child(agent_id);
-            }
-            AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
-                let index = self.ensure_child(agent_id);
-                if let TranscriptBlock::ChildAgent {
-                    outcome: child_outcome,
-                    ..
-                } = &mut self.transcript[index]
-                {
-                    *child_outcome = Some(outcome);
-                }
-            }
-            AgentEvent::Failed { error } => self.transcript.push(TranscriptBlock::Error {
-                code: error.code,
-                message: error.message,
-            }),
-            AgentEvent::Completed { outcome } => self.notice(format!("Run completed: {outcome:?}")),
-            AgentEvent::ToolCallDenied { reason, .. } => {
-                self.notice(format!("Tool call denied: {reason}"))
-            }
-            AgentEvent::ProfileChanged { to, .. } => self.notice(format!("Profile: {to}")),
-            AgentEvent::CompletionGateEvaluated {
-                passed: false,
-                continuing,
-                failed_checks,
-                ..
-            } => self.notice(if continuing {
-                format!(
-                    "Completion rejected ({}); continuing",
-                    failed_checks.join(", ")
-                )
-            } else {
-                format!("Completion gate not passed ({})", failed_checks.join(", "))
-            }),
-            AgentEvent::BehaviorRuleFired { .. }
-            | AgentEvent::ContextInjected { .. }
-            | AgentEvent::ModelRequestPrepared { .. }
-            | AgentEvent::CompletionGateEvaluated { .. } => {}
-        }
+            return;
+        };
+
+        self.apply_event(events::fold_event(event));
 
         if self.auto_follow {
             self.follow_bottom();
         }
     }
 
+    fn apply_event(&mut self, action: events::EventAction) {
+        match action {
+            events::EventAction::StateChanged(status) => self.status = status,
+            events::EventAction::Notice(text) => self.notice(text),
+            events::EventAction::UsageUpdated(usage) => self.usage = Some(usage),
+            events::EventAction::Failed { code, message } => {
+                self.transcript
+                    .push(TranscriptBlock::Error { code, message });
+            }
+            events::EventAction::Ignore => {}
+        }
+    }
+
     fn notice(&mut self, text: impl Into<String>) {
         self.transcript
             .push(TranscriptBlock::SystemNotice { text: text.into() });
-    }
-
-    fn ensure_message(&mut self, id: MessageId, agent_id: AgentId) -> usize {
-        if let Some(index) = self.messages.get(&id) {
-            return *index;
-        }
-        let index = self.transcript.len();
-        self.transcript.push(TranscriptBlock::AssistantMessage {
-            id,
-            agent_id,
-            text: String::new(),
-            reasoning: String::new(),
-            complete: false,
-        });
-        self.messages.insert(id, index);
-        index
-    }
-
-    fn ensure_tool(&mut self, id: ToolCallId, agent_id: AgentId, name: &str) -> usize {
-        if let Some(index) = self.tools.get(&id) {
-            return *index;
-        }
-        let index = self.transcript.len();
-        self.transcript.push(TranscriptBlock::ToolCall {
-            id,
-            agent_id,
-            name: name.to_owned(),
-            arguments: serde_json::Value::Null,
-            state: ToolCallState::Requested,
-        });
-        self.tools.insert(id, index);
-        index
-    }
-
-    fn ensure_child(&mut self, agent_id: AgentId) -> usize {
-        if let Some(index) = self.children.get(&agent_id) {
-            return *index;
-        }
-        let index = self.transcript.len();
-        self.transcript.push(TranscriptBlock::ChildAgent {
-            agent_id,
-            outcome: None,
-        });
-        self.children.insert(agent_id, index);
-        index
     }
 }
 
@@ -685,7 +391,7 @@ mod tests {
     use super::*;
     use harness_protocol::{
         events::{AgentEvent, EventVisibility},
-        ids::{AgentId, RunId, Timestamp},
+        ids::{AgentId, EventId, MessageId, RunId, Timestamp},
     };
 
     fn envelope(event_id: EventId, agent_id: AgentId, event: AgentEvent) -> AgentEventEnvelope {
