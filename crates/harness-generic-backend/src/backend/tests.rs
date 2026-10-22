@@ -1,6 +1,12 @@
+use std::sync::Mutex;
+
+use super::stream::MODEL_EVENT_BUFFER;
 use super::*;
 use crate::testing::FakeModelClient;
 use harness_model::client::ModelEventSender;
+use harness_model::events::{ModelError, ModelEvent, ModelResult};
+use harness_model::request::ModelRequest;
+use harness_protocol::ids::RequestId;
 
 /// A client that advertises `structured_output` must have that reach
 /// `BackendCapabilities`. This was wrong once already: the four HTTP

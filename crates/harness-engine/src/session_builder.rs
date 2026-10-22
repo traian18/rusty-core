@@ -1,26 +1,31 @@
 //! Public session builder and live session handle.
+//!
+//! The builder only collects configuration; [`assembly`] holds the steps
+//! [`SessionBuilder::start`] runs and [`handle`] the live session API.
+
+mod assembly;
+mod handle;
 
 use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::backend::{discovered_capability, BroadcastEventSink, ToolAdvertisingBackend};
+use crate::backend::BroadcastEventSink;
 use crate::tool_factory::build_executor_with_context;
+use assembly::DiscoveredTools;
 use harness_code_analysis::CallGraph;
-use harness_protocol::commands::{PermissionDecision, UserInput};
-use harness_protocol::events::AgentEventEnvelope;
-use harness_protocol::ids::{PermissionId, SessionId};
+use harness_protocol::ids::SessionId;
 use harness_protocol::tools::AgentToolset;
-use harness_runtime::session_client::{SessionClient, SessionSnapshot};
+use harness_runtime::session_client::SessionClient;
 use harness_runtime::session_manager::{SessionManager, SessionManagerError};
-use harness_runtime::session_runtime::{SessionCommand, SessionError, SessionRuntime};
+use harness_runtime::session_runtime::SessionError;
 use harness_runtime::traits::{ExecutionBackend, ToolRegistry};
 use harness_runtime::{IntegrationError, IntegrationRegistry};
 use harness_tool_repository_intelligence::RepositoryIntelligence;
 
+pub use handle::{ContextInspection, SessionHandle};
 pub use harness_skills::SkillsConfig;
-use harness_skills::{SkillCatalog, SkillsContextProvider};
 pub use harness_tool_mcp::{McpServerConfig, McpTransportConfig};
 
 // ---------------------------------------------------------------------------
@@ -169,27 +174,8 @@ impl SessionBuilder {
         session_manager: Arc<SessionManager>,
     ) -> Self {
         Self {
-            execution_policy: None,
-            backend: None,
-            integration: None,
-            integrations,
-            tool_registry: None,
-            workspace: None,
-            root_toolset: None,
             session_manager: Some(session_manager),
-            context_provider: None,
-            context_factory: None,
-            execution_params: None,
-            mcp_servers: Vec::new(),
-            optional_mcp_servers: Default::default(),
-            skills: None,
-            orchestration: None,
-            profiles: None,
-            profile: None,
-            workspace_profiles: None,
-            child_behavior_resolver: None,
-            command_trust: Default::default(),
-            allow_draft_profiles: false,
+            ..Self::with_integrations(integrations)
         }
     }
 
@@ -451,7 +437,7 @@ impl SessionBuilder {
                 graph.clone(),
                 repository.as_ref(),
             );
-            let _ = registry.register(executor);
+            assembly::register_tool(&registry, executor);
         }
 
         self.tool_registry = Some(Arc::new(registry));
@@ -469,36 +455,15 @@ impl SessionBuilder {
     pub async fn start(self) -> Result<SessionHandle, HarnessError> {
         // Resolve the behavior profile first so a bad reference or a broken
         // workspace profile fails before MCP servers or backends are started.
-        let mut profile_registry = self
-            .profiles
-            .as_ref()
-            .map(crate::profiles::ProfilesConfig::snapshot)
-            .unwrap_or_default()
-            .allow_drafts(self.allow_draft_profiles);
-        if let Some(root) = &self.workspace_profiles {
-            crate::profiles::load_workspace_profiles(root, &mut profile_registry)?;
-        }
-        let root_profile = crate::profiles::resolve_bundle(
-            &profile_registry,
+        let (profile_registry, root_profile) = assembly::resolve_profiles(
+            self.profiles.as_ref(),
+            self.allow_draft_profiles,
+            self.workspace_profiles.as_deref(),
             self.profile.as_ref(),
             self.command_trust,
         )?;
-
-        let (backend, persisted_selection) = match (self.backend, self.integration) {
-            (Some(backend), _) => (backend, None),
-            (None, Some(integration)) => {
-                let persisted_selection = integration
-                    .config
-                    .get("_backend_selection")
-                    .and_then(|value| serde_json::from_value(value.clone()).ok());
-                let backend = self
-                    .integrations
-                    .create(&integration.id, integration.config)
-                    .await?;
-                (backend, persisted_selection)
-            }
-            (None, None) => return Err(HarnessError::MissingBackend),
-        };
+        let (backend, persisted_selection) =
+            assembly::resolve_backend(self.backend, self.integration, &self.integrations).await?;
         let tool_registry = self
             .tool_registry
             .ok_or(HarnessError::MissingToolRegistry)?;
@@ -513,114 +478,32 @@ impl SessionBuilder {
         // This needs to happen before `root_toolset` is derived below so
         // the no-explicit-toolset fallback (which reads straight from
         // `tool_registry.descriptors()`) picks the MCP tools up too.
-        let mut discovered_descriptors = Vec::new();
-        let mut allowed_mcp_tools = Vec::new();
-        for config in &self.mcp_servers {
-            use harness_core::execution_policy::{mcp_server_access, McpServerAccess};
-            let access = self
-                .execution_policy
-                .as_ref()
-                .map_or(McpServerAccess::Full, |policy| {
-                    mcp_server_access(policy, &config.name)
-                });
-            let discovered = match access {
-                McpServerAccess::Denied => continue,
-                McpServerAccess::ReadOnly => {
-                    harness_tool_mcp::connect_and_discover_read_only(config).await
-                }
-                McpServerAccess::Full => harness_tool_mcp::connect_and_discover(config).await,
-            };
-            let executors = match discovered {
-                Ok(executors) => executors,
-                Err(error) if self.optional_mcp_servers.contains(&config.name) => {
-                    tracing::warn!(server = %config.name, %error, "skipping unavailable MCP server");
-                    continue;
-                }
-                Err(error) => return Err(HarnessError::Mcp(config.name.clone(), error)),
-            };
-            for executor in executors {
-                let descriptor = executor.descriptor();
-                allowed_mcp_tools.push(descriptor.id.to_string());
-                let _ = tool_registry.register(executor);
-                discovered_descriptors.push(discovered_capability(descriptor));
-            }
-        }
-
         // Skills are discovered at the same point and for the same reason:
         // `skill.load`/`skill.read` have to be in the registry and in the
         // root toolset before either is frozen below.
-        //
-        // Unlike an MCP server, a broken skill is never fatal — one
-        // malformed `SKILL.md` costs its author that skill and nothing
-        // else, so `discover` hands back problems alongside the catalog and
-        // we log them rather than failing the session.
-        let skills_provider = match &self.skills {
-            Some(config) => {
-                let (catalog, errors) = SkillCatalog::discover(config).await;
-                for error in &errors {
-                    tracing::warn!(error = %error, "skills: skipping unreadable skill");
-                }
-                let catalog = Arc::new(catalog);
-                tracing::debug!(skills = catalog.len(), "skills: catalog ready");
+        let mut discovered = DiscoveredTools::default();
+        assembly::connect_mcp_servers(
+            &self.mcp_servers,
+            &self.optional_mcp_servers,
+            self.execution_policy.as_ref(),
+            tool_registry.as_ref(),
+            &mut discovered,
+        )
+        .await?;
+        let skills_provider = assembly::discover_skills(
+            self.skills.as_ref(),
+            tool_registry.as_ref(),
+            &mut discovered,
+        )
+        .await;
 
-                for executor in harness_tool_skills::skill_tools(catalog.clone()) {
-                    let descriptor = executor.descriptor();
-                    let _ = tool_registry.register(executor);
-                    discovered_descriptors.push(discovered_capability(descriptor));
-                }
-                Some(Arc::new(SkillsContextProvider::new(catalog))
-                    as Arc<dyn harness_context::ContextProvider>)
-            }
-            None => None,
-        };
-
-        // A high-level toolset carries explicit policy. For callers that
-        // provide a registry directly, derive an enabled/allowed toolset so
-        // registered tools are also executable by the root agent.
-        let mut root_toolset = match self.root_toolset {
-            Some(mut toolset) => {
-                // `.toolset()` already fixed its policy before MCP servers
-                // and skills were discovered — merge the newly discovered
-                // tools in rather than rebuilding from the registry, which
-                // would silently drop the caller's explicit choices.
-                for (id, capability) in discovered_descriptors {
-                    if !toolset
-                        .tools
-                        .values()
-                        .any(|existing| existing.descriptor.name == capability.descriptor.name)
-                    {
-                        toolset.tools.insert(id, capability);
-                    }
-                }
-                toolset
-            }
-            None => {
-                let tools = tool_registry
-                    .descriptors()
-                    .into_iter()
-                    .map(discovered_capability)
-                    .collect();
-                AgentToolset { tools }
-            }
-        };
-        if let Some(policy) = &self.execution_policy {
-            harness_core::execution_policy::restrict_toolset(
-                policy,
-                &mut root_toolset,
-                &allowed_mcp_tools,
-            );
-        }
-        let protocol_descriptors = root_toolset
-            .enabled_descriptors()
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let backend: Arc<dyn ExecutionBackend> = Arc::new(ToolAdvertisingBackend {
-            inner: backend,
-            tools: protocol_descriptors,
-            selection: persisted_selection,
-        });
+        let root_toolset = assembly::root_toolset(
+            self.root_toolset,
+            discovered,
+            tool_registry.as_ref(),
+            self.execution_policy.as_ref(),
+        );
+        let backend = assembly::advertise_tools(backend, &root_toolset, persisted_selection);
         // An unbound session used to fall back to `FakeWorkspace`, an
         // in-memory store: `fs.read` reported "not found" for files that
         // exist on disk and `fs.edit` wrote into a buffer that was dropped
@@ -631,40 +514,13 @@ impl SessionBuilder {
         let workspace: Arc<dyn harness_runtime::traits::Workspace> = self
             .workspace
             .unwrap_or_else(|| Arc::new(harness_workspace::UnboundWorkspace::new()));
-
-        // The skills provider runs *before* whatever the caller installed,
-        // so that a compaction provider (which sizes a token budget) sees
-        // the prompt that will actually ship rather than one still missing
-        // the skill catalog.
-        let factory_provider = self.context_factory.map(|factory| factory(backend.clone()));
-        let caller_provider = match (self.context_provider, factory_provider) {
-            (Some(first), Some(second)) => {
-                Some(Arc::new(harness_context::ChainedContextProvider::new(vec![
-                    first, second,
-                ]))
-                    as Arc<dyn harness_context::ContextProvider>)
-            }
-            (only, None) | (None, only) => only,
-        };
-        let context_provider = match (skills_provider, caller_provider) {
-            (Some(skills), Some(caller)) => {
-                Some(Arc::new(harness_context::ChainedContextProvider::new(vec![
-                    skills, caller,
-                ]))
-                    as Arc<dyn harness_context::ContextProvider>)
-            }
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
-        };
-
-        let backend: Arc<dyn ExecutionBackend> = match context_provider {
-            Some(provider) => Arc::new(harness_context::ContextAssemblingBackend::new(
-                backend,
-                provider,
-                workspace.clone(),
-            )),
-            None => backend,
-        };
+        let backend = assembly::assemble_context(
+            backend,
+            &workspace,
+            skills_provider,
+            self.context_provider,
+            self.context_factory,
+        );
 
         let (event_tx, _) = broadcast::channel(256);
         let event_sink = Arc::new(BroadcastEventSink {
@@ -686,271 +542,21 @@ impl SessionBuilder {
         let session_id = runtime.session_id;
 
         let client = SessionClient::new(runtime);
-        if let Some(params) = self.execution_params {
-            client
-                .send(SessionCommand::ConfigureExecution(params))
-                .await?;
-        }
-        if !root_profile.is_default() {
-            client.send(root_profile.command()).await?;
-        }
+        assembly::apply_session_defaults(&client, self.execution_params, &root_profile).await?;
 
-        Ok(SessionHandle {
+        Ok(SessionHandle::new(
             client,
             session_id,
             session_manager,
-            orchestration: self.orchestration,
-            profiles: Arc::new(profile_registry),
-            command_trust: self.command_trust,
-        })
+            self.orchestration,
+            Arc::new(profile_registry),
+            self.command_trust,
+        ))
     }
 }
 
 impl Default for SessionBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Handle to a live session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextInspection {
-    pub generation: u64,
-    pub estimated_tokens: Option<u64>,
-    pub checkpoint: Option<String>,
-    pub covered_through: Option<String>,
-    pub pinned_items: usize,
-    pub last_compacted_at: Option<String>,
-}
-
-pub struct SessionHandle {
-    client: SessionClient,
-    pub(crate) session_id: SessionId,
-    pub(crate) session_manager: Arc<SessionManager>,
-    pub(crate) orchestration: Option<crate::orchestration::OrchestrationConfig>,
-    /// Profiles this session resolves references against (host registry
-    /// plus any workspace profiles loaded at start).
-    pub(crate) profiles: Arc<harness_core::behavior::ProfileRegistry>,
-    /// Whether this session's profiles may run commands.
-    pub(crate) command_trust: crate::profiles::CommandTrust,
-}
-
-impl SessionHandle {
-    /// Wraps an already-running session runtime as a live [`SessionHandle`].
-    ///
-    /// This is the restore path's counterpart to
-    /// [`SessionBuilder::start`](SessionBuilder::start): instead of creating
-    /// a fresh session, it exposes a runtime that was rebuilt from a
-    /// persisted snapshot (see
-    /// [`Harness::restore_session`](crate::Harness::restore_session)) through
-    /// the same handle API.
-    pub(crate) fn from_runtime(
-        runtime: Arc<SessionRuntime>,
-        session_manager: Arc<SessionManager>,
-        orchestration: Option<crate::orchestration::OrchestrationConfig>,
-        profiles: Arc<harness_core::behavior::ProfileRegistry>,
-    ) -> Self {
-        let session_id = runtime.session_id;
-        // A restored agent keeps the trust it was installed with; new
-        // installs through this handle get none unless re-granted.
-        Self {
-            client: SessionClient::new(runtime),
-            session_id,
-            session_manager,
-            orchestration,
-            profiles,
-            command_trust: Default::default(),
-        }
-    }
-
-    /// The behavior profile the root agent is running under.
-    pub async fn behavior_profile(
-        &self,
-    ) -> Result<harness_core::behavior::ProfileRef, HarnessError> {
-        let runtime = self
-            .session_manager
-            .session_handle(self.session_id)
-            .await
-            .ok_or(HarnessError::SessionUnavailable(self.session_id))?;
-        Ok(runtime.root_behavior().reference())
-    }
-
-    /// Switch the root agent to another registered profile (e.g. plan →
-    /// build). Takes effect immediately when the agent is idle; during a run
-    /// it applies before the next model request, and the model is told its
-    /// mode changed.
-    pub async fn set_behavior_profile(
-        &self,
-        reference: harness_core::behavior::ProfileRef,
-    ) -> Result<(), HarnessError> {
-        let bundle =
-            crate::profiles::resolve_bundle(&self.profiles, Some(&reference), self.command_trust)?;
-        self.client.send(bundle.command()).await?;
-        Ok(())
-    }
-
-    pub async fn send(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.send_input(UserInput {
-            text: prompt.to_string(),
-            attachments: vec![],
-        })
-        .await?;
-        Ok(())
-    }
-
-    /// Send a complete user input, preserving any supplied attachments.
-    pub async fn send_input(&self, input: UserInput) -> Result<(), HarnessError> {
-        self.client.send(SessionCommand::Prompt(input)).await?;
-        Ok(())
-    }
-
-    /// Inject additional user input into this session.
-    pub async fn steer(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.steer_input(UserInput {
-            text: prompt.to_string(),
-            attachments: vec![],
-        })
-        .await?;
-        Ok(())
-    }
-
-    /// Inject complete user input, preserving any supplied attachments.
-    pub async fn steer_input(&self, input: UserInput) -> Result<(), HarnessError> {
-        self.client.steer(input).await?;
-        Ok(())
-    }
-
-    /// Queue a prompt to run after the current command boundary.
-    pub async fn follow_up(&self, prompt: &str) -> Result<(), HarnessError> {
-        self.follow_up_input(UserInput {
-            text: prompt.to_string(),
-            attachments: vec![],
-        })
-        .await?;
-        Ok(())
-    }
-
-    /// Queue complete user input, preserving any supplied attachments.
-    pub async fn follow_up_input(&self, input: UserInput) -> Result<(), HarnessError> {
-        self.client.follow_up(input).await?;
-        Ok(())
-    }
-
-    /// Update this session's default model/execution params.
-    ///
-    /// Applied as a partial update — fields left unset in `params` keep
-    /// their previous value (see `ExecutionParams::merge_over`). Takes
-    /// effect starting with the root agent's next model request -- the next
-    /// prompt/steer/follow-up, or the active run's next turn -- and never
-    /// mutates an already-in-flight request. Use this both to change the session's
-    /// standing default (e.g. "switch this session to opus") and, sent
-    /// immediately before one `send`, as a one-off override for the next
-    /// run only if you follow it with another call reverting the field.
-    pub async fn set_execution_params(
-        &self,
-        params: harness_protocol::backend::ExecutionParams,
-    ) -> Result<(), HarnessError> {
-        self.client
-            .send(SessionCommand::ConfigureExecution(params))
-            .await?;
-        Ok(())
-    }
-
-    /// Change the execution parameters (e.g. the model) of a session this one
-    /// delegates to -- an orchestration step running right now -- from its
-    /// next model request. The step keeps the output format it was started
-    /// with unless `params` sets one.
-    pub async fn set_delegated_execution_params(
-        &self,
-        session_id: SessionId,
-        mut params: harness_protocol::backend::ExecutionParams,
-    ) -> Result<(), HarnessError> {
-        let parent = self
-            .session_manager
-            .session_handle(self.session_id)
-            .await
-            .ok_or(HarnessError::SessionUnavailable(self.session_id))?;
-        let step = parent
-            .delegated_session(session_id)
-            .ok_or(HarnessError::SessionUnavailable(session_id))?;
-        if params.response_format.is_none() {
-            params.response_format = step.root_execution_params().response_format;
-        }
-        step.send_command(SessionCommand::ConfigureExecution(params))
-            .await?;
-        Ok(())
-    }
-
-    /// Cancel the active run without closing the session.
-    ///
-    /// Queued follow-ups are preserved and the handle remains usable for
-    /// future prompts.
-    pub async fn cancel(&self) -> Result<(), HarnessError> {
-        self.client.cancel_run().await?;
-        Ok(())
-    }
-
-    /// Pause the session's active run.
-    ///
-    /// Unlike [`cancel`](Self::cancel) this is recoverable: the agent stops
-    /// at its next transition point and holds its run state, so
-    /// [`resume`](Self::resume) continues the same run rather than starting a
-    /// new one. Pausing an already-paused, cancelled, or failed agent is a
-    /// no-op — the state machine rejects the transition and emits nothing.
-    ///
-    /// Note that this does not abort an in-flight backend request; a run
-    /// waiting on the model pauses once that request settles.
-    pub async fn pause(&self) -> Result<(), HarnessError> {
-        self.client.send(SessionCommand::Pause).await?;
-        Ok(())
-    }
-
-    /// Resume a paused session, continuing the run that was interrupted.
-    ///
-    /// A no-op unless the agent is actually paused.
-    pub async fn resume(&self) -> Result<(), HarnessError> {
-        self.client.send(SessionCommand::Resume).await?;
-        Ok(())
-    }
-
-    /// Close this session permanently, cancelling active work, stopping event
-    /// forwarding, and releasing its scheduler slot.
-    pub async fn close(&self) -> Result<(), HarnessError> {
-        self.session_manager.close_session(self.session_id).await?;
-        Ok(())
-    }
-
-    /// Answer a pending tool permission request.
-    pub async fn resolve_permission(
-        &self,
-        id: PermissionId,
-        decision: PermissionDecision,
-    ) -> Result<(), HarnessError> {
-        self.client.resolve_permission(id, decision).await?;
-        Ok(())
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<AgentEventEnvelope> {
-        self.client.subscribe()
-    }
-
-    pub fn snapshot(&self) -> SessionSnapshot {
-        self.client.snapshot()
-    }
-
-    pub fn context_inspection(&self) -> ContextInspection {
-        let context = self.client.snapshot().context;
-        ContextInspection {
-            generation: context.generation,
-            estimated_tokens: context.estimated_tokens,
-            checkpoint: context.checkpoint,
-            covered_through: context.covered_through,
-            pinned_items: context.pinned_items,
-            last_compacted_at: context.last_compacted_at,
-        }
-    }
-
-    pub fn session_id(&self) -> SessionId {
-        self.session_id
     }
 }

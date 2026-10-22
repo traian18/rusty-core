@@ -22,8 +22,8 @@ pub struct OpenAiResponsesConfig {
     pub default_max_tokens: u64,
     #[serde(
         rename = "request_timeout_secs",
-        serialize_with = "serialize_duration_secs",
-        deserialize_with = "deserialize_duration_secs"
+        serialize_with = "harness_generic_backend::duration_serde::serialize",
+        deserialize_with = "harness_generic_backend::duration_serde::deserialize"
     )]
     /// Maximum gap between HTTP reads, not a total streaming deadline.
     pub request_timeout: Duration,
@@ -32,20 +32,6 @@ pub struct OpenAiResponsesConfig {
     /// Extra headers sent with every request, beyond `Authorization` and
     /// `Content-Type`.
     pub extra_headers: HashMap<String, String>,
-}
-
-fn serialize_duration_secs<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_u64(duration.as_secs())
-}
-
-fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Duration::from_secs(u64::deserialize(deserializer)?))
 }
 
 impl Default for OpenAiResponsesConfig {

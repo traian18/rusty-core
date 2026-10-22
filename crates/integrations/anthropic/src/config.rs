@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -17,27 +18,16 @@ pub struct AnthropicConfig {
     pub default_max_tokens: u64,
     #[serde(
         rename = "request_timeout_secs",
-        serialize_with = "serialize_duration_secs",
-        deserialize_with = "deserialize_duration_secs"
+        serialize_with = "harness_generic_backend::duration_serde::serialize",
+        deserialize_with = "harness_generic_backend::duration_serde::deserialize"
     )]
     /// Maximum gap between HTTP reads, not a total streaming deadline.
     pub request_timeout: Duration,
     /// Retry, inactivity timeout, and circuit-breaker settings for provider calls.
     pub recovery: RecoveryPolicy,
-}
-
-fn serialize_duration_secs<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_u64(duration.as_secs())
-}
-
-fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Duration::from_secs(u64::deserialize(deserializer)?))
+    /// Extra headers sent with every request, beyond auth,
+    /// `anthropic-version` and `content-type`.
+    pub extra_headers: HashMap<String, String>,
 }
 
 impl Default for AnthropicConfig {
@@ -49,6 +39,7 @@ impl Default for AnthropicConfig {
             default_max_tokens: 8192,
             request_timeout: Duration::from_secs(600),
             recovery: RecoveryPolicy::default(),
+            extra_headers: HashMap::new(),
         }
     }
 }
@@ -118,6 +109,16 @@ mod tests {
         assert_eq!(config.recovery.max_attempts, 4);
         assert_eq!(config.recovery.idle_timeout, Duration::from_secs(45));
         assert_eq!(config.recovery.circuit_failure_threshold, 3);
+    }
+
+    #[test]
+    fn extra_headers_deserialize() {
+        let config: AnthropicConfig = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "extra_headers": { "X-Custom": "value" }
+        }))
+        .expect("valid config");
+        assert_eq!(config.extra_headers.get("X-Custom").map(String::as_str), Some("value"));
     }
 
     #[test]

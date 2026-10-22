@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use harness_core::capabilities::{AgentCapabilities, WorkspaceCapabilities};
 use harness_protocol::backend::{
-    BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference, ExecutionResult,
+    BackendBinding, BackendCapabilities, BackendDescriptor, BackendReference, ExecutionEvent,
+    ExecutionResult,
 };
 use harness_protocol::commands::UserInput;
+use harness_protocol::events::AgentOutcome;
 use harness_protocol::ids::{BackendId, ConfigurationId, IntegrationId, RequestId, SessionId};
 use harness_protocol::tools::AgentToolset;
 use harness_protocol::usage::AgentBudget;

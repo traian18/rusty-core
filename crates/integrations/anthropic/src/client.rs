@@ -342,6 +342,9 @@ impl AnthropicClient {
             request_builder =
                 request_builder.header("authorization", format!("Bearer {}", self.config.api_key));
         }
+        for (key, value) in &self.config.extra_headers {
+            request_builder = request_builder.header(key, value);
+        }
 
         request_builder.json(body)
     }

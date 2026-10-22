@@ -3,6 +3,7 @@
 //! Implements ExecutionBackend using provider-neutral model machinery and a ModelClient.
 
 pub mod backend;
+pub mod duration_serde;
 
 /// Reusable test doubles and contract-test support for backend implementors.
 ///
