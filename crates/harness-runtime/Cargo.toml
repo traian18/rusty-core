@@ -32,6 +32,8 @@ futures = { workspace = true }
 harness-runtime = { path = ".", features = ["testing"] }
 # MemoryStore/FaultInjectingStore, used by this crate's own test modules.
 harness-session-store = { path = "../harness-session-store", default-features = false, features = ["testing"] }
+# The plans a change folder produces must be plans the queue accepts (task_queue.rs tests).
+harness-specs = { path = "../harness-specs" }
 tempfile = "3"
 git2 = { workspace = true }
 rust_decimal_macros = { workspace = true }

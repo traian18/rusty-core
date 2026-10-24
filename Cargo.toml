@@ -26,6 +26,7 @@ members = [
     "crates/harness-code-analysis",
     "crates/harness-code-health",
     "crates/harness-infra-analysis",
+    "crates/harness-specs",
     "crates/tools/code-analysis",
     "crates/harness-session-store",
     "crates/harness-skills",

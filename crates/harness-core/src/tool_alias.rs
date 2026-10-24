@@ -33,12 +33,13 @@ const ALIASES: &[(&str, &str)] = &[
 /// question to a read-only research step inside a workflow: a step that may
 /// read may ask for it. `repo_context` answers questions about how files
 /// connect from the repository index and never changes anything, so any step
-/// that may read may use it; `repo_wiki` reads the documentation pages rendered from the same index.
+/// that may read may use it; `repo_wiki` reads the documentation pages rendered from the same index; `spec_context` reads the spec files.
 const GRANTED_WITH: &[(&str, &str)] = &[
     ("project_info", "read_file"),
     ("request_research", "read_file"),
     ("repo_context", "read_file"),
     ("repo_wiki", "read_file"),
+    ("spec_context", "read_file"),
 ];
 
 /// The tool `name` follows in rules, history, allow-lists and permissions,
@@ -106,6 +107,7 @@ mod tests {
         assert_eq!(granted_by("request_research"), Some("read_file"));
         assert_eq!(granted_by("repo_context"), Some("read_file"));
         assert_eq!(granted_by("repo_wiki"), Some("read_file"));
+        assert_eq!(granted_by("spec_context"), Some("read_file"));
         assert_eq!(granted_by("read_file"), None);
         assert_eq!(granted_by("run_command"), None);
     }
@@ -128,7 +130,8 @@ mod tests {
                 "project_info",
                 "request_research",
                 "repo_context",
-                "repo_wiki"
+                "repo_wiki",
+                "spec_context"
             ])
         );
         assert_eq!(
@@ -149,7 +152,8 @@ mod tests {
                 "project_info",
                 "request_research",
                 "repo_context",
-                "repo_wiki"
+                "repo_wiki",
+                "spec_context"
             ])
         );
         assert_eq!(
@@ -169,7 +173,8 @@ mod tests {
                 "project_info",
                 "request_research",
                 "repo_context",
-                "repo_wiki"
+                "repo_wiki",
+                "spec_context"
             ]),
             "reading does not admit edit_file"
         );

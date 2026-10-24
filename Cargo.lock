@@ -1419,6 +1419,7 @@ dependencies = [
  "harness-protocol",
  "harness-runtime",
  "harness-session-store",
+ "harness-specs",
  "harness-tools",
  "harness-workspace",
  "metrics",
@@ -1463,6 +1464,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "harness-specs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

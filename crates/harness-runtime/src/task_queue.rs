@@ -1051,6 +1051,42 @@ mod tests {
         p["requirements"] = json!([]);
         assert!(plan(&p).is_err());
     }
+    /// The plans composed from a change folder (spec.md and tasks.md) are the plans this queue runs.
+    #[test]
+    fn the_plans_of_a_change_folder_are_accepted() {
+        use harness_specs::{plan::queue_plans, MemoryStore};
+        let store = MemoryStore::default();
+        store.insert(
+            "specs/changes/0001-a/spec.md",
+            "# A\n\n## Requirements\n### R1: One\n- C1: WHEN a THEN b\n- C2: WHEN c THEN d\n### R2: Two\n- C3: WHEN e THEN f\n",
+        );
+        let tasks = [
+            "- [x] **T1** Model. R1 (C1)\n  Add it.\n- [ ] **T2** Sidebar. R1 (C2) after T1\n- [ ] **T3** Delete. R2 (C3)\n",
+            "- [x] **T1** Model. R1 (C1, C2)\n- [x] **T2** Delete. R2 (C3)\n",
+        ];
+        for text in tasks {
+            store.insert("specs/changes/0001-a/tasks.md", text);
+            let plans = queue_plans(&store, "0001-a").unwrap();
+            let full = plan(&plans.full).unwrap();
+            let remaining = plan(&plans.remaining).unwrap();
+            assert_eq!(full.tasks.len(), plans.total_tasks);
+            assert_eq!(remaining.tasks.len(), plans.remaining_tasks.max(1));
+            // Nothing already done is planned again: every criterion of the queue's plan is covered by its tasks.
+            let covered: Vec<&String> = remaining
+                .tasks
+                .iter()
+                .flat_map(|t| &t.criterion_ids)
+                .collect();
+            for criterion in remaining.requirements.iter().flat_map(|r| &r.criteria) {
+                assert!(
+                    covered.contains(&&criterion.id),
+                    "{} is not covered",
+                    criterion.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn review_must_cover_each_criterion_with_evidence() {
         let task = plan(&example()).unwrap().tasks.remove(0);
