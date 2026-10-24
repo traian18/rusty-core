@@ -168,6 +168,8 @@ fn summarize(
         status,
         created: front.as_ref().and_then(|f| f.created.clone()),
         branch: front.as_ref().and_then(|f| f.branch.clone()),
+        main: front.as_ref().and_then(|f| f.main.clone()),
+        links: front.as_ref().map(|f| f.links.clone()).unwrap_or_default(),
         tasks_done: done,
         tasks_total: total,
         open_questions: spec.as_ref().map_or(0, |s| s.open_questions.len()),

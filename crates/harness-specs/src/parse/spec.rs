@@ -245,4 +245,14 @@ mod tests {
             ["why", "requirements", "open questions"]
         );
     }
+
+    #[test]
+    fn the_sections_around_the_requirements_do_not_leak_into_them() {
+        let doc = parse("# A\n\n## User stories\n- US1 (P1): As a user, I want albums. Independent check: create one.\n\n## Requirements\n\n### R1: Albums\nServes US1.\n\n- C1: WHEN x THEN y.\n\n## Success criteria\n- S1: Users create an album in under 30 seconds.\n\n## Key entities\n- Album: a named group of photos.\n\n## Open questions\n- Q1: Can albums nest? Why it matters: navigation. Recommended: A. Options: A) no; B) yes.\n");
+        assert_eq!(doc.requirements.len(), 1);
+        assert_eq!(doc.requirements[0].criteria.len(), 1);
+        assert_eq!(doc.requirements[0].detail, "Serves US1.");
+        assert_eq!(doc.open_questions.len(), 1);
+        assert!(doc.open_questions[0].1.starts_with("Q1: Can albums nest?"));
+    }
 }

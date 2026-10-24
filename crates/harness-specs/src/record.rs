@@ -28,7 +28,7 @@ impl Step {
     /// The files this step may write.
     pub fn documents(self) -> &'static [&'static str] {
         match self {
-            Self::Specify => &["spec.md"],
+            Self::Specify => &["spec.md", "checklist.md"],
             Self::Plan => &["research.md", "design.md", "tasks.md"],
             Self::Implement => &[],
             Self::Start => &["project.md", "onboarding.md"],

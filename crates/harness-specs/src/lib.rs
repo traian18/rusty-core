@@ -10,6 +10,7 @@
 //! | `export` | One-way copy of these specs into OpenSpec's or Spec Kit's layout |
 //! | `import` | One-time conversion of OpenSpec and Spec Kit folders into this layout |
 //! | `layout` | Where things live: root, change folders, numbering, slugs, branch names |
+//! | `linked` | Changes linked across a workspace's repositories, and what a run on one part sees of the others |
 //! | `store` | The `SpecStore` trait over a repository's files, with disk and memory implementations |
 //! | `model` | Plain data the formats parse into and the overview reports |
 //! | `parse` | Front matter, `spec.md`, `tasks.md` and capability specs, read leniently |
@@ -29,6 +30,7 @@ pub mod drift;
 pub mod export;
 pub mod import;
 pub mod layout;
+pub mod linked;
 pub mod model;
 pub mod onboarding;
 pub mod overview;

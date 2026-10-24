@@ -14,6 +14,7 @@ and every step leaves Markdown here, so a person or any coding agent can pick it
   changes/NNNN-slug/         one folder per change
     change.md                status and history
     spec.md                  why, what, requirements with criteria, open questions
+    checklist.md             quality questions about the spec, ticked when it answers them
     research.md              optional: sourced options
     design.md                approach, files, data, risks
     tasks.md                 the ordered checklist

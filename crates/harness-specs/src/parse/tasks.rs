@@ -163,4 +163,15 @@ mod tests {
             "- [ ] **T1** One. R1\r\n- [x] **T2** Two. R1\r\n"
         );
     }
+
+    #[test]
+    fn phase_headings_and_checkpoints_are_not_tasks_or_instructions() {
+        let doc = parse("# Tasks: 0001 Albums\n\n## Phase 1: Foundation\nCheckpoint: albums are stored.\n\n- [ ] **T1** Album model in `src/albums/model.rs`. R1 (C1)\n  Add it.\n\n## Phase 2: US1 Create albums (MVP)\nCheckpoint: a user creates an album.\n\n- [x] **T2** Sidebar. R1 (C2) after T1\n");
+        assert_eq!(doc.tasks.len(), 2);
+        assert_eq!(doc.tasks[0].instructions, "Add it.");
+        assert_eq!(
+            (doc.tasks[1].done, doc.tasks[1].after.clone()),
+            (true, vec!["T1".to_owned()])
+        );
+    }
 }

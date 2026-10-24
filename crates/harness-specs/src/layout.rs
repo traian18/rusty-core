@@ -5,9 +5,10 @@ pub const DEFAULT_ROOT: &str = "specs";
 /// Optional `{"root": "docs/specs"}` for repositories where `specs/` is taken.
 pub const CONFIG_PATH: &str = ".rusty/specs.json";
 /// The documents of a change, in reading order.
-pub const CHANGE_DOCUMENTS: [&str; 6] = [
+pub const CHANGE_DOCUMENTS: [&str; 7] = [
     "change.md",
     "spec.md",
+    "checklist.md",
     "research.md",
     "design.md",
     "tasks.md",

@@ -109,6 +109,9 @@ fn feature(
         .map(|(_, done)| done.clone())
         .unwrap_or_default();
     let mut files = vec![("spec.md", spec(&title, name, &spec_text))];
+    if let Some(checklist) = checklist(store, &base) {
+        files.push(("checklist.md", checklist));
+    }
     let design = design(store, &base, name);
     if let Some(design) = design {
         files.push(("design.md", design));
@@ -131,6 +134,36 @@ fn feature(
             files,
         },
     )
+}
+
+/// The feature's `checklists/*.md` as one file, a section per checklist under its own title.
+fn checklist(store: &dyn SpecStore, base: &str) -> Option<String> {
+    let folder = format!("{base}/checklists");
+    let mut out = String::from("# Checklist\n");
+    for file in store.files(&folder) {
+        let Some(stem) = file.strip_suffix(".md") else {
+            continue;
+        };
+        let Some(text) = store.read(&format!("{folder}/{file}")) else {
+            continue;
+        };
+        let body: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("# "))
+            .skip(1)
+            .collect();
+        let body = if body.is_empty() {
+            text.lines().collect()
+        } else {
+            body
+        };
+        out.push_str(&format!(
+            "\n## {}\n{}\n",
+            common::humanize(stem),
+            body.join("\n").trim()
+        ));
+    }
+    (out.len() > "# Checklist\n".len()).then_some(out)
 }
 
 /// `plan.md`, with a note of the Spec Kit files this layout has no place for.
@@ -403,6 +436,25 @@ mod tests {
         let parsed = crate::parse::spec::parse(&spec);
         assert_eq!(parsed.requirements.len(), 3);
         assert!(parsed.requirements.iter().all(|r| !r.criteria.is_empty()));
+    }
+
+    #[test]
+    fn the_feature_checklists_become_one_checklist() {
+        let store = fixture();
+        store.insert(
+            "specs/001-photo-albums/checklists/requirements.md",
+            "# Specification Quality Checklist\n\n- [x] CHK001 No implementation details\n",
+        );
+        store.insert(
+            "specs/001-photo-albums/checklists/ux.md",
+            "# UX Checklist\n\n- [ ] CHK001 Are empty states defined?\n",
+        );
+        import(&store, "2026-10-24").unwrap();
+        let checklist = store
+            .read("specs/changes/0001-photo-albums/checklist.md")
+            .unwrap();
+        assert_eq!(checklist, "# Checklist\n\n## Requirements\n- [x] CHK001 No implementation details\n\n## Ux\n- [ ] CHK001 Are empty states defined?\n");
+        assert_eq!(crate::parse::checklist::parse(&checklist).len(), 2);
     }
 
     #[test]

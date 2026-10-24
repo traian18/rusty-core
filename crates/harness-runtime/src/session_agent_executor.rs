@@ -35,6 +35,9 @@ use crate::{
     traits::{EventSink, ToolRegistry},
 };
 
+mod answer_text;
+use answer_text::AnswerText;
+
 /// The isolated session's events are observed through its event bus and
 /// republished by the orchestration runner with step correlation, so the
 /// session itself has no external sink.
@@ -665,8 +668,7 @@ impl IsolatedSessionAgentExecutor {
             .map_err(|error| AgentExecutionError::new("session_start_failed", error.to_string()))?;
 
         let mut permissions: HashMap<String, PermissionId> = HashMap::new();
-        let mut current_text = String::new();
-        let mut final_text = None;
+        let mut answer = AnswerText::default();
         // Checks still failing when the completion gate gave up.
         let mut unpassed_gate: Option<Vec<String>> = None;
         let mut permissions_open = true;
@@ -738,14 +740,11 @@ impl IsolatedSessionAgentExecutor {
                     delegated.agent_run_id = Some(run_id.to_string());
                     context.signal(StepSignal::Delegated(delegated.clone()));
                 }
-                AgentEvent::AssistantMessageStarted { .. } => current_text.clear(),
-                AgentEvent::AssistantTextDelta { delta, .. } => current_text.push_str(&delta),
-                AgentEvent::AssistantMessageCompleted { .. } => {
-                    // Only the last message with text is the answer; earlier
-                    // messages narrate tool use.
-                    if !current_text.trim().is_empty() {
-                        final_text = Some(std::mem::take(&mut current_text));
-                    }
+                // Only the last message with text is the answer (`AnswerText`).
+                AgentEvent::AssistantMessageStarted { .. }
+                | AgentEvent::AssistantMessageCompleted { .. } => answer.close(),
+                AgentEvent::AssistantTextDelta { message_id, delta } => {
+                    answer.delta(message_id, &delta)
                 }
                 AgentEvent::PermissionRequested {
                     request: permission,
@@ -793,7 +792,7 @@ impl IsolatedSessionAgentExecutor {
                             RetryReason::VerificationFailed,
                         ));
                     }
-                    let text = final_text.unwrap_or(current_text);
+                    let text = std::mem::take(&mut answer).finish();
                     if request.structured_output == StructuredOutputMode::Text {
                         if text.trim().is_empty() {
                             return Err(AgentExecutionError::new(

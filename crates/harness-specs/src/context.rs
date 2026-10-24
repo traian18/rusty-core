@@ -13,6 +13,36 @@ const MAX_DOCUMENT_CHARS: usize = 24_000;
 /// The context for `step` on change `dir`. Specify sees the project and the capabilities; Plan
 /// also sees the spec and what an earlier Plan wrote (to revise it, not start over).
 pub fn compose(store: &dyn SpecStore, dir: &str, step: Step) -> String {
+    let mut out = compose_documents(store, dir, step);
+    append_instructions(&mut out, store, step);
+    out
+}
+
+fn step_file(step: Step) -> &'static str {
+    match step {
+        Step::Specify => "specify",
+        Step::Plan => "plan",
+        Step::Implement => "implement",
+        Step::Start => "start",
+        Step::Capability => "capability",
+    }
+}
+
+/// The project's own rules for a step: `<root>/instructions/all.md` and `<step>.md`, written by
+/// the team and given to the step after its documents, as additions to its built-in instructions.
+fn append_instructions(out: &mut String, store: &dyn SpecStore, step: Step) {
+    let layout = Layout::of(store);
+    for name in ["all", step_file(step)] {
+        section(
+            out,
+            &format!("This project's instructions for this step ({name}.md); follow them in addition to yours"),
+            &format!("{}/instructions/{name}.md", layout.root),
+            store,
+        );
+    }
+}
+
+fn compose_documents(store: &dyn SpecStore, dir: &str, step: Step) -> String {
     match step {
         Step::Start => return compose_start(store),
         // `dir` is the capability's folder name.
@@ -32,10 +62,16 @@ pub fn compose(store: &dyn SpecStore, dir: &str, step: Step) -> String {
         store,
     );
     let documents: &[(&str, &str)] = match step {
-        Step::Specify => &[(
-            "Current spec.md (revise it; keep the ids and what the person wrote)",
-            "spec.md",
-        )],
+        Step::Specify => &[
+            (
+                "Current spec.md (revise it; keep the ids and what the person wrote)",
+                "spec.md",
+            ),
+            (
+                "Current checklist.md (keep the ids and the items the person ticked)",
+                "checklist.md",
+            ),
+        ],
         Step::Start | Step::Capability => &[],
         Step::Implement => &[
             ("The spec being built", "spec.md"),
@@ -43,6 +79,10 @@ pub fn compose(store: &dyn SpecStore, dir: &str, step: Step) -> String {
         ],
         Step::Plan => &[
             ("The spec to design and plan for", "spec.md"),
+            (
+                "The spec's quality checklist (open items are gaps the design must handle or name)",
+                "checklist.md",
+            ),
             ("Current research.md (revise it)", "research.md"),
             (
                 "Current design.md (revise it; keep what the person wrote)",
@@ -130,7 +170,12 @@ fn compose_capability(store: &dyn SpecStore, name: &str) -> String {
 
 fn section(out: &mut String, title: &str, path: &str, store: &dyn SpecStore) {
     let Some(text) = store.read(path) else { return };
-    out.push_str(&format!("\n## {title} ({path})\n\n"));
+    push_document(out, &format!("{title} ({path})"), &text);
+}
+
+/// A document under its own heading, cut at [`MAX_DOCUMENT_CHARS`] with a note.
+pub(crate) fn push_document(out: &mut String, heading: &str, text: &str) {
+    out.push_str(&format!("\n## {heading}\n\n"));
     if text.chars().count() > MAX_DOCUMENT_CHARS {
         out.extend(text.chars().take(MAX_DOCUMENT_CHARS));
         out.push_str("\n[… the rest of this document is omitted]\n");
@@ -191,6 +236,21 @@ mod tests {
     }
 
     #[test]
+    fn specify_revises_the_checklist_and_plan_reads_it() {
+        let store = seeded();
+        store.insert(
+            "specs/changes/0002-dark/checklist.md",
+            "- [ ] CHK001 Is the contrast given?\n",
+        );
+        let specify = compose(&store, "0002-dark", Step::Specify);
+        let plan = compose(&store, "0002-dark", Step::Plan);
+        let implement = compose(&store, "0002-dark", Step::Implement);
+        assert!(specify.contains("Current checklist.md") && specify.contains("CHK001"));
+        assert!(plan.contains("quality checklist") && plan.contains("CHK001"));
+        assert!(!implement.contains("CHK001"));
+    }
+
+    #[test]
     fn implement_sees_the_spec_and_the_design_but_not_the_old_tasks() {
         let store = seeded();
         store.insert("specs/changes/0002-dark/tasks.md", "- [ ] **T1** x. R1\n");
@@ -223,6 +283,18 @@ mod tests {
         assert!(text.contains("- import: bringing photos in") && !text.contains("- albums:"));
         assert!(text.contains("Current spec (revise it") && text.contains("Purpose: grouping."));
         assert!(text.contains("- small"));
+    }
+
+    #[test]
+    fn the_projects_own_instructions_follow_the_documents() {
+        let store = seeded();
+        store.insert("specs/instructions/all.md", "Always note rollback.");
+        store.insert("specs/instructions/plan.md", "Use ADR style.");
+        let plan = compose(&store, "0002-dark", Step::Plan);
+        assert!(plan.contains("Always note rollback.") && plan.contains("Use ADR style."));
+        assert!(plan.find("# Old design") < plan.find("Always note rollback."));
+        let specify = compose(&store, "0002-dark", Step::Specify);
+        assert!(specify.contains("Always note rollback.") && !specify.contains("ADR"));
     }
 
     #[test]

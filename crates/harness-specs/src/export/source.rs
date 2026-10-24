@@ -19,6 +19,7 @@ pub struct ChangeDoc {
     pub what: String,
     pub requirements: Vec<Requirement>,
     pub open_questions: Vec<String>,
+    pub checklist: Option<String>,
     pub design: Option<String>,
     pub research: Option<String>,
     pub tasks: Vec<Task>,
@@ -64,6 +65,7 @@ fn read(store: &dyn SpecStore, base: &str, dir: &str, archived: bool) -> Option<
         what: section("what changes"),
         requirements: spec.requirements,
         open_questions: spec.open_questions.into_iter().map(|(_, q)| q).collect(),
+        checklist: store.read(&format!("{base}/checklist.md")),
         design: store.read(&format!("{base}/design.md")),
         research: store.read(&format!("{base}/research.md")),
         tasks: store

@@ -55,6 +55,15 @@ pub struct ChangeRequest<'a> {
     pub date: &'a str,
     /// The branch the caller created and switched to, if any.
     pub branch: Option<&'a str>,
+    /// Set when the change is one part of a change linked across repositories.
+    pub linked: Option<LinkedRequest<'a>>,
+}
+
+pub struct LinkedRequest<'a> {
+    /// The repository, relative to the workspace, that holds the whole change's spec.
+    pub main: &'a str,
+    /// The other parts, as `<repository>/<change folder>`.
+    pub links: &'a [String],
 }
 
 /// Writes `change.md` and `spec.md`; returns their paths. Refuses to touch an existing change.
@@ -76,11 +85,24 @@ pub fn create_change(
         created: Some(request.date.to_owned()),
         branch: request.branch.map(str::to_owned),
         capabilities: Vec::new(),
+        main: request.linked.as_ref().map(|l| l.main.to_owned()),
+        links: request
+            .linked
+            .as_ref()
+            .map(|l| l.links.to_vec())
+            .unwrap_or_default(),
         ..Default::default()
     };
     let mut history = vec![format!("{} Created.", request.date)];
     if let Some(branch) = request.branch {
         history.push(format!("{} Branch {branch} created.", request.date));
+    }
+    if let Some(linked) = &request.linked {
+        history.push(format!(
+            "{} Linked with {}.",
+            request.date,
+            linked.links.join(", ")
+        ));
     }
     let files = [
         (
@@ -138,6 +160,7 @@ mod tests {
             description: "Group shoots.",
             date: "2026-10-23",
             branch: Some(&plan.branch),
+            linked: None,
         };
         create_change(&store, &plan, &request).unwrap();
         let found = overview(&store);
@@ -174,6 +197,7 @@ mod tests {
             description: "",
             date: "2026-10-23",
             branch: None,
+            linked: None,
         };
         create_change(&store, &plan, &request).unwrap();
         assert!(create_change(&store, &plan, &request).is_err());

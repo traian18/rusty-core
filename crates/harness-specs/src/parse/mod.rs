@@ -1,6 +1,7 @@
 //! Readers for the Markdown formats. Reading never fails: what cannot be understood is skipped and
 //! `validate` reports it. Line numbers are 1-based and refer to the file as stored.
 pub mod capability;
+pub mod checklist;
 pub mod front;
 pub mod spec;
 pub mod tasks;

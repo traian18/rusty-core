@@ -48,6 +48,10 @@ pub fn validate_change(
         }
         None => {}
     }
+    let checklist_path = format!("{base}/checklist.md");
+    if let Some(text) = store.read(&checklist_path) {
+        check_checklist(&checklist_path, &text, status, &mut warnings);
+    }
     warnings.sort_by_key(|w| std::cmp::Reverse(w.severity));
     warnings
 }
@@ -78,6 +82,31 @@ pub fn validate_project(store: &dyn SpecStore, layout: &Layout) -> Vec<Warning> 
             )]
         }
         Some(_) => Vec::new(),
+    }
+}
+
+/// Open checklist items are questions the spec does not answer yet; like open questions, they
+/// matter more once the change is planned.
+fn check_checklist(path: &str, text: &str, status: Status, out: &mut Vec<Warning>) {
+    let items = parse::checklist::parse(text);
+    let open: Vec<_> = items.iter().filter(|item| !item.done).collect();
+    if let Some(first) = open.first() {
+        let severity = if status >= Status::Planned {
+            Severity::Warning
+        } else {
+            Severity::Note
+        };
+        let count = open.len();
+        out.push(Warning::new(
+            path,
+            Some(first.line),
+            severity,
+            format!(
+                "{count} of {} checklist item{} open",
+                items.len(),
+                if items.len() == 1 { "" } else { "s" }
+            ),
+        ));
     }
 }
 
@@ -277,6 +306,30 @@ mod tests {
 
     const SPEC: &str =
         "# A\n\n## Requirements\n\n### R1: One\n- C1: WHEN a THEN b\n- C2: WHEN c THEN d\n";
+
+    #[test]
+    fn open_checklist_items_are_a_note_then_a_warning_once_planned() {
+        let store = MemoryStore::default();
+        store.insert("specs/changes/0001-a/spec.md", SPEC);
+        store.insert(
+            "specs/changes/0001-a/checklist.md",
+            "- [x] CHK001 Done?\n- [ ] CHK002 Limits given? [Gap]\n",
+        );
+        let layout = Layout::new("specs");
+        let specified = validate_change(&store, &layout, "0001-a", Status::Specified);
+        let found = specified
+            .iter()
+            .find(|w| w.message == "1 of 2 checklist items open")
+            .unwrap();
+        assert_eq!((found.severity, found.line), (Severity::Note, Some(2)));
+        let planned = validate_change(&store, &layout, "0001-a", Status::Planned);
+        assert!(planned
+            .iter()
+            .any(|w| w.message.contains("checklist") && w.severity == Severity::Warning));
+        store.insert("specs/changes/0001-a/checklist.md", "- [x] CHK001 Done?\n");
+        let ticked = validate_change(&store, &layout, "0001-a", Status::Planned);
+        assert!(!ticked.iter().any(|w| w.message.contains("checklist")));
+    }
 
     #[test]
     fn a_consistent_change_has_no_warnings() {

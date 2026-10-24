@@ -104,6 +104,11 @@ pub struct ChangeFront {
     pub created: Option<String>,
     pub branch: Option<String>,
     pub capabilities: Vec<String>,
+    /// For a change linked across repositories: the repository (relative to the workspace) that
+    /// holds the whole change's spec.
+    pub main: Option<String>,
+    /// The other parts of a linked change, as `<repository>/<change folder>`.
+    pub links: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,6 +188,9 @@ pub struct ChangeSummary {
     pub status: Status,
     pub created: Option<String>,
     pub branch: Option<String>,
+    /// See [`ChangeFront::main`] and [`ChangeFront::links`].
+    pub main: Option<String>,
+    pub links: Vec<String>,
     pub tasks_done: usize,
     pub tasks_total: usize,
     pub open_questions: usize,

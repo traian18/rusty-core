@@ -57,6 +57,8 @@ pub fn change(text: &str) -> ChangeFront {
         created: get("created"),
         branch: get("branch"),
         capabilities: get("capabilities").map(|v| list(&v)).unwrap_or_default(),
+        main: get("main"),
+        links: get("links").map(|v| list(&v)).unwrap_or_default(),
     }
 }
 
@@ -78,6 +80,12 @@ pub fn render_change(front: &ChangeFront, history: &[String]) -> String {
         "capabilities",
         &format!("[{}]", front.capabilities.join(", ")),
     );
+    if let Some(main) = &front.main {
+        field("main", main);
+    }
+    if !front.links.is_empty() {
+        field("links", &format!("[{}]", front.links.join(", ")));
+    }
     out.push_str("---\n");
     out.push_str(&format!(
         "# {}\n\n## History\n",
@@ -188,6 +196,11 @@ mod tests {
             created: Some("2026-10-23".into()),
             branch: Some("spec/0003-dark-mode".into()),
             capabilities: vec!["theme".into()],
+            main: Some("rusty-ide".into()),
+            links: vec![
+                "rusty-core/0004-dark-mode".into(),
+                "apps/web/0001-dark-mode".into(),
+            ],
             ..Default::default()
         };
         let text = render_change(&front, &["2026-10-23 Created.".into()]);

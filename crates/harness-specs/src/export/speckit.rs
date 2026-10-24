@@ -1,6 +1,6 @@
 //! To GitHub Spec Kit: the project's principles as `.specify/memory/constitution.md`, and each
 //! change as a feature folder `specs/NNN-slug/` with `spec.md`, `plan.md` (the design),
-//! `research.md` and `tasks.md`.
+//! `research.md`, `tasks.md` and the quality checklist as `checklists/requirements.md`.
 //!
 //! A requirement becomes a user story whose criteria are its acceptance scenarios, and also a
 //! functional requirement. Capability specs have no Spec Kit equivalent and are not exported.
@@ -33,6 +33,14 @@ pub fn export(store: &dyn SpecStore, date: &str) -> Result<ExportReport, SpecErr
             &format!("{base}/spec.md"),
             &spec(&change, &feature),
         )?;
+        if let Some(checklist) = &change.checklist {
+            write_new(
+                store,
+                &mut report,
+                &format!("{base}/checklists/requirements.md"),
+                &format!("{}\n", checklist.trim_end()),
+            )?;
+        }
         if let Some(design) = &change.design {
             write_new(
                 store,
@@ -184,6 +192,22 @@ mod tests {
             "- [x] **T1** Model. R1 (C1)\n  Add it.\n- [ ] **T2** Sidebar. R1 (C2)\n",
         );
         store
+    }
+
+    #[test]
+    fn the_checklist_becomes_the_requirements_checklist() {
+        let store = project();
+        store.insert(
+            "specs/changes/0007-rename/checklist.md",
+            "# Checklist\n\n- [ ] CHK001 Are name limits given? [Gap]\n",
+        );
+        export(&store, "2026-10-30").unwrap();
+        assert_eq!(
+            store
+                .read("specs/007-rename/checklists/requirements.md")
+                .unwrap(),
+            "# Checklist\n\n- [ ] CHK001 Are name limits given? [Gap]\n"
+        );
     }
 
     #[test]
