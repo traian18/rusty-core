@@ -36,7 +36,9 @@ use crate::{
 };
 
 mod answer_text;
+pub(crate) mod watchdog;
 use answer_text::AnswerText;
+use watchdog::{Watchdog, WatchedRegistry, WATCHDOG_STOPPED};
 
 /// The isolated session's events are observed through its event bus and
 /// republished by the orchestration runner with step correlation, so the
@@ -221,6 +223,11 @@ pub struct IsolatedSessionAgentExecutor {
 }
 
 impl IsolatedSessionAgentExecutor {
+    /// The folder the steps work in.
+    pub(crate) fn workspace_root(&self) -> std::path::PathBuf {
+        self.parent.workspace.root().to_path_buf()
+    }
+
     pub fn new(parent: Arc<SessionRuntime>) -> Self {
         Self {
             parent,
@@ -523,6 +530,30 @@ impl IsolatedSessionAgentExecutor {
         context: &mut StepContext,
         usage: &mut HashMap<AgentId, AgentUsageMetrics>,
     ) -> Result<AgentStepOutput, AgentExecutionError> {
+        self.run_agent_step(request, context, usage, None).await
+    }
+
+    /// Runs one agent step whose tool calls `watchdog` observes; when it
+    /// stops the attempt and the model still goes on, the run is cancelled
+    /// with [`WATCHDOG_STOPPED`].
+    pub(crate) async fn run_watched_agent_step(
+        &self,
+        request: AgentStepRequest,
+        context: &mut StepContext,
+        usage: &mut HashMap<AgentId, AgentUsageMetrics>,
+        watchdog: Arc<Watchdog>,
+    ) -> Result<AgentStepOutput, AgentExecutionError> {
+        self.run_agent_step(request, context, usage, Some(watchdog))
+            .await
+    }
+
+    async fn run_agent_step(
+        &self,
+        request: AgentStepRequest,
+        context: &mut StepContext,
+        usage: &mut HashMap<AgentId, AgentUsageMetrics>,
+        watchdog: Option<Arc<Watchdog>>,
+    ) -> Result<AgentStepOutput, AgentExecutionError> {
         if request.context_mode == AgentContextMode::SharedSession {
             return Err(AgentExecutionError::new(
                 "unsupported_context_mode",
@@ -587,6 +618,17 @@ impl IsolatedSessionAgentExecutor {
             drop(research_calls);
             scoped
         };
+        let registry: Arc<dyn ToolRegistry> = match &watchdog {
+            Some(watchdog) => Arc::new(WatchedRegistry {
+                inner: registry,
+                watchdog: watchdog.clone(),
+            }),
+            None => registry,
+        };
+        let hard_stop = watchdog
+            .as_ref()
+            .map(|watchdog| watchdog.hard_stop())
+            .unwrap_or_default();
         let mut research_asked = 0u32;
         let backend = Arc::new(ScopedExecutionBackend::new(
             self.parent.default_backend.clone(),
@@ -677,6 +719,11 @@ impl IsolatedSessionAgentExecutor {
                 _ = context.cancellation.cancelled() => {
                     let _ = runtime.cancel_run().await;
                     return Err(AgentExecutionError::new("cancelled", "agent attempt cancelled"));
+                }
+                _ = hard_stop.cancelled() => {
+                    let _ = runtime.cancel_run().await;
+                    let reason = watchdog.as_ref().and_then(|watchdog| watchdog.stopped()).unwrap_or_default();
+                    return Err(AgentExecutionError::new(WATCHDOG_STOPPED, reason));
                 }
                 resolution = context.permissions.recv(), if permissions_open => {
                     match resolution {
