@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+mod brief;
 mod recovery;
 mod snapshot;
 mod split;
@@ -450,23 +451,6 @@ fn is_read_only(tool: &str) -> bool {
     )
 }
 
-/// What a task's planner and builder are given: the task-specific contract,
-/// plus the preparation outputs (diagnosis, architecture, baseline, audit)
-/// the step was bound.
-fn task_input(request: &AgentStepRequest, plan: &Plan, task: &Task, progress: &Progress) -> Value {
-    let mut input = json!({"request":request.input.get("request"),"context":request.input.get("context"),"requirements":plan.requirements,"task":task,"completed_tasks":progress.completed,"previous_attempt":progress.current});
-    if let Some(fields) = request.input.as_object() {
-        for (name, value) in fields {
-            input
-                .as_object_mut()
-                .unwrap()
-                .entry(name.clone())
-                .or_insert_with(|| value.clone());
-        }
-    }
-    input
-}
-
 impl IsolatedSessionAgentExecutor {
     /// Runs a step that carries a task queue: executes the planned tasks one at
     /// a time, each with fresh builder and reviewer sessions, and returns the
@@ -736,7 +720,11 @@ impl IsolatedSessionAgentExecutor {
                 child.feedback.retain(|f| !is_user_change(&f.code));
                 child.structured_output = StructuredOutputMode::HostValidated;
                 child.output_schema = result_schema(false);
-                child.input = task_input(request, plan, task, progress);
+                child.input =
+                    brief::builder_input(request, plan, task, progress, step_plan.is_some());
+                child
+                    .tools
+                    .retain(|tool| !brief::BUILDER_SKIPS.contains(&tool.as_str()));
                 if let Some(step_plan) = &step_plan {
                     child.input["step_plan"] = Value::String(step_plan.clone());
                 }
@@ -745,7 +733,7 @@ impl IsolatedSessionAgentExecutor {
                 } else {
                     ""
                 };
-                child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
+                child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. The workflow verifies the whole project after the last task, so check this task with the typecheck and the tests of what it changes, not the full suite. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
                 if let Some(guidance) = guidance {
                     // The user's own words, given when they chose to try again.
                     child.instructions.push_str(&format!(
@@ -956,7 +944,7 @@ impl IsolatedSessionAgentExecutor {
         }
         child.structured_output = StructuredOutputMode::Text;
         child.output_schema = json!({"type":"string"});
-        child.input = task_input(request, plan, task, progress);
+        child.input = brief::planner_input(request, plan, task, progress);
         child.tools.retain(|t| is_read_only(t));
         let planned = self
             .run_single_agent_step(child, context, usage)

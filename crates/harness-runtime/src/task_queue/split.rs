@@ -9,7 +9,7 @@ use harness_core::orchestration::StructuredOutputMode;
 use harness_protocol::{ids::AgentId, usage::AgentUsageMetrics};
 use serde_json::{json, Value};
 
-use super::{is_read_only, task_input, Plan, Progress, Task};
+use super::{brief::planner_input, is_read_only, Plan, Progress, Task};
 use crate::orchestration::{is_user_change, AgentExecutionError, AgentStepRequest, StepContext};
 use crate::session_agent_executor::IsolatedSessionAgentExecutor;
 
@@ -112,7 +112,7 @@ impl IsolatedSessionAgentExecutor {
         child.instructions = format!("{}\n\n{SPLIT_INSTRUCTIONS}", planner.instructions);
         child.structured_output = StructuredOutputMode::Text;
         child.output_schema = json!({"type":"string"});
-        child.input = task_input(request, plan, task, progress);
+        child.input = planner_input(request, plan, task, progress);
         child.tools.retain(|t| is_read_only(t));
         let reply = match self
             .run_single_agent_step(child, context, usage)
