@@ -1211,7 +1211,11 @@ mod isolated_session {
                 .with_events(vec![
                     ExecutionEvent::TextDelta {
                         request_id,
-                        delta: reply.to_string(),
+                        // A text reply is sent as the model writes it.
+                        delta: match &reply {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        },
                     },
                     ExecutionEvent::Completed {
                         request_id,
@@ -1445,6 +1449,104 @@ mod isolated_session {
             .as_ref()
             .unwrap();
         assert!(checkpoint.get("step_plan").is_none(), "{checkpoint}");
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_repairs_run_out_is_split_and_built_in_steps() {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskPlannerConfig, TaskQueueConfig},
+        };
+        let profile = || ProfileRef {
+            id: "rusty.default".into(),
+            revision: None,
+        };
+        let unfinished = json!({"status":"needs_repair","summary":"29 type errors left"});
+        let step_done = json!({"status":"complete","summary":"step done, typecheck passes"});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(SessionId::new(), Arc::new(QueueBackend {
+            requests: requests.clone(),
+            replies: Mutex::new(vec![
+                json!("STEP-PLAN-T1: everything at once"),
+                unfinished.clone(),
+                unfinished.clone(),
+                unfinished,
+                json!("### S1 — Wire the registry\nChange useAgentTab.ts and its callers.\n### S2 — Send from the owning chat\nEdit sendMessage.ts."),
+                step_done.clone(),
+                step_done,
+                json!({"status":"complete","summary":"inspected","criteria":[{"id":"C1","evidence":"sendMessage.ts:40 keeps the chat"}]}),
+            ].into()),
+        }), Arc::new(FakeToolRegistry::new()), Arc::new(FakeWorkspace::new()), Arc::new(NoopSink)));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: profile(),
+                    review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: Some(TaskPlannerConfig {
+                        profile: profile(),
+                        instructions: "PLAN THIS TASK in detail.".into(),
+                    }),
+                    max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.output_schema = Some(definition.output_contract.schema.clone());
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"multi chat","plan":{"status":"ready","summary":"one big task","requirements":[{"id":"R1","text":"keep the chat","criteria":[{"id":"C1","text":"send keeps its chat"}]}],"tasks":[{"id":"T1","instructions":"integrate everything","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]}]}});
+        let finished = runner
+            .start(run_id("split-queue"), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(
+            finished.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            finished.result
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 8, "plan, 3 builds, split, 2 steps, review");
+        assert!(prompt_of(&sent[4]).contains("split the task into smaller steps"));
+        assert!(prompt_of(&sent[4]).contains("29 type errors left"));
+        assert!(prompt_of(&sent[5]).contains("Do only step 1 now"));
+        assert!(prompt_of(&sent[6]).contains("Do only step 2 now"));
+        assert!(prompt_of(&sent[7]).contains("Built in 2 steps"));
+        let checkpoint = finished.state.steps[&node("execute")]
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert!(checkpoint.get("split").is_none(), "{checkpoint}");
+        assert_eq!(checkpoint["completed"][0]["task_id"], "T1");
     }
 
     /// Runs the default workflow with its agent step in `mode`, against a

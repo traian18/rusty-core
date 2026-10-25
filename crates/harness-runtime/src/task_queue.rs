@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+mod recovery;
+mod snapshot;
+mod split;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Criterion {
@@ -71,6 +75,33 @@ struct Progress {
     /// (`{task_id, plan}`), kept across its repairs and a resumed run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     step_plan: Option<Value>,
+    /// The tree the task in progress started from (`{task_id, snapshot}`),
+    /// so a stuck or failed attempt can be undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline: Option<Value>,
+    /// The smaller steps the task in progress was split into after an
+    /// attempt got stuck (`{task_id, steps, done}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split: Option<Value>,
+}
+
+/// Whether `task` was already split once.
+fn split_tried(progress: &Progress, task: &Task) -> bool {
+    progress
+        .split
+        .as_ref()
+        .is_some_and(|split| split["task_id"] == task.id.as_str())
+}
+
+/// The steps of `task`'s split and how many are done, while some remain.
+fn pending_split(progress: &Progress, task: &Task) -> Option<(Vec<String>, usize)> {
+    let split = progress
+        .split
+        .as_ref()
+        .filter(|split| split["task_id"] == task.id.as_str())?;
+    let steps: Vec<String> = serde_json::from_value(split["steps"].clone()).ok()?;
+    let done = split["done"].as_u64().unwrap_or(0) as usize;
+    (done < steps.len()).then_some((steps, done))
 }
 
 fn invalid(message: impl Into<String>) -> AgentExecutionError {
@@ -675,117 +706,214 @@ impl IsolatedSessionAgentExecutor {
                 .run_task_flow(request, plan, task, target, progress, context, record)
                 .await;
         }
-        let step_plan = self
+        // A task that is tried again starts from the tree it started from,
+        // not from the unfinished edits of its last attempt.
+        self.baseline(request, task, progress).await;
+        if recovery::needs_undo(progress, task, guidance) {
+            self.undo_attempt(request, task, progress, "the task is tried again")
+                .await;
+        }
+        context
+            .checkpoint(serde_json::to_value(&*progress).unwrap())
+            .await?;
+        let mut step_plan = self
             .plan_task(request, plan, task, progress, context, usage, guidance)
             .await?;
-        for repair in 0..=queue.max_repairs {
-            if context.cancellation.is_cancelled() {
-                return Err(AgentExecutionError::new(
-                    "cancelled",
-                    "task queue cancelled",
-                ));
+        loop {
+            let mut stopped: Option<String> = None;
+            for attempt in 0..=queue.max_repairs {
+                if context.cancellation.is_cancelled() {
+                    return Err(AgentExecutionError::new(
+                        "cancelled",
+                        "task queue cancelled",
+                    ));
+                }
+                let mut child = request.clone();
+                child.task_queue = None;
+                child.checkpoint = None;
+                // The user's change requests are the repair task's instructions,
+                // not something every task and reviewer should act on.
+                child.feedback.retain(|f| !is_user_change(&f.code));
+                child.structured_output = StructuredOutputMode::HostValidated;
+                child.output_schema = result_schema(false);
+                child.input = task_input(request, plan, task, progress);
+                if let Some(step_plan) = &step_plan {
+                    child.input["step_plan"] = Value::String(step_plan.clone());
+                }
+                let follow = if step_plan.is_some() {
+                    " Follow workflow_input.step_plan, the detailed plan for this task; where the code proves it wrong, do the smallest thing that meets the criteria and say what you did differently."
+                } else {
+                    ""
+                };
+                child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
+                if let Some(guidance) = guidance {
+                    // The user's own words, given when they chose to try again.
+                    child.instructions.push_str(&format!(
+                        "\n\nThe user asked you to try this task again with this guidance:\n{guidance}"
+                    ));
+                }
+                let built = match self
+                    .build_task(&child, request, task, progress, context, usage)
+                    .await?
+                {
+                    recovery::Built::Replied(built) => built,
+                    recovery::Built::Stopped(reason) => {
+                        progress.current =
+                            Some(json!({"task_id":task.id,"stopped":reason,"repair":attempt}));
+                        stopped = Some(reason);
+                        break;
+                    }
+                };
+                BasicSchemaValidator
+                    .validate(&child.output_schema, &built)
+                    .map_err(|e| AgentExecutionError::new("invalid_task_result", e.to_string()))?;
+                progress.current = Some(json!({"task_id":task.id,"build":built,"repair":attempt}));
+                context
+                    .checkpoint(serde_json::to_value(&*progress).unwrap())
+                    .await?;
+                let status = built["status"].as_str().unwrap_or("invalid");
+                if status == "checkpoint" || status == "needs_repair" {
+                    continue;
+                }
+                // A check that cannot run here (no network, a missing tool) does
+                // not stop the work: the reviewer judges the code that was
+                // written, and the final validation reports what did not run.
+                if status != "complete" && status != "blocked_environment" {
+                    let why = if status == "blocked_user" {
+                        "it needs something from you"
+                    } else {
+                        "the builder could not finish it"
+                    };
+                    return Ok(TaskOutcome::Failed(format!(
+                        "Task {} stopped because {why}: {}",
+                        task.id,
+                        built["summary"].as_str().unwrap_or("no summary")
+                    )));
+                }
+                child.profile = Some(queue.review_profile.clone());
+                child.instructions = queue.review_instructions.clone();
+                child.output_schema = result_schema(true);
+                child.input["build"] = built;
+                // Reviewer never gets a mutating tool, even if a user supplies a
+                // permissive profile. Checks run in the dedicated validation step.
+                child.tools.retain(|t| is_read_only(t));
+                let reviewed = self
+                    .run_single_agent_step(child.clone(), context, usage)
+                    .await?
+                    .value;
+                BasicSchemaValidator
+                    .validate(&child.output_schema, &reviewed)
+                    .map_err(|e| AgentExecutionError::new("invalid_task_review", e.to_string()))?;
+                progress.current.as_mut().unwrap()["review"] = reviewed.clone();
+                let accepted = review_complete(task, &reviewed);
+                if accepted && record {
+                    let mut done = json!({"task_id":task.id,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed});
+                    // The tree the accepted task ends with, kept under a ref.
+                    if let Some(checkpoint) = self.accepted_checkpoint(request, task).await {
+                        done["checkpoint"] = checkpoint;
+                    }
+                    progress.completed.push(done);
+                } else if accepted {
+                    progress.repairs.push(json!({"task_id":task.id,"instructions":task.instructions,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
+                }
+                if accepted {
+                    progress.current = None;
+                    progress.step_plan = None;
+                    progress.baseline = None;
+                    progress.split = None;
+                }
+                context
+                    .checkpoint(serde_json::to_value(&*progress).unwrap())
+                    .await?;
+                if accepted {
+                    return Ok(TaskOutcome::Accepted);
+                }
+                if matches!(
+                    reviewed["status"].as_str(),
+                    Some("blocked_environment" | "blocked_user" | "checkpoint")
+                ) {
+                    return Ok(TaskOutcome::Failed(format!(
+                        "The review of task {} could not finish: {}",
+                        task.id,
+                        reviewed["summary"].as_str().unwrap_or("no summary")
+                    )));
+                }
             }
-            let mut child = request.clone();
-            child.task_queue = None;
-            child.checkpoint = None;
-            // The user's change requests are the repair task's instructions,
-            // not something every task and reviewer should act on.
-            child.feedback.retain(|f| !is_user_change(&f.code));
-            child.structured_output = StructuredOutputMode::HostValidated;
-            child.output_schema = result_schema(false);
-            child.input = task_input(request, plan, task, progress);
-            if let Some(step_plan) = &step_plan {
-                child.input["step_plan"] = Value::String(step_plan.clone());
-            }
-            let follow = if step_plan.is_some() {
-                " Follow workflow_input.step_plan, the detailed plan for this task; where the code proves it wrong, do the smallest thing that meets the criteria and say what you did differently."
-            } else {
-                ""
+            // The attempt got stuck, or its repairs ran out: undo it and,
+            // once per task, try again in smaller steps before giving up.
+            let why = match &stopped {
+                Some(reason) => format!("the workflow stopped its build: {reason}"),
+                None => format!(
+                    "it still needs repair after {} attempts",
+                    queue.max_repairs + 1
+                ),
             };
-            child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
-            if let Some(guidance) = guidance {
-                // The user's own words, given when they chose to try again.
-                child.instructions.push_str(&format!(
-                    "\n\nThe user asked you to try this task again with this guidance:\n{guidance}"
-                ));
-            }
-            let built = self
-                .run_single_agent_step(child.clone(), context, usage)
-                .await?
-                .value;
-            BasicSchemaValidator
-                .validate(&child.output_schema, &built)
-                .map_err(|e| AgentExecutionError::new("invalid_task_result", e.to_string()))?;
-            progress.current = Some(json!({"task_id":task.id,"build":built,"repair":repair}));
+            self.undo_attempt(request, task, progress, &why).await;
             context
                 .checkpoint(serde_json::to_value(&*progress).unwrap())
                 .await?;
-            let status = built["status"].as_str().unwrap_or("invalid");
-            if status == "checkpoint" || status == "needs_repair" {
+            if !split_tried(progress, task)
+                && self
+                    .split_task(request, plan, task, progress, context, usage)
+                    .await?
+                    .is_some()
+            {
+                step_plan = None;
                 continue;
             }
-            // A check that cannot run here (no network, a missing tool) does
-            // not stop the work: the reviewer judges the code that was
-            // written, and the final validation reports what did not run.
+            return Ok(TaskOutcome::Failed(format!(
+                "Task {} could not be completed: {why}. Its last attempt was undone; completed tasks are checkpointed",
+                task.id
+            )));
+        }
+    }
+
+    /// Builds a task once, watched: the whole task, or, when it was split,
+    /// its remaining steps one after the other (each a watched build that
+    /// must leave the code compiling).
+    async fn build_task(
+        &self,
+        child: &AgentStepRequest,
+        request: &AgentStepRequest,
+        task: &Task,
+        progress: &mut Progress,
+        context: &mut StepContext,
+        usage: &mut HashMap<AgentId, AgentUsageMetrics>,
+    ) -> Result<recovery::Built, AgentExecutionError> {
+        let Some((steps, done)) = pending_split(progress, task) else {
+            return self.build_watched(child.clone(), context, usage).await;
+        };
+        let mut summaries = Vec::new();
+        for index in done..steps.len() {
+            let mut step = child.clone();
+            step.instructions
+                .push_str(&split::step_instructions(&steps, index));
+            let place = format!("Step {} of {}", index + 1, steps.len());
+            let value = match self.build_watched(step, context, usage).await? {
+                recovery::Built::Stopped(reason) => {
+                    return Ok(recovery::Built::Stopped(format!("{place}: {reason}")))
+                }
+                recovery::Built::Replied(value) => value,
+            };
+            let summary = value["summary"].as_str().unwrap_or("no summary");
+            let status = value["status"].as_str().unwrap_or("invalid");
             if status != "complete" && status != "blocked_environment" {
-                let why = if status == "blocked_user" {
-                    "it needs something from you"
-                } else {
-                    "the builder could not finish it"
-                };
-                return Ok(TaskOutcome::Failed(format!(
-                    "Task {} stopped because {why}: {}",
-                    task.id,
-                    built["summary"].as_str().unwrap_or("no summary")
-                )));
+                return Ok(recovery::Built::Replied(
+                    json!({"status": status, "summary": format!("{place}: {summary}")}),
+                ));
             }
-            child.profile = Some(queue.review_profile.clone());
-            child.instructions = queue.review_instructions.clone();
-            child.output_schema = result_schema(true);
-            child.input["build"] = built;
-            // Reviewer never gets a mutating tool, even if a user supplies a
-            // permissive profile. Checks run in the dedicated validation step.
-            child.tools.retain(|t| is_read_only(t));
-            let reviewed = self
-                .run_single_agent_step(child.clone(), context, usage)
-                .await?
-                .value;
-            BasicSchemaValidator
-                .validate(&child.output_schema, &reviewed)
-                .map_err(|e| AgentExecutionError::new("invalid_task_review", e.to_string()))?;
-            progress.current.as_mut().unwrap()["review"] = reviewed.clone();
-            let accepted = review_complete(task, &reviewed);
-            if accepted && record {
-                progress.completed.push(json!({"task_id":task.id,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
-            } else if accepted {
-                progress.repairs.push(json!({"task_id":task.id,"instructions":task.instructions,"build":progress.current.as_ref().unwrap()["build"],"review":reviewed}));
-            }
-            if accepted {
-                progress.current = None;
-                progress.step_plan = None;
-            }
+            summaries.push(format!("{place}: {summary}"));
+            progress.split.as_mut().unwrap()["done"] = json!(index + 1);
+            self.advance_baseline(request, task, progress, &format!("step-{}", index + 1))
+                .await;
             context
                 .checkpoint(serde_json::to_value(&*progress).unwrap())
                 .await?;
-            if accepted {
-                return Ok(TaskOutcome::Accepted);
-            }
-            if matches!(
-                reviewed["status"].as_str(),
-                Some("blocked_environment" | "blocked_user" | "checkpoint")
-            ) {
-                return Ok(TaskOutcome::Failed(format!(
-                    "The review of task {} could not finish: {}",
-                    task.id,
-                    reviewed["summary"].as_str().unwrap_or("no summary")
-                )));
-            }
         }
-        Ok(TaskOutcome::Failed(format!(
-            "Task {} still needs repair after {} attempts; completed tasks are checkpointed",
-            task.id,
-            queue.max_repairs + 1
-        )))
+        Ok(recovery::Built::Replied(json!({
+            "status": "complete",
+            "summary": format!("Built in {} steps after the first attempt got stuck.\n{}", steps.len(), summaries.join("\n")),
+        })))
     }
 
     /// The task planner's detailed plan for `task`, when the queue has a
