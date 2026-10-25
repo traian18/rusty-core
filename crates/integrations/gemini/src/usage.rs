@@ -11,6 +11,10 @@ pub struct RawGeminiUsage {
     pub prompt_token_count: Option<u64>,
     pub candidates_token_count: Option<u64>,
     pub total_token_count: Option<u64>,
+    /// The part of the prompt Gemini read from its cache. Gemini 2.5 and
+    /// later cache a repeated prompt prefix on their own (implicit caching);
+    /// this is how much of it they found.
+    pub cached_content_token_count: Option<u64>,
 }
 
 pub struct GeminiUsageMapper;
@@ -20,7 +24,7 @@ impl GeminiUsageMapper {
         ModelUsage {
             input_tokens: UsageValue::new(raw.prompt_token_count),
             output_tokens: UsageValue::new(raw.candidates_token_count),
-            cache_read_tokens: UsageValue::new(None),
+            cache_read_tokens: UsageValue::new(raw.cached_content_token_count),
             cache_write_tokens: UsageValue::new(None),
             reasoning_tokens: UsageValue::new(None),
             total_tokens: UsageValue::new(raw.total_token_count),
@@ -89,11 +93,25 @@ mod tests {
             prompt_token_count: Some(100),
             candidates_token_count: Some(50),
             total_token_count: Some(150),
+            cached_content_token_count: None,
         };
         let usage = GeminiUsageMapper::map_usage(&raw);
         assert_eq!(usage.input_tokens.value(), Some(100));
         assert_eq!(usage.output_tokens.value(), Some(50));
         assert_eq!(usage.total_tokens.value(), Some(150));
+    }
+
+    #[test]
+    fn reports_what_the_implicit_cache_served() {
+        let raw: RawGeminiUsage = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 40000, "candidatesTokenCount": 80,
+            "totalTokenCount": 40080, "cachedContentTokenCount": 32768
+        }))
+        .unwrap();
+        assert_eq!(
+            GeminiUsageMapper::map_usage(&raw).cache_read_tokens.value(),
+            Some(32768)
+        );
     }
 
     #[test]
