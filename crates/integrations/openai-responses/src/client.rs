@@ -152,6 +152,13 @@ impl ModelClient for OpenAiResponsesClient {
         }
         if self.chatgpt_subscription {
             prepare_chatgpt_body(&mut body, system);
+            // The subscription backend routes its prompt cache by the
+            // conversation, as the Codex CLI sends it, not by the body alone.
+            if let Some(key) = &request.cache_key {
+                request_builder = request_builder
+                    .header("session_id", key)
+                    .header("conversation_id", key);
+            }
         }
 
         if let Some(auth) = &self.auth {

@@ -102,6 +102,16 @@ async fn attempt(name: &str, mode: ExecutionMode, allowed: bool) {
                 .expect("prompt_cache_key")
                 .to_owned();
             assert_eq!(cache_key.get_or_insert_with(|| key.clone()), &key);
+            // The cache is routed by the conversation headers too.
+            let lower = headers.to_lowercase();
+            assert!(
+                lower.contains(&format!("session_id: {}", key.to_lowercase())),
+                "{headers}"
+            );
+            assert!(
+                lower.contains(&format!("conversation_id: {}", key.to_lowercase())),
+                "{headers}"
+            );
             assert_eq!(body["instructions"], "Fixture system prompt");
             assert_eq!(body["model"], "gpt-5.5");
             assert!(body.get("temperature").is_none());
