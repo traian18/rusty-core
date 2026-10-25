@@ -88,7 +88,8 @@ struct Signals {
     edits: HashMap<String, u32>,
     reads: HashMap<String, u32>,
     failed_edits: u32,
-    best_check_errors: Option<u32>,
+    /// The fewest errors each check (by its arguments) has reported.
+    best_check_errors: HashMap<String, u32>,
     checks_without_progress: u32,
     /// Nudges already given, so each is given once.
     nudged: Vec<String>,
@@ -173,7 +174,7 @@ impl Watchdog {
                 found.push((format!("reads:{path}"), count, self.limits.reads_of_one_file, format!("You have read {path} {count} times. Read it whole once (no line range) and work from that copy.")));
             }
             ("run_check", _) => {
-                if let Some(count) = check_progress(&mut signals, failed, output) {
+                if let Some(count) = check_progress(&mut signals, arguments, failed, output) {
                     found.push(("checks".into(), count, self.limits.checks_without_progress, format!("The last {count} checks failed without fewer errors. Stop patching symptoms: re-read the errors, find their common cause, and fix that; if the task is larger than one change, finish a smaller part that compiles and say what remains.")));
                 }
             }
@@ -214,32 +215,52 @@ fn file_argument(arguments: &Value) -> Option<String> {
         .map(|path| path.trim_start_matches("./").to_owned())
 }
 
-/// Counts failed checks that did not lower the error count; a passing check
-/// or fewer errors than ever before starts over. `None` when it passed.
-fn check_progress(signals: &mut Signals, failed: bool, output: &Value) -> Option<u32> {
+/// Counts failed checks that did not lower the error count. Each check
+/// (typecheck, a test file, the whole suite: told apart by the call's
+/// arguments) is compared only with itself, so a focused test's single
+/// failure never makes a typecheck's falling count look stuck. A passing
+/// check, or fewer errors than that check ever had, starts over; the first
+/// result of a check counts neither way. `None` when it passed.
+fn check_progress(
+    signals: &mut Signals,
+    arguments: &Value,
+    failed: bool,
+    output: &Value,
+) -> Option<u32> {
+    let check = arguments.to_string();
     if !failed {
-        signals.best_check_errors = None;
+        signals.best_check_errors.remove(&check);
         signals.checks_without_progress = 0;
         return None;
     }
-    let errors = error_count(&output_text(output));
-    match (errors, signals.best_check_errors) {
+    match (
+        error_count(&output_text(output)),
+        signals.best_check_errors.get(&check).copied(),
+    ) {
         (Some(now), Some(best)) if now < best => {
-            signals.best_check_errors = Some(now);
+            signals.best_check_errors.insert(check, now);
             signals.checks_without_progress = 0;
         }
         (Some(now), None) => {
-            signals.best_check_errors = Some(now);
-            signals.checks_without_progress = 0;
+            signals.best_check_errors.insert(check, now);
         }
         _ => signals.checks_without_progress += 1,
     }
     Some(signals.checks_without_progress)
 }
 
+/// The text of a tool result: its strings with their real line breaks (a
+/// check's failure comes as `{"error": "..."}`, whose JSON form would escape
+/// them).
 fn output_text(output: &Value) -> String {
     match output {
         Value::String(text) => text.clone(),
+        Value::Array(items) => items.iter().map(output_text).collect::<Vec<_>>().join("\n"),
+        Value::Object(fields) => fields
+            .values()
+            .map(output_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
         other => other.to_string(),
     }
 }

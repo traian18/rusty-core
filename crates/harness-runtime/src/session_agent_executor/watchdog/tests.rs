@@ -66,6 +66,39 @@ fn checks_that_get_better_are_progress() {
 }
 
 #[test]
+fn each_check_is_compared_with_itself() {
+    // The T4 run of 2026-10-25: a focused test with 1 failure, then a
+    // typecheck going 12, 12, 8, 4, 2 was wrongly stopped as stuck.
+    let dog = Watchdog::new(Limits::default());
+    let test =
+        json!({"check":"test","path":"rusty-ide","test_file":"src/AgentTab.multiChat.test.tsx"});
+    let typecheck = json!({"check":"typecheck","path":"rusty-ide"});
+    let out = |n: u32| json!({ "error": format!("FAILED (exit 2)\n  {n} errors:\n  - a.ts:1") });
+    assert_eq!(
+        dog.observe(
+            "run_check",
+            &test,
+            true,
+            &json!({"error":"Result: 1 failed (1)\n  1 error:"})
+        ),
+        Verdict::Fine
+    );
+    for errors in [12, 12, 8, 4, 2] {
+        assert_eq!(
+            dog.observe("run_check", &typecheck, true, &out(errors)),
+            Verdict::Fine,
+            "{errors}"
+        );
+    }
+    // The same test failing the same way again and again is still stuck.
+    let stuck: Vec<_> = (0..7)
+        .map(|_| dog.observe("run_check", &test, true, &out(1)))
+        .collect();
+    assert!(matches!(stuck[2], Verdict::Nudge(_)));
+    assert!(matches!(stuck[5], Verdict::Stop(_)));
+}
+
+#[test]
 fn checks_stuck_at_the_same_errors_stop() {
     let dog = Watchdog::new(Limits::default());
     let out = json!("typecheck: FAILED\n  29 errors:");
@@ -123,6 +156,12 @@ fn error_counts_are_read_from_check_output() {
     );
     assert_eq!(error_count("found 1 error."), Some(1));
     assert_eq!(error_count("tests failed"), None);
+}
+
+#[test]
+fn error_counts_are_read_from_a_failure_object() {
+    let failure = json!({"error": "typecheck for rusty-ide: FAILED\n\n[1/2] npm run typecheck: FAILED (exit 2)\n  12 errors:\n  - a.ts:1"});
+    assert_eq!(error_count(&output_text(&failure)), Some(12));
 }
 
 #[test]
