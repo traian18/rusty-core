@@ -136,6 +136,7 @@ impl OpenAiCompatibleConfig {
             recovery: self.recovery,
             extra_headers: self.extra_headers,
             supports_reasoning: self.supports_reasoning,
+            prompt_cache: Default::default(),
         }
     }
 }

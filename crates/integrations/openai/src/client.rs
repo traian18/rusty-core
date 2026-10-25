@@ -133,12 +133,18 @@ impl ModelClient for OpenAiClient {
         // `OpenAiRequest` — see `harness_model::merge_provider_options`'s
         // doc comment for the precedence rule (typed fields above always
         // win).
-        let body = harness_model::merge_provider_options(
+        let mut body = harness_model::merge_provider_options(
             serde_json::to_value(&openai_request).map_err(|error| ModelError::InvalidRequest {
                 message: format!("failed to serialize request: {error}"),
             })?,
             &request.provider_options,
             "openai",
+        );
+        crate::cache::add_cache_hints(
+            &mut body,
+            self.config.prompt_cache,
+            &self.config.base_url,
+            request.cache_key.as_deref(),
         );
 
         if let Some(auth) = &self.auth {

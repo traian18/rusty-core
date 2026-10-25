@@ -351,8 +351,7 @@ impl MockCopilot {
         }
     }
     fn client(&self) -> CopilotClient {
-        let mut chat = OpenAiConfig::new("");
-        chat.base_url = self.root.clone();
+        let chat = chat_config(&self.root);
         let mut responses = OpenAiResponsesConfig::new("");
         responses.base_url = self.root.clone();
         let mut messages = AnthropicConfig::new("");
@@ -460,6 +459,60 @@ async fn haiku_uses_native_messages_with_the_same_oauth_credential_as_discovery(
     assert_eq!(requests[1].1["max_tokens"], 32);
     assert_eq!(requests[1].1["messages"][0]["role"], "user");
 }
+#[tokio::test]
+async fn every_route_carries_prompt_cache_hints() {
+    let mock = MockCopilot::start(Some(serde_json::json!({"data":[
+        {"id":"claude-sonnet-4.5", "supported_endpoints":["/chat/completions","/v1/messages"]},
+        {"id":"claude-sonnet-4", "supported_endpoints":["/chat/completions"]},
+        {"id":"gpt-5.1", "supported_endpoints":["/responses"]},
+        {"id":"gpt-4.1", "supported_endpoints":["/chat/completions"]}
+    ]})))
+    .await;
+    let client = mock.client();
+    for model in ["claude-sonnet-4.5", "claude-sonnet-4", "gpt-5.1", "gpt-4.1"] {
+        let mut request = model_request(Some(model));
+        request.system_prompt = "You are Build.".into();
+        request.cache_key = Some("run-7".into());
+        // The mock answers in Chat Completions form only, so the Responses
+        // reply does not parse; what was sent is recorded either way.
+        let answered = ask_request(&client, request).await;
+        assert!(
+            answered.is_ok() || model == "gpt-5.1",
+            "{model}: {answered:?}"
+        );
+    }
+    let requests = mock.requests.lock().unwrap();
+    let sent = |path: &str, model: &str| {
+        requests
+            .iter()
+            .find(|(p, body)| p == path && body["model"] == model)
+            .map(|(_, body)| body.clone())
+            .unwrap_or_else(|| panic!("no {path} request for {model}"))
+    };
+    // Messages (Claude): Anthropic cache marks on the system prompt and the last message.
+    let messages = sent("/v1/messages", "claude-sonnet-4.5");
+    assert_eq!(messages["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        messages["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    // Chat Completions (Claude without Messages): Copilot's own marks.
+    let chat = sent("/chat/completions", "claude-sonnet-4");
+    assert_eq!(
+        chat["messages"][0]["copilot_cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        chat["messages"][1]["copilot_cache_control"]["type"],
+        "ephemeral"
+    );
+    // Responses (GPT-5): the run's cache key.
+    assert_eq!(sent("/responses", "gpt-5.1")["prompt_cache_key"], "run-7");
+    // Chat Completions (GPT-4.1): Copilot caches OpenAI models by itself; nothing extra is sent.
+    let gpt = sent("/chat/completions", "gpt-4.1");
+    assert!(!gpt.to_string().contains("cache_control"), "{gpt}");
+}
+
 #[tokio::test]
 async fn a_model_refusing_budget_thinking_is_retried_with_adaptive_thinking() {
     let mock = MockCopilot::start(Some(serde_json::json!({"data":[{

@@ -47,6 +47,22 @@ pub struct OpenAiConfig {
     /// providers (e.g. OpenCode Zen's chat-completions model family) known
     /// to support it.
     pub supports_reasoning: bool,
+    /// Which prompt-cache hints requests carry (see `crate::cache`).
+    pub prompt_cache: PromptCache,
+}
+
+/// Which prompt-cache hints a Chat Completions endpoint understands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCache {
+    /// Decided by the host: OpenAI and OpenRouter get their hints, any other
+    /// server none.
+    #[default]
+    ByHost,
+    /// GitHub Copilot's Chat Completions endpoint, at whatever host.
+    Copilot,
+    /// No hints.
+    Off,
 }
 
 impl Default for OpenAiConfig {
@@ -60,6 +76,7 @@ impl Default for OpenAiConfig {
             recovery: RecoveryPolicy::default(),
             extra_headers: HashMap::new(),
             supports_reasoning: false,
+            prompt_cache: PromptCache::default(),
         }
     }
 }

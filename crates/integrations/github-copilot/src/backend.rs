@@ -228,6 +228,17 @@ pub fn api_root(host: &str) -> Result<String, String> {
     Err("Unsupported Copilot host; configure github.com or a GitHub Enterprise Cloud .ghe.com host.".into())
 }
 
+/// Copilot's Chat Completions client settings.
+pub(crate) fn chat_config(root: &str) -> OpenAiConfig {
+    let mut chat = OpenAiConfig::new("");
+    chat.base_url = root.to_owned();
+    chat.supports_reasoning = true;
+    // Claude models on this route cache up to the messages marked the way
+    // Copilot's own clients mark them.
+    chat.prompt_cache = harness_integration_openai::PromptCache::Copilot;
+    chat
+}
+
 pub struct GitHubCopilotBackend;
 impl GitHubCopilotBackend {
     pub fn build(config: GitHubCopilotConfig) -> Result<GenericModelBackend, String> {
@@ -237,10 +248,8 @@ impl GitHubCopilotBackend {
             config.github_host,
         ));
         let catalog = CatalogSource::new(&root, auth.clone());
-        let mut chat = OpenAiConfig::new("");
-        chat.base_url = root.clone();
+        let mut chat = chat_config(&root);
         chat.default_model = config.default_model.clone();
-        chat.supports_reasoning = true;
         let mut responses = OpenAiResponsesConfig::new("");
         responses.base_url = root.clone();
         responses.default_model = config.default_model.clone();
