@@ -612,14 +612,9 @@ fn parse_items(name: &str, items: &Value, body: &str, level: usize) -> Vec<Value
             .enumerate()
             .map(|(index, bullet)| {
                 // `C1: text` carries its own ID; a plain bullet gets one.
-                let (id, text) = bullet
-                    .split_once(':')
-                    .or_else(|| bullet.split_once(char::is_whitespace))
-                    .filter(|(id, _)| looks_like_id(&clean_id(id)))
-                    .map_or_else(
-                        || (format!("{}{}", id_prefix(name), index + 1), bullet.clone()),
-                        |(id, text)| (clean_id(id), text.trim().to_owned()),
-                    );
+                let (id, text) = bullet_id(bullet.as_str()).unwrap_or_else(|| {
+                    (format!("{}{}", id_prefix(name), index + 1), bullet.clone())
+                });
                 let mut map = Map::new();
                 map.insert("id".into(), Value::String(id));
                 map.insert(body_name.clone(), Value::String(text));
@@ -750,6 +745,24 @@ fn parse_item(schema: &Value, title: &str, section: &str, fallback_id: String) -
         }
     }
     Value::Object(out)
+}
+
+/// The ID a bullet starts with, and the text after it: `C1: text`, `C1 text`,
+/// `**C14 — complete.** text`. Only the first word is looked at, so a colon
+/// later in the text (`a.ts:12`) is not mistaken for the end of the ID.
+fn bullet_id(bullet: &str) -> Option<(String, String)> {
+    let start = bullet.trim_start_matches(['*', '`']);
+    let end = start
+        .find(|c: char| c.is_whitespace() || c == ':')
+        .unwrap_or(start.len());
+    let id = clean_id(&start[..end]);
+    if !looks_like_id(&id) {
+        return None;
+    }
+    let text = start[end..].trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '*' | '-' | '–' | '—')
+    });
+    Some((id, text.trim().to_owned()))
 }
 
 fn clean_id(raw: &str) -> String {

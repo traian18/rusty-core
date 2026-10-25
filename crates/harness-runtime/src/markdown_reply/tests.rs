@@ -153,6 +153,25 @@ fn the_template_names_every_section() {
 }
 
 #[test]
+fn a_bullet_keeps_its_own_id_when_its_text_has_colons() {
+    let schema = json!({"type":"object","required":["criteria"],"properties":{
+            "criteria":{"type":"array","items":{"type":"object","required":["id","evidence"],"properties":{
+                "id":{"type":"string"},"evidence":{"type":"string"}}}}}});
+    let reply = "## criteria\n- **C14 — complete.** `a.ts:5` restores it.\n- **C2:** `b.ts:9` keeps it.\n- C7 holds: see `c.ts:1`.\n- `C9`: d.ts\n- Checked by hand: fine.";
+    let value = parse(&schema, reply).unwrap();
+    assert_eq!(
+        value["criteria"],
+        json!([
+            {"id":"C14","evidence":"complete.** `a.ts:5` restores it."},
+            {"id":"C2","evidence":"`b.ts:9` keeps it."},
+            {"id":"C7","evidence":"holds: see `c.ts:1`."},
+            {"id":"C9","evidence":"d.ts"},
+            {"id":"C5","evidence":"Checked by hand: fine."}
+        ])
+    );
+}
+
+#[test]
 fn a_dash_after_an_item_id_is_read_without_panicking() {
     // `### R1 — Title` once cut a string inside the dash and lost every criterion.
     let schema = json!({"type":"object","required":["criteria","summary"],"properties":{
