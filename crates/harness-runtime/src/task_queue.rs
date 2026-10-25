@@ -769,6 +769,8 @@ impl IsolatedSessionAgentExecutor {
                     ""
                 };
                 child.instructions = format!("{}\nImplement only workflow_input.task.{follow} Preserve completed tasks. The workflow verifies the whole project after the last task, so check this task with the typecheck and the tests of what it changes, not the full suite. Return status complete only when every assigned criterion is implemented. Commands really run on this machine: when a check fails or a tool is missing, read the output and try the sensible alternatives before giving up. Never leave the implementation undone because a command fails: make every change the task needs first. If the command still cannot run, quote it and its output, end the summary with a short \"Please test\" request giving the exact command for the user to run and what to report back, and use complete. Use blocked_user only when you cannot do the task without something the user must provide. For unfinished work use checkpoint, with precise remaining work in summary. Never invent evidence.", request.instructions);
+                // The general prompt may still ask for progress updates.
+                child.instructions.push_str("\n\nreport_progress is not offered in this step: skip the progress updates the general instructions ask for, and never try to run it as a command.");
                 if let Some(guidance) = guidance {
                     // The user's own words, given when they chose to try again.
                     child.instructions.push_str(&format!(
