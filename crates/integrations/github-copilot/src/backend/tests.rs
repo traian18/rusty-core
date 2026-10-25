@@ -203,6 +203,7 @@ async fn both_inference_protocols_return_tool_requests_without_executing_them() 
             reasoning_effort: None,
             response_format: None,
             provider_options: serde_json::json!({"openai":{"tools":[{"type":"web_search"}]},"openai-responses":{"tools":[{"type":"web_search"}]}}),
+            cache_key: None,
         };
         let (events, mut receiver) = tokio::sync::mpsc::channel(32);
         tokio::time::timeout(
@@ -418,6 +419,7 @@ fn model_request(model: Option<&str>) -> ModelRequest {
         reasoning_effort: None,
         response_format: None,
         provider_options: serde_json::Value::Null,
+        cache_key: None,
     }
 }
 async fn ask_request(

@@ -118,7 +118,10 @@ mod tests {
             "extra_headers": { "X-Custom": "value" }
         }))
         .expect("valid config");
-        assert_eq!(config.extra_headers.get("X-Custom").map(String::as_str), Some("value"));
+        assert_eq!(
+            config.extra_headers.get("X-Custom").map(String::as_str),
+            Some("value")
+        );
     }
 
     #[test]

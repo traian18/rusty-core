@@ -154,7 +154,11 @@ impl GenericModelBackend {
                     sink,
                     ExecutionEvent::ToolCallRequested {
                         request_id,
-                        call: ToolCall { id, name, arguments: input },
+                        call: ToolCall {
+                            id,
+                            name,
+                            arguments: input,
+                        },
                     },
                 );
             }

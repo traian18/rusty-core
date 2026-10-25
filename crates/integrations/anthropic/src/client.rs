@@ -581,6 +581,7 @@ mod tests {
             reasoning_effort,
             response_format: None,
             provider_options: serde_json::Value::Null,
+            cache_key: None,
         }
     }
 

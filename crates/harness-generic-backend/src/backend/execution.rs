@@ -13,8 +13,8 @@ use harness_protocol::ids::RequestId;
 
 use super::convert::{emit_terminal, to_execution_error, to_execution_result};
 use super::retry::{
-    append_interrupted_response, classify_attempt, retry_delay, wait_retry_delay,
-    AttemptDecision, RetryContext,
+    append_interrupted_response, classify_attempt, retry_delay, wait_retry_delay, AttemptDecision,
+    RetryContext,
 };
 use super::stream::AttemptProgress;
 use super::GenericModelBackend;
@@ -59,7 +59,14 @@ impl GenericModelBackend {
         loop {
             let mut progress = AttemptProgress::default();
             let decision = self
-                .attempt_once(&model_request, request_id, sink, cancel, attempt, &mut progress)
+                .attempt_once(
+                    &model_request,
+                    request_id,
+                    sink,
+                    cancel,
+                    attempt,
+                    &mut progress,
+                )
                 .await;
             let AttemptDecision::Retry(error) = decision else {
                 return (self.settle(decision, request_id), attempt);
@@ -190,5 +197,6 @@ fn prepare_model_request(request: ExecutionRequest) -> ModelRequest {
         reasoning_effort: request.params.reasoning_effort,
         response_format: request.params.response_format,
         provider_options: request.params.provider_options,
+        cache_key: Some(request.run_id.to_string()),
     }
 }

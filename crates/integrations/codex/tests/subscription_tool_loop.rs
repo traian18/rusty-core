@@ -85,6 +85,8 @@ async fn attempt(name: &str, mode: ExecutionMode, allowed: bool) {
     let name = name.to_string();
     let expected_name = name.clone();
     let server = tokio::spawn(async move {
+        // Every call of one run carries the same cache key.
+        let mut cache_key: Option<String> = None;
         for turn in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let (headers, body) = request(&mut socket).await;
@@ -95,6 +97,11 @@ async fn attempt(name: &str, mode: ExecutionMode, allowed: bool) {
             assert!(headers.to_lowercase().contains("authorization: bearer "));
             assert_eq!(body["store"], false);
             assert_eq!(body["stream"], true);
+            let key = body["prompt_cache_key"]
+                .as_str()
+                .expect("prompt_cache_key")
+                .to_owned();
+            assert_eq!(cache_key.get_or_insert_with(|| key.clone()), &key);
             assert_eq!(body["instructions"], "Fixture system prompt");
             assert_eq!(body["model"], "gpt-5.5");
             assert!(body.get("temperature").is_none());

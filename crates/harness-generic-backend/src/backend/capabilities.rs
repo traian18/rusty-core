@@ -21,12 +21,8 @@ impl GenericModelBackend {
     fn check_reasoning_capability(&self, request: &ExecutionRequest) -> Option<ModelError> {
         let wants_reasoning =
             request.extended_thinking || request.params.reasoning_effort.is_some();
-        (wants_reasoning && !self.capabilities.reasoning_stream).then(|| {
-            self.unsupported(
-                "reasoning",
-                "does not support reasoning/extended thinking",
-            )
-        })
+        (wants_reasoning && !self.capabilities.reasoning_stream)
+            .then(|| self.unsupported("reasoning", "does not support reasoning/extended thinking"))
     }
 
     fn check_image_capability(&self, request: &ExecutionRequest) -> Option<ModelError> {
@@ -54,9 +50,8 @@ impl GenericModelBackend {
             request.params.response_format,
             None | Some(ResponseFormat::Text)
         );
-        (wants_structured_output && !self.capabilities.structured_output).then(|| {
-            self.unsupported("structured_output", "cannot constrain its response format")
-        })
+        (wants_structured_output && !self.capabilities.structured_output)
+            .then(|| self.unsupported("structured_output", "cannot constrain its response format"))
     }
 
     fn unsupported(&self, capability: &str, what: &str) -> ModelError {

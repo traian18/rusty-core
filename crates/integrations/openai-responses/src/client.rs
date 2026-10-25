@@ -145,6 +145,11 @@ impl ModelClient for OpenAiResponsesClient {
             &request.provider_options,
             "openai-responses",
         );
+        if let (Some(key), Some(object)) = (&request.cache_key, body.as_object_mut()) {
+            object
+                .entry("prompt_cache_key")
+                .or_insert_with(|| key.clone().into());
+        }
         if self.chatgpt_subscription {
             prepare_chatgpt_body(&mut body, system);
         }

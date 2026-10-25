@@ -61,4 +61,10 @@ pub struct ModelRequest {
     /// Provider-specific options namespaced by provider id. See
     /// `harness_protocol::backend::ExecutionParams::provider_options`.
     pub provider_options: serde_json::Value,
+    /// A key that stays the same for every request of one run. Providers
+    /// with prompt caching route by it (`prompt_cache_key` on the Responses
+    /// API), so the run's growing conversation is read from cache instead of
+    /// being processed again on every call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
 }
