@@ -36,6 +36,7 @@ use crate::{
 };
 
 mod answer_text;
+mod rate_limit;
 pub(crate) mod watchdog;
 use answer_text::AnswerText;
 use watchdog::{Watchdog, WatchedRegistry, WATCHDOG_STOPPED};
@@ -226,6 +227,11 @@ impl IsolatedSessionAgentExecutor {
     /// The folder the steps work in.
     pub(crate) fn workspace_root(&self) -> std::path::PathBuf {
         self.parent.workspace.root().to_path_buf()
+    }
+
+    /// One of the host's tools, for the workflow's own calls (no session).
+    pub(crate) fn host_tool(&self, name: &str) -> Option<Arc<dyn harness_tools::ToolExecutor>> {
+        self.parent.tool_registry.get_executor(name)
     }
 
     pub fn new(parent: Arc<SessionRuntime>) -> Self {
@@ -443,7 +449,17 @@ impl IsolatedSessionAgentExecutor {
 fn classify_failure(error: AgentError) -> AgentExecutionError {
     let reason = match error.code.as_str() {
         "BACKEND_ERROR" if error.message.starts_with("RateLimited") => {
-            Some(RetryReason::BackendRateLimited)
+            match rate_limit::advertised_wait(&error.message) {
+                // A usage limit: no retry can help before it resets.
+                Some(wait) if wait > rate_limit::MAX_STEP_WAIT => {
+                    return AgentExecutionError {
+                        code: rate_limit::USAGE_LIMIT.into(),
+                        message: rate_limit::usage_limit_message(wait),
+                        retry_reason: None,
+                    };
+                }
+                _ => Some(RetryReason::BackendRateLimited),
+            }
         }
         "BACKEND_ERROR" if error.message.starts_with("Timeout") => {
             Some(RetryReason::BackendTimeout)
@@ -809,7 +825,14 @@ impl IsolatedSessionAgentExecutor {
                     failed_checks,
                     ..
                 } => unpassed_gate = Some(failed_checks),
-                AgentEvent::Failed { error } => return Err(classify_failure(error)),
+                AgentEvent::Failed { error } => {
+                    let failure = classify_failure(error);
+                    if failure.retry_reason == Some(RetryReason::BackendRateLimited) {
+                        rate_limit::wait_before_retry(&failure.message, &context.cancellation)
+                            .await;
+                    }
+                    return Err(failure);
+                }
                 AgentEvent::Completed { outcome } => {
                     match outcome {
                         AgentOutcome::Success => {}
@@ -954,6 +977,13 @@ mod tests {
                 .retry_reason,
             Some(RetryReason::BackendRateLimited)
         );
+        let usage_limit = classify_failure(error(
+            "BACKEND_ERROR",
+            "RateLimited { retry_after: Some(16743s) }",
+        ));
+        assert_eq!(usage_limit.retry_reason, None);
+        assert_eq!(usage_limit.code, "usage_limit");
+        assert!(usage_limit.message.contains("resets_at="));
         assert_eq!(
             classify_failure(error("BACKEND_ERROR", "Timeout")).retry_reason,
             Some(RetryReason::BackendTimeout)

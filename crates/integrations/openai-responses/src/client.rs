@@ -195,7 +195,7 @@ impl ModelClient for OpenAiResponsesClient {
             )
             .await
         } else if status.as_u16() == 429 {
-            Self::handle_rate_limit(response)
+            Self::handle_rate_limit(response).await
         } else {
             Self::handle_error_response(response, status).await
         }
@@ -277,8 +277,10 @@ impl OpenAiResponsesClient {
         Ok(result)
     }
 
-    fn handle_rate_limit(response: reqwest::Response) -> Result<ModelResult, ModelError> {
-        let retry_after = retry_after_from_headers(response.headers());
+    async fn handle_rate_limit(response: reqwest::Response) -> Result<ModelResult, ModelError> {
+        let from_headers = retry_after_from_headers(response.headers());
+        let body = response.text().await.unwrap_or_default();
+        let retry_after = from_headers.or_else(|| usage_limit_reset(&body, now_unix()));
         Err(ModelError::RateLimited { retry_after })
     }
 
@@ -294,6 +296,26 @@ impl OpenAiResponsesClient {
     }
 }
 
+/// When a ChatGPT subscription's usage limit resets, from the 429 body
+/// (`{"error": {"type": "usage_limit_reached", "resets_in_seconds": …}}`, or
+/// `resets_at` in Unix seconds), so the run can say when to continue.
+fn usage_limit_reset(body: &str, now: u64) -> Option<std::time::Duration> {
+    let error = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let error = error.get("error")?;
+    if let Some(seconds) = error.get("resets_in_seconds").and_then(|v| v.as_u64()) {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let at = error.get("resets_at").and_then(|v| v.as_u64())?;
+    Some(std::time::Duration::from_secs(at.saturating_sub(now)))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
 fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     harness_model::retry::parse_retry_after(|name| {
         headers.get(name).and_then(|value| value.to_str().ok())
@@ -302,6 +324,17 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<std:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_usage_limit_body_says_when_it_resets() {
+        use super::usage_limit_reset;
+        use std::time::Duration;
+        let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":16743}}"#;
+        assert_eq!(usage_limit_reset(body, 0), Some(Duration::from_secs(16743)));
+        let body = r#"{"error":{"type":"usage_limit_reached","resets_at":1000}}"#;
+        assert_eq!(usage_limit_reset(body, 400), Some(Duration::from_secs(600)));
+        assert_eq!(usage_limit_reset("Too Many Requests", 0), None);
+    }
+
     use super::retry_after_from_headers;
     use std::time::Duration;
 

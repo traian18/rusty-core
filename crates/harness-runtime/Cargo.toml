@@ -28,6 +28,7 @@ serde = { workspace = true }
 metrics = { workspace = true }
 futures = { workspace = true }
 git2 = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 harness-runtime = { path = ".", features = ["testing"] }
