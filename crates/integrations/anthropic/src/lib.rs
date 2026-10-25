@@ -3,6 +3,7 @@
 //! Implements ExecutionBackend via GenericModelBackend and a ModelClient for the Anthropic Messages API. Empty until Phase 3.
 
 pub mod backend;
+pub mod cache;
 pub mod client;
 pub mod config;
 pub mod usage;

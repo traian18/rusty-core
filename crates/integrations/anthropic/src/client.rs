@@ -298,12 +298,14 @@ impl AnthropicClient {
         // (e.g. `top_k`) that have no typed field on `AnthropicRequest` —
         // see `harness_model::merge_provider_options`'s doc comment for the
         // precedence rule (typed fields above always win).
+        let mut body = serde_json::to_value(&anthropic_request).map_err(|error| {
+            ModelError::InvalidRequest {
+                message: format!("failed to serialize request: {error}"),
+            }
+        })?;
+        crate::cache::add_cache_breakpoints(&mut body);
         Ok(harness_model::merge_provider_options(
-            serde_json::to_value(&anthropic_request).map_err(|error| {
-                ModelError::InvalidRequest {
-                    message: format!("failed to serialize request: {error}"),
-                }
-            })?,
+            body,
             &request.provider_options,
             "anthropic",
         ))
