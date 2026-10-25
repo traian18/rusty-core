@@ -134,3 +134,34 @@ fn labels_become_valid_ref_names() {
         "refs/rusty/checkpoints/run-1/T4-start"
     );
 }
+
+#[test]
+fn a_fingerprint_changes_only_with_the_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo_with_commit(root);
+    let first = fingerprint(root);
+    assert_eq!(first.len(), 1);
+    // Recording a checkpoint is not a change.
+    take(root, "run/T1-start");
+    assert_eq!(fingerprint(root), first);
+    fs::write(root.join("changed.ts"), "after\n").unwrap();
+    assert_ne!(fingerprint(root), first);
+}
+
+#[test]
+fn an_undone_attempt_keeps_its_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    repo_with_commit(root);
+    let baseline = take(root, "run/T2-start");
+    fs::write(root.join("changed.ts"), "after\n").unwrap();
+    let undone = undo_to(root, &baseline, "run/T2-undone").unwrap();
+    let diff = patch(root, &baseline, &undone.attempt, 10_000);
+    assert!(diff.contains("-before\n+after\n"), "{diff}");
+    let cut = patch(root, &baseline, &undone.attempt, 10);
+    assert!(
+        cut.ends_with("(diff cut; the whole attempt is kept under its ref)"),
+        "{cut}"
+    );
+}

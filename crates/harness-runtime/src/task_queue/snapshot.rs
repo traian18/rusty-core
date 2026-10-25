@@ -113,15 +113,80 @@ fn is_repository(path: &Path) -> bool {
         .is_ok()
 }
 
+/// The tree of every repository's working tree, as (repository, tree id),
+/// without recording anything: two equal fingerprints mean no file changed.
+pub(super) fn fingerprint(root: &Path) -> Vec<(String, String)> {
+    repositories(root)
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let repo = Repository::open(&path).ok()?;
+            Some((name, working_tree(&repo).ok()?.to_string()))
+        })
+        .collect()
+}
+
+/// The changes from `base` to `now` as a unified diff, cut to about
+/// `max_chars` (a planner reads it to reuse what an undone attempt learned).
+pub(super) fn patch(root: &Path, base: &Snapshot, now: &Snapshot, max_chars: usize) -> String {
+    let mut text = String::new();
+    for base_repo in &base.repos {
+        let Some(now_repo) = now.repos.iter().find(|repo| repo.repo == base_repo.repo) else {
+            continue;
+        };
+        let path = root.join(&base_repo.repo);
+        let Ok(diff) = repo_patch(&path, &base_repo.commit, &now_repo.commit) else {
+            continue;
+        };
+        if diff.is_empty() {
+            continue;
+        }
+        if !base_repo.repo.is_empty() {
+            text.push_str(&format!("# repository {}\n", base_repo.repo));
+        }
+        text.push_str(&diff);
+        if text.len() > max_chars {
+            let mut cut = max_chars;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push_str("\n… (diff cut; the whole attempt is kept under its ref)");
+            break;
+        }
+    }
+    text
+}
+
+fn repo_patch(path: &Path, base: &str, now: &str) -> Result<String, git2::Error> {
+    let repo = Repository::open(path)?;
+    let base_tree = repo.find_commit(Oid::from_str(base)?)?.tree()?;
+    let now_tree = repo.find_commit(Oid::from_str(now)?)?.tree()?;
+    let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&now_tree), None)?;
+    let mut text = String::new();
+    diff.print(git2::DiffFormat::Patch, |_, _, line| {
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            text.push(line.origin());
+        }
+        text.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })?;
+    Ok(text)
+}
+
+/// The working tree (tracked and untracked, not ignored) as a tree object.
+/// The index is changed in memory only and never written back.
+fn working_tree(repo: &Repository) -> Result<Oid, git2::Error> {
+    let mut index = repo.index()?;
+    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+    index.update_all(["*"], None)?;
+    index.write_tree_to(repo)
+}
+
 /// Commits the working tree (tracked and untracked, not ignored) without
 /// touching the index on disk, and points `refs/rusty/checkpoints/<label>` at it.
 fn record(path: &Path, label: &str) -> Result<Oid, git2::Error> {
     let repo = Repository::open(path)?;
-    // The index is changed in memory only and never written back.
-    let mut index = repo.index()?;
-    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
-    index.update_all(["*"], None)?;
-    let tree = repo.find_tree(index.write_tree_to(&repo)?)?;
+    let tree = repo.find_tree(working_tree(&repo)?)?;
     let signature = repo
         .signature()
         .or_else(|_| Signature::now("Rusty", "rusty@localhost"))?;

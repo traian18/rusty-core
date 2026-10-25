@@ -49,6 +49,37 @@ pub(crate) struct Limits {
     pub duration: Duration,
     /// Tool calls refused after a stop before the run is cancelled.
     pub refused_after_stop: u32,
+    /// A planning step: it reads and writes a plan, so its notes ask for the
+    /// plan, and it is only nudged, never stopped.
+    pub planner: bool,
+}
+
+impl Limits {
+    /// A task planner's limits: a nudge to write the plan after 40 calls
+    /// (the healthy planners of the 2026-10-25 traces made 10-36) or the
+    /// fourth read of one file; no stop, as a stopped planner has no plan.
+    pub(crate) fn planner() -> Self {
+        let never = Threshold {
+            nudge: u32::MAX,
+            stop: u32::MAX,
+        };
+        Self {
+            tool_calls: Threshold {
+                nudge: 40,
+                stop: u32::MAX,
+            },
+            edits_of_one_file: never,
+            reads_of_one_file: Threshold {
+                nudge: 4,
+                stop: u32::MAX,
+            },
+            failed_edits: never,
+            checks_without_progress: never,
+            duration: Duration::MAX,
+            refused_after_stop: u32::MAX,
+            planner: true,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -70,6 +101,7 @@ impl Default for Limits {
             checks_without_progress: Threshold { nudge: 3, stop: 6 },
             duration: Duration::from_secs(30 * 60),
             refused_after_stop: 4,
+            planner: false,
         }
     }
 }
@@ -154,11 +186,16 @@ impl Watchdog {
         let mut signals = self.signals.lock().unwrap();
         signals.calls += 1;
         let path = file_argument(arguments);
+        let calls_note = if self.limits.planner {
+            format!("This planning step has made {} tool calls. You have read enough: write the plan now from what you know; the builder reads the details itself.", signals.calls)
+        } else {
+            format!("This attempt has made {} tool calls. Finish the task with fewer, larger steps: read whole files once and make each change in one edit.", signals.calls)
+        };
         let mut found: Vec<(String, u32, Threshold, String)> = vec![(
             "calls".into(),
             signals.calls,
             self.limits.tool_calls,
-            format!("This attempt has made {} tool calls. Finish the task with fewer, larger steps: read whole files once and make each change in one edit.", signals.calls),
+            calls_note,
         )];
         match (tool, path) {
             ("edit_file" | "write_file", Some(path)) => {
@@ -171,7 +208,17 @@ impl Watchdog {
             }
             ("read_file", Some(path)) => {
                 let count = bump(&mut signals.reads, &path);
-                found.push((format!("reads:{path}"), count, self.limits.reads_of_one_file, format!("You have read {path} {count} times. Read it whole once (no line range) and work from that copy.")));
+                let note = if self.limits.planner {
+                    format!("You have read {path} {count} times. Use what you already read; the builder will read it again anyway.")
+                } else {
+                    format!("You have read {path} {count} times. Read it whole once (no line range) and work from that copy.")
+                };
+                found.push((
+                    format!("reads:{path}"),
+                    count,
+                    self.limits.reads_of_one_file,
+                    note,
+                ));
             }
             ("run_check", _) => {
                 if let Some(count) = check_progress(&mut signals, arguments, failed, output) {

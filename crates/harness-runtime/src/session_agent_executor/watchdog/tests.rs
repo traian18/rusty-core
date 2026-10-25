@@ -176,3 +176,25 @@ fn notes_are_added_to_every_kind_of_result() {
         json!({"result":[1],"workflow_note":"n"})
     );
 }
+
+#[test]
+fn a_planner_is_nudged_to_write_its_plan_and_never_stopped() {
+    let dog = Watchdog::new(Limits::planner());
+    let read = json!({ "path": "src/a.ts" });
+    let verdicts: Vec<_> = (0..120)
+        .map(|_| dog.observe("read_file", &read, false, &json!("text")))
+        .collect();
+    let notes: Vec<_> = verdicts
+        .iter()
+        .filter_map(|verdict| match verdict {
+            Verdict::Nudge(note) => Some(note.clone()),
+            Verdict::Stop(reason) => panic!("a planner was stopped: {reason}"),
+            Verdict::Fine => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 2);
+    assert!(notes[0].contains("read src/a.ts 4 times"), "{}", notes[0]);
+    assert!(notes[1].contains("write the plan now"), "{}", notes[1]);
+    assert!(dog.stopped().is_none());
+    assert!(dog.refuse().is_none());
+}

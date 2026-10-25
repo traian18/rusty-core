@@ -16,7 +16,7 @@ use crate::session_agent_executor::IsolatedSessionAgentExecutor;
 const MIN_STEPS: usize = 2;
 const MAX_STEPS: usize = 5;
 
-const SPLIT_INSTRUCTIONS: &str = "An attempt at this task got stuck and was stopped; its changes were undone, so the code is back where the task started. workflow_input.previous_attempt says what happened (why it was stopped, the builder's account, the files it touched). Your job is to split the task into smaller steps a builder can each finish in one short attempt.
+const SPLIT_INSTRUCTIONS: &str = "An attempt at this task did not succeed and its changes were undone, so the code is back where the task started. workflow_input.previous_attempt says what happened: undone.why says why it was undone, undone.changes is the diff of what the attempt changed, and the builder's account and the review, when there was one, follow. Start from that diff: keep what it got right, and read only the code you still need. Your job is to split the task into smaller steps a builder can each finish in one short attempt.
 
 Rules for the steps:
 1. 2 to 5 steps, in the order they must be done.
@@ -24,7 +24,7 @@ Rules for the steps:
 3. The first step is the smallest change that makes the rest possible (usually: change the shared type or hook and update every caller so it compiles, with no behaviour change).
 4. Name the files of each step and how to check it (the exact command).
 5. Together the steps meet every criterion of workflow_input.task; say which step covers which criterion.
-6. Use what the stuck attempt learned: if it found the real difficulty, put it in a step of its own.
+6. Use what the undone attempt learned: if it found the real difficulty, put it in a step of its own.
 
 Read the code you need with your read tools; change nothing. Reply with one section per step, exactly in this shape:
 ### S1 — <short title>
@@ -80,7 +80,7 @@ pub(super) fn step_instructions(steps: &[String], index: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "\n\nThis task was split into {} smaller steps after an earlier attempt got stuck (that attempt was undone). Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step.\n\nAll steps:\n{all}\n\nYour step:\n{}",
+        "\n\nThis task was split into {} smaller steps after an earlier attempt did not succeed (that attempt was undone). Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step.\n\nAll steps:\n{all}\n\nYour step:\n{}",
         steps.len(),
         index + 1,
         steps[index]
@@ -115,7 +115,7 @@ impl IsolatedSessionAgentExecutor {
         child.input = planner_input(request, plan, task, progress);
         child.tools.retain(|t| is_read_only(t));
         let reply = match self
-            .run_single_agent_step(child, context, usage)
+            .run_watched_agent_step(child, context, usage, super::planner_watchdog())
             .await?
             .value
         {

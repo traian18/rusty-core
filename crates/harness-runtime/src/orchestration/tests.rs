@@ -1345,6 +1345,91 @@ mod isolated_session {
     }
 
     #[tokio::test]
+    async fn a_review_that_repeats_after_an_empty_repair_keeps_the_work_and_stops() {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskQueueConfig},
+        };
+        // A real repository, so the queue can tell that the repair changed nothing.
+        let folder = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(folder.path()).unwrap();
+        std::fs::write(folder.path().join("a.txt"), "one\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let me = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &me, &me, "start", &tree, &[])
+            .unwrap();
+        let built = json!({"status":"complete","summary":"implemented"});
+        let rejected = json!({"status":"needs_repair","summary":"the other repository must prove it first","criteria":[]});
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(QueueBackend {
+                requests: requests.clone(),
+                replies: Mutex::new(vec![built.clone(), rejected.clone(), built, rejected].into()),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new().with_root(folder.path())),
+            Arc::new(NoopSink),
+        ));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: ProfileRef {
+                        id: "rusty.default".into(),
+                        revision: None,
+                    },
+                    review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: None,
+                    max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"one change","plan":{"status":"ready","summary":"one task","requirements":[{"id":"R1","text":"the change","criteria":[{"id":"C1","text":"first"}]}],"tasks":[{"id":"T1","instructions":"first","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]}]}});
+        let failed = runner
+            .start(run_id("queue-disagreement"), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(failed.state.status, OrchestrationStatus::Failed);
+        let checkpoint = failed.state.steps[&node("execute")]
+            .checkpoint
+            .as_ref()
+            .unwrap();
+        assert_eq!(checkpoint["current"]["kept"], true, "{checkpoint}");
+        assert!(checkpoint["current"].get("undone").is_none());
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "build, review, an empty repair, the same review: then stop"
+        );
+        let reviewer = prompt_of(&requests.lock().unwrap()[1]);
+        assert!(reviewer.contains("Judge only workflow_input.task"));
+    }
+
+    #[tokio::test]
     async fn a_task_planner_plans_each_task_once_and_its_plan_reaches_builder_and_reviewer() {
         use harness_core::{
             behavior::{ProfileRef, ProfileRegistry},

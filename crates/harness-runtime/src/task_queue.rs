@@ -11,9 +11,10 @@ use harness_core::orchestration::{
 use harness_protocol::{ids::AgentId, usage::AgentUsageMetrics};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod brief;
+mod checks;
 mod recovery;
 mod snapshot;
 mod split;
@@ -84,6 +85,35 @@ struct Progress {
     /// attempt got stuck (`{task_id, steps, done}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     split: Option<Value>,
+    /// Each repository's typecheck errors at the tree they were found for,
+    /// so a task is judged only by the errors its build added.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    check_errors: BTreeMap<String, checks::CheckErrors>,
+}
+
+/// Added to every reviewer's instructions: what a task review judges.
+const REVIEW_SCOPE: &str = "Judge only workflow_input.task: its own criteria and what its instructions ask of it. Something the task itself leaves to another repository's change, a later task, a prerequisite or a follow-up is not this task's to deliver: mention it in summary, but it is never a reason for needs_repair. Use needs_repair only for a defect in what this task had to do. workflow_input.host_checks, when present, is the workflow's own typecheck after this build: errors it says were there before this task are not this task's.";
+
+/// Why a round of attempts at a task ended without an accepted task.
+enum Ended {
+    /// The watchdog stopped a build.
+    Stopped(String),
+    /// The builder did not finish (checkpoint or needs_repair).
+    Unfinished,
+    /// The build added typecheck errors.
+    NewErrors,
+    /// The review sent back a finished build that added no errors.
+    Rejected,
+    /// The review asked again after a repair that changed nothing: the
+    /// builder and the reviewer disagree, which another try cannot settle.
+    Disagreement(String),
+}
+
+/// A planning step's watchdog: it nudges a planner that keeps reading.
+fn planner_watchdog() -> std::sync::Arc<crate::session_agent_executor::watchdog::Watchdog> {
+    crate::session_agent_executor::watchdog::Watchdog::new(
+        crate::session_agent_executor::watchdog::Limits::planner(),
+    )
 }
 
 /// Whether `task` was already split once.
@@ -703,8 +733,13 @@ impl IsolatedSessionAgentExecutor {
         let mut step_plan = self
             .plan_task(request, plan, task, progress, context, usage, guidance)
             .await?;
+        let cancel = context.cancellation.clone();
+        self.check_before_build(task, step_plan.as_deref(), progress, &cancel)
+            .await;
         loop {
-            let mut stopped: Option<String> = None;
+            let mut ended: Option<Ended> = None;
+            // The last review sent the build back.
+            let mut rejected = false;
             for attempt in 0..=queue.max_repairs {
                 if context.cancellation.is_cancelled() {
                     return Err(AgentExecutionError::new(
@@ -740,6 +775,10 @@ impl IsolatedSessionAgentExecutor {
                         "\n\nThe user asked you to try this task again with this guidance:\n{guidance}"
                     ));
                 }
+                if child.input["previous_attempt"].get("new_errors").is_some() {
+                    child.instructions.push_str("\n\nYour last build added the typecheck errors in workflow_input.previous_attempt.new_errors (the workflow checked it). Fix them first; errors that were there before this task are not yours.");
+                }
+                let before = self.tree_fingerprint().await;
                 let built = match self
                     .build_task(&child, request, task, progress, context, usage)
                     .await?
@@ -748,7 +787,7 @@ impl IsolatedSessionAgentExecutor {
                     recovery::Built::Stopped(reason) => {
                         progress.current =
                             Some(json!({"task_id":task.id,"stopped":reason,"repair":attempt}));
-                        stopped = Some(reason);
+                        ended = Some(Ended::Stopped(reason));
                         break;
                     }
                 };
@@ -761,6 +800,8 @@ impl IsolatedSessionAgentExecutor {
                     .await?;
                 let status = built["status"].as_str().unwrap_or("invalid");
                 if status == "checkpoint" || status == "needs_repair" {
+                    ended = Some(Ended::Unfinished);
+                    rejected = false;
                     continue;
                 }
                 // A check that cannot run here (no network, a missing tool) does
@@ -778,10 +819,27 @@ impl IsolatedSessionAgentExecutor {
                         built["summary"].as_str().unwrap_or("no summary")
                     )));
                 }
+                // The workflow's own typecheck: errors the build added go back
+                // to the builder before any review.
+                let checked = self.check_after_build(progress, &cancel).await;
+                if !checked.added.is_empty() {
+                    progress.current.as_mut().unwrap()["new_errors"] = json!(checked.added);
+                    context
+                        .checkpoint(serde_json::to_value(&*progress).unwrap())
+                        .await?;
+                    ended = Some(Ended::NewErrors);
+                    rejected = false;
+                    continue;
+                }
+                // Without a git repository nothing can be compared: count it as changed.
+                let changed = before.is_empty() || self.tree_fingerprint().await != before;
                 child.profile = Some(queue.review_profile.clone());
-                child.instructions = queue.review_instructions.clone();
+                child.instructions = format!("{}\n\n{REVIEW_SCOPE}", queue.review_instructions);
                 child.output_schema = result_schema(true);
                 child.input["build"] = built;
+                if let Some(note) = checked.note {
+                    child.input["host_checks"] = Value::String(note);
+                }
                 // Reviewer never gets a mutating tool, even if a user supplies a
                 // permissive profile. Checks run in the dedicated validation step.
                 child.tools.retain(|t| is_read_only(t));
@@ -809,6 +867,7 @@ impl IsolatedSessionAgentExecutor {
                     progress.step_plan = None;
                     progress.baseline = None;
                     progress.split = None;
+                    progress.check_errors.extend(checked.results);
                 }
                 context
                     .checkpoint(serde_json::to_value(&*progress).unwrap())
@@ -826,13 +885,48 @@ impl IsolatedSessionAgentExecutor {
                         reviewed["summary"].as_str().unwrap_or("no summary")
                     )));
                 }
+                let reason = reviewed["summary"].as_str().unwrap_or("no summary");
+                if rejected && !changed {
+                    ended = Some(Ended::Disagreement(reason.to_owned()));
+                    break;
+                }
+                rejected = true;
+                ended = Some(Ended::Rejected);
             }
-            // The attempt got stuck, or its repairs ran out: undo it and,
-            // once per task, try again in smaller steps before giving up.
-            let why = match &stopped {
-                Some(reason) => format!("the workflow stopped its build: {reason}"),
-                None => format!(
-                    "it still needs repair after {} attempts",
+            // A finished build the review keeps sending back is kept: undoing
+            // and splitting it cannot settle what the review wants. The user
+            // decides, and another try builds on it.
+            let kept = match &ended {
+                Some(Ended::Disagreement(reason)) => Some(format!(
+                    "the review sent it back again after a repair that changed nothing, so the builder and the reviewer disagree. The review said: {reason}"
+                )),
+                Some(Ended::Rejected) => Some(format!(
+                    "the review still sends it back after {} attempts, although the build adds no typecheck errors. The last review said: {}",
+                    queue.max_repairs + 1,
+                    progress.current.as_ref().and_then(|current| current["review"]["summary"].as_str()).unwrap_or("no summary")
+                )),
+                _ => None,
+            };
+            if let Some(why) = kept {
+                progress.current.as_mut().unwrap()["kept"] = Value::Bool(true);
+                context
+                    .checkpoint(serde_json::to_value(&*progress).unwrap())
+                    .await?;
+                return Ok(TaskOutcome::Failed(format!(
+                    "Task {} was not accepted: {why}. Its work is kept: try again with guidance for the builder, skip the task, or revise the plan",
+                    task.id
+                )));
+            }
+            // The attempt got stuck, did not finish, or kept adding errors:
+            // undo it and, once per task, try again in smaller steps.
+            let why = match &ended {
+                Some(Ended::Stopped(reason)) => format!("the workflow stopped its build: {reason}"),
+                Some(Ended::NewErrors) => format!(
+                    "its build still added typecheck errors after {} attempts",
+                    queue.max_repairs + 1
+                ),
+                _ => format!(
+                    "the builder did not finish it in {} attempts",
                     queue.max_repairs + 1
                 ),
             };
@@ -900,7 +994,7 @@ impl IsolatedSessionAgentExecutor {
         }
         Ok(recovery::Built::Replied(json!({
             "status": "complete",
-            "summary": format!("Built in {} steps after the first attempt got stuck.\n{}", steps.len(), summaries.join("\n")),
+            "summary": format!("Built in {} steps after the first attempt did not succeed.\n{}", steps.len(), summaries.join("\n")),
         })))
     }
 
@@ -947,7 +1041,7 @@ impl IsolatedSessionAgentExecutor {
         child.input = brief::planner_input(request, plan, task, progress);
         child.tools.retain(|t| is_read_only(t));
         let planned = self
-            .run_single_agent_step(child, context, usage)
+            .run_watched_agent_step(child, context, usage, planner_watchdog())
             .await?
             .value;
         let planned = match planned {

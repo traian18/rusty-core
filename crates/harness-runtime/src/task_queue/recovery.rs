@@ -21,6 +21,9 @@ pub(super) enum Built {
     Stopped(String),
 }
 
+/// How much of an undone attempt's diff is kept for the planner.
+const UNDONE_DIFF_CHARS: usize = 12_000;
+
 fn label(request: &AgentStepRequest, task: &Task, what: &str) -> String {
     format!("{}/{}-{what}", request.run_id, task.id)
 }
@@ -121,17 +124,23 @@ impl IsolatedSessionAgentExecutor {
         };
         let root = self.workspace_root();
         let attempt = label(request, task, &format!("undone-{}", now_millis()));
-        let undone =
-            tokio::task::spawn_blocking(move || snapshot::undo_to(&root, &baseline, &attempt))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+        // The undone attempt's diff goes with the note, so a planner can
+        // reuse what it got right instead of exploring again.
+        let undone = tokio::task::spawn_blocking(move || {
+            let undone = snapshot::undo_to(&root, &baseline, &attempt)?;
+            let changes = snapshot::patch(&root, &baseline, &undone.attempt, UNDONE_DIFF_CHARS);
+            Ok((undone, changes))
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
         let note = match undone {
-            Ok(undone) if undone.files.is_empty() => return,
-            Ok(undone) => json!({
+            Ok((undone, _)) if undone.files.is_empty() => return,
+            Ok((undone, changes)) => json!({
                 "why": why,
                 "files_put_back": undone.files,
                 "attempt_kept_at": undone.attempt.repos.iter().map(|repo| json!({"repo": repo.repo, "commit": repo.commit})).collect::<Vec<_>>(),
+                "changes": changes,
             }),
             Err(error) => {
                 json!({"why": why, "error": format!("the attempt could not be undone: {error}")})
@@ -141,6 +150,15 @@ impl IsolatedSessionAgentExecutor {
             .current
             .get_or_insert_with(|| json!({"task_id": task.id}));
         current["undone"] = note;
+    }
+
+    /// Every repository's working tree, to tell whether a build changed
+    /// anything.
+    pub(super) async fn tree_fingerprint(&self) -> Vec<(String, String)> {
+        let root = self.workspace_root();
+        tokio::task::spawn_blocking(move || snapshot::fingerprint(&root))
+            .await
+            .unwrap_or_default()
     }
 
     async fn snapshot(&self, label: String) -> Option<Snapshot> {
@@ -163,7 +181,8 @@ fn now_millis() -> u128 {
 /// Whether the task's last attempt should be undone before trying again: it
 /// did not finish (any status but complete), it was stopped, or the user
 /// asked for another try. A finished build the review sent back is kept, so
-/// its repair builds on it.
+/// its repair builds on it; so is one the review kept rejecting (`kept`),
+/// even when the user asks for another try.
 pub(super) fn needs_undo(progress: &Progress, task: &Task, guidance: Option<&str>) -> bool {
     let Some(current) = progress
         .current
@@ -172,7 +191,7 @@ pub(super) fn needs_undo(progress: &Progress, task: &Task, guidance: Option<&str
     else {
         return false;
     };
-    if current.get("undone").is_some() {
+    if current.get("undone").is_some() || current["kept"] == true {
         return false;
     }
     guidance.is_some()
