@@ -12,6 +12,7 @@ pub mod policy;
 pub mod provider;
 pub mod providers;
 pub mod summary;
+pub mod superseded;
 
 pub use backend::ContextAssemblingBackend;
 #[cfg(feature = "jev-http")]
@@ -33,3 +34,4 @@ pub use summary::{
     BackendSummarizer, SummarizeError, Summarizer, SummarizingCompactionProvider,
     CONTEXT_SUMMARY_PURPOSE,
 };
+pub use superseded::SupersededReadsProvider;
