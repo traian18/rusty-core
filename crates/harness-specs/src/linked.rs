@@ -39,6 +39,11 @@ pub struct Found<'a> {
 /// What a run on the part of `this` repository needs about the others: the parts and their state,
 /// this part's job for `step`, and the other parts' documents the step works from. Empty for a
 /// change that is not linked.
+///
+/// Every part is self-contained: it has the complete spec of what its repository delivers, and it
+/// is planned, built and verified on its own, with its own repository's tests. The parts meet in
+/// contracts, requirements written identically in each part that uses them and checked against a
+/// test double, so no part ever waits for, or checks, another part's work.
 pub fn compose(this: &str, front: &ChangeFront, step: Step, parts: &[Found]) -> String {
     if front.links.is_empty() {
         return String::new();
@@ -50,7 +55,7 @@ pub fn compose(this: &str, front: &ChangeFront, step: Step, parts: &[Found]) -> 
         .collect();
     let mut out = String::from("\n## This change spans several repositories\n\n");
     out.push_str(&format!(
-        "This change is linked across the repositories {} of the workspace. Each has its own part: a change folder with its own spec, design, tasks and status, on the same branch. The whole change's spec is in {main}. This run works on the part in {this}{}.\n\nThe other parts:\n",
+        "This change is linked across the repositories {} of the workspace. Each has its own part: a change folder with its own complete spec, design, tasks and status, on the same branch, planned, built and verified on its own with its own repository's tests. The overview of the whole change (the discussion, how the work is split, the shared contracts) is the file overview.md in {main}'s part, when it was written; it is background, not a spec to verify. This run works on the part in {this}{}.\n\nThe other parts:\n",
         list(&repositories),
         if is_main { ", the main part" } else { "" },
     ));
@@ -58,7 +63,7 @@ pub fn compose(this: &str, front: &ChangeFront, step: Step, parts: &[Found]) -> 
         out.push_str(&format!("- {}\n", state_line(found, main)));
     }
     out.push('\n');
-    out.push_str(&job(step, this, main, &repositories));
+    out.push_str(&job(step, this, &repositories));
     out.push('\n');
     for found in parts {
         let Some(store) = found.store else { continue };
@@ -66,12 +71,11 @@ pub fn compose(this: &str, front: &ChangeFront, step: Step, parts: &[Found]) -> 
         let repository = &found.part.repository;
         let from_main = found.part.repository == main;
         let wanted: &[(&str, &str)] = match step {
-            Step::Specify if from_main => &[("The main spec of the whole change", "spec.md")],
-            Step::Specify => &[("Its part of the spec", "spec.md")],
-            Step::Plan if from_main => &[
-                ("The main spec of the whole change", "spec.md"),
-                ("Its design", "design.md"),
+            Step::Specify if from_main => &[
+                ("The overview of the whole change", "overview.md"),
+                ("Its part of the spec", "spec.md"),
             ],
+            Step::Specify => &[("Its part of the spec", "spec.md")],
             Step::Plan | Step::Implement => &[("Its design", "design.md")],
             Step::Start | Step::Capability => &[],
         };
@@ -125,28 +129,24 @@ fn state_line(found: &Found, main: &str) -> String {
     format!("{repository} ({dir}){role}: {status}, {progress}")
 }
 
-fn job(step: Step, this: &str, main: &str, repositories: &[&str]) -> String {
+fn job(step: Step, this: &str, repositories: &[&str]) -> String {
     let others: Vec<&str> = repositories
         .iter()
         .copied()
         .filter(|r| *r != this)
         .collect();
     match step {
-        Step::Specify if this == main => format!(
-            "Your job in this part: write the spec of the whole change, across every repository. Give each requirement a line `Repository: <name>` under its title naming the repository that delivers it ({}). What two repositories exchange (an API, a file format, an event, a command) is a requirement of its own that names both, with its exact shape. The other parts write their share of the spec from yours, so make each requirement's repository unambiguous. Keep this spec consistent with the parts already written below.",
-            list(repositories)
-        ),
         Step::Specify => format!(
-            "Your job in this part: write only what {this} delivers. Take the requirements of the main spec whose `Repository:` line names {this}, keep their meaning and criteria, and add what only this repository needs. Begin each requirement's text with `From: R<n> of the main spec` when it comes from one. State what this repository exchanges with {} exactly as the main spec does, and do not specify their work. When the main spec does not say which repository delivers something that seems to belong here, list it under Open questions.",
+            "Your job in this part: write the complete spec of what {this} delivers, and only that. It must stand on its own: every requirement and criterion can be built and checked with {this}'s own tests, and none needs {} to be running or finished. Never write a `Repository:` line and never specify another repository's work. What {this} exchanges with {} (an API, a file format, an event, a command, a state) is a contract: write it as a requirement of its own with its exact shape (names, fields, values, errors), word for word the same as in the other parts' specs below when they already state it, and give it criteria that check {this}'s side against a test double or an example that follows that text (a provider checks that it produces the contract, a consumer that it handles it). A criterion that can only be seen with several repositories running together belongs in no spec: leave it out, or split it into one criterion per repository that each checks its own side. Keep your spec consistent with the parts already written below.",
+            list(&others),
             list(&others)
         ),
         Step::Plan => format!(
-            "Your job in this part: design and plan only the work in {this}. Use the contract the main spec states for what {this} exchanges with {}, and keep it identical to the other parts' designs below; where they disagree, say so at the top of the design. When a task needs another repository's work first, say so in its instructions (for example \"Needs {} T3 first\"); each part is built in its own run.",
-            list(&others),
-            others.first().copied().unwrap_or("the other repository")
+            "Your job in this part: design and plan only the work in {this}, from its own spec. Never write a task, a criterion or a precondition that needs {} to do something first or to be running: the contract {this} exchanges with them is in your spec, keep it identical to the other parts' designs below (where they disagree, say so at the top of the design), and verify your side against a test double or an example that follows it. Work that belongs to another repository is not a task here.",
+            list(&others)
         ),
         Step::Implement => format!(
-            "Your job in this part: build only in the folder {this}/. The other parts ({}) are built in their own runs: do not change their files, and keep to the contract their designs state. When a task needs work another part has not done yet, say so in your report instead of doing it.",
+            "Your job in this part: build only in the folder {this}/, from its own spec, design and tasks. The other parts ({}) are built in their own runs and never wait for or check each other: do not change their files, and check your side of each contract against a test double or an example. Never leave a task undone, or report it as not ready, because another repository has not done its share.",
             list(&others)
         ),
         Step::Start | Step::Capability => String::new(),
@@ -213,8 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn the_main_part_specifies_the_whole_change_and_sees_the_parts() {
+    fn every_part_specifies_only_its_own_share_and_sees_the_parts() {
         let core = core_part();
+        core.insert("specs/changes/0004-dark/overview.md", "# Overview\n");
         let parts = [
             Found {
                 part: parse_link("rusty-core/0004-dark").unwrap(),
@@ -238,18 +239,50 @@ mod tests {
         assert!(text.contains("the part in rusty-ide, the main part"));
         assert!(text.contains("- rusty-core (0004-dark): planned, 1 of 2 tasks done"));
         assert!(text.contains("rusty-website (0002-dark): not in this workspace"));
-        assert!(text.contains("write the spec of the whole change"));
+        assert!(text.contains("write the complete spec of what rusty-ide delivers, and only that"));
+        assert!(text.contains("none needs rusty-core and rusty-website to be running or finished"));
+        assert!(
+            text.contains("never write a `Repository:` line")
+                || text.contains("Never write a `Repository:` line")
+        );
+        assert!(!text.contains("spec of the whole change"));
         assert!(text.contains(
             "rusty-core: Its part of the spec (rusty-core/specs/changes/0004-dark/spec.md)"
         ));
         assert!(text.contains("# Core part") && !text.contains("# Core design"));
+        // The overview is only shown from the main part.
+        assert!(!text.contains("# Overview"));
     }
 
     #[test]
-    fn a_part_takes_its_share_and_plans_against_the_others() {
+    fn the_overview_of_the_main_part_is_background_for_the_others() {
         let main = MemoryStore::default();
-        main.insert("specs/changes/0001-dark/spec.md", "# Whole change\n");
-        main.insert("specs/changes/0001-dark/design.md", "# Main design\n");
+        main.insert("specs/changes/0001-dark/overview.md", "# Overview\n");
+        main.insert("specs/changes/0001-dark/spec.md", "# Ide part\n");
+        let parts = [Found {
+            part: parse_link("rusty-ide/0001-dark").unwrap(),
+            store: Some(&main),
+        }];
+        let text = compose(
+            "rusty-core",
+            &front(
+                "rusty-ide",
+                &["rusty-ide/0001-dark", "rusty-core/0004-dark"],
+            ),
+            Step::Specify,
+            &parts,
+        );
+        assert!(text.contains(
+            "The overview of the whole change (rusty-ide/specs/changes/0001-dark/overview.md)"
+        ));
+        assert!(text.contains("it is background, not a spec to verify"));
+    }
+
+    #[test]
+    fn a_part_plans_and_builds_on_its_own_against_the_contract() {
+        let main = MemoryStore::default();
+        main.insert("specs/changes/0001-dark/spec.md", "# Ide spec\n");
+        main.insert("specs/changes/0001-dark/design.md", "# Ide design\n");
         let core = core_part();
         let parts = [
             Found {
@@ -262,18 +295,6 @@ mod tests {
             },
         ];
         let links = ["rusty-ide/0001-dark", "rusty-website/0004-dark"];
-        let specify = compose(
-            "rusty-core",
-            &front("rusty-ide", &links),
-            Step::Specify,
-            &parts,
-        );
-        assert!(specify.contains("write only what rusty-core delivers"));
-        assert!(specify.contains("- rusty-ide (0001-dark), the main spec"));
-        assert!(
-            specify.contains("rusty-ide: The main spec of the whole change")
-                && specify.contains("# Whole change")
-        );
         let plan = compose(
             "rusty-core",
             &front("rusty-ide", &links),
@@ -281,7 +302,9 @@ mod tests {
             &parts,
         );
         assert!(plan.contains("design and plan only the work in rusty-core"));
-        assert!(plan.contains("# Main design") && plan.contains("# Core design"));
+        assert!(plan.contains("Never write a task, a criterion or a precondition that needs rusty-ide and rusty-website"));
+        assert!(plan.contains("# Ide design") && plan.contains("# Core design"));
+        assert!(!plan.contains("# Ide spec"));
         let implement = compose(
             "rusty-core",
             &front("rusty-ide", &links),
@@ -289,6 +312,7 @@ mod tests {
             &parts,
         );
         assert!(implement.contains("build only in the folder rusty-core/"));
-        assert!(!implement.contains("# Whole change"));
+        assert!(implement.contains("never wait for or check each other"));
+        assert!(!implement.contains("# Ide spec"));
     }
 }

@@ -24,6 +24,19 @@ pub fn parse(text: &str) -> SpecDoc {
     doc
 }
 
+/// Whether `text` is a spec that was never written: the template's empty requirement (`### R1:`
+/// with `WHEN … THEN …`), or no requirement with a titled, written criterion at all. A run that
+/// plans or builds from such a spec would have nothing to go on.
+pub fn is_unwritten(text: &str) -> bool {
+    !parse(text).requirements.iter().any(|requirement| {
+        !requirement.title.trim().is_empty()
+            && requirement
+                .criteria
+                .iter()
+                .any(|criterion| !criterion.text.trim().is_empty() && !criterion.text.contains('…'))
+    })
+}
+
 fn read_requirement_line(doc: &mut SpecDoc, line: &str, number: usize) {
     if let Some(heading) = line.strip_prefix("### ") {
         let (id, title) = split_heading(heading, doc.requirements.len() + 1);
@@ -158,6 +171,17 @@ mod tests {
     use super::*;
 
     const SPEC: &str = "# Photo albums\n\n## Why\nGroup shoots.\n\n## Requirements\n\n### R1: Albums can be created and named\nCapability: albums (adds \"Album creation\")\nA user creates an album.\n\n- C1: WHEN the user creates an album with a new name THEN it appears.\n- C2: WHEN the name is taken THEN nothing is created.\n\n### Albums can be deleted\n- WHEN the user deletes an album THEN its photos stay.\n\n## Open questions\n- Can albums nest?\n- None\n";
+
+    #[test]
+    fn the_template_is_unwritten_and_a_real_spec_is_not() {
+        let template = "# T\n\n## Requirements\n\n### R1: \nCapability: \n\n- C1: WHEN … THEN ….\n\n## Out of scope\n";
+        assert!(is_unwritten(template));
+        assert!(is_unwritten(""));
+        assert!(is_unwritten(
+            "# T\n\n## Requirements\n\n### R1: Title only\n"
+        ));
+        assert!(!is_unwritten(SPEC));
+    }
 
     #[test]
     fn reads_requirements_criteria_and_capability() {
