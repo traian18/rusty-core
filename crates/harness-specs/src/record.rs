@@ -28,7 +28,8 @@ impl Step {
     /// The files this step may write.
     pub fn documents(self) -> &'static [&'static str] {
         match self {
-            Self::Specify => &["spec.md", "checklist.md"],
+            // research.md: what Analyze found in the project and the code; Plan may revise it.
+            Self::Specify => &["research.md", "spec.md", "checklist.md"],
             Self::Plan => &["research.md", "design.md", "tasks.md"],
             Self::Implement => &[],
             Self::Start => &["project.md", "onboarding.md"],
@@ -334,6 +335,26 @@ mod tests {
                 .status,
             Status::Building
         );
+    }
+
+    #[test]
+    fn specify_also_writes_the_research_and_the_checklist() {
+        let store = seeded();
+        let done = record(
+            &store,
+            "0001-albums",
+            Step::Specify,
+            &[
+                input("research.md", "# Research\n\nAlbums live in the store.\n"),
+                input("spec.md", "# Albums\n\n## Requirements\n### R1: One\n- C1: WHEN a THEN b\n"),
+                input("checklist.md", "# Checklist\n\n- [ ] CHK001 Is it clear?\n"),
+            ],
+            "2026-10-26",
+        )
+        .unwrap();
+        assert_eq!(done.written.len(), 3);
+        assert!(store.read("specs/changes/0001-albums/research.md").is_some());
+        assert!(store.read("specs/changes/0001-albums/checklist.md").is_some());
     }
 
     #[test]
