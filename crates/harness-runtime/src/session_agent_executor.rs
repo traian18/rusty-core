@@ -609,7 +609,11 @@ impl IsolatedSessionAgentExecutor {
             .filter(|tool| RESEARCH_TOOLS.contains(&tool.as_str()))
             .cloned()
             .collect();
+        // A research step never asks for research itself: `read_file` admits
+        // `request_research`, and without this each research step could start
+        // another, nesting until the first call's timeout cancels them all.
         let research = request.research.max_per_attempt > 0
+            && request.instructions != RESEARCH_INSTRUCTIONS
             && self.subflows.is_some()
             && request.subflow_depth <= MAX_SUBFLOW_DEPTH
             && step_tools.iter().any(|tool| tool == RESEARCH_TOOL)

@@ -1899,6 +1899,127 @@ mod isolated_session {
         assert_eq!(actions.research, vec!["Where are sessions stored?"]);
     }
 
+    /// The research step itself may read but never asks for research: each
+    /// research step could otherwise start another, nesting until the first
+    /// call's timeout cancelled them all.
+    #[tokio::test]
+    async fn a_research_step_cannot_ask_for_research() {
+        let session = |turns: Vec<Turn>, requests: &Arc<Mutex<Vec<ExecutionRequest>>>| {
+            Arc::new(SessionRuntime::new(
+                SessionId::new(),
+                Arc::new(ScriptBackend {
+                    turns: Mutex::new(VecDeque::from(turns)),
+                    requests: requests.clone(),
+                }),
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+            ))
+        };
+        let stub_flows = || {
+            Arc::new(StubFlows {
+                outcome: Ok(json!("## Answer\nIn src/store.rs:42.")),
+                requests: Mutex::new(Vec::new()),
+            })
+        };
+
+        // A step asks, so the research target is the one the executor builds.
+        let asking = Arc::new(Mutex::new(Vec::new()));
+        let flows = stub_flows();
+        let mut definition = default_orchestration_definition();
+        for node in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut node.kind {
+                config.structured_output = StructuredOutputMode::Text;
+                config.tools = ToolScope::AllowList(vec!["read_file".into()]);
+                node.output_schema = None;
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut node.kind {
+                config.checks = vec![VerificationCheck::ArtifactExists {
+                    pointer: "/report".into(),
+                }];
+            }
+        }
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "text".into(),
+            schema: json!({"type": "string"}),
+        };
+        OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(session(
+                    vec![
+                        Turn::Tool(
+                            "request_research",
+                            json!({ "question": "Where are sessions stored?" }),
+                        ),
+                        Turn::Text("Done."),
+                    ],
+                    &asking,
+                ))
+                .with_subflows(flows.clone()),
+            ),
+        )
+        .with_available_tools(["read_file".to_string()])
+        .run(run_id("asking"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+        let asked = flows.requests.lock().unwrap().remove(0);
+        let ToolScope::AllowList(research_tools) = (match &asked.target {
+            harness_core::orchestration::SubflowTarget::Step { tools, .. } => tools.clone(),
+            other => panic!("research runs as a step: {other:?}"),
+        }) else {
+            panic!("research runs with an allow-list")
+        };
+        assert!(research_tools.iter().any(|tool| tool == "read_file"));
+
+        // Run that research step: it may read, yet is not offered research.
+        let researching = Arc::new(Mutex::new(Vec::new()));
+        let nested = stub_flows();
+        let inputs: Vec<String> = asked.input.as_object().unwrap().keys().cloned().collect();
+        let research = asked
+            .target
+            .step_definition(&asked.node_id, &inputs)
+            .expect("a step target has a definition");
+        let output = OrchestrationRunner::new(
+            compiled(research),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(session(
+                    vec![Turn::Text("## Answer\nIn src/store.rs:42.")],
+                    &researching,
+                ))
+                .with_subflows(nested.clone()),
+            ),
+        )
+        .with_available_tools(research_tools)
+        .run(
+            run_id("research"),
+            asked.input.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output.result.status,
+            OrchestrationOutcome::Completed,
+            "{:?}",
+            output.result
+        );
+        let sent = researching.lock().unwrap().clone();
+        assert!(
+            !sent[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "request_research"),
+            "the research step is not offered request_research"
+        );
+        assert!(
+            !prompt_of(&sent[0]).contains("call request_research"),
+            "the research step is not told it can ask"
+        );
+        assert!(nested.requests.lock().unwrap().is_empty());
+    }
+
     /// A native schema rides on every request of a step, tool-calling turns
     /// included. Some models reject that outright ("function calling with a
     /// response mime type is unsupported" on Gemini), and some providers
