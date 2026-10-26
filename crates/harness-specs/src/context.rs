@@ -11,7 +11,8 @@ use crate::{
 const MAX_DOCUMENT_CHARS: usize = 24_000;
 
 /// The context for `step` on change `dir`. Specify sees the project and the capabilities; Plan
-/// also sees the spec and what an earlier Plan wrote (to revise it, not start over).
+/// also sees the spec and what an earlier Plan wrote (to revise it, not start over); Implement
+/// sees the spec, the design and the research behind them.
 pub fn compose(store: &dyn SpecStore, dir: &str, step: Step) -> String {
     let mut out = compose_documents(store, dir, step);
     append_instructions(&mut out, store, step);
@@ -76,6 +77,10 @@ fn compose_documents(store: &dyn SpecStore, dir: &str, step: Step) -> String {
         Step::Implement => &[
             ("The spec being built", "spec.md"),
             ("The design to follow", "design.md"),
+            (
+                "What research found (where things are in the code, with file:line evidence)",
+                "research.md",
+            ),
         ],
         Step::Plan => &[
             ("The spec to design and plan for", "spec.md"),
@@ -260,6 +265,18 @@ mod tests {
                 && text.contains("# Old design")
                 && !text.contains("**T1**")
         );
+    }
+
+    #[test]
+    fn implement_sees_the_research_after_the_design() {
+        let store = seeded();
+        store.insert(
+            "specs/changes/0002-dark/research.md",
+            "Themes load in src/theme.ts:12.\n",
+        );
+        let text = compose(&store, "0002-dark", Step::Implement);
+        assert!(text.contains("What research found") && text.contains("src/theme.ts:12"));
+        assert!(text.find("# Old design") < text.find("src/theme.ts:12"));
     }
 
     #[test]
