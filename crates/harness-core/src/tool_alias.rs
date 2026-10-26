@@ -40,7 +40,18 @@ const GRANTED_WITH: &[(&str, &str)] = &[
     ("repo_context", "read_file"),
     ("repo_wiki", "read_file"),
     ("spec_context", "read_file"),
+    ("repo_overview", "read_file"),
+    ("repo_health", "read_file"),
+    ("repo_risk", "read_file"),
+    ("repo_symbol", "read_file"),
 ];
+
+/// The read-only repository tools every model that may use tools at all gets,
+/// whatever its step or profile lists: what a repository is, what is risky to
+/// touch, whether an edit made the code better or worse, one symbol's body.
+/// They are granted with `read_file` too, so its permission override binds them;
+/// a scope with no tools at all (a step that only replies) stays without them.
+pub const ALWAYS_ADMITTED: &[&str] = &["repo_overview", "repo_health", "repo_risk", "repo_symbol"];
 
 /// The tool `name` follows in rules, history, allow-lists and permissions,
 /// when `name` is an alias.
@@ -64,13 +75,21 @@ pub fn granted_by(name: &str) -> Option<&'static str> {
 
 /// `tools` plus every tool a listed tool's grant also admits: scoping a
 /// session to `write_file` scopes `edit_file` in as well, and `read_file`
-/// brings `project_info`. Order is kept and nothing is listed twice.
+/// brings `project_info`. Any tool at all brings [`ALWAYS_ADMITTED`]. Order is
+/// kept and nothing is listed twice.
 pub fn with_aliases(tools: &[String]) -> Vec<String> {
     let mut all = tools.to_vec();
     for (admitted, granting) in ALIASES.iter().chain(GRANTED_WITH.iter()) {
         let wanted = tools.iter().any(|tool| tool == granting);
         if wanted && !all.iter().any(|tool| tool == admitted) {
             all.push((*admitted).to_string());
+        }
+    }
+    if !tools.is_empty() {
+        for admitted in ALWAYS_ADMITTED {
+            if !all.iter().any(|tool| tool == admitted) {
+                all.push((*admitted).to_string());
+            }
         }
     }
     all
@@ -108,6 +127,7 @@ mod tests {
         assert_eq!(granted_by("repo_context"), Some("read_file"));
         assert_eq!(granted_by("repo_wiki"), Some("read_file"));
         assert_eq!(granted_by("spec_context"), Some("read_file"));
+        assert_eq!(granted_by("repo_risk"), Some("read_file"));
         assert_eq!(granted_by("read_file"), None);
         assert_eq!(granted_by("run_command"), None);
     }
@@ -116,7 +136,15 @@ mod tests {
     fn a_command_grant_scopes_run_check_in_and_nothing_else_does() {
         assert_eq!(
             with_aliases(&names(&["run_command"])),
-            names(&["run_command", "run_check", "install_dependencies"])
+            names(&[
+                "run_command",
+                "run_check",
+                "install_dependencies",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
+            ])
         );
         assert_eq!(
             with_aliases(&names(&["read_file", "write_file", "run_command"])),
@@ -131,12 +159,22 @@ mod tests {
                 "request_research",
                 "repo_context",
                 "repo_wiki",
-                "spec_context"
+                "spec_context",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
             ])
         );
         assert_eq!(
             with_aliases(&names(&["run_check"])),
-            names(&["run_check"]),
+            names(&[
+                "run_check",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
+            ]),
             "run_check alone does not grant run_command"
         );
     }
@@ -153,18 +191,35 @@ mod tests {
                 "request_research",
                 "repo_context",
                 "repo_wiki",
-                "spec_context"
+                "spec_context",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
             ])
         );
         assert_eq!(
             with_aliases(&names(&["write_file", "edit_file"])),
-            names(&["write_file", "edit_file"]),
+            names(&[
+                "write_file",
+                "edit_file",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
+            ]),
             "already listed"
         );
         assert_eq!(
             with_aliases(&names(&["web_search"])),
-            names(&["web_search"]),
-            "no grant, nothing admitted"
+            names(&[
+                "web_search",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
+            ]),
+            "no grant: only the repository tools every model gets"
         );
         assert_eq!(
             with_aliases(&names(&["read_file"])),
@@ -174,14 +229,44 @@ mod tests {
                 "request_research",
                 "repo_context",
                 "repo_wiki",
-                "spec_context"
+                "spec_context",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
             ]),
             "reading does not admit edit_file"
         );
         assert_eq!(
             with_aliases(&names(&["edit_file", "project_info"])),
-            names(&["edit_file", "project_info"]),
+            names(&[
+                "edit_file",
+                "project_info",
+                "repo_overview",
+                "repo_health",
+                "repo_risk",
+                "repo_symbol"
+            ]),
             "an admitted tool alone does not grant the tool that admits it"
+        );
+    }
+
+    #[test]
+    fn every_scope_with_tools_gets_the_repository_tools_and_one_without_stays_empty() {
+        for tools in [
+            &["read_file"][..],
+            &["write_file"],
+            &["run_command"],
+            &["web_search"],
+        ] {
+            let scoped = with_aliases(&names(tools));
+            for tool in ALWAYS_ADMITTED {
+                assert!(scoped.iter().any(|t| t == tool), "{tools:?} lacks {tool}");
+            }
+        }
+        assert!(
+            with_aliases(&[]).is_empty(),
+            "a step that only replies gets no tools"
         );
     }
 }

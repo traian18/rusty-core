@@ -290,6 +290,27 @@ fn tool_scope_and_overrides_only_ever_narrow() {
 }
 
 #[test]
+fn any_allow_list_admits_the_repository_tools_every_model_gets() {
+    let mut writer = profile("p", 1);
+    writer.tools = ToolScope::AllowList(vec!["write_file".into()]);
+    let writer = compiled(writer);
+    for tool in ["repo_overview", "repo_health", "repo_risk", "repo_symbol"] {
+        assert!(writer.allows_tool(tool), "{tool}");
+    }
+    assert!(
+        !writer.allows_tool("repo_context"),
+        "repo_context still comes with read_file"
+    );
+
+    let mut none = profile("p", 2);
+    none.tools = ToolScope::None;
+    assert!(
+        !compiled(none).allows_tool("repo_risk"),
+        "a profile with no tools gets none"
+    );
+}
+
+#[test]
 fn edit_file_follows_the_write_file_scope_and_permission_of_a_profile() {
     let mut scoped = profile("p", 1);
     scoped.tools = ToolScope::AllowList(vec!["read_file".into(), "write_file".into()]);

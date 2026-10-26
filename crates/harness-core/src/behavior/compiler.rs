@@ -4,7 +4,7 @@ use harness_protocol::backend::{ExecutionParams, ReasoningEffort};
 use harness_protocol::tools::PermissionMode;
 
 use crate::orchestration::ToolScope;
-use crate::tool_alias::granted_by;
+use crate::tool_alias::{granted_by, ALWAYS_ADMITTED};
 
 use super::definition::{
     Action, BehaviorProfile, ChildPolicy, Comparison, CompletionGate, Condition, EvaluatorSpec,
@@ -741,10 +741,14 @@ impl CompiledProfile {
     /// Whether the profile's scope lets the model see and call `tool`. An
     /// allow-list naming a tool also admits what that tool's grant covers (see
     /// [`crate::tool_alias`]): `write_file` brings `edit_file` with it, and
-    /// `read_file` brings `project_info` and `repo_context`.
+    /// `read_file` brings `project_info` and `repo_context`. Any allow-list at
+    /// all admits the repository tools every model gets ([`ALWAYS_ADMITTED`]).
     pub fn allows_tool(&self, tool: &str) -> bool {
         match &self.profile.tools {
             ToolScope::None => false,
+            ToolScope::AllowList(tools) if !tools.is_empty() && ALWAYS_ADMITTED.contains(&tool) => {
+                true
+            }
             ToolScope::AllowList(tools) => tools
                 .iter()
                 .any(|allowed| allowed == tool || granted_by(tool) == Some(allowed.as_str())),

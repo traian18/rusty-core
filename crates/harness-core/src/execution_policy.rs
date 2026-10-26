@@ -37,6 +37,9 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         // `decide` is advisory: the IDE asks a decision model and returns its pick.
         // `update_todos` only keeps the session's task list.
         "report_progress" | "ask_user_question" | "decide" | "update_todos" => return true,
+        // The repository tools every model gets (`tool_alias::ALWAYS_ADMITTED`):
+        // they only read the repository index, its history and the code on disk.
+        name if crate::tool_alias::ALWAYS_ADMITTED.contains(&name) => return true,
         "write_plan" => return policy.mode == ExecutionMode::Plan,
         // `project_info` is the IDE's project-detection tool: it only reads
         // manifests, so it shares the `read_file` grant (in plan mode too), as

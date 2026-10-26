@@ -138,6 +138,24 @@ fn project_info_follows_the_read_file_grant_in_every_mode() {
 }
 
 #[test]
+fn the_repository_tools_every_model_gets_survive_any_policy() {
+    let mut policy = ExecutionPolicy {
+        mode: ExecutionMode::Plan,
+        enabled_tools: vec!["write_file".into()],
+        allowed_mcp_servers: vec![],
+    };
+    for tool in ["repo_overview", "repo_health", "repo_risk", "repo_symbol"] {
+        assert!(
+            allows_tool(&policy, tool),
+            "{tool} in plan mode without read_file"
+        );
+    }
+    policy.mode = ExecutionMode::Virtual;
+    policy.enabled_tools.clear();
+    assert!(allows_tool(&policy, "repo_risk"));
+}
+
+#[test]
 fn decide_is_allowed_without_any_grant_in_every_mode() {
     for mode in [
         ExecutionMode::Execute,
