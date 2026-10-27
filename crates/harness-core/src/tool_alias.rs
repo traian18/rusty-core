@@ -34,6 +34,8 @@ const ALIASES: &[(&str, &str)] = &[
 /// read may ask for it. `repo_context` answers questions about how files
 /// connect from the repository index and never changes anything, so any step
 /// that may read may use it; `repo_wiki` reads the documentation pages rendered from the same index; `spec_context` reads the spec files.
+/// `job_output` reads a background job a command or check started, so it comes
+/// with the grant that may start one.
 const GRANTED_WITH: &[(&str, &str)] = &[
     ("project_info", "read_file"),
     ("request_research", "read_file"),
@@ -44,6 +46,7 @@ const GRANTED_WITH: &[(&str, &str)] = &[
     ("repo_health", "read_file"),
     ("repo_risk", "read_file"),
     ("repo_symbol", "read_file"),
+    ("job_output", "run_command"),
 ];
 
 /// The read-only repository tools every model that may use tools at all gets,
@@ -128,6 +131,7 @@ mod tests {
         assert_eq!(granted_by("repo_wiki"), Some("read_file"));
         assert_eq!(granted_by("spec_context"), Some("read_file"));
         assert_eq!(granted_by("repo_risk"), Some("read_file"));
+        assert_eq!(granted_by("job_output"), Some("run_command"));
         assert_eq!(granted_by("read_file"), None);
         assert_eq!(granted_by("run_command"), None);
     }
@@ -140,6 +144,7 @@ mod tests {
                 "run_command",
                 "run_check",
                 "install_dependencies",
+                "job_output",
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
@@ -163,7 +168,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "job_output"
             ])
         );
         assert_eq!(
