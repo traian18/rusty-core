@@ -273,12 +273,19 @@ impl RunLoop {
 
     /// When the active attempt becomes stale, if the watchdog applies: a
     /// limit is set, a step is running and not already cancelled, and it is
-    /// neither paused nor waiting on a person's permission decision or answer.
+    /// neither paused nor waiting on a person's permission decision or answer,
+    /// nor on one of its own tool calls. A call runs a command or check for as
+    /// long as it needs, or waits for the user to approve it, and sends nothing
+    /// meanwhile; the tool's own limits stop it. The stall counts again from
+    /// the call's result.
     fn stall_deadline(&self) -> Option<Instant> {
         let limit = self.runner.compiled.definition.policies.stall_timeout_ms?;
         let active = self.active.as_ref().filter(|active| !active.stalled)?;
         let step = &self.state.steps[&active.node_id];
-        if self.state.paused || !step.pending_permissions.is_empty() || step.pending_input.is_some()
+        if self.state.paused
+            || !step.pending_permissions.is_empty()
+            || step.pending_input.is_some()
+            || active.actions.calls_in_flight()
         {
             return None;
         }

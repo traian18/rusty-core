@@ -56,8 +56,17 @@ impl ActionRecorder {
                     self.record(&name, &arguments, result.has_error, &result.output_preview);
                 }
             }
+            AgentEvent::ToolCallDenied { call_id, .. } => {
+                self.pending.remove(&call_id.to_string());
+            }
             _ => {}
         }
+    }
+
+    /// Whether a tool call is running, or waiting for the user to approve it: a
+    /// command or check can take minutes without the attempt sending anything.
+    pub(crate) fn calls_in_flight(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     fn record(&mut self, name: &str, arguments: &Value, failed: bool, output: &str) {

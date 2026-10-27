@@ -37,6 +37,58 @@ enum Behavior {
     ExhaustUsage,
     /// Report these tool calls (name, arguments) as done, then return `Value`.
     Tools(Vec<(&'static str, Value)>, Value),
+    /// Start a tool call that sends nothing for this long (a long command, or
+    /// one waiting for approval), then complete it and return `Value`.
+    SlowTool(Duration, Value),
+}
+
+fn agent_event(event: harness_protocol::events::AgentEvent) -> StepSignal {
+    use harness_protocol::{
+        events::{AgentEventEnvelope, EventVisibility},
+        ids::{AgentId, EventId, SessionId, Timestamp},
+    };
+    StepSignal::Agent(Box::new(AgentEventEnvelope {
+        event_id: EventId::new(),
+        session_id: SessionId::new(),
+        agent_id: AgentId::new(),
+        parent_agent_id: None,
+        run_id: None,
+        agent_sequence: 0,
+        session_sequence: None,
+        timestamp: Timestamp::now(),
+        visibility: EventVisibility::User,
+        event,
+    }))
+}
+
+fn tool_requested(
+    context: &StepContext,
+    name: &str,
+    arguments: Value,
+) -> harness_protocol::ids::ToolCallId {
+    let id = harness_protocol::ids::ToolCallId::new();
+    context.signal(agent_event(
+        harness_protocol::events::AgentEvent::ToolCallRequested {
+            call: harness_protocol::tools::ToolCall {
+                id,
+                name: name.into(),
+                arguments,
+            },
+        },
+    ));
+    id
+}
+
+fn tool_completed(context: &StepContext, call_id: harness_protocol::ids::ToolCallId) {
+    context.signal(agent_event(
+        harness_protocol::events::AgentEvent::ToolCallCompleted {
+            call_id,
+            result: harness_protocol::tools::ToolResultSummary {
+                has_error: false,
+                output_preview: String::new(),
+            },
+        },
+    ));
 }
 
 #[derive(Default)]
@@ -107,42 +159,21 @@ impl AgentStepExecutor for ScriptedAgent {
                 value
             }
             Behavior::Tools(calls, value) => {
-                use harness_protocol::{
-                    events::{AgentEvent, AgentEventEnvelope, EventVisibility},
-                    ids::{AgentId, EventId, SessionId, Timestamp, ToolCallId},
-                    tools::{ToolCall, ToolResultSummary},
-                };
-                let envelope = |event| {
-                    Box::new(AgentEventEnvelope {
-                        event_id: EventId::new(),
-                        session_id: SessionId::new(),
-                        agent_id: AgentId::new(),
-                        parent_agent_id: None,
-                        run_id: None,
-                        agent_sequence: 0,
-                        session_sequence: None,
-                        timestamp: Timestamp::now(),
-                        visibility: EventVisibility::User,
-                        event,
-                    })
-                };
                 for (name, arguments) in calls {
-                    let id = ToolCallId::new();
-                    context.signal(StepSignal::Agent(envelope(AgentEvent::ToolCallRequested {
-                        call: ToolCall {
-                            id,
-                            name: name.into(),
-                            arguments,
-                        },
-                    })));
-                    context.signal(StepSignal::Agent(envelope(AgentEvent::ToolCallCompleted {
-                        call_id: id,
-                        result: ToolResultSummary {
-                            has_error: false,
-                            output_preview: String::new(),
-                        },
-                    })));
+                    let id = tool_requested(&context, name, arguments);
+                    tool_completed(&context, id);
                 }
+                value
+            }
+            Behavior::SlowTool(quiet, value) => {
+                let id = tool_requested(&context, "run_check", json!({ "check": "test" }));
+                tokio::select! {
+                    _ = tokio::time::sleep(quiet) => {}
+                    _ = context.cancellation.cancelled() => {
+                        return Err(AgentExecutionError::new("cancelled", "cancelled during the call"));
+                    }
+                }
+                tool_completed(&context, id);
                 value
             }
             Behavior::AwaitCancel(flag) => {
@@ -815,6 +846,37 @@ async fn stalled_step_is_cancelled_and_retried() {
     let attempts = &output.state.steps[&node("execute")].attempts;
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].error.as_ref().unwrap().code, "step_stalled");
+}
+
+#[tokio::test]
+async fn a_tool_call_in_flight_is_not_a_stall() {
+    // A check that runs for ten minutes, or waits that long for the user to
+    // approve it, sends nothing meanwhile; the step is still working.
+    let agent = ScriptedAgent::new(vec![Behavior::SlowTool(
+        Duration::from_millis(200),
+        report("completed"),
+    )]);
+    let mut definition = default_orchestration_definition();
+    definition.policies.stall_timeout_ms = Some(50);
+    for node in definition.nodes.iter_mut() {
+        node.retry.max_attempts = 1;
+    }
+    let output = OrchestrationRunner::new(compiled(definition), agent.clone())
+        .with_available_tools(Vec::<String>::new())
+        .run(run_id("slow-tool"), input(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        output.state.status,
+        OrchestrationStatus::Completed,
+        "{:?}",
+        output.result
+    );
+    assert_eq!(
+        agent.requests().len(),
+        1,
+        "the attempt was not cancelled and retried"
+    );
 }
 
 #[tokio::test]
