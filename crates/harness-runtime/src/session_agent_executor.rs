@@ -74,7 +74,7 @@ const RESEARCH_TOOLS: &[&str] = &[
 const RESEARCH_INSTRUCTIONS: &str = "You are a research step. A step of a running workflow cannot go on without an answer to the question in workflow_input.question; workflow_input.why (when given) says what that step needs it for, and workflow_input.request is the user's overall request, for orientation only.
 
 What to do:
-1. Find the answer in the project's files. Search first, then read only what the search points at.
+1. Find the answer in the project's files, asking the repository index before opening files when those tools are offered: repo_context for how files connect (several targets in one call) and the functions a file defines, repo_symbol for the body of one function or class (path::Name) instead of reading the whole file. Search for text the index does not hold (strings, configuration, documentation), then read only what the search points at.
 2. Use the web only when the question is about something outside the project (a library, an API, a tool's behavior).
 3. Do not change anything and do not run commands: you only read.
 4. Be quick and stay on this one question; the step that asked is waiting for you.
@@ -419,7 +419,7 @@ impl IsolatedSessionAgentExecutor {
         }
         if research {
             prompt.push_str(&format!(
-                "\n\nIf you need information your input does not give you and finding it yourself would take many reads, call {RESEARCH_TOOL} with one specific question (at most {} times); a read-only research step answers it with evidence.",
+                "\n\nIf you need information your input does not give you and finding it yourself would take many reads, call {RESEARCH_TOOL} with one specific question (at most {} times); a read-only research step answers it with evidence. Its answer is evidence you must account for: for every defect, gap or risk it reports, either act on it or say in your reply why it does not apply here (citing the plan, the design or the code). Do not leave one unmentioned.",
                 request.research.max_per_attempt
             ));
         }

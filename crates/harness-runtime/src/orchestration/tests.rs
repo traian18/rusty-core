@@ -1883,6 +1883,11 @@ mod isolated_session {
             "the step is told it can ask"
         );
         assert!(
+            prompt_of(&sent[0])
+                .contains("either act on it or say in your reply why it does not apply"),
+            "and that each defect the research reports must be answered for"
+        );
+        assert!(
             sent[0]
                 .tools
                 .iter()
@@ -2016,6 +2021,10 @@ mod isolated_session {
         assert!(
             !prompt_of(&sent[0]).contains("call request_research"),
             "the research step is not told it can ask"
+        );
+        assert!(
+            prompt_of(&sent[0]).contains("repo_symbol for the body of one function"),
+            "the research step asks the repository index before opening whole files"
         );
         assert!(nested.requests.lock().unwrap().is_empty());
     }
