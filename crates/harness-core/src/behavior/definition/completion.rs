@@ -86,6 +86,11 @@ pub enum EvaluatorSpec {
         tool: String,
         #[serde(default)]
         args: Value,
+        /// The argument that receives the proposed answer, for a check of
+        /// the answer itself (a task list against its spec) rather than of
+        /// the workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer_arg: Option<String>,
     },
     /// Ask a model whether the answer is acceptable. It returns
     /// `{"passed": bool, "feedback": string}`, validated by the host.

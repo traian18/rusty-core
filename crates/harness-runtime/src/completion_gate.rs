@@ -69,7 +69,12 @@ pub(crate) async fn evaluate(
             Err(error) => VerdictOutcome::Error {
                 message: format!("invalid evaluator: {error}"),
             },
-            Ok(EvaluatorSpec::Tool { tool, args }) => {
+            Ok(EvaluatorSpec::Tool {
+                tool,
+                args,
+                answer_arg,
+            }) => {
+                let args = with_answer(args, answer_arg.as_deref(), &request.final_response);
                 harness_tools::with_tool_call(
                     format!("gate-{}", check.id),
                     context.session_id.clone(),
@@ -144,6 +149,19 @@ fn truncate(text: &str, limit: usize) -> String {
         Some((cut, _)) => format!("{}… (truncated)", &text[..cut]),
         None => text.to_string(),
     }
+}
+
+/// `args` with the proposed answer under `answer_arg`, when the check names one.
+fn with_answer(args: Value, answer_arg: Option<&str>, answer: &str) -> Value {
+    let Some(name) = answer_arg else {
+        return args;
+    };
+    let mut object = match args {
+        Value::Object(object) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert(name.to_owned(), Value::String(answer.to_owned()));
+    Value::Object(object)
 }
 
 /// Run a tool directly. The gate acts for the harness, not the model, so
@@ -710,6 +728,20 @@ fn verifier_usage(live: &crate::session_runtime::AgentLiveState) -> Vec<UsageRec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_check_of_the_answer_gets_it_under_its_argument() {
+        let args = json!({"mode": "strict"});
+        assert_eq!(with_answer(args.clone(), None, "the list"), args);
+        assert_eq!(
+            with_answer(args, Some("tasks"), "the list"),
+            json!({"mode": "strict", "tasks": "the list"})
+        );
+        assert_eq!(
+            with_answer(Value::Null, Some("tasks"), "x"),
+            json!({"tasks": "x"})
+        );
+    }
 
     #[test]
     fn verdicts_parse_with_or_without_fences() {

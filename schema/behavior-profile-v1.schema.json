@@ -688,6 +688,13 @@
             "type"
           ],
           "properties": {
+            "answer_arg": {
+              "description": "The argument that receives the proposed answer, for a check of the answer itself (a task list against its spec) rather than of the workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "args": {
               "default": null
             },

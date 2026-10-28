@@ -56,6 +56,46 @@ pub fn validate_change(
     warnings
 }
 
+/// A task list about to be written as the change's `tasks.md`, checked against its `spec.md`
+/// before it is saved: what [`validate_change`] would say about it, and also no task list at all
+/// and a task that names no criterion. Empty when there is nothing to fix, or no spec to check
+/// against.
+pub fn check_task_list(
+    store: &dyn SpecStore,
+    layout: &Layout,
+    dir: &str,
+    tasks_text: &str,
+) -> Vec<Warning> {
+    let base = layout.change(dir);
+    let spec_path = format!("{base}/spec.md");
+    let tasks_path = format!("{base}/tasks.md");
+    let Some(spec) = store.read(&spec_path).map(|text| parse::spec::parse(&text)) else {
+        return Vec::new();
+    };
+    let tasks = parse::tasks::parse(tasks_text);
+    let mut warnings = Vec::new();
+    if tasks.tasks.is_empty() {
+        warnings.push(Warning::new(
+            &tasks_path,
+            None,
+            Severity::Error,
+            "the reply has no task lines (`- [ ] **T1** <title>. R1 (C1)`)",
+        ));
+        return warnings;
+    }
+    for task in tasks.tasks.iter().filter(|t| t.criteria.is_empty()) {
+        warnings.push(Warning::new(
+            &tasks_path,
+            Some(task.line),
+            Severity::Warning,
+            format!("{} names no criterion", task.id),
+        ));
+    }
+    check_tasks(&tasks_path, &spec_path, &tasks, Some(&spec), &mut warnings);
+    warnings.sort_by_key(|w| std::cmp::Reverse(w.severity));
+    warnings
+}
+
 /// `project.md` should hold the principles the plan is checked against.
 pub fn validate_project(store: &dyn SpecStore, layout: &Layout) -> Vec<Warning> {
     let path = layout.project();
@@ -352,6 +392,36 @@ mod tests {
             ("C2 is not named by any task", Some(7))
         );
         assert!(found[0].file.ends_with("spec.md"));
+    }
+
+    #[test]
+    fn a_ranged_task_list_covers_every_criterion_in_its_range() {
+        let tasks = "- [ ] **T1** One. R1 (C1–C2)\n";
+        assert!(check(SPEC, Some(tasks), Status::Planned).is_empty());
+    }
+
+    #[test]
+    fn a_task_list_is_checked_against_the_spec_before_it_is_saved() {
+        let store = MemoryStore::default();
+        store.insert("specs/changes/0001-a/spec.md", SPEC);
+        let layout = Layout::new("specs");
+        let messages = |text: &str| -> Vec<String> {
+            check_task_list(&store, &layout, "0001-a", text)
+                .into_iter()
+                .map(|w| w.message)
+                .collect()
+        };
+        assert!(messages("# Tasks\n\n- [ ] **T1** One. R1 (C1, C2)\n").is_empty());
+        assert_eq!(
+            messages("- [ ] **T1** One. R1 (C1)\n- [ ] **T2** Docs.\n"),
+            ["T2 names no criterion", "C2 is not named by any task"]
+        );
+        assert_eq!(
+            messages("Here is the plan, as asked."),
+            ["the reply has no task lines (`- [ ] **T1** <title>. R1 (C1)`)"]
+        );
+        // Without a spec there is nothing to check against.
+        assert!(check_task_list(&store, &layout, "0002-b", "anything").is_empty());
     }
 
     #[test]

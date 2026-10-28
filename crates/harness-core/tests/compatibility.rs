@@ -29,6 +29,7 @@ fn public_facades_expose_representative_types() {
     let evaluator = EvaluatorSpec::Tool {
         tool: "check".into(),
         args: Value::Null,
+        answer_arg: None,
     };
 
     let definition = default_orchestration_definition();

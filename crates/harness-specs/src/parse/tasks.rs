@@ -1,5 +1,5 @@
 //! A change's `tasks.md`: `- [x] **T1** Title. R1 (C1, C2) after T0` with indented instructions.
-use super::ids_with_prefix;
+use super::{ids_with_prefix, ids_with_ranges};
 use crate::model::{Task, TasksDoc};
 
 pub fn parse(text: &str) -> TasksDoc {
@@ -48,13 +48,7 @@ fn read_task(done: bool, rest: &str, line: usize, position: usize) -> Task {
         format!("T{position}")
     };
     let (head, after) = match tail.rfind(" after ") {
-        Some(at) => (
-            &tail[..at],
-            ids_with_prefix(&tail[at + 7..], 'T')
-                .into_iter()
-                .map(|(_, id)| id)
-                .collect(),
-        ),
+        Some(at) => (&tail[..at], ids_with_ranges(&tail[at + 7..], 'T')),
         None => (tail, Vec::new()),
     };
     let first_requirement = ids_with_prefix(head, 'R').first().map(|(at, _)| *at);
@@ -70,14 +64,8 @@ fn read_task(done: bool, rest: &str, line: usize, position: usize) -> Task {
         title,
         done,
         line,
-        requirements: ids_with_prefix(refs, 'R')
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect(),
-        criteria: ids_with_prefix(refs, 'C')
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect(),
+        requirements: ids_with_ranges(refs, 'R'),
+        criteria: ids_with_ranges(refs, 'C'),
         after,
         instructions: String::new(),
     }
@@ -132,6 +120,22 @@ mod tests {
             (&["T1".to_owned()][..], &["C1".to_owned()][..])
         );
         assert!(!second.done);
+    }
+
+    #[test]
+    fn ranges_name_every_id_between_their_ends() {
+        let doc = parse("# Tasks\n\n- [ ] **T4** Measure requests. R1 (C1–C3, C21) R2 (C7-C9) after T1–T3\n- [ ] **T5** Verify. R1–R3 (C1 to C4, C2) after T4\n");
+        let measure = &doc.tasks[0];
+        assert_eq!(measure.title, "Measure requests");
+        assert_eq!(measure.requirements, ["R1", "R2"]);
+        assert_eq!(
+            measure.criteria,
+            ["C1", "C2", "C3", "C21", "C7", "C8", "C9"]
+        );
+        assert_eq!(measure.after, ["T1", "T2", "T3"]);
+        let verify = &doc.tasks[1];
+        assert_eq!(verify.requirements, ["R1", "R2", "R3"]);
+        assert_eq!(verify.criteria, ["C1", "C2", "C3", "C4"]);
     }
 
     #[test]

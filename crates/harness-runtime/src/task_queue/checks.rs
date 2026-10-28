@@ -132,22 +132,30 @@ fn output_text(output: &Value) -> String {
 }
 
 /// The repositories a task works in, as far as its text says: the ones it
-/// names, or all of them when it names none (or the workspace is one).
+/// names by path (`services/api`), else by their folder's name (`api`), or
+/// all of them when it names none (or the workspace is one).
 pub(super) fn named_repos(
     repos: &[(String, String)],
     task: &Task,
     step_plan: Option<&str>,
 ) -> Vec<(String, String)> {
     let text = format!("{}\n{}", task.instructions, step_plan.unwrap_or(""));
-    let named: Vec<_> = repos
-        .iter()
-        .filter(|(name, _)| !name.is_empty() && text.contains(name.as_str()))
-        .cloned()
-        .collect();
-    if named.is_empty() {
+    let named_by = |key: fn(&str) -> &str| -> Vec<(String, String)> {
+        repos
+            .iter()
+            .filter(|(name, _)| !name.is_empty() && text.contains(key(name)))
+            .cloned()
+            .collect()
+    };
+    let by_path = named_by(|name| name);
+    if !by_path.is_empty() {
+        return by_path;
+    }
+    let by_folder = named_by(|name| name.rsplit('/').next().unwrap_or(name));
+    if by_folder.is_empty() {
         repos.to_vec()
     } else {
-        named
+        by_folder
     }
 }
 

@@ -88,3 +88,28 @@ fn a_task_is_checked_in_the_repositories_it_names() {
     };
     assert_eq!(named_repos(&repos, &vague, None), repos);
 }
+
+#[test]
+fn a_repository_in_a_group_is_named_by_its_path_or_its_folder() {
+    let repos = vec![
+        ("services/api".to_owned(), "a".to_owned()),
+        ("services/web".to_owned(), "b".to_owned()),
+    ];
+    let task = |instructions: &str| Task {
+        id: "T1".into(),
+        requirement_ids: vec![],
+        criterion_ids: vec![],
+        depends_on: vec![],
+        instructions: instructions.into(),
+        flow: None,
+    };
+    assert_eq!(
+        named_repos(&repos, &task("Edit services/web/src/a.ts"), None),
+        [repos[1].clone()]
+    );
+    assert_eq!(
+        named_repos(&repos, &task("Add the endpoint to api"), None),
+        [repos[0].clone()]
+    );
+    assert_eq!(named_repos(&repos, &task("Tidy up"), None), repos);
+}

@@ -37,9 +37,9 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
         // `decide` is advisory: the IDE asks a decision model and returns its pick.
         // `update_todos` only keeps the session's task list.
         // `job_output` only reads a background job the session's own commands started.
-        "report_progress" | "ask_user_question" | "decide" | "update_todos" | "job_output" => {
-            return true
-        }
+        // `spec_tasks_check` only checks the text it is given against the change's spec.
+        "report_progress" | "ask_user_question" | "decide" | "update_todos" | "job_output"
+        | "spec_tasks_check" => return true,
         // The repository tools every model gets (`tool_alias::ALWAYS_ADMITTED`):
         // they only read the repository index, its history and the code on disk.
         name if crate::tool_alias::ALWAYS_ADMITTED.contains(&name) => return true,

@@ -117,6 +117,64 @@ fn a_workspace_of_repositories_snapshots_each_of_them() {
 }
 
 #[test]
+fn repositories_grouped_in_folders_are_snapshotted_and_undone_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("services/payments/api")).unwrap();
+    fs::create_dir_all(root.join("apps/web")).unwrap();
+    repo_with_commit(&root.join("services/payments/api"));
+    repo_with_commit(&root.join("apps/web"));
+
+    let baseline = take(root, "run/T1-start");
+    let names: Vec<_> = baseline
+        .repos
+        .iter()
+        .map(|repo| repo.repo.as_str())
+        .collect();
+    assert_eq!(names, ["apps/web", "services/payments/api"]);
+
+    fs::write(root.join("services/payments/api/changed.ts"), "attempt\n").unwrap();
+    let undone = undo_to(root, &baseline, "run/T1-attempt-1").unwrap();
+    assert_eq!(undone.files, ["services/payments/api/changed.ts"]);
+    assert_eq!(
+        fs::read_to_string(root.join("services/payments/api/changed.ts")).unwrap(),
+        "before\n"
+    );
+}
+
+#[test]
+fn a_workspace_repository_keeps_the_repositories_inside_it_in_their_own_snapshots() {
+    // The Rusty workspace layout: the folder is a repository that ignores the
+    // repositories in it, which hold the code.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let workspace = Repository::init(root).unwrap();
+    fs::write(root.join(".gitignore"), "/*\n!/.gitignore\n").unwrap();
+    let mut index = workspace.index().unwrap();
+    index.add_path(Path::new(".gitignore")).unwrap();
+    let tree = workspace.find_tree(index.write_tree().unwrap()).unwrap();
+    let who = git2::Signature::now("t", "t@example.com").unwrap();
+    workspace
+        .commit(Some("HEAD"), &who, &who, "init", &tree, &[])
+        .unwrap();
+    fs::create_dir_all(root.join("core")).unwrap();
+    repo_with_commit(&root.join("core"));
+
+    let baseline = take(root, "run/T1-start");
+    let names: Vec<_> = baseline
+        .repos
+        .iter()
+        .map(|repo| repo.repo.as_str())
+        .collect();
+    assert_eq!(names, ["", "core"]);
+    fs::write(root.join("core/changed.ts"), "attempt\n").unwrap();
+    assert_eq!(
+        undo_to(root, &baseline, "run/T1-attempt-1").unwrap().files,
+        ["core/changed.ts"]
+    );
+}
+
+#[test]
 fn a_folder_without_repositories_has_nothing_to_undo() {
     let dir = tempfile::tempdir().unwrap();
     let baseline = take(dir.path(), "run/T1-start");

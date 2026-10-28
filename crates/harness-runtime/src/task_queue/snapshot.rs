@@ -3,7 +3,7 @@
 //! half-finished edits.
 //!
 //! A snapshot records the working tree of every repository (the workspace
-//! root when it is one, otherwise each folder directly inside it that is) as
+//! root when it is one, and every repository below it at any depth) as
 //! a commit under `refs/rusty/checkpoints/…`. It never moves a branch, never
 //! changes the index and never touches ignored files. Undoing an attempt
 //! first snapshots the attempt itself, so nothing is lost: the attempt's
@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{Delta, DiffOptions, IndexAddOption, Oid, Repository, RepositoryOpenFlags, Signature};
+use git2::{Delta, DiffOptions, IndexAddOption, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 
 /// One repository's recorded tree.
@@ -84,33 +84,14 @@ pub fn undo_to(root: &Path, baseline: &Snapshot, label: &str) -> Result<Undone, 
     Ok(Undone { files, attempt })
 }
 
-/// The workspace root when it is a repository, otherwise the repositories
-/// directly inside it, as (name relative to the root, path).
+/// Every repository in the workspace at any depth (the root itself when it is
+/// one, repositories grouped in folders, repositories inside repositories), as
+/// (path relative to the root, path).
 fn repositories(root: &Path) -> Vec<(String, PathBuf)> {
-    if is_repository(root) {
-        return vec![(String::new(), root.to_path_buf())];
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut found: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && is_repository(path))
-        .filter_map(|path| Some((path.file_name()?.to_str()?.to_owned(), path)))
-        .collect();
-    found.sort();
-    found
-}
-
-fn is_repository(path: &Path) -> bool {
-    path.join(".git").exists()
-        && Repository::open_ext(
-            path,
-            RepositoryOpenFlags::NO_SEARCH,
-            std::iter::empty::<&Path>(),
-        )
-        .is_ok()
+    harness_workspace::nested_repositories::nested_repositories(root)
+        .into_iter()
+        .map(|found| (found.relative, found.path))
+        .collect()
 }
 
 /// The tree of every repository's working tree, as (repository, tree id),

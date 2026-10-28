@@ -7,6 +7,7 @@ pub mod filesystem;
 pub mod folder_tree;
 pub mod framework_relations;
 pub mod import_graph;
+pub mod nested_repositories;
 pub mod repository_intelligence;
 pub mod workspace;
 pub mod worktree;
