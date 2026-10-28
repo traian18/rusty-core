@@ -19,6 +19,10 @@ pub struct Goal {
     /// passes changed.
     #[serde(default)]
     pub scope: Vec<String>,
+    /// The scope in the user's words (`scope="..."`): what the passes keep their work within. The
+    /// measurement still runs on `scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_note: Option<String>,
     #[serde(default)]
     pub targets: Targets,
     #[serde(default)]
@@ -46,6 +50,9 @@ pub struct Goal {
     /// Files the passes changed, for an empty scope.
     #[serde(default)]
     pub touched: Vec<String>,
+    /// The plan as the last kept pass left it: what a task goal is worked through by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<PlanStep>,
     #[serde(default)]
     pub journal: Vec<JournalEntry>,
     /// Why the goal stopped, when it did.
@@ -65,6 +72,7 @@ impl Goal {
             status: GoalStatus::Running,
             instruction,
             scope: Vec::new(),
+            scope_note: None,
             targets: Targets::default(),
             budget: Budget::default(),
             keep_best: true,
@@ -76,6 +84,7 @@ impl Goal {
             baseline: None,
             last: None,
             touched: Vec::new(),
+            plan: Vec::new(),
             journal: Vec::new(),
             reason: None,
         }
@@ -89,6 +98,21 @@ impl Goal {
         }
     }
 
+    /// A task goal: no target on the files' code health, so it is worked through a plan and
+    /// judged in words. A quality goal is measured.
+    pub fn is_task(&self) -> bool {
+        !self.targets.on_files()
+    }
+
+    /// The result in words the pass judges: the one given, or for a task goal its instruction.
+    pub fn done_when(&self) -> Option<&str> {
+        match &self.targets.done_when {
+            Some(words) => Some(words.as_str()),
+            None if self.is_task() => Some(self.instruction.as_str()),
+            None => None,
+        }
+    }
+
     /// Resumes a paused or blocked goal with a fresh pass budget.
     pub fn resume(&mut self, now: String) {
         self.status = GoalStatus::Running;
@@ -96,6 +120,29 @@ impl Goal {
         self.stalled = 0;
         self.reason = None;
         self.updated_at = now;
+    }
+}
+
+/// One step of a goal's plan, as the pass's to-do list had it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub content: String,
+    pub status: StepStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+impl StepStatus {
+    /// Completed or cancelled: nothing left to do for it.
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
     }
 }
 
@@ -115,13 +162,17 @@ impl GoalStatus {
     }
 }
 
-/// What counts as done. Every target set must be met; with none set, the goal is done when the
-/// checks pass and the guidelines report no errors.
+/// What counts as done. Every target set must be met. Without a target on the files the goal is a
+/// task goal (see [`Goal::is_task`]): done when its plan is finished and the pass judges the
+/// instruction met.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Targets {
     /// Every file in scope scores at least this (code health, 1-10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_file_health: Option<f64>,
+    /// The mean score of the files in scope is at least this ("general health").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_mean_health: Option<f64>,
     /// No code health finding in scope is more severe than this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<Severity>,
@@ -140,10 +191,29 @@ impl Default for Targets {
     fn default() -> Self {
         Self {
             min_file_health: None,
+            min_mean_health: None,
             max_severity: None,
             checks: Vec::new(),
             guidelines: true,
             done_when: None,
+        }
+    }
+}
+
+impl Targets {
+    /// A target measured on the files' code health, which an empty measurement cannot meet.
+    pub fn on_files(&self) -> bool {
+        self.min_file_health.is_some()
+            || self.min_mean_health.is_some()
+            || self.max_severity.is_some()
+    }
+
+    /// The score below which a file is still work: the higher of the minimum and the mean target
+    /// (a mean is raised by raising the files below it).
+    pub fn work_bar(&self) -> Option<f64> {
+        match (self.min_file_health, self.min_mean_health) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
         }
     }
 }
@@ -193,4 +263,7 @@ pub struct JournalEntry {
     /// The agent's own status line, when it gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<String>,
+    /// What the agent left for the next pass (its `Next:` line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }

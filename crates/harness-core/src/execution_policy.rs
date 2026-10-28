@@ -33,60 +33,65 @@ fn enabled(policy: &ExecutionPolicy, name: &str) -> bool {
 }
 
 pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
-    let permission = match name {
-        // `decide` is advisory: the IDE asks a decision model and returns its pick.
-        // `update_todos` only keeps the session's task list.
-        // `job_output` only reads a background job the session's own commands started.
-        // `spec_tasks_check` only checks the text it is given against the change's spec.
-        "report_progress" | "ask_user_question" | "decide" | "update_todos" | "job_output"
-        | "spec_tasks_check" => return true,
-        // The repository tools every model gets (`tool_alias::ALWAYS_ADMITTED`):
-        // they only read the repository index, its history and the code on disk.
-        name if crate::tool_alias::ALWAYS_ADMITTED.contains(&name) => return true,
-        "write_plan" => return policy.mode == ExecutionMode::Plan,
-        // `project_info` is the IDE's project-detection tool: it only reads
-        // manifests, so it shares the `read_file` grant (in plan mode too), as
-        // does the workflow-author's `workflow_catalog`, which only reads the
-        // workflows and profiles the workspace can use, and `repo_context`,
-        // which only reads the repository index, and `spec_context`, which only reads
-        // the spec files.
+    if is_unconditionally_allowed(name) {
+        return true;
+    }
+    if name == "write_plan" {
+        return policy.mode == ExecutionMode::Plan;
+    }
+    if is_write_tool(name) && policy.mode == ExecutionMode::Plan {
+        return false;
+    }
+    if name == "save_workflow" && policy.mode != ExecutionMode::Execute {
+        return false;
+    }
+    if is_command_tool(name) {
+        return allows_command_execution(policy);
+    }
+    tool_permission(name).is_some_and(|permission| enabled(policy, permission))
+}
+
+fn is_unconditionally_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "report_progress"
+            | "ask_user_question"
+            | "decide"
+            | "update_todos"
+            | "job_output"
+            | "spec_tasks_check"
+    ) || crate::tool_alias::ALWAYS_ADMITTED.contains(&name)
+}
+
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file" | "fs.edit")
+}
+
+fn is_command_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "run_command" | "shell.exec" | "run_check" | "install_dependencies"
+    )
+}
+
+fn allows_command_execution(policy: &ExecutionPolicy) -> bool {
+    policy.mode == ExecutionMode::Execute
+        && enabled(policy, "write_file")
+        && enabled(policy, "web_search")
+        && enabled(policy, "run_command")
+}
+
+fn tool_permission(name: &str) -> Option<&'static str> {
+    match name {
         "read_file" | "fs.read" | "open_document" | "project_info" | "request_research"
-        | "workflow_catalog" | "repo_context" | "repo_wiki" | "spec_context" => "read_file",
-        // `edit_file` is the IDE's targeted patch tool: same grant as `write_file`.
-        "write_file" | "edit_file" | "fs.edit" => {
-            if policy.mode == ExecutionMode::Plan {
-                return false;
-            }
-            "write_file"
-        }
-        // The IDE's workflow-author tool persists a workflow definition, so it
-        // needs its own grant and a session that may really write.
-        "save_workflow" => {
-            if policy.mode != ExecutionMode::Execute {
-                return false;
-            }
-            "save_workflow"
-        }
-        "list_files" => "list_files",
-        "search_codebase" | "workspace.search" => "search_codebase",
-        // web_extract fetches a page like web_fetch, so it needs the same network grant.
-        "web_search" | "web_fetch" | "web_extract" => "web_search",
-        // `run_check` (the IDE's project-check tool) and `install_dependencies`
-        // run commands through the same executor, so they need everything
-        // `run_command` needs.
-        "run_command" | "shell.exec" | "run_check" | "install_dependencies" => {
-            // The current command executor has host filesystem/network access.
-            if policy.mode != ExecutionMode::Execute
-                || !enabled(policy, "write_file")
-                || !enabled(policy, "web_search")
-            {
-                return false;
-            }
-            "run_command"
-        }
-        _ => return false,
-    };
-    enabled(policy, permission)
+        | "workflow_catalog" | "repo_context" | "repo_wiki" | "spec_context" => Some("read_file"),
+        "write_file" | "edit_file" | "fs.edit" => Some("write_file"),
+        "save_workflow" => Some("save_workflow"),
+        "list_files" => Some("list_files"),
+        "search_codebase" | "workspace.search" => Some("search_codebase"),
+        "web_search" | "web_fetch" | "web_extract" => Some("web_search"),
+        _ => None,
+    }
 }
 
 /// Apply a ceiling to the existing policy; never change Ask/Deny into Allow.

@@ -83,6 +83,22 @@ fn round(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
+/// Items named in an unmet target's detail; the rest are counted.
+const LISTED: usize = 10;
+
+fn listed(items: &[String]) -> String {
+    let mut out = items
+        .iter()
+        .take(LISTED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > LISTED {
+        out.push_str(&format!(" and {} more", items.len() - LISTED));
+    }
+    out
+}
+
 impl Measurement {
     pub fn scored(&self) -> impl Iterator<Item = (&FileMeasure, f64)> {
         self.files.iter().filter_map(|f| f.score.map(|s| (f, s)))
@@ -103,9 +119,50 @@ impl Measurement {
         self.checks.iter().filter(|c| !c.passed)
     }
 
+    /// Whether `file` is still work: below the minimum or mean score, or with a finding more
+    /// severe than allowed.
+    pub fn misses(file: &FileMeasure, targets: &Targets) -> bool {
+        let low = matches!((file.score, targets.work_bar()), (Some(s), Some(bar)) if s < bar);
+        let severe = targets
+            .max_severity
+            .is_some_and(|max| file.findings.iter().any(|f| f.severity > max));
+        low || severe
+    }
+
+    /// The files that miss a target, worst score first: the work still to do.
+    pub fn work(&self, targets: &Targets) -> Vec<&FileMeasure> {
+        let mut files: Vec<&FileMeasure> = self
+            .files
+            .iter()
+            .filter(|f| Self::misses(f, targets))
+            .collect();
+        files.sort_by(|a, b| {
+            let score = |f: &FileMeasure| f.score.unwrap_or(f64::MAX);
+            score(a)
+                .total_cmp(&score(b))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        files
+    }
+
     /// Every target `targets` sets that this measurement misses.
     pub fn unmet(&self, targets: &Targets) -> Vec<Unmet> {
         let mut out = Vec::new();
+        // An empty measurement proves nothing: the scope named no file that is measured.
+        if targets.on_files() && self.scored().next().is_none() {
+            out.push(Unmet {
+                target: "the scope is measured".into(),
+                detail: "no file in scope has a code health score".into(),
+            });
+        }
+        if let (Some(min), Some(mean)) = (targets.min_mean_health, self.mean_score()) {
+            if mean < min {
+                out.push(Unmet {
+                    target: format!("mean health at least {min}"),
+                    detail: format!("the mean is {}", round(mean)),
+                });
+            }
+        }
         if let Some(min) = targets.min_file_health {
             let below: Vec<String> = self
                 .scored()
@@ -115,7 +172,7 @@ impl Measurement {
             if !below.is_empty() {
                 out.push(Unmet {
                     target: format!("every file scores at least {min}"),
-                    detail: below.join(", "),
+                    detail: listed(&below),
                 });
             }
         }
@@ -130,7 +187,7 @@ impl Measurement {
             if !worse.is_empty() {
                 out.push(Unmet {
                     target: format!("no finding above {max:?}").to_lowercase(),
-                    detail: worse.join(", "),
+                    detail: listed(&worse),
                 });
             }
         }
@@ -152,14 +209,14 @@ impl Measurement {
             }
         }
         if targets.guidelines && !self.guideline_errors.is_empty() {
-            let listed: Vec<String> = self
+            let errors: Vec<String> = self
                 .guideline_errors
                 .iter()
                 .map(|e| format!("{}:{} {}", e.path, e.line, e.rule))
                 .collect();
             out.push(Unmet {
                 target: "no guideline errors".into(),
-                detail: listed.join(", "),
+                detail: listed(&errors),
             });
         }
         out
@@ -167,7 +224,7 @@ impl Measurement {
 
     /// One line for the journal and the user: scores, findings, guideline errors, checks.
     pub fn headline(&self) -> String {
-        let mut parts = Vec::new();
+        let mut parts = vec![format!("{} file(s) measured", self.scored().count())];
         if let (Some(worst), Some(mean)) = (self.worst_score(), self.mean_score()) {
             parts.push(format!(
                 "health worst {} / mean {}",

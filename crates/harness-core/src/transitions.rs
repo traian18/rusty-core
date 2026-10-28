@@ -1,3 +1,10 @@
+//! Deterministic reducer for agent commands and backend events.
+//!
+//! Backend-event handlers live in [`backend_events`], keeping this module's
+//! command reducer focused while sharing its private domain state.
+
+mod backend_events;
+
 use harness_protocol::backend::{ExecutionEvent, ExecutionRequest};
 use harness_protocol::commands::{
     AgentCommand, AgentError, AgentResult, AgentStatus, Attachment, CheckVerdict,
@@ -13,7 +20,7 @@ use harness_protocol::ids::{
 use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 use harness_protocol::tools::{PermissionMode, ToolCall, ToolError, ToolResult, ToolResultSummary};
 use harness_protocol::usage::{
-    AgentUsageMetrics, AgentUsageSnapshot, AgentUsageSummary, UsageRecord,
+    AgentUsageMetrics, AgentUsageSnapshot, AgentUsageSummary, ModelUsage, UsageRecord,
 };
 
 use crate::agent::Agent;
@@ -646,118 +653,28 @@ impl Agent {
 
     fn backend_event(&mut self, run_id: RunId, event: ExecutionEvent) -> Vec<AgentEffect> {
         if self.state.active_run != Some(run_id) {
-            return Vec::new();
+            Vec::new()
+        } else {
+            self.handle_backend_event(run_id, event)
         }
+    }
+
+    fn handle_backend_event(&mut self, run_id: RunId, event: ExecutionEvent) -> Vec<AgentEffect> {
         match event {
-            ExecutionEvent::TextDelta { delta, .. } => {
-                let from = self.state.status;
-                self.state.status = AgentStatus::Streaming;
-                let message_id = self.append_assistant_text(&delta);
-                let mut effects = Vec::new();
-                if from != AgentStatus::Streaming {
-                    effects.push(Self::state_changed(from, AgentStatus::Streaming));
-                }
-                effects.push(AgentEffect::Emit {
-                    event: AgentEvent::AssistantTextDelta { message_id, delta },
-                });
-                effects
-            }
+            ExecutionEvent::TextDelta { delta, .. } => backend_events::text_delta(self, delta),
             ExecutionEvent::ReasoningDelta { delta, .. } => {
-                let message_id = self.assistant_message_id();
-                vec![AgentEffect::Emit {
-                    event: AgentEvent::ReasoningDelta { message_id, delta },
-                }]
+                backend_events::reasoning_delta(self, delta)
             }
             ExecutionEvent::ToolCallRequested { call, .. } => self.tool_requested(call),
             ExecutionEvent::ToolCallStarted { call, .. } => {
-                let from = self.state.status;
-                self.state.status = AgentStatus::Executing;
-                let call_id = call.id;
-                self.push_tool_use(call.clone());
-                let mut effects = Vec::new();
-                if from != AgentStatus::Executing {
-                    effects.push(Self::state_changed(from, AgentStatus::Executing));
-                }
-                effects.push(AgentEffect::Emit {
-                    event: AgentEvent::ToolCallRequested { call },
-                });
-                effects.push(AgentEffect::Emit {
-                    event: AgentEvent::ToolCallStarted { call_id },
-                });
-                effects
+                backend_events::tool_started(self, call)
             }
             ExecutionEvent::ToolCallCompleted {
                 call_id, result, ..
-            } => {
-                let from = self.state.status;
-                self.state.status = AgentStatus::Streaming;
-                self.usage.tool_calls = self.usage.tool_calls.saturating_add(1);
-                let message_id = self.next_message_id();
-                let created_at = self.next_timestamp();
-                self.state.messages.push(AgentMessage {
-                    id: message_id,
-                    role: MessageRole::Tool,
-                    content: vec![ContentBlock::ToolResult {
-                        call_id,
-                        result: result.clone(),
-                    }],
-                    created_at,
-                });
-                let mut effects = Vec::new();
-                if from != AgentStatus::Streaming {
-                    effects.push(Self::state_changed(from, AgentStatus::Streaming));
-                }
-                effects.push(AgentEffect::Emit {
-                    event: AgentEvent::ToolCallCompleted { call_id, result },
-                });
-                effects
-            }
-            ExecutionEvent::UsageUpdate { usage, .. } => {
-                let timestamp = self.next_timestamp().to_rfc3339();
-                vec![AgentEffect::Emit {
-                    event: AgentEvent::UsageUpdated {
-                        usage: AgentUsageSnapshot {
-                            agent_id: self.id.to_string(),
-                            model: self.state.execution_params.model.clone(),
-                            metrics: AgentUsageMetrics {
-                                total_runs: self.usage.runs,
-                                total_requests: self.usage.records.len() as u64,
-                                total_tool_calls: self.usage.tool_calls,
-                                total_tokens: usage.total_tokens,
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                                cache_read_tokens: usage.cache_read_tokens,
-                                cache_write_tokens: usage.cache_write_tokens,
-                                reasoning_tokens: usage.reasoning_tokens,
-                                total_cost: None,
-                            },
-                            timestamp,
-                        },
-                    },
-                }]
-            }
+            } => backend_events::tool_completed(self, call_id, result),
+            ExecutionEvent::UsageUpdate { usage, .. } => backend_events::usage_update(self, usage),
             ExecutionEvent::Completed { result, .. } => {
-                self.state.backend_in_flight = false;
-                self.discard_trailing_empty_assistant_message();
-                let is_tool_turn = result.finish_reason == "tool_use";
-                self.usage.records.push(UsageRecord {
-                    model_usage: result.usage,
-                    cost: result.cost,
-                    tool_usage: None,
-                });
-                if matches!(
-                    result.finish_reason.as_str(),
-                    "max_tokens" | "length" | "max_output_tokens"
-                ) {
-                    return self.fail(
-                        "OUTPUT_LIMIT_REACHED",
-                        format!("The model stopped at its output token limit ({}); the response is incomplete.", result.finish_reason),
-                    );
-                }
-                if is_tool_turn {
-                    return self.continue_after_tools();
-                }
-                self.propose_completion(run_id, format!("Run completed: {}", result.finish_reason))
+                backend_events::completed(self, run_id, result)
             }
             ExecutionEvent::Error { error, .. } => self.fail("BACKEND_ERROR", format!("{error:?}")),
         }

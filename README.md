@@ -6,7 +6,7 @@ The repository is a Cargo workspace of small crates with explicit responsibility
 
 This README covers what the engine does, how it works, every integration and tool it ships with, and the three ways to use it: **embedding the crates in a Rust application**, **talking to a `harnessd` daemon over a socket/stdio/WebSocket** (directly or via an SDK), or **running one of the ready-made apps** (`harness`, `harnessd` + `harnessctl`).
 
-New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where each feature starts and which function does the next step.
+New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where each feature starts and which function does the next step. The [source module guide](crates/harness-core/src/README.md) explains the layout of the deterministic core implementation.
 
 ## Contents
 

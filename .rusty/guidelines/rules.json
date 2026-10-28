@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "size-and-complexity",
+      "kind": "metric",
+      "severity": "warn",
+      "max_file_lines": 800,
+      "max_function_lines": 80,
+      "max_complexity": 15,
+      "max_nesting": 4,
+      "max_params": 6,
+      "exclude": ["**/tests/**", "**/tests.rs"],
+      "message": "Organize modules around responsibility (style guide, section 6): this is past the project's size or complexity limit.",
+      "fix": "Split the function or file by responsibility behind a small interface; keep behaviour and the public API unchanged."
+    },
+    {
+      "id": "no-unwrap-outside-tests",
+      "kind": "pattern",
+      "regex": "\\.unwrap\\(\\)",
+      "severity": "warn",
+      "applies": ["crates/*/src/**/*.rs"],
+      "exclude": ["**/tests/**", "**/tests.rs", "**/testing/**"],
+      "message": "Represent absence and failure in the type (style guide, section 2): unwrap() panics on ordinary failure.",
+      "fix": "Return a Result or Option with `?`, or handle the case. In an inline #[cfg(test)] module this is fine."
+    },
+    {
+      "id": "expect-states-an-invariant",
+      "kind": "pattern",
+      "regex": "\\.expect\\(",
+      "severity": "warn",
+      "applies": ["crates/*/src/**/*.rs"],
+      "exclude": ["**/tests/**", "**/tests.rs", "**/testing/**"],
+      "message": "expect() is for a broken invariant, not for ordinary failure (style guide, section 2).",
+      "fix": "Return the error to the caller, or make the message say which invariant holds and why."
+    },
+    {
+      "id": "no-panic-for-ordinary-failure",
+      "kind": "pattern",
+      "regex": "\\bpanic!\\(",
+      "severity": "warn",
+      "applies": ["crates/*/src/**/*.rs"],
+      "exclude": ["**/tests/**", "**/tests.rs", "**/testing/**"],
+      "message": "Panicking for ordinary failure is a common trap (style guide, section 11).",
+      "fix": "Return an error the caller can handle; panic only on a bug."
+    },
+    {
+      "id": "no-todo-or-unimplemented",
+      "kind": "pattern",
+      "regex": "\\b(todo|unimplemented)!\\(",
+      "severity": "error",
+      "exclude": ["**/tests/**"],
+      "message": "Unfinished code: todo!() and unimplemented!() panic when reached.",
+      "fix": "Finish the code, or return an error that says what is not supported."
+    },
+    {
+      "id": "no-dbg",
+      "kind": "pattern",
+      "regex": "\\bdbg!\\(",
+      "severity": "error",
+      "message": "dbg!() is for local debugging and must not be committed.",
+      "fix": "Remove it, or log through the crate's tracing/logging."
+    },
+    {
+      "id": "no-print-in-libraries",
+      "kind": "pattern",
+      "regex": "\\b(e?println|e?print)!\\(",
+      "severity": "error",
+      "applies": ["crates/*/src/**/*.rs"],
+      "exclude": ["**/tests/**", "**/tests.rs", "**/testing/**", "**/bin/**", "**/main.rs"],
+      "message": "Library crates do not print: callers decide what reaches the terminal.",
+      "fix": "Return the value or an event, or use tracing/logging."
+    },
+    {
+      "id": "no-process-exit",
+      "kind": "pattern",
+      "regex": "\\bprocess::exit\\(",
+      "severity": "error",
+      "applies": ["crates/*/src/**/*.rs"],
+      "exclude": ["**/bin/**", "**/main.rs"],
+      "message": "A library must not end the process; it skips destructors and takes the decision from the caller.",
+      "fix": "Return an error and let the binary decide how to exit."
+    },
+    {
+      "id": "unsafe-needs-a-safety-comment",
+      "kind": "pattern",
+      "regex": "\\bunsafe\\s*\\{",
+      "severity": "warn",
+      "message": "Treat unsafe code as a contract (style guide, section 10).",
+      "fix": "Keep the block as small as possible and put a `// SAFETY:` comment above it saying why each assumption holds."
+    },
+    {
+      "id": "no-glob-reexports",
+      "kind": "pattern",
+      "regex": "^\\s*pub\\s+use\\s+.*::\\*;",
+      "severity": "warn",
+      "applies": ["crates/*/src/**/*.rs"],
+      "message": "Making everything public is a common trap (style guide, sections 4 and 11): a glob re-export widens the public API silently.",
+      "fix": "Re-export the items callers need, by name."
+    },
+    {
+      "id": "shared-state-is-a-design-choice",
+      "kind": "prose",
+      "severity": "info",
+      "applies": ["crates/*/src/**/*.rs"],
+      "text": "Prefer clear ownership and message passing over Arc<Mutex<_>>; reach for shared mutable state only when the design needs it, and keep locks short (style guide, section 9)."
+    },
+    {
+      "id": "errors-are-layered",
+      "kind": "prose",
+      "severity": "info",
+      "applies": ["crates/*/src/**/*.rs"],
+      "text": "Library crates return typed errors (thiserror-style enums) that say what failed; add context at boundaries instead of turning errors into strings early (style guide, section 7)."
+    }
+  ]
+}

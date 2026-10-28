@@ -1,6 +1,7 @@
 use harness_goals::{
     decide, pass_prompt, record, status_text, CheckOutcome, FileMeasure, FindingSummary, Goal,
-    GoalStatus, GuidelineSummary, Measurement, PassReport, Severity, Targets, Verdict,
+    GoalStatus, GuidelineSummary, Measurement, PassReport, PlanStep, Severity, StepStatus, Targets,
+    Verdict,
 };
 
 fn finding(severity: Severity) -> FindingSummary {
@@ -261,4 +262,243 @@ fn a_check_the_pass_did_not_run_is_unmet_but_never_undoes_the_pass() {
         "t".into(),
     );
     assert_eq!(goal.status, GoalStatus::Running);
+}
+
+fn files(scores: &[(&str, f64)], fingerprint: &str) -> Measurement {
+    Measurement {
+        files: scores
+            .iter()
+            .map(|(path, score)| FileMeasure {
+                path: (*path).into(),
+                score: Some(*score),
+                findings: vec![finding(Severity::Medium)],
+            })
+            .collect(),
+        guideline_errors: Vec::new(),
+        guideline_warnings: 0,
+        checks: Vec::new(),
+        fingerprint: fingerprint.into(),
+    }
+}
+
+fn health_goal(min: f64, baseline: Measurement) -> Goal {
+    let mut goal = Goal::new("g2".into(), "Raise the repo's health".into(), "t0".into());
+    goal.scope = vec!["crates".into()];
+    goal.targets = Targets {
+        min_file_health: Some(min),
+        ..Targets::default()
+    };
+    goal.baseline = Some(baseline);
+    goal
+}
+
+#[test]
+fn a_scope_with_nothing_measured_never_meets_a_health_target() {
+    let empty = files(&[], "e");
+    let mut goal = health_goal(8.5, empty.clone());
+    let decision = decide(&goal, &empty, &PassReport::default());
+    assert_ne!(decision.verdict, Verdict::Done);
+    assert!(decision.unmet.iter().any(|u| u.target.contains("measured")));
+    goal.targets.min_file_health = None;
+    goal.targets.min_mean_health = Some(8.5);
+    assert_ne!(
+        decide(&goal, &empty, &PassReport::default()).verdict,
+        Verdict::Done
+    );
+}
+
+#[test]
+fn the_mean_target_is_the_scope_s_general_health() {
+    let mut goal = health_goal(6.0, files(&[("a.rs", 9.0), ("b.rs", 7.0)], "a"));
+    goal.targets.min_mean_health = Some(8.5);
+    let unmet = goal.baseline.as_ref().unwrap().unmet(&goal.targets);
+    assert_eq!(unmet.len(), 1, "{unmet:?}");
+    assert!(unmet[0].detail.contains("8"));
+    let now = files(&[("a.rs", 9.0), ("b.rs", 8.5)], "b");
+    assert_eq!(pass(&mut goal, now, PassReport::default()), Verdict::Done);
+}
+
+#[test]
+fn fixing_one_file_of_many_is_progress() {
+    let many: Vec<(String, f64)> = (0..200).map(|i| (format!("f{i:03}.rs"), 3.0)).collect();
+    let scores = |fixed: f64| {
+        let mut list: Vec<(&str, f64)> = many.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        list[0].1 = fixed;
+        list
+    };
+    let mut goal = health_goal(8.5, files(&scores(3.0), "a"));
+    // Better but still below the target: the shortfall says so, the mean hardly moves.
+    assert_eq!(
+        pass(&mut goal, files(&scores(5.0), "b"), PassReport::default()),
+        Verdict::Continue
+    );
+    assert_eq!(goal.stalled, 0);
+}
+
+#[test]
+fn a_pass_is_told_to_plan_a_share_of_the_work_list_and_hand_over() {
+    let scores: Vec<(String, f64)> = (0..20)
+        .map(|i| (format!("f{i:02}.rs"), 2.0 + i as f64 * 0.4))
+        .collect();
+    let list: Vec<(&str, f64)> = scores.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut goal = health_goal(8.5, files(&list, "a"));
+    let prompt = pass_prompt(&goal, goal.baseline.as_ref().unwrap());
+    for expected in [
+        "Work list: 17 file(s) miss a target (3 already meet them)",
+        "update_todos",
+        "at least 3 from the top of the work list (17 left, 8 pass(es) left",
+        "- `f00.rs`: health 2",
+        "also missing a target: `f15.rs`",
+        "Next: <",
+    ] {
+        assert!(prompt.contains(expected), "missing {expected}:\n{prompt}");
+    }
+    assert!(
+        !prompt.contains("`f19.rs`"),
+        "files meeting the target are not work:\n{prompt}"
+    );
+    let report = PassReport {
+        agent_status: Some("done".into()),
+        next: Some("split task_queue.rs".into()),
+        ..PassReport::default()
+    };
+    pass(&mut goal, files(&list, "b"), report);
+    let prompt = pass_prompt(&goal, goal.last.as_ref().unwrap());
+    assert!(
+        prompt.contains("The last pass left this for you: split task_queue.rs"),
+        "{prompt}"
+    );
+}
+
+fn step(content: &str, status: StepStatus) -> PlanStep {
+    PlanStep {
+        content: content.into(),
+        status,
+    }
+}
+
+fn judged(yes: bool, plan: Vec<PlanStep>) -> PassReport {
+    PassReport {
+        agent_status: Some("done".into()),
+        done_when_met: Some(yes),
+        plan,
+        ..PassReport::default()
+    }
+}
+
+#[test]
+fn a_task_goal_is_planned_first_and_done_only_when_the_plan_is_closed_and_judged_done() {
+    let mut goal = Goal::new(
+        "g3".into(),
+        "Add CSV export to the report page".into(),
+        "t0".into(),
+    );
+    goal.baseline = Some(files(&[], "e"));
+    assert!(goal.is_task());
+    let prompt = pass_prompt(&goal, goal.baseline.as_ref().unwrap());
+    for expected in [
+        "Plan the whole goal first",
+        "No plan yet",
+        "update_todos",
+        "Done when: yes",
+        "whether the goal is fully done",
+    ] {
+        assert!(prompt.contains(expected), "missing {expected}:\n{prompt}");
+    }
+    assert!(!prompt.contains("Work list"), "{prompt}");
+
+    // The agent's word alone, without a plan, does not end it.
+    assert_eq!(
+        pass(&mut goal, files(&[], "e"), judged(true, vec![])),
+        Verdict::Continue
+    );
+
+    // A plan with steps open is kept and counts as progress even if the files hash the same.
+    let plan = vec![
+        step("Add the export button in report.tsx", StepStatus::Completed),
+        step("Write the CSV encoder and its test", StepStatus::Pending),
+    ];
+    assert_eq!(
+        pass(&mut goal, files(&[], "e"), judged(true, plan)),
+        Verdict::Continue
+    );
+    assert_eq!(goal.stalled, 0);
+    assert_eq!(goal.plan.len(), 2);
+    let prompt = pass_prompt(&goal, goal.last.as_ref().unwrap());
+    for expected in [
+        "The plan so far (1 of 2 closed)",
+        "[x] Add the export button",
+        "[ ] Write the CSV encoder",
+        "Carry on with the plan above",
+        "1 step(s) left: Write the CSV encoder",
+    ] {
+        assert!(prompt.contains(expected), "missing {expected}:\n{prompt}");
+    }
+
+    // Closed, but a check the pass ran fails: not done.
+    let closed = vec![
+        step("Add the export button in report.tsx", StepStatus::Completed),
+        step("Write the CSV encoder and its test", StepStatus::Completed),
+    ];
+    let mut failing = files(&[], "f");
+    failing.checks.push(CheckOutcome {
+        name: "test".into(),
+        passed: false,
+        ran: true,
+        summary: "1 failed".into(),
+    });
+    let decision = decide(&goal, &failing, &judged(true, closed.clone()));
+    assert_ne!(decision.verdict, Verdict::Done);
+    assert!(
+        decision.unmet.iter().any(|u| u.target == "test passes"),
+        "{:?}",
+        decision.unmet
+    );
+
+    // Closed and judged not done: goes on; closed, checks pass and judged done: done.
+    assert_eq!(
+        decide(&goal, &files(&[], "g"), &judged(false, closed.clone())).verdict,
+        Verdict::Continue
+    );
+    assert_eq!(
+        pass(&mut goal, files(&[], "g"), judged(true, closed)),
+        Verdict::Done
+    );
+    assert_eq!(goal.status, GoalStatus::Done);
+}
+
+#[test]
+fn a_task_pass_whose_new_code_scores_lower_is_kept() {
+    let mut goal = Goal::new("g4".into(), "Add an importer".into(), "t0".into());
+    goal.baseline = Some(files(&[("src/a.rs", 9.0)], "a"));
+    let plan = vec![
+        step("Write the importer", StepStatus::Completed),
+        step("Wire it in", StepStatus::Pending),
+    ];
+    let verdict = pass(
+        &mut goal,
+        files(&[("src/a.rs", 6.0), ("src/importer.rs", 5.0)], "b"),
+        judged(false, plan),
+    );
+    assert_eq!(verdict, Verdict::Continue);
+    assert!(goal
+        .journal
+        .last()
+        .is_some_and(|e| e.verdict != Verdict::Undone));
+}
+
+#[test]
+fn a_scope_in_words_is_given_to_the_pass_to_work_out() {
+    let mut goal = Goal::new("g5".into(), "Make it fast".into(), "t0".into());
+    goal.scope_note = Some("the task queue and whatever schedules it".into());
+    goal.baseline = Some(files(&[], "e"));
+    let prompt = pass_prompt(&goal, goal.baseline.as_ref().unwrap());
+    assert!(
+        prompt.contains("Scope: the task queue and whatever schedules it\nWork out from this"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Measured on: the files you change."),
+        "{prompt}"
+    );
 }

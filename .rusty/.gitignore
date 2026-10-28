@@ -1,0 +1,31 @@
+# Written by Rusty; remove this line to keep your own version.
+# Git keeps only the shared parts of this folder; everything else, including anything new,
+# stays on this machine. (A repository whose own .gitignore ignores /.rusty keeps none of it.)
+/*
+# README.md: this guide to the folder
+!/README.md
+# .gitignore: what Git keeps of this folder: the shared parts only
+!/.gitignore
+# guidelines/: the project's code guidelines: rules.json (patterns, size and complexity limits, import boundaries; checked on every edit and before a run finishes) and style.md (the prose style guide the agent is shown before it edits a file)
+!/guidelines/
+# specs/: spec-driven changes: each change's proposal, design and task list, and the capability specs (Specs page)
+!/specs/
+# specs.json: where the specs live
+!/specs.json
+# skills/: the project's own skills
+!/skills/
+# workflows/: saved workflows (Behaviors page)
+!/workflows/
+# profiles/: behavior profiles, and config.json naming the default one
+!/profiles/
+# canvas/: canvas pipelines and their layout
+!/canvas/
+
+# Stays on this machine:
+# chats/: the Agent tab's conversations, one file per chat
+# runs/: event logs of agent and workflow runs
+# goals/: goal loops (/goal): each goal's targets, plan, measurements and journal; <id>.checkpoint.json names the snapshot the running pass started from
+# findings/: long answers the agent saved as documents
+# metrics/: usage and code health history
+# observability/: traces of model and tool calls
+# notepad.txt: the notepad

@@ -54,6 +54,27 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
         })
     };
 
+    validate_identity(&profile, &mut issue);
+    validate_instructions(&profile, &mut issue);
+    validate_tools(&profile, &mut issue);
+    validate_execution_and_limits(&profile, &mut issue);
+    validate_rules_and_children(&profile, &mut issue);
+
+    if issues.is_empty() {
+        let content_hash = crate::content_hash::content_hash(&profile);
+        Ok(CompiledProfile {
+            profile,
+            content_hash,
+        })
+    } else {
+        Err(ProfileValidationError { issues })
+    }
+}
+
+fn validate_identity(
+    profile: &BehaviorProfile,
+    issue: &mut impl FnMut(&str, &'static str, String),
+) {
     if profile.schema_version != BEHAVIOR_SCHEMA_VERSION {
         issue(
             "schema_version",
@@ -77,7 +98,12 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
     if profile.name.trim().is_empty() {
         issue("name", "empty_name", "profile name cannot be empty".into());
     }
+}
 
+fn validate_instructions(
+    profile: &BehaviorProfile,
+    issue: &mut impl FnMut(&str, &'static str, String),
+) {
     for (family, text) in &profile.instructions.variants {
         if family.trim().is_empty() || *family != family.to_lowercase() {
             issue(
@@ -105,7 +131,9 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
                 .into(),
         );
     }
+}
 
+fn validate_tools(profile: &BehaviorProfile, issue: &mut impl FnMut(&str, &'static str, String)) {
     if let ToolScope::AllowList(tools) = &profile.tools {
         let mut seen = BTreeSet::new();
         for tool in tools {
@@ -145,7 +173,12 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
             );
         }
     }
+}
 
+fn validate_execution_and_limits(
+    profile: &BehaviorProfile,
+    issue: &mut impl FnMut(&str, &'static str, String),
+) {
     if let Some(temperature) = profile.execution.temperature {
         if !(0.0..=2.0).contains(&temperature) {
             issue(
@@ -194,7 +227,12 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
             "final_turn_prompt cannot be empty".into(),
         );
     }
+}
 
+fn validate_rules_and_children(
+    profile: &BehaviorProfile,
+    issue: &mut impl FnMut(&str, &'static str, String),
+) {
     let mut rule_ids = BTreeSet::new();
     for (index, rule) in profile.rules.iter().enumerate() {
         let path = format!("rules[{index}]");
@@ -219,12 +257,12 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
             );
         }
         if let Some(condition) = &rule.when {
-            validate_condition(condition, rule.on, &format!("{path}.when"), &mut issue);
+            validate_condition(condition, rule.on, &format!("{path}.when"), issue);
         }
-        validate_action(&rule.action, rule.on, &format!("{path}.do"), &mut issue);
+        validate_action(&rule.action, rule.on, &format!("{path}.do"), issue);
     }
     if let Some(gate) = &profile.completion_gate {
-        validate_gate(gate, &mut issue);
+        validate_gate(gate, issue);
     }
     if !matches!(profile.children, ChildPolicy::Inherit) {
         issue(
@@ -235,16 +273,6 @@ pub fn compile(profile: BehaviorProfile) -> Result<CompiledProfile, ProfileValid
                 profile.children.type_name()
             ),
         );
-    }
-
-    if issues.is_empty() {
-        let content_hash = crate::content_hash::content_hash(&profile);
-        Ok(CompiledProfile {
-            profile,
-            content_hash,
-        })
-    } else {
-        Err(ProfileValidationError { issues })
     }
 }
 
