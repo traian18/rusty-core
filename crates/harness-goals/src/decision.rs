@@ -182,7 +182,11 @@ pub fn decide(goal: &Goal, now: &Measurement, report: &PassReport) -> Decision {
         let reason = format!("No measurable progress in {stalled} pass(es) in a row; paused.");
         return decision(Verdict::NoProgress, GoalStatus::Paused, undo, reason);
     }
-    if passes >= goal.budget.max_passes.max(1) {
+    if goal
+        .budget
+        .max_passes
+        .is_some_and(|max| passes >= max.max(1))
+    {
         let reason = format!("{passes} pass(es) used, the whole budget; paused.");
         let verdict = if undo {
             Verdict::Undone

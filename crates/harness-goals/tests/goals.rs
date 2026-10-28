@@ -158,7 +158,7 @@ fn passes_without_progress_pause_the_goal() {
 #[test]
 fn the_budget_pauses_and_a_blocker_blocks() {
     let mut goal = goal();
-    goal.budget.max_passes = 2;
+    goal.budget.max_passes = Some(2);
     pass(
         &mut goal,
         measured(6.0, vec![], true, "b"),
@@ -171,6 +171,28 @@ fn the_budget_pauses_and_a_blocker_blocks() {
             PassReport::default()
         ),
         Verdict::Budget
+    );
+    assert_eq!(goal.status, GoalStatus::Paused);
+
+    // Without a limit the goal goes on while it makes progress, and stops when it makes none.
+    let mut goal = self::goal();
+    assert_eq!(goal.budget.max_passes, None);
+    assert!(pass_prompt(&goal, goal.baseline.as_ref().unwrap()).contains("There is no pass limit"));
+    for (pass_number, score) in (1..=12).map(|n| 5.0 + f64::from(n) * 0.2).enumerate() {
+        let verdict = pass(
+            &mut goal,
+            measured(score, vec![], true, &format!("p{pass_number}")),
+            PassReport::default(),
+        );
+        assert_eq!(verdict, Verdict::Continue, "pass {pass_number}");
+    }
+    assert_eq!(goal.passes, 12);
+    assert!(status_text(&goal).contains("12 pass(es)"));
+    let same = measured(7.4, vec![], true, "same");
+    pass(&mut goal, same.clone(), PassReport::default());
+    assert_eq!(
+        pass(&mut goal, same, PassReport::default()),
+        Verdict::NoProgress
     );
     assert_eq!(goal.status, GoalStatus::Paused);
 
@@ -230,7 +252,7 @@ fn the_prompt_and_status_say_where_the_goal_stands() {
     let goal = goal();
     let prompt = pass_prompt(&goal, goal.baseline.as_ref().unwrap());
     for expected in [
-        "Goal pass 1 of at most 8",
+        "Goal pass 1. There is no pass limit",
         "Make run.ts healthy",
         "at least 8.5",
         "`test` passes",
@@ -240,7 +262,13 @@ fn the_prompt_and_status_say_where_the_goal_stands() {
     ] {
         assert!(prompt.contains(expected), "missing {expected}:\n{prompt}");
     }
-    assert!(status_text(&goal).starts_with("Goal (running, 0 of 8 passes)"));
+    assert!(status_text(&goal).starts_with("Goal (running, 0 pass(es))"));
+    let mut limited = goal.clone();
+    limited.budget.max_passes = Some(8);
+    assert!(
+        pass_prompt(&limited, goal.baseline.as_ref().unwrap()).contains("Goal pass 1 of at most 8")
+    );
+    assert!(status_text(&limited).starts_with("Goal (running, 0 of 8 passes)"));
 }
 
 #[test]
@@ -346,7 +374,7 @@ fn a_pass_is_told_to_plan_a_share_of_the_work_list_and_hand_over() {
     for expected in [
         "Work list: 17 file(s) miss a target (3 already meet them)",
         "update_todos",
-        "at least 3 from the top of the work list (17 left, 8 pass(es) left",
+        "at least 4 from the top of the work list (17 left, no pass limit)",
         "- `f00.rs`: health 2",
         "also missing a target: `f15.rs`",
         "Next: <",
@@ -356,6 +384,12 @@ fn a_pass_is_told_to_plan_a_share_of_the_work_list_and_hand_over() {
     assert!(
         !prompt.contains("`f19.rs`"),
         "files meeting the target are not work:\n{prompt}"
+    );
+    goal.budget.max_passes = Some(8);
+    let prompt = pass_prompt(&goal, goal.baseline.as_ref().unwrap());
+    assert!(
+        prompt.contains("at least 3 from the top of the work list (17 left, 8 pass(es) left"),
+        "{prompt}"
     );
     let report = PassReport {
         agent_status: Some("done".into()),

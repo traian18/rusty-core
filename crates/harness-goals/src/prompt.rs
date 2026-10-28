@@ -16,6 +16,8 @@ const JOURNAL_LINES: usize = 5;
 const WORK_LISTED: usize = 15;
 /// Files a pass takes on at least, while that many are left.
 const MIN_FILES_PER_PASS: usize = 3;
+/// Without a pass limit, a pass takes on the work list as if this many passes were left.
+const UNLIMITED_PACE: usize = 5;
 
 fn round(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
@@ -87,9 +89,12 @@ fn measurement_section(out: &mut String, measurement: &Measurement, targets: &Ta
 }
 
 /// How many files of the work list this pass takes on: its share of what is left over the passes
-/// left, and at least [`MIN_FILES_PER_PASS`].
+/// left (or [`UNLIMITED_PACE`] without a limit), and at least [`MIN_FILES_PER_PASS`].
 fn files_this_pass(goal: &Goal, left: usize) -> usize {
-    let passes_left = goal.budget.max_passes.saturating_sub(goal.passes).max(1) as usize;
+    let passes_left = goal
+        .budget
+        .passes_left(goal.passes)
+        .map_or(UNLIMITED_PACE, |n| n as usize);
     left.div_ceil(passes_left).max(MIN_FILES_PER_PASS).min(left)
 }
 
@@ -158,10 +163,13 @@ fn this_pass(out: &mut String, goal: &Goal, current: &Measurement) {
     );
     if left > 0 {
         let take = files_this_pass(goal, left);
+        let passes = match goal.budget.passes_left(goal.passes) {
+            Some(n) => format!("{n} pass(es) left including this one"),
+            None => "no pass limit".to_owned(),
+        };
         let _ = writeln!(
             out,
-            "1. Plan first. Look at each file you take on (repo_health and repo_context; repo_health's score also counts change history, which no edit fixes, while the scores here are the code alone), then call update_todos with one item per file — at least {take} from the top of the work list ({left} left, {} pass(es) left including this one) — each naming the findings you will fix and how.",
-            goal.budget.max_passes.saturating_sub(goal.passes).max(1)
+            "1. Plan first. Look at each file you take on (repo_health and repo_context; repo_health's score also counts change history, which no edit fixes, while the scores here are the code alone), then call update_todos with one item per file — at least {take} from the top of the work list ({left} left, {passes}) — each naming the findings you will fix and how."
         );
         let _ = writeln!(
             out,
@@ -188,11 +196,18 @@ fn this_pass(out: &mut String, goal: &Goal, current: &Measurement) {
 pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
     let pass = goal.passes + 1;
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Goal pass {pass} of at most {}.",
-        goal.budget.max_passes
-    );
+    match goal.budget.max_passes {
+        Some(max) => {
+            let _ = writeln!(out, "Goal pass {pass} of at most {max}.");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "Goal pass {pass}. There is no pass limit: passes go on until the goal is done, blocked, or {} pass(es) in a row make no progress.",
+                goal.budget.no_progress_passes.max(1)
+            );
+        }
+    }
     let _ = writeln!(out, "\n## Goal\n{}", goal.instruction.trim());
     let _ = writeln!(out, "\n## Done when");
     let unmet = unmet(goal, &goal.plan, current);
@@ -312,12 +327,11 @@ pub fn status_text(goal: &Goal) -> String {
         GoalStatus::Blocked => "blocked",
         GoalStatus::Cleared => "cleared",
     };
-    let mut out = format!(
-        "Goal ({status}, {} of {} passes): {}",
-        goal.passes,
-        goal.budget.max_passes,
-        goal.instruction.trim()
-    );
+    let passes = match goal.budget.max_passes {
+        Some(max) => format!("{} of {max} passes", goal.passes),
+        None => format!("{} pass(es)", goal.passes),
+    };
+    let mut out = format!("Goal ({status}, {passes}): {}", goal.instruction.trim());
     if let Some(reason) = &goal.reason {
         let _ = write!(out, "\n{reason}");
     }

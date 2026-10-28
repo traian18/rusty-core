@@ -220,16 +220,30 @@ impl Targets {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
-    /// Passes before the goal pauses; resuming starts a fresh count.
-    pub max_passes: u32,
+    /// Passes before the goal pauses (`loops=`); resuming starts a fresh count. Without one the
+    /// goal runs until it is done, blocked, or stops making progress.
+    #[serde(default)]
+    pub max_passes: Option<u32>,
     /// Passes in a row without measurable progress before the goal pauses.
+    #[serde(default = "default_no_progress")]
     pub no_progress_passes: u32,
+}
+
+fn default_no_progress() -> u32 {
+    Budget::default().no_progress_passes
+}
+
+impl Budget {
+    /// Passes left after `used`, when there is a limit.
+    pub fn passes_left(&self, used: u32) -> Option<u32> {
+        self.max_passes.map(|max| max.saturating_sub(used).max(1))
+    }
 }
 
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_passes: 8,
+            max_passes: None,
             no_progress_passes: 2,
         }
     }
