@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 mod brief;
 mod checks;
 mod recovery;
-mod snapshot;
+pub(crate) mod snapshot;
 mod split;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -471,6 +471,7 @@ fn is_read_only(tool: &str) -> bool {
             | "repo_health"
             | "repo_risk"
             | "repo_symbol"
+            | "code_guidelines"
             | "repo_wiki"
             | "report_progress"
             | "ask_user_question"

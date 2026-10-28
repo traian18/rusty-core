@@ -294,7 +294,13 @@ fn any_allow_list_admits_the_repository_tools_every_model_gets() {
     let mut writer = profile("p", 1);
     writer.tools = ToolScope::AllowList(vec!["write_file".into()]);
     let writer = compiled(writer);
-    for tool in ["repo_overview", "repo_health", "repo_risk", "repo_symbol"] {
+    for tool in [
+        "repo_overview",
+        "repo_health",
+        "repo_risk",
+        "repo_symbol",
+        "code_guidelines",
+    ] {
         assert!(writer.allows_tool(tool), "{tool}");
     }
     assert!(

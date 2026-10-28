@@ -47,6 +47,17 @@ pub fn metrics_supported(language: &LanguageId) -> bool {
     dialect::for_language(language).is_some()
 }
 
+/// The tree-sitter grammar `path` is parsed with, for queries over its syntax; `None` for a
+/// language that is not measured.
+pub fn grammar(language: &LanguageId, path: &str) -> Option<tree_sitter::Language> {
+    dialect::for_language(language).map(|dialect| dialect.grammar(path))
+}
+
+/// The measured language of a file, by its extension.
+pub fn language_of(path: &str) -> Option<LanguageId> {
+    crate::adapters::language_for(path)
+}
+
 /// Measures every function and class in `source`. A file with syntax errors is still measured
 /// and marked `partial`.
 pub fn measure_file(

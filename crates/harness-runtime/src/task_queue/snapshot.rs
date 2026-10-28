@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// One repository's recorded tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct RepoSnapshot {
+pub struct RepoSnapshot {
     /// The repository folder relative to the workspace root ("" for the root).
     pub repo: String,
     pub commit: String,
@@ -24,14 +24,14 @@ pub(super) struct RepoSnapshot {
 
 /// The recorded trees of every repository in the workspace.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(super) struct Snapshot {
+pub struct Snapshot {
     pub label: String,
     pub repos: Vec<RepoSnapshot>,
 }
 
 /// What undoing an attempt did.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(super) struct Undone {
+pub struct Undone {
     /// Files put back as they were (`repo/path`).
     pub files: Vec<String>,
     /// Where the undone attempt is kept.
@@ -40,7 +40,7 @@ pub(super) struct Undone {
 
 /// Records every repository under `root`. Repositories that cannot be read
 /// are left out; no repository at all gives an empty snapshot.
-pub(super) fn take(root: &Path, label: &str) -> Snapshot {
+pub fn take(root: &Path, label: &str) -> Snapshot {
     let repos = repositories(root)
         .into_iter()
         .filter_map(|(name, path)| {
@@ -59,7 +59,7 @@ pub(super) fn take(root: &Path, label: &str) -> Snapshot {
 
 /// Puts every file that changed since `baseline` back as it was, after
 /// recording the current state under `<label>`.
-pub(super) fn undo_to(root: &Path, baseline: &Snapshot, label: &str) -> Result<Undone, String> {
+pub fn undo_to(root: &Path, baseline: &Snapshot, label: &str) -> Result<Undone, String> {
     let attempt = take(root, label);
     let mut files = Vec::new();
     for base in &baseline.repos {
@@ -115,7 +115,7 @@ fn is_repository(path: &Path) -> bool {
 
 /// The tree of every repository's working tree, as (repository, tree id),
 /// without recording anything: two equal fingerprints mean no file changed.
-pub(super) fn fingerprint(root: &Path) -> Vec<(String, String)> {
+pub fn fingerprint(root: &Path) -> Vec<(String, String)> {
     repositories(root)
         .into_iter()
         .filter_map(|(name, path)| {
@@ -127,7 +127,7 @@ pub(super) fn fingerprint(root: &Path) -> Vec<(String, String)> {
 
 /// The changes from `base` to `now` as a unified diff, cut to about
 /// `max_chars` (a planner reads it to reuse what an undone attempt learned).
-pub(super) fn patch(root: &Path, base: &Snapshot, now: &Snapshot, max_chars: usize) -> String {
+pub fn patch(root: &Path, base: &Snapshot, now: &Snapshot, max_chars: usize) -> String {
     let mut text = String::new();
     for base_repo in &base.repos {
         let Some(now_repo) = now.repos.iter().find(|repo| repo.repo == base_repo.repo) else {

@@ -1,0 +1,307 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GuidelinesFile",
+  "description": "`.rusty/guidelines/rules.json`.",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "properties": {
+    "detectors": {
+      "description": "Code health thresholds for this project, over the defaults: any detector's settings, and `disabled` detector ids. Code health and the goal loop measure with these."
+    },
+    "limits": {
+      "description": "Limits every source file is held to; a rule of kind `metric` narrows or widens them for some files.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/MetricLimits"
+        }
+      ]
+    },
+    "rules": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Rule"
+      }
+    },
+    "version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "MetricLimits": {
+      "description": "Unset limits do not apply.",
+      "type": "object",
+      "properties": {
+        "max_complexity": {
+          "description": "Cyclomatic complexity of one function.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_file_lines": {
+          "description": "Lines in the file, blank and comment lines included.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_function_lines": {
+          "description": "Lines of code in one function.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_nesting": {
+          "description": "Deepest nesting of control blocks in one function.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_params": {
+          "description": "Declared parameters of one function.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Rule": {
+      "description": "Unknown fields are not refused here: the rule's kind (flattened in) reads the rest.",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Text that must not appear: a regex over each line, or a tree-sitter query over the syntax (`lang` names the grammar; a capture named `violation` marks the lines, otherwise the first capture). Exactly one of `regex` and `query`.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "pattern"
+              ]
+            },
+            "lang": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "regex": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Size and complexity limits for the files the rule applies to, over the file's `limits`.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "metric"
+              ]
+            },
+            "max_complexity": {
+              "description": "Cyclomatic complexity of one function.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_file_lines": {
+              "description": "Lines in the file, blank and comment lines included.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_function_lines": {
+              "description": "Lines of code in one function.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_nesting": {
+              "description": "Deepest nesting of control blocks in one function.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_params": {
+              "description": "Declared parameters of one function.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Files the rule applies to must not import files matching `must_not_import`.",
+          "type": "object",
+          "required": [
+            "kind",
+            "must_not_import"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "boundary"
+              ]
+            },
+            "must_not_import": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A guideline in words, given to the model for the files it applies to. Not checked by the host.",
+          "type": "object",
+          "required": [
+            "kind",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "prose"
+              ]
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "applies": {
+          "description": "Globs of the files the rule applies to, relative to the repository root; empty = all.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "disabled": {
+          "description": "Switched off without deleting it.",
+          "type": "boolean"
+        },
+        "exclude": {
+          "description": "Globs of files the rule never applies to (tests, generated code).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fix": {
+          "description": "How to fix a violation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Unique, kebab-case: what violations and the tool name it by.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What a violation says; each kind has a default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "default": "error",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Severity"
+            }
+          ]
+        }
+      }
+    },
+    "Severity": {
+      "oneOf": [
+        {
+          "description": "Shown to the model; never reported as a violation.",
+          "type": "string",
+          "enum": [
+            "info"
+          ]
+        },
+        {
+          "description": "Reported, never blocks.",
+          "type": "string",
+          "enum": [
+            "warn"
+          ]
+        },
+        {
+          "description": "Blocks finishing while the change introduced it.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        }
+      ]
+    }
+  }
+}

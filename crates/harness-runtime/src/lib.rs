@@ -37,5 +37,13 @@ pub mod workspace;
 
 pub use integration::{IntegrationError, IntegrationFactory, IntegrationRegistry};
 
+/// Checkpoints of the workspace's git repositories under hidden refs, and undoing back to one:
+/// the task queue's, also used by hosts that run their own passes (goal loops).
+pub mod workspace_snapshot {
+    pub use crate::task_queue::snapshot::{
+        fingerprint, patch, take, undo_to, RepoSnapshot, Snapshot, Undone,
+    };
+}
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

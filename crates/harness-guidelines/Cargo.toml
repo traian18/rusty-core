@@ -1,0 +1,18 @@
+[package]
+name = "harness-guidelines"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+harness-code-analysis = { path = "../harness-code-analysis" }
+harness-code-health = { path = "../harness-code-health" }
+regex = "1"
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }

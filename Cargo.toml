@@ -25,6 +25,8 @@ members = [
     "crates/harness-context-repository",
     "crates/harness-code-analysis",
     "crates/harness-code-health",
+    "crates/harness-guidelines",
+    "crates/harness-goals",
     "crates/harness-infra-analysis",
     "crates/harness-specs",
     "crates/tools/code-analysis",

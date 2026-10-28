@@ -144,7 +144,13 @@ fn the_repository_tools_every_model_gets_survive_any_policy() {
         enabled_tools: vec!["write_file".into()],
         allowed_mcp_servers: vec![],
     };
-    for tool in ["repo_overview", "repo_health", "repo_risk", "repo_symbol"] {
+    for tool in [
+        "repo_overview",
+        "repo_health",
+        "repo_risk",
+        "repo_symbol",
+        "code_guidelines",
+    ] {
         assert!(
             allows_tool(&policy, tool),
             "{tool} in plan mode without read_file"

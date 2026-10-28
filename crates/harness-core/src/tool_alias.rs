@@ -46,15 +46,23 @@ const GRANTED_WITH: &[(&str, &str)] = &[
     ("repo_health", "read_file"),
     ("repo_risk", "read_file"),
     ("repo_symbol", "read_file"),
+    ("code_guidelines", "read_file"),
     ("job_output", "run_command"),
 ];
 
 /// The read-only repository tools every model that may use tools at all gets,
 /// whatever its step or profile lists: what a repository is, what is risky to
-/// touch, whether an edit made the code better or worse, one symbol's body.
+/// touch, whether an edit made the code better or worse, one symbol's body, and the project's
+/// own code guidelines.
 /// They are granted with `read_file` too, so its permission override binds them;
 /// a scope with no tools at all (a step that only replies) stays without them.
-pub const ALWAYS_ADMITTED: &[&str] = &["repo_overview", "repo_health", "repo_risk", "repo_symbol"];
+pub const ALWAYS_ADMITTED: &[&str] = &[
+    "repo_overview",
+    "repo_health",
+    "repo_risk",
+    "repo_symbol",
+    "code_guidelines",
+];
 
 /// The tool `name` follows in rules, history, allow-lists and permissions,
 /// when `name` is an alias.
@@ -148,7 +156,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ])
         );
         assert_eq!(
@@ -169,6 +178,7 @@ mod tests {
                 "repo_health",
                 "repo_risk",
                 "repo_symbol",
+                "code_guidelines",
                 "job_output"
             ])
         );
@@ -179,7 +189,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ]),
             "run_check alone does not grant run_command"
         );
@@ -201,7 +212,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ])
         );
         assert_eq!(
@@ -212,7 +224,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ]),
             "already listed"
         );
@@ -223,7 +236,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ]),
             "no grant: only the repository tools every model gets"
         );
@@ -239,7 +253,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ]),
             "reading does not admit edit_file"
         );
@@ -251,7 +266,8 @@ mod tests {
                 "repo_overview",
                 "repo_health",
                 "repo_risk",
-                "repo_symbol"
+                "repo_symbol",
+                "code_guidelines"
             ]),
             "an admitted tool alone does not grant the tool that admits it"
         );
