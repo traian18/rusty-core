@@ -1,7 +1,7 @@
 //! Public session builder and live session handle.
 //!
-//! The builder only collects configuration; [`assembly`] holds the steps
-//! [`SessionBuilder::start`] runs and [`handle`] the live session API.
+//! The builder only collects configuration; `assembly` holds the steps
+//! [`SessionBuilder::start`] runs and `handle` the live session API.
 
 mod assembly;
 mod handle;

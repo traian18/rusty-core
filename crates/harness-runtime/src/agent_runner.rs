@@ -1,8 +1,8 @@
 //! Async runtime loop for a single deterministic agent.
 //!
 //! The loop and effect dispatch live here; work that runs off the loop is in
-//! [`backend_run`] and [`tool_run`], child agents in [`children`], and event
-//! publication in [`publishing`].
+//! `backend_run` and `tool_run`, child agents in `children`, and event
+//! publication in `publishing`.
 
 mod backend_run;
 mod children;

@@ -1,6 +1,6 @@
 //! Deterministic reducer for agent commands and backend events.
 //!
-//! Backend-event handlers live in [`backend_events`], keeping this module's
+//! Backend-event handlers live in `backend_events`, keeping this module's
 //! command reducer focused while sharing its private domain state.
 
 mod backend_events;
