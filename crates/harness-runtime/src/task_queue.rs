@@ -408,6 +408,19 @@ fn review_complete(task: &Task, result: &Value) -> bool {
         })
 }
 
+/// The first task `task` depends on that this run skipped.
+fn skipped_dependency(progress: &Progress, task: &Task) -> Option<String> {
+    task.depends_on
+        .iter()
+        .find(|id| {
+            progress
+                .completed
+                .iter()
+                .any(|done| done["skipped"] == true && done["task_id"] == id.as_str())
+        })
+        .cloned()
+}
+
 /// Why a task could not be completed, as the user is told.
 enum TaskOutcome {
     Accepted,
@@ -612,6 +625,22 @@ impl IsolatedSessionAgentExecutor {
                     _ => break,
                 },
             };
+            // A task built on a skipped one would build on a gap: skip it too.
+            if let Some(gap) = planned
+                .then(|| skipped_dependency(&progress, task))
+                .flatten()
+            {
+                progress.completed.push(json!({
+                    "task_id": task.id,
+                    "skipped": true,
+                    "reason": format!("Task {} builds on {gap}, which was skipped, so it was not built.", task.id),
+                }));
+                context
+                    .checkpoint(serde_json::to_value(&progress).unwrap())
+                    .await?;
+                index += 1;
+                continue;
+            }
             let mut guidance: Option<String> = None;
             loop {
                 let reason = match self
@@ -679,7 +708,7 @@ impl IsolatedSessionAgentExecutor {
             format!("Implemented and inspected {} tasks.", plan.tasks.len())
         } else {
             format!(
-                "Implemented and inspected {} of {} tasks; {skipped} skipped at the user's request.",
+                "Implemented and inspected {} of {} tasks; {skipped} skipped, at the user's request or because they build on a skipped task.",
                 plan.tasks.len() - skipped,
                 plan.tasks.len()
             )
@@ -731,9 +760,19 @@ impl IsolatedSessionAgentExecutor {
         context
             .checkpoint(serde_json::to_value(&*progress).unwrap())
             .await?;
-        let mut step_plan = self
+        let mut step_plan = match self
             .plan_task(request, plan, task, progress, context, usage, guidance)
-            .await?;
+            .await?
+        {
+            Ok(step_plan) => step_plan,
+            // Nothing was built: the person answers, and another try plans with the answer.
+            Err(question) => {
+                return Ok(TaskOutcome::Failed(format!(
+                    "Task {} needs a decision before it can be built. The step planner asks:\n{question}\nTry again with your answer as guidance, or revise the design and the task list",
+                    task.id
+                )))
+            }
+        };
         let cancel = context.cancellation.clone();
         self.check_before_build(task, step_plan.as_deref(), progress, &cancel)
             .await;
@@ -781,6 +820,9 @@ impl IsolatedSessionAgentExecutor {
                 if child.input["previous_attempt"].get("new_errors").is_some() {
                     child.instructions.push_str("\n\nYour last build added the typecheck errors in workflow_input.previous_attempt.new_errors (the workflow checked it). Fix them first; errors that were there before this task are not yours.");
                 }
+                if child.input["previous_attempt"]["unchanged"] == true {
+                    child.instructions.push_str("\n\nYour last attempt ended without changing any file (the workflow compared the tree), so the task was never tried. Its size, its blast radius and how widely the code is used are not blockers: they mean more mechanical edits and more tests. Do not survey or measure again what workflow_input.previous_attempt already found; make the first change of your plan now with edit_file or write_file, then continue until the step is done. Use checkpoint only if you get stuck after real edits.");
+                }
                 let before = self.tree_fingerprint().await;
                 let built = match self
                     .build_task(&child, request, task, progress, context, usage)
@@ -797,11 +839,20 @@ impl IsolatedSessionAgentExecutor {
                 BasicSchemaValidator
                     .validate(&child.output_schema, &built)
                     .map_err(|e| AgentExecutionError::new("invalid_task_result", e.to_string()))?;
+                let status = built["status"].as_str().unwrap_or("invalid").to_owned();
+                // A build that stops before changing anything was not a try: the
+                // next attempt is told so, instead of inheriting its reasons to stop.
+                let unchanged = (status == "checkpoint" || status == "needs_repair")
+                    && !before.is_empty()
+                    && self.tree_fingerprint().await == before;
                 progress.current = Some(json!({"task_id":task.id,"build":built,"repair":attempt}));
+                if unchanged {
+                    progress.current.as_mut().unwrap()["unchanged"] = Value::Bool(true);
+                }
                 context
                     .checkpoint(serde_json::to_value(&*progress).unwrap())
                     .await?;
-                let status = built["status"].as_str().unwrap_or("invalid");
+                let status = status.as_str();
                 if status == "checkpoint" || status == "needs_repair" {
                     ended = Some(Ended::Unfinished);
                     rejected = false;
@@ -997,14 +1048,17 @@ impl IsolatedSessionAgentExecutor {
         }
         Ok(recovery::Built::Replied(json!({
             "status": "complete",
-            "summary": format!("Built in {} steps after the first attempt did not succeed.\n{}", steps.len(), summaries.join("\n")),
+            "summary": format!("Built in {} steps.\n{}", steps.len(), summaries.join("\n")),
         })))
     }
 
     /// The task planner's detailed plan for `task`, when the queue has a
     /// planner: the one already made for it (kept across repairs and a
     /// resumed run), or a new one. The user's guidance for another try asks
-    /// for a new plan that takes it into account.
+    /// for a new plan that takes it into account. A planner that finds the
+    /// task too big splits it here, before any build (no plan: the steps are
+    /// the plan); one that finds a decision only the person can make returns
+    /// its question as the inner `Err`.
     #[allow(clippy::too_many_arguments)]
     async fn plan_task(
         &self,
@@ -1015,25 +1069,30 @@ impl IsolatedSessionAgentExecutor {
         context: &mut StepContext,
         usage: &mut HashMap<AgentId, AgentUsageMetrics>,
         guidance: Option<&str>,
-    ) -> Result<Option<String>, AgentExecutionError> {
+    ) -> Result<Result<Option<String>, String>, AgentExecutionError> {
         let queue = request.task_queue.as_ref().expect("task queue");
         let Some(planner) = &queue.task_planner else {
-            return Ok(None);
+            return Ok(Ok(None));
         };
+        // A split task's steps are its plan: a new plan of the whole task
+        // would contradict "do only this step".
+        if pending_split(progress, task).is_some() {
+            return Ok(Ok(None));
+        }
         let kept = progress
             .step_plan
             .as_ref()
             .filter(|kept| kept["task_id"] == task.id.as_str() && guidance.is_none())
             .and_then(|kept| kept["plan"].as_str());
         if let Some(kept) = kept {
-            return Ok(Some(kept.to_owned()));
+            return Ok(Ok(Some(kept.to_owned())));
         }
         let mut child = request.clone();
         child.task_queue = None;
         child.checkpoint = None;
         child.feedback.retain(|f| !is_user_change(&f.code));
         child.profile = Some(planner.profile.clone());
-        child.instructions = planner.instructions.clone();
+        child.instructions = format!("{}\n\n{}", planner.instructions, split::FIT_INSTRUCTIONS);
         if let Some(guidance) = guidance {
             child.instructions.push_str(&format!(
                 "\n\nThe task failed before, and the user asked for another try with this guidance; plan for it:\n{guidance}"
@@ -1057,11 +1116,21 @@ impl IsolatedSessionAgentExecutor {
                 format!("the planner returned no plan for task {}", task.id),
             ));
         }
-        progress.step_plan = Some(json!({"task_id":task.id,"plan":planned}));
+        let planned = match split::read_planned(&planned) {
+            split::Planned::Gap(question) => return Ok(Err(question)),
+            split::Planned::Split(steps) => {
+                split::record_split(progress, task, &steps);
+                None
+            }
+            split::Planned::Plan(plan) => {
+                progress.step_plan = Some(json!({"task_id":task.id,"plan":plan}));
+                Some(plan)
+            }
+        };
         context
             .checkpoint(serde_json::to_value(&*progress).unwrap())
             .await?;
-        Ok(Some(planned))
+        Ok(Ok(planned))
     }
 
     /// Does `task` by running one of the queue's flows. The flow judges its

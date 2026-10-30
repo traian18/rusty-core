@@ -1492,6 +1492,100 @@ mod isolated_session {
     }
 
     #[tokio::test]
+    async fn a_checkpoint_that_changed_nothing_tells_the_next_attempt_to_start_editing() {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskQueueConfig},
+        };
+        // A real repository, so the queue can tell that the attempt changed nothing.
+        let folder = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(folder.path()).unwrap();
+        std::fs::write(folder.path().join("a.txt"), "one\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let me = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &me, &me, "start", &tree, &[])
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(QueueBackend {
+                requests: requests.clone(),
+                replies: Mutex::new(vec![
+                    json!({"status":"checkpoint","summary":"No files were changed. Blast radius: 192 files."}),
+                    json!({"status":"complete","summary":"implemented"}),
+                    json!({"status":"complete","summary":"inspected","criteria":[{"id":"C1","evidence":"a.txt:1"}]}),
+                ].into()),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new().with_root(folder.path())),
+            Arc::new(NoopSink),
+        ));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: ProfileRef {
+                        id: "rusty.default".into(),
+                        revision: None,
+                    },
+                    review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: None,
+                    max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.output_schema = Some(definition.output_contract.schema.clone());
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"one change","plan":{"status":"ready","summary":"one task","requirements":[{"id":"R1","text":"the change","criteria":[{"id":"C1","text":"first"}]}],"tasks":[{"id":"T1","instructions":"first","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]}]}});
+        let finished = runner
+            .start(run_id("queue-empty-checkpoint"), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(
+            finished.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            finished.result
+        );
+        let sent = requests.lock().unwrap();
+        assert_eq!(sent.len(), 3, "empty checkpoint, build, review");
+        assert!(!prompt_of(&sent[0]).contains("the task was never tried"));
+        assert!(prompt_of(&sent[1]).contains("the task was never tried"));
+    }
+
+    #[tokio::test]
     async fn a_task_planner_plans_each_task_once_and_its_plan_reaches_builder_and_reviewer() {
         use harness_core::{
             behavior::{ProfileRef, ProfileRegistry},
@@ -1694,6 +1788,128 @@ mod isolated_session {
             .unwrap();
         assert!(checkpoint.get("split").is_none(), "{checkpoint}");
         assert_eq!(checkpoint["completed"][0]["task_id"], "T1");
+    }
+
+    /// Runs one task T1 through a queue whose planner gives `replies` first,
+    /// and returns the finished run and the requests sent.
+    async fn planned_queue_run(
+        name: &str,
+        replies: Vec<Value>,
+    ) -> (
+        harness_core::orchestration::OrchestrationRunState,
+        Vec<ExecutionRequest>,
+        String,
+    ) {
+        use harness_core::{
+            behavior::{ProfileRef, ProfileRegistry},
+            orchestration::{InputBinding, OutputBinding, TaskPlannerConfig, TaskQueueConfig},
+        };
+        let profile = || ProfileRef {
+            id: "rusty.default".into(),
+            revision: None,
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let parent = Arc::new(SessionRuntime::new(
+            SessionId::new(),
+            Arc::new(QueueBackend {
+                requests: requests.clone(),
+                replies: Mutex::new(replies.into()),
+            }),
+            Arc::new(FakeToolRegistry::new()),
+            Arc::new(FakeWorkspace::new()),
+            Arc::new(NoopSink),
+        ));
+        let mut definition = default_orchestration_definition();
+        definition.input_schema = None;
+        definition.output_contract.schema = SchemaReference::Inline {
+            name: "tasks".into(),
+            schema: json!({"type":"object"}),
+        };
+        for n in &mut definition.nodes {
+            if let OrchestrationNodeKind::Agent(config) = &mut n.kind {
+                config.task_queue = Some(TaskQueueConfig {
+                    plan_pointer: "/plan".into(),
+                    review_profile: profile(),
+                    review_instructions: "Inspect the task criteria.".into(),
+                    task_planner: Some(TaskPlannerConfig {
+                        profile: profile(),
+                        instructions: "PLAN THIS TASK in detail.".into(),
+                    }),
+                    max_repairs: 2,
+                    on_task_failure: harness_core::orchestration::TaskFailurePolicy::Stop,
+                    flows: Default::default(),
+                });
+                config.structured_output = StructuredOutputMode::HostValidated;
+                n.output_schema = Some(definition.output_contract.schema.clone());
+                n.input_bindings.push(InputBinding {
+                    target: "plan".into(),
+                    source: OutputBinding::RunInput {
+                        pointer: "/plan".into(),
+                    },
+                });
+            }
+            if let OrchestrationNodeKind::Verify(config) = &mut n.kind {
+                config.checks = vec![VerificationCheck::RequiredStatus {
+                    pointer: "/report/status".into(),
+                    equals: "implemented".into(),
+                }];
+            }
+        }
+        let runner = OrchestrationRunner::new(
+            compiled(definition),
+            Arc::new(
+                IsolatedSessionAgentExecutor::new(parent)
+                    .with_profiles(Arc::new(ProfileRegistry::new())),
+            ),
+        )
+        .with_available_tools(Vec::<String>::new());
+        let input = json!({"request":"route binding","plan":{"status":"ready","summary":"one task","requirements":[{"id":"R1","text":"bind","criteria":[{"id":"C1","text":"bound"}]}],"tasks":[{"id":"T1","instructions":"bind the route","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]}]}});
+        let finished = runner
+            .start(run_id(name), input)
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        let result = format!("{:?}", finished.result);
+        let sent = requests.lock().unwrap().clone();
+        (finished.state, sent, result)
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_finds_the_task_too_big_splits_it_before_any_build() {
+        let step_done = json!({"status":"complete","summary":"step done"});
+        let (state, sent, result) = planned_queue_run(
+            "upfront-split",
+            vec![
+                json!("Six files: too big.\n## Split\n### S1 — Add the field\nbackend.rs\n### S2 — Assign ordinals\nagent_runner.rs"),
+                step_done.clone(),
+                step_done,
+                json!({"status":"complete","summary":"inspected","criteria":[{"id":"C1","evidence":"agent_runner.rs:40"}]}),
+            ],
+        )
+        .await;
+        assert_eq!(state.status, OrchestrationStatus::Completed, "{result}");
+        assert_eq!(sent.len(), 4, "plan with split, 2 steps, review");
+        assert!(prompt_of(&sent[0]).contains("## Design gap"));
+        assert!(prompt_of(&sent[1]).contains("Do only step 1 now"));
+        assert!(prompt_of(&sent[2]).contains("Do only step 2 now"));
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_finds_a_design_gap_stops_the_task_before_any_build() {
+        let (state, sent, result) = planned_queue_run(
+            "design-gap",
+            vec![json!(
+                "## Design gap\nWhere does `routeId` come from? Recommended: the IDE launch."
+            )],
+        )
+        .await;
+        assert_eq!(state.status, OrchestrationStatus::Failed);
+        assert_eq!(sent.len(), 1, "only the planner ran");
+        assert!(
+            result.contains("Where does `routeId` come from?"),
+            "{result}"
+        );
     }
 
     /// Runs the default workflow with its agent step in `mode`, against a
@@ -2362,6 +2578,13 @@ mod isolated_session {
         json!({"request":"two changes","plan":{"status":"ready","summary":"two tasks","requirements":[{"id":"R1","text":"both changes","criteria":[{"id":"C1","text":"first"},{"id":"C2","text":"second"}]}],"tasks":[{"id":"T1","instructions":"first","requirement_ids":["R1"],"criterion_ids":["C1"],"depends_on":[]},{"id":"T2","instructions":"second","requirement_ids":["R1"],"criterion_ids":["C2"],"depends_on":["T1"]}]}})
     }
 
+    /// Two tasks where the second does not build on the first.
+    fn independent_tasks() -> Value {
+        let mut input = two_tasks();
+        input["plan"]["tasks"][1]["depends_on"] = json!([]);
+        input
+    }
+
     fn built() -> Value {
         json!({"status":"complete","summary":"implemented"})
     }
@@ -2441,7 +2664,9 @@ mod isolated_session {
             vec![blocked(), built(), reviewed("C2")],
             harness_core::orchestration::TaskFailurePolicy::Ask,
         );
-        let handle = runner.start(run_id("queue-skip"), two_tasks()).unwrap();
+        let handle = runner
+            .start(run_id("queue-skip"), independent_tasks())
+            .unwrap();
         let question = task_question(&handle).await;
         handle
             .resolve_input(&question.id, answer("skip", None))
@@ -2459,6 +2684,39 @@ mod isolated_session {
         assert_eq!(report["tasks"][0]["skipped"], true);
         assert_eq!(report["tasks"][1]["task_id"], "T2");
         assert!(report["summary"].as_str().unwrap().contains("1 skipped"));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_builds_on_a_skipped_task_is_skipped_without_a_build() {
+        let (runner, requests) = queue_runner(
+            vec![blocked()],
+            harness_core::orchestration::TaskFailurePolicy::Ask,
+        );
+        let handle = runner
+            .start(run_id("queue-skip-dependent"), two_tasks())
+            .unwrap();
+        let question = task_question(&handle).await;
+        handle
+            .resolve_input(&question.id, answer("skip", None))
+            .await
+            .unwrap();
+        let output = handle.wait().await.unwrap();
+        assert_eq!(
+            output.state.status,
+            OrchestrationStatus::Completed,
+            "{:?}",
+            output.result
+        );
+        let report = output.result.output.unwrap();
+        assert_eq!(report["tasks"][1]["task_id"], "T2");
+        assert_eq!(report["tasks"][1]["skipped"], true);
+        assert!(report["tasks"][1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("builds on T1"));
+        assert!(report["summary"].as_str().unwrap().contains("2 skipped"));
+        // Only T1's build ran: T2 was neither built nor asked about.
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2492,7 +2750,7 @@ mod isolated_session {
         let output = runner
             .run(
                 run_id("queue-auto-skip"),
-                two_tasks(),
+                independent_tasks(),
                 CancellationToken::new(),
             )
             .await

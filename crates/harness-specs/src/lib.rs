@@ -40,6 +40,7 @@ pub mod progress;
 pub mod record;
 pub mod scaffold;
 pub mod store;
+pub mod task_shape;
 mod templates;
 pub mod validate;
 

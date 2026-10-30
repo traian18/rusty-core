@@ -32,6 +32,53 @@ Read the code you need with your read tools; change nothing. Reply with one sect
 ### S2 — <short title>
 …";
 
+/// Appended to the step planner's instructions: before planning, it judges
+/// whether the task fits one builder session, and may split it up front or
+/// stop it on a decision only the person can make.
+pub(super) const FIT_INSTRUCTIONS: &str = "Before you plan, judge whether this task fits one builder session: it changes at most 4 files (tests included), and nothing is left to discover or decide. Then reply in exactly one of these three shapes:
+1. It fits: your whole reply is the step plan, as described above.
+2. It is too big: reply with the heading `## Split`, then 2 to 5 steps in the order they must be done, each a section `### S1 — <short title>` naming its files (at most 4) and the exact command that checks it. Every step leaves the project compiling and its tests passing; a step that changes a shared type or hook also updates every caller. The first step is the smallest change that makes the rest possible. Together the steps meet every criterion of workflow_input.task; say which step covers which.
+3. It cannot be built without a decision only the person can make (the design relies on something that is not in the code and does not say how to create it, or the spec and the design allow two different results): reply with the heading `## Design gap`, then the question, the options with what each means for the code, and your recommended answer. Use it only when no careful reading of the design and the code settles the question: a detail you can settle from the code is yours to settle in the plan.";
+
+/// What the step planner replied: a plan, steps to build instead, or a
+/// question for the person.
+#[derive(Debug, PartialEq)]
+pub(super) enum Planned {
+    Plan(String),
+    Split(Vec<String>),
+    Gap(String),
+}
+
+/// Reads the step planner's reply. A `## Split` whose steps cannot be read
+/// is taken as a plan, so the builder still gets the planner's work.
+pub(super) fn read_planned(reply: &str) -> Planned {
+    let after = |heading: &str| {
+        let mut at = 0;
+        for line in reply.split_inclusive('\n') {
+            if line.trim().eq_ignore_ascii_case(heading) {
+                return Some(reply[at + line.len()..].trim());
+            }
+            at += line.len();
+        }
+        None
+    };
+    if let Some(question) = after("## Design gap").filter(|q| !q.is_empty()) {
+        return Planned::Gap(question.to_owned());
+    }
+    if let Some(steps) = after("## Split").map(parse_steps) {
+        if !steps.is_empty() {
+            return Planned::Split(steps);
+        }
+    }
+    Planned::Plan(reply.to_owned())
+}
+
+/// Records `steps` as the split of `task`, built from its first step.
+pub(super) fn record_split(progress: &mut Progress, task: &Task, steps: &[String]) {
+    progress.split = Some(json!({"task_id": task.id, "steps": steps, "done": 0}));
+    progress.step_plan = None;
+}
+
 /// The steps of a split, from the planner's reply: every `### S<n>` (or
 /// `## S<n>`, `### Step <n>`) section with its heading. Empty when the
 /// reply has fewer than two or more than five.
@@ -80,7 +127,7 @@ pub(super) fn step_instructions(steps: &[String], index: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "\n\nThis task was split into {} smaller steps after an earlier attempt did not succeed (that attempt was undone). Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step.\n\nAll steps:\n{all}\n\nYour step:\n{}",
+        "\n\nThis task was split into {} smaller steps, each small enough for one session. Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step.\n\nAll steps:\n{all}\n\nYour step:\n{}",
         steps.len(),
         index + 1,
         steps[index]
@@ -126,8 +173,7 @@ impl IsolatedSessionAgentExecutor {
         if steps.is_empty() {
             return Ok(None);
         }
-        progress.split = Some(json!({"task_id": task.id, "steps": steps, "done": 0}));
-        progress.step_plan = None;
+        record_split(progress, task, &steps);
         context
             .checkpoint(serde_json::to_value(&*progress).unwrap())
             .await?;
@@ -149,6 +195,33 @@ mod tests {
             "S1 — Wire the registry\nChange `useAgentTab.ts`.\nCheck: npm run typecheck"
         );
         assert!(steps[2].starts_with("S3 Tests"));
+    }
+
+    #[test]
+    fn the_planner_reply_is_a_plan_a_split_or_a_design_gap() {
+        assert_eq!(
+            read_planned("1. Edit `a.rs`.\n2. Run `cargo test`."),
+            Planned::Plan("1. Edit `a.rs`.\n2. Run `cargo test`.".into())
+        );
+        let split = read_planned(
+            "Too big for one session.\n## Split\n### S1 — Add the field\nbackend.rs\n### S2 — Assign ordinals\nagent_runner.rs",
+        );
+        assert_eq!(
+            split,
+            Planned::Split(vec![
+                "S1 — Add the field\nbackend.rs".into(),
+                "S2 — Assign ordinals\nagent_runner.rs".into()
+            ])
+        );
+        assert_eq!(
+            read_planned("## Design gap\nWhere does `routeId` come from? Options: …"),
+            Planned::Gap("Where does `routeId` come from? Options: …".into())
+        );
+        // A split with one step is not a split: the planner's text is still a plan.
+        assert!(matches!(
+            read_planned("## Split\n### S1 — all of it"),
+            Planned::Plan(_)
+        ));
     }
 
     #[test]

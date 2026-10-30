@@ -7,6 +7,7 @@ use crate::{
     model::{Severity, SpecDoc, Status, TasksDoc, Warning},
     parse,
     store::SpecStore,
+    task_shape,
 };
 
 /// Everything wrong or odd about the change in folder `dir`, most serious first.
@@ -90,6 +91,9 @@ pub fn check_task_list(
             Severity::Warning,
             format!("{} names no criterion", task.id),
         ));
+    }
+    for task in &tasks.tasks {
+        task_shape::check(&tasks_path, task, &mut warnings);
     }
     check_tasks(&tasks_path, &spec_path, &tasks, Some(&spec), &mut warnings);
     warnings.sort_by_key(|w| std::cmp::Reverse(w.severity));
@@ -411,10 +415,25 @@ mod tests {
                 .map(|w| w.message)
                 .collect()
         };
-        assert!(messages("# Tasks\n\n- [ ] **T1** One. R1 (C1, C2)\n").is_empty());
+        let shaped = "  Files: `src/one.rs`\n  Check: `cargo test`\n";
+        assert!(messages(&format!(
+            "# Tasks\n\n- [ ] **T1** One. R1 (C1, C2)\n{shaped}"
+        ))
+        .is_empty());
         assert_eq!(
-            messages("- [ ] **T1** One. R1 (C1)\n- [ ] **T2** Docs.\n"),
+            messages(&format!(
+                "- [ ] **T1** One. R1 (C1)\n{shaped}- [ ] **T2** Docs.\n{shaped}"
+            )),
             ["T2 names no criterion", "C2 is not named by any task"]
+        );
+        // A task that does not fit one session goes back before it is saved.
+        assert_eq!(
+            messages("- [ ] **T1** One. R1 (C1, C2)\n  Trace where it starts.\n"),
+            [
+                "T1 has no `Files:` line listing every file it changes (at most 4)",
+                "T1 has no `Check:` line with the command that proves it is done",
+                "T1 leaves work to discover or decide (\"trace\"): settle it in the plan and write the concrete change, or report it as an open question for the person"
+            ]
         );
         assert_eq!(
             messages("Here is the plan, as asked."),
