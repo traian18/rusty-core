@@ -127,80 +127,137 @@ impl FrameworkAdapter for SpringAdapter {
         for p in &parsed {
             let package_name = file_package.get(&p.file).cloned().unwrap_or_default();
             let bindings = import_bindings(input, &p.file);
+            let context = ClassContext {
+                package,
+                file: &p.file,
+                source: &p.source,
+                package_name: &package_name,
+                bindings: &bindings,
+                types: &types,
+            };
             for class in classes(p.tree.root_node(), &p.source) {
-                routes(package, &p.file, &class, &p.source, output);
-                // JPA entity.
-                if let Some(entity) = class.annotations.iter().find(|a| a.name == "Entity") {
-                    let table = class
-                        .annotations
-                        .iter()
-                        .find(|a| a.name == "Table")
-                        .and_then(|t| named_string(t.node, "name", &p.source));
-                    let (label, certainty) = match table {
-                        Some(name) => (name, Certainty::Declared),
-                        None => (snake_case(&class.name), Certainty::Convention),
-                    };
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::ModelMappedToTable,
-                            rule: ENTITY_RULE,
-                            rule_version: VERSION,
-                            certainty,
-                            from: p.file.clone(),
-                            to: None,
-                            from_symbol: Some(class.name.clone()),
-                            to_symbol: None,
-                            label,
-                            evidence: evidence(&p.file, entity.node, &p.source),
-                        },
-                    ));
-                }
-                // Injection.
-                if !class
-                    .annotations
-                    .iter()
-                    .any(|a| BEANS.contains(&a.name.as_str()))
-                {
-                    continue;
-                }
-                for injected in injected_types(&class, &p.source) {
-                    let provider = bindings.get(&injected.type_name).cloned().or_else(|| {
-                        types
-                            .get(&(package_name.clone(), injected.type_name.clone()))
-                            .filter(|(_, is)| *is)
-                            .map(|(f, _)| f.clone())
-                    });
-                    let Some(provider) = provider else { continue };
-                    // The type must be a bean: look it up by name in the file it resolved to.
-                    let is_bean = types.iter().any(|((_, name), (file, is))| {
-                        *name == injected.type_name && *file == provider && *is
-                    });
-                    if !is_bean {
-                        continue;
-                    }
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::ProviderInjectedInto,
-                            rule: INJECTION_RULE,
-                            rule_version: VERSION,
-                            certainty: Certainty::Declared,
-                            from: provider,
-                            to: Some(p.file.clone()),
-                            from_symbol: Some(injected.type_name.clone()),
-                            to_symbol: Some(class.name.clone()),
-                            label: injected.type_name,
-                            evidence: evidence(&p.file, injected.node, &p.source),
-                        },
-                    ));
-                }
+                process_class(&context, &class, output);
             }
         }
         Ok(())
     }
+}
+
+struct ClassContext<'a> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    source: &'a str,
+    package_name: &'a str,
+    bindings: &'a HashMap<String, RootRelativePath>,
+    types: &'a HashMap<(String, String), (RootRelativePath, bool)>,
+}
+
+fn process_class(context: &ClassContext<'_>, class: &Class<'_>, output: &mut FrameworkOutput) {
+    routes(context.package, context.file, class, context.source, output);
+    emit_entity_relation(context.package, context.file, context.source, class, output);
+    emit_injection_relations(context, class, output);
+}
+
+fn emit_entity_relation(
+    package: &Package,
+    file: &RootRelativePath,
+    source: &str,
+    class: &Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    let Some(entity) = class
+        .annotations
+        .iter()
+        .find(|annotation| annotation.name == "Entity")
+    else {
+        return;
+    };
+    let table = class
+        .annotations
+        .iter()
+        .find(|annotation| annotation.name == "Table")
+        .and_then(|annotation| named_string(annotation.node, "name", source));
+    let (label, certainty) = match table {
+        Some(name) => (name, Certainty::Declared),
+        None => (snake_case(&class.name), Certainty::Convention),
+    };
+    output.relate(FrameworkRelation::new(
+        ID,
+        Some(&package.id),
+        RelationDraft {
+            kind: RelationKind::ModelMappedToTable,
+            rule: ENTITY_RULE,
+            rule_version: VERSION,
+            certainty,
+            from: file.clone(),
+            to: None,
+            from_symbol: Some(class.name.clone()),
+            to_symbol: None,
+            label,
+            evidence: evidence(file, entity.node, source),
+        },
+    ));
+}
+
+fn emit_injection_relations(
+    context: &ClassContext<'_>,
+    class: &Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    if !is_bean_class(class) {
+        return;
+    }
+    for injected in injected_types(class, context.source) {
+        let Some(provider) = resolve_provider(
+            context.package_name,
+            context.bindings,
+            context.types,
+            &injected.type_name,
+        ) else {
+            continue;
+        };
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&context.package.id),
+            RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule: INJECTION_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: provider,
+                to: Some(context.file.clone()),
+                from_symbol: Some(injected.type_name.clone()),
+                to_symbol: Some(class.name.clone()),
+                label: injected.type_name,
+                evidence: evidence(context.file, injected.node, context.source),
+            },
+        ));
+    }
+}
+
+fn is_bean_class(class: &Class<'_>) -> bool {
+    class
+        .annotations
+        .iter()
+        .any(|annotation| BEANS.contains(&annotation.name.as_str()))
+}
+
+fn resolve_provider(
+    package_name: &str,
+    bindings: &HashMap<String, RootRelativePath>,
+    types: &HashMap<(String, String), (RootRelativePath, bool)>,
+    type_name: &str,
+) -> Option<RootRelativePath> {
+    let provider = bindings.get(type_name).cloned().or_else(|| {
+        types
+            .get(&(package_name.to_owned(), type_name.to_owned()))
+            .filter(|(_, is_provider)| *is_provider)
+            .map(|(file, _)| file.clone())
+    })?;
+    let is_bean = types.iter().any(|((_, name), (file, is_provider))| {
+        name == type_name && *file == provider && *is_provider
+    });
+    is_bean.then_some(provider)
 }
 
 fn java_package(root: Node<'_>, source: &str) -> String {
@@ -398,33 +455,11 @@ fn routes(
     source: &str,
     output: &mut FrameworkOutput,
 ) {
-    if !class
-        .annotations
-        .iter()
-        .any(|a| matches!(a.name.as_str(), "RestController" | "Controller"))
-    {
+    if !is_controller(class) {
         return;
     }
-    let prefixes = match class
-        .annotations
-        .iter()
-        .find(|a| a.name == "RequestMapping")
-    {
-        None => vec![String::new()],
-        Some(mapping) => match mapping_paths(mapping.node, source) {
-            Some(paths) if paths.is_empty() => vec![String::new()],
-            Some(paths) => paths,
-            None => {
-                output.unresolved(
-                    file,
-                    format!(
-                        "`{}` has a computed @RequestMapping path; its routes were not read",
-                        class.name
-                    ),
-                );
-                return;
-            }
-        },
+    let Some(prefixes) = class_route_prefixes(class, file, source, output) else {
+        return;
     };
     let Some(body) = class.node.child_by_field_name("body") else {
         return;
@@ -432,57 +467,147 @@ fn routes(
     let mut cursor = body.walk();
     for member in body
         .named_children(&mut cursor)
-        .filter(|m| m.kind() == "method_declaration")
+        .filter(|member| member.kind() == "method_declaration")
     {
         let method_name = member
             .child_by_field_name("name")
-            .map(|n| text(n, source).to_owned())
+            .map(|name| text(name, source).to_owned())
             .unwrap_or_default();
         for annotation in annotations(member, source) {
-            let verbs: Vec<String> = match annotation.name.as_str() {
-                "GetMapping" => vec!["GET".into()],
-                "PostMapping" => vec!["POST".into()],
-                "PutMapping" => vec!["PUT".into()],
-                "DeleteMapping" => vec!["DELETE".into()],
-                "PatchMapping" => vec!["PATCH".into()],
-                "RequestMapping" => request_methods(annotation.node, source),
-                _ => continue,
+            let Some(verbs) = mapping_verbs(&annotation, source) else {
+                continue;
             };
-            let paths = match mapping_paths(annotation.node, source) {
-                Some(paths) if paths.is_empty() => vec![String::new()],
-                Some(paths) => paths,
-                None => {
-                    output.unresolved(
-                        file,
-                        format!(
-                            "`{}.{method_name}` has a computed @{} path; no relation emitted",
-                            class.name, annotation.name
-                        ),
-                    );
-                    continue;
-                }
+            let Some(paths) =
+                method_route_paths(&annotation, file, &class.name, &method_name, source, output)
+            else {
+                continue;
             };
-            for prefix in &prefixes {
-                for path in &paths {
-                    for verb in &verbs {
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::RouteRegisteredTo,
-                                rule: ROUTE_RULE,
-                                rule_version: VERSION,
-                                certainty: Certainty::Declared,
-                                from: file.clone(),
-                                to: Some(file.clone()),
-                                from_symbol: Some(class.name.clone()),
-                                to_symbol: Some(format!("{}.{method_name}", class.name)),
-                                label: format!("{verb} {}", join(prefix, path)),
-                                evidence: evidence(file, annotation.node, source),
-                            },
-                        ));
-                    }
-                }
+            let route = RouteContext {
+                package,
+                file,
+                class,
+                method_name: &method_name,
+                annotation: &annotation,
+                source,
+            };
+            emit_routes(&route, &prefixes, &paths, &verbs, output);
+        }
+    }
+}
+
+fn is_controller(class: &Class<'_>) -> bool {
+    class
+        .annotations
+        .iter()
+        .any(|annotation| matches!(annotation.name.as_str(), "RestController" | "Controller"))
+}
+
+fn class_route_prefixes(
+    class: &Class<'_>,
+    file: &RootRelativePath,
+    source: &str,
+    output: &mut FrameworkOutput,
+) -> Option<Vec<String>> {
+    let mapping = class
+        .annotations
+        .iter()
+        .find(|annotation| annotation.name == "RequestMapping");
+    let Some(mapping) = mapping else {
+        return Some(vec![String::new()]);
+    };
+    match mapping_paths(mapping.node, source) {
+        Some(paths) => Some(default_empty_path(paths)),
+        None => {
+            output.unresolved(
+                file,
+                format!(
+                    "`{}` has a computed @RequestMapping path; its routes were not read",
+                    class.name
+                ),
+            );
+            None
+        }
+    }
+}
+
+fn default_empty_path(paths: Vec<String>) -> Vec<String> {
+    if paths.is_empty() {
+        vec![String::new()]
+    } else {
+        paths
+    }
+}
+
+fn mapping_verbs(annotation: &Annotation<'_>, source: &str) -> Option<Vec<String>> {
+    match annotation.name.as_str() {
+        "GetMapping" => Some(vec!["GET".into()]),
+        "PostMapping" => Some(vec!["POST".into()]),
+        "PutMapping" => Some(vec!["PUT".into()]),
+        "DeleteMapping" => Some(vec!["DELETE".into()]),
+        "PatchMapping" => Some(vec!["PATCH".into()]),
+        "RequestMapping" => Some(request_methods(annotation.node, source)),
+        _ => None,
+    }
+}
+
+fn method_route_paths(
+    annotation: &Annotation<'_>,
+    file: &RootRelativePath,
+    class_name: &str,
+    method_name: &str,
+    source: &str,
+    output: &mut FrameworkOutput,
+) -> Option<Vec<String>> {
+    match mapping_paths(annotation.node, source) {
+        Some(paths) => Some(default_empty_path(paths)),
+        None => {
+            output.unresolved(
+                file,
+                format!(
+                    "`{class_name}.{method_name}` has a computed @{} path; no relation emitted",
+                    annotation.name
+                ),
+            );
+            None
+        }
+    }
+}
+
+struct RouteContext<'a, 't> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    class: &'a Class<'t>,
+    method_name: &'a str,
+    annotation: &'a Annotation<'t>,
+    source: &'a str,
+}
+
+fn emit_routes(
+    route: &RouteContext<'_, '_>,
+    prefixes: &[String],
+    paths: &[String],
+    verbs: &[String],
+    output: &mut FrameworkOutput,
+) {
+    for prefix in prefixes {
+        for path in paths {
+            for verb in verbs {
+                output.relate(FrameworkRelation::new(
+                    ID,
+                    Some(&route.package.id),
+                    RelationDraft {
+                        kind: RelationKind::RouteRegisteredTo,
+                        rule: ROUTE_RULE,
+                        rule_version: VERSION,
+                        certainty: Certainty::Declared,
+                        from: route.file.clone(),
+                        to: Some(route.file.clone()),
+                        from_symbol: Some(route.class.name.clone()),
+                        to_symbol: Some(format!("{}.", route.class.name) + route.method_name),
+                        label: format!("{verb} {}", join(prefix, path)),
+                        evidence: evidence(route.file, route.annotation.node, route.source),
+                    },
+                ));
             }
         }
     }
@@ -496,57 +621,70 @@ struct Injected<'t> {
 /// Types a bean class receives: constructor parameters, `@Autowired`/`@Inject` fields, and final
 /// fields when Lombok's `@RequiredArgsConstructor` writes the constructor.
 fn injected_types<'t>(class: &Class<'t>, source: &str) -> Vec<Injected<'t>> {
-    let mut found = Vec::new();
     let Some(body) = class.node.child_by_field_name("body") else {
-        return found;
+        return Vec::new();
     };
-    let lombok = class
+    let lombok = has_required_args_constructor(class);
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .flat_map(|member| injected_member_types(member, source, lombok))
+        .collect()
+}
+
+fn has_required_args_constructor(class: &Class<'_>) -> bool {
+    class
         .annotations
         .iter()
-        .any(|a| a.name == "RequiredArgsConstructor");
-    let mut cursor = body.walk();
-    for member in body.named_children(&mut cursor) {
-        match member.kind() {
-            "constructor_declaration" => {
-                if let Some(parameters) = member.child_by_field_name("parameters") {
-                    let mut inner = parameters.walk();
-                    for parameter in parameters
-                        .named_children(&mut inner)
-                        .filter(|p| p.kind() == "formal_parameter")
-                    {
-                        if let Some(name) = type_name(parameter, source) {
-                            found.push(Injected {
-                                type_name: name,
-                                node: parameter,
-                            });
-                        }
-                    }
-                }
-            }
-            "field_declaration" => {
-                let modifiers = member
-                    .children(&mut member.walk())
-                    .find(|c| c.kind() == "modifiers")
-                    .map(|m| text(m, source).to_owned())
-                    .unwrap_or_default();
-                let wired = annotations(member, source)
-                    .iter()
-                    .any(|a| matches!(a.name.as_str(), "Autowired" | "Inject" | "Resource"));
-                let final_field =
-                    lombok && modifiers.contains("final") && !modifiers.contains("static");
-                if wired || final_field {
-                    if let Some(name) = type_name(member, source) {
-                        found.push(Injected {
-                            type_name: name,
-                            node: member,
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
+        .any(|annotation| annotation.name == "RequiredArgsConstructor")
+}
+
+fn injected_member_types<'t>(member: Node<'t>, source: &str, lombok: bool) -> Vec<Injected<'t>> {
+    match member.kind() {
+        "constructor_declaration" => constructor_injected_types(member, source),
+        "field_declaration" => field_injected_type(member, source, lombok)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
     }
-    found
+}
+
+fn constructor_injected_types<'t>(constructor: Node<'t>, source: &str) -> Vec<Injected<'t>> {
+    let Some(parameters) = constructor.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| parameter.kind() == "formal_parameter")
+        .filter_map(|parameter| {
+            type_name(parameter, source).map(|type_name| Injected {
+                type_name,
+                node: parameter,
+            })
+        })
+        .collect()
+}
+
+fn field_injected_type<'t>(field: Node<'t>, source: &str, lombok: bool) -> Option<Injected<'t>> {
+    let modifiers = field
+        .children(&mut field.walk())
+        .find(|child| child.kind() == "modifiers")
+        .map(|modifiers| text(modifiers, source))
+        .unwrap_or_default();
+    let explicitly_wired = annotations(field, source).iter().any(|annotation| {
+        matches!(
+            annotation.name.as_str(),
+            "Autowired" | "Inject" | "Resource"
+        )
+    });
+    let lombok_injected = lombok && modifiers.contains("final") && !modifiers.contains("static");
+    if !explicitly_wired && !lombok_injected {
+        return None;
+    }
+    Some(Injected {
+        type_name: type_name(field, source)?,
+        node: field,
+    })
 }
 
 /// The simple name of a declaration's type: `UserService`, or `Repo` for `Repo<User>`.

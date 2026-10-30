@@ -95,66 +95,117 @@ impl FrameworkAdapter for NestjsAdapter {
             };
             let file = &indexed.path;
             for class in classes(tree.root_node(), &source) {
-                let Some(controller) = class.decorator("Controller") else {
-                    continue;
-                };
-                let prefix = match path_argument(controller, &source) {
-                    PathArgument::None => String::new(),
-                    PathArgument::Literal(path) => path,
-                    PathArgument::Computed => {
-                        output.unresolved(
-                            file,
-                            format!(
-                                "`{}` has a computed @Controller path; its routes were not read",
-                                class.name
-                            ),
-                        );
-                        continue;
-                    }
-                };
-                for method in &class.methods {
-                    for decorator in &method.decorators {
-                        let Some((_, verb)) =
-                            METHODS.iter().find(|(name, _)| *name == decorator.name)
-                        else {
-                            continue;
-                        };
-                        let sub = match path_argument(decorator, &source) {
-                            PathArgument::None => String::new(),
-                            PathArgument::Literal(path) => path,
-                            PathArgument::Computed => {
-                                output.unresolved(
-                                    file,
-                                    format!(
-                                        "`{}.{}` has a computed @{} path; no relation emitted",
-                                        class.name, method.name, decorator.name
-                                    ),
-                                );
-                                continue;
-                            }
-                        };
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::RouteRegisteredTo,
-                                rule: ROUTE_RULE,
-                                rule_version: VERSION,
-                                certainty: Certainty::Declared,
-                                from: file.clone(),
-                                to: Some(file.clone()),
-                                from_symbol: Some(class.name.clone()),
-                                to_symbol: Some(format!("{}.{}", class.name, method.name)),
-                                label: format!("{verb} {}", join_paths(&prefix, &sub)),
-                                evidence: evidence(file, decorator.node, &source),
-                            },
-                        ));
-                    }
-                }
+                emit_controller_routes(package, file, &source, &class, output);
             }
         }
         injections(package, input, &INJECTION, output);
         Ok(())
+    }
+}
+
+struct RouteContext<'a, 't> {
+    package: &'a Package,
+    file: &'a harness_workspace::repository_intelligence::RootRelativePath,
+    source: &'a str,
+    class: &'a crate::decorators::Class<'t>,
+    prefix: &'a str,
+}
+
+fn emit_controller_routes(
+    package: &Package,
+    file: &harness_workspace::repository_intelligence::RootRelativePath,
+    source: &str,
+    class: &crate::decorators::Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    let Some(prefix) = controller_prefix(class, file, source, output) else {
+        return;
+    };
+    let context = RouteContext {
+        package,
+        file,
+        source,
+        class,
+        prefix: &prefix,
+    };
+    for method in &class.methods {
+        emit_method_routes(&context, method, output);
+    }
+}
+
+fn controller_prefix(
+    class: &crate::decorators::Class<'_>,
+    file: &harness_workspace::repository_intelligence::RootRelativePath,
+    source: &str,
+    output: &mut FrameworkOutput,
+) -> Option<String> {
+    let controller = class.decorator("Controller")?;
+    match path_argument(controller, source) {
+        PathArgument::None => Some(String::new()),
+        PathArgument::Literal(path) => Some(path),
+        PathArgument::Computed => {
+            output.unresolved(
+                file,
+                format!(
+                    "`{}` has a computed @Controller path; its routes were not read",
+                    class.name
+                ),
+            );
+            None
+        }
+    }
+}
+
+fn emit_method_routes(
+    context: &RouteContext<'_, '_>,
+    method: &crate::decorators::Method<'_>,
+    output: &mut FrameworkOutput,
+) {
+    for decorator in &method.decorators {
+        let Some((_, verb)) = METHODS.iter().find(|(name, _)| *name == decorator.name) else {
+            continue;
+        };
+        let Some(subpath) = method_path(context, method, decorator, output) else {
+            continue;
+        };
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&context.package.id),
+            RelationDraft {
+                kind: RelationKind::RouteRegisteredTo,
+                rule: ROUTE_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: context.file.clone(),
+                to: Some(context.file.clone()),
+                from_symbol: Some(context.class.name.clone()),
+                to_symbol: Some(format!("{}.{}", context.class.name, method.name)),
+                label: format!("{verb} {}", join_paths(context.prefix, &subpath)),
+                evidence: evidence(context.file, decorator.node, context.source),
+            },
+        ));
+    }
+}
+
+fn method_path(
+    context: &RouteContext<'_, '_>,
+    method: &crate::decorators::Method<'_>,
+    decorator: &crate::decorators::Decorator<'_>,
+    output: &mut FrameworkOutput,
+) -> Option<String> {
+    match path_argument(decorator, context.source) {
+        PathArgument::None => Some(String::new()),
+        PathArgument::Literal(path) => Some(path),
+        PathArgument::Computed => {
+            output.unresolved(
+                context.file,
+                format!(
+                    "`{}.{} ` has a computed @{} path; no relation emitted",
+                    context.class.name, method.name, decorator.name
+                ),
+            );
+            None
+        }
     }
 }
 

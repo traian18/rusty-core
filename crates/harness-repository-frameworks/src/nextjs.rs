@@ -290,40 +290,54 @@ fn pages_route(
 
 /// Names an `export` statement exposes: `export function X`, `export const X = …`, `export { X, Y }`.
 fn exported_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(declaration) = node.child_by_field_name("declaration") {
-        match declaration.kind() {
-            "function_declaration" | "generator_function_declaration" => {
-                if let Some(name) = declaration.child_by_field_name("name") {
-                    names.push(text(name, source).to_owned());
-                }
-            }
-            "lexical_declaration" | "variable_declaration" => {
-                let mut cursor = declaration.walk();
-                for declarator in declaration.children(&mut cursor) {
-                    if let Some(name) = declarator.child_by_field_name("name") {
-                        names.push(text(name, source).to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "export_clause" {
-            let mut inner = child.walk();
-            for specifier in child.children(&mut inner) {
-                if specifier.kind() == "export_specifier" {
-                    let exported = specifier
-                        .child_by_field_name("alias")
-                        .or_else(|| specifier.child_by_field_name("name"));
-                    if let Some(exported) = exported {
-                        names.push(text(exported, source).to_owned());
-                    }
-                }
-            }
-        }
-    }
+    let mut names = declaration_export_names(node, source);
+    names.extend(clause_export_names(node, source));
     names
+}
+
+fn declaration_export_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(declaration) = node.child_by_field_name("declaration") else {
+        return Vec::new();
+    };
+    match declaration.kind() {
+        "function_declaration" | "generator_function_declaration" => declaration
+            .child_by_field_name("name")
+            .map(|name| vec![text(name, source).to_owned()])
+            .unwrap_or_default(),
+        "lexical_declaration" | "variable_declaration" => {
+            variable_declaration_names(declaration, source)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn variable_declaration_names(declaration: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = declaration.walk();
+    declaration
+        .children(&mut cursor)
+        .filter_map(|declarator| declarator.child_by_field_name("name"))
+        .map(|name| text(name, source).to_owned())
+        .collect()
+}
+
+fn clause_export_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "export_clause")
+        .flat_map(|clause| export_specifier_names(clause, source))
+        .collect()
+}
+
+fn export_specifier_names(clause: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = clause.walk();
+    clause
+        .children(&mut cursor)
+        .filter(|specifier| specifier.kind() == "export_specifier")
+        .filter_map(|specifier| {
+            specifier
+                .child_by_field_name("alias")
+                .or_else(|| specifier.child_by_field_name("name"))
+        })
+        .map(|exported| text(exported, source).to_owned())
+        .collect()
 }

@@ -94,167 +94,244 @@ impl FrameworkAdapter for AspNetAdapter {
         cancel: &CancellationToken,
         output: &mut FrameworkOutput,
     ) -> Result<(), DiscoveryError> {
-        struct Parsed {
-            file: RootRelativePath,
-            source: String,
-            tree: tree_sitter::Tree,
-        }
-        let mut parsed = Vec::new();
-        for indexed in input.files_of(package) {
-            if cancel.is_cancelled() {
-                return Err(DiscoveryError::Cancelled);
+        let parsed = parse_package_files(package, input, cancel)?;
+        let catalog = TypeCatalog::from_parsed(&parsed);
+        let registrations = collect_registrations(&parsed);
+        for parsed_file in &parsed {
+            let classes = classes(parsed_file.tree.root_node(), &parsed_file.source);
+            for class in &classes {
+                emit_class_relations(
+                    package,
+                    parsed_file,
+                    class,
+                    &catalog,
+                    &registrations,
+                    output,
+                );
             }
-            if indexed.path.as_path().extension().and_then(|e| e.to_str()) != Some("cs") {
-                continue;
-            }
-            let Some(source) = input.read(&indexed.path) else {
-                continue;
-            };
-            let Some(tree) = parse_csharp(&source) else {
-                continue;
-            };
-            parsed.push(Parsed {
-                file: indexed.path.clone(),
-                source,
-                tree,
-            });
-        }
-        // Type name -> files that declare it, and the [Table] name of each.
-        let mut types: HashMap<String, Vec<RootRelativePath>> = HashMap::new();
-        let mut tables: HashMap<String, String> = HashMap::new();
-        for p in &parsed {
-            for class in classes(p.tree.root_node(), &p.source) {
-                types
-                    .entry(class.name.clone())
-                    .or_default()
-                    .push(p.file.clone());
-                if let Some(table) = class
-                    .attributes
-                    .iter()
-                    .find(|a| a.name == "Table")
-                    .and_then(|a| a.first_string.clone())
-                {
-                    tables.insert(class.name.clone(), table);
-                }
-            }
-        }
-        let unique = |name: &str| {
-            types
-                .get(name)
-                .filter(|files| files.len() == 1)
-                .map(|files| files[0].clone())
-        };
-
-        // Registrations first, so constructors anywhere can be matched.
-        let mut registrations: HashMap<String, String> = HashMap::new();
-        for p in &parsed {
-            walk(p.tree.root_node(), &mut |node| {
-                if node.kind() != "invocation_expression" {
-                    return;
-                }
-                let Some(function) = node
-                    .child_by_field_name("function")
-                    .filter(|f| f.kind() == "member_access_expression")
-                else {
-                    return;
-                };
-                let Some(name) = function
-                    .child_by_field_name("name")
-                    .filter(|n| n.kind() == "generic_name")
-                else {
-                    return;
-                };
-                let method = name
-                    .named_child(0)
-                    .map(|n| text(n, &p.source))
-                    .unwrap_or("");
-                if !REGISTRATIONS.contains(&method) {
-                    return;
-                }
-                let args: Vec<String> = name
-                    .named_child(1)
-                    .map(|list| {
-                        let mut cursor = list.walk();
-                        list.named_children(&mut cursor)
-                            .filter(|t| matches!(t.kind(), "identifier" | "generic_name"))
-                            .map(|t| simple_name(t, &p.source))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                match args.as_slice() {
-                    [only] => {
-                        registrations.insert(only.clone(), only.clone());
-                    }
-                    [service, implementation] => {
-                        registrations.insert(service.clone(), implementation.clone());
-                    }
-                    _ => {}
-                }
-            });
-        }
-
-        for p in &parsed {
-            let root = p.tree.root_node();
-            let all = classes(root, &p.source);
-            for class in &all {
-                controller_routes(package, &p.file, class, &p.source, output);
-                // Injection through constructors.
-                for parameter in &class.constructor_types {
-                    let Some(implementation) = registrations.get(&parameter.name) else {
-                        continue;
-                    };
-                    let Some(provider) = unique(implementation) else {
-                        continue;
-                    };
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::ProviderInjectedInto,
-                            rule: DI_RULE,
-                            rule_version: VERSION,
-                            certainty: Certainty::Declared,
-                            from: provider,
-                            to: Some(p.file.clone()),
-                            from_symbol: Some(implementation.clone()),
-                            to_symbol: Some(class.name.clone()),
-                            label: implementation.clone(),
-                            evidence: evidence(&p.file, parameter.node, &p.source),
-                        },
-                    ));
-                }
-                // DbContext tables.
-                if class.bases.iter().any(|b| b.ends_with("DbContext")) {
-                    for (entity, property, node) in &class.db_sets {
-                        let Some(entity_file) = unique(entity) else {
-                            continue;
-                        };
-                        let (label, certainty) = match tables.get(entity) {
-                            Some(table) => (table.clone(), Certainty::Declared),
-                            None => (property.clone(), Certainty::Convention),
-                        };
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::ModelMappedToTable,
-                                rule: EF_RULE,
-                                rule_version: VERSION,
-                                certainty,
-                                from: entity_file,
-                                to: None,
-                                from_symbol: Some(entity.clone()),
-                                to_symbol: None,
-                                label,
-                                evidence: evidence(&p.file, *node, &p.source),
-                            },
-                        ));
-                    }
-                }
-            }
-            minimal_apis(package, &p.file, root, &p.source, &unique, output);
+            minimal_apis(
+                package,
+                &parsed_file.file,
+                parsed_file.tree.root_node(),
+                &parsed_file.source,
+                &|name| catalog.unique(name),
+                output,
+            );
         }
         Ok(())
+    }
+}
+
+struct ParsedFile {
+    file: RootRelativePath,
+    source: String,
+    tree: tree_sitter::Tree,
+}
+
+fn collect_registrations(parsed: &[ParsedFile]) -> HashMap<String, String> {
+    let mut registrations = HashMap::new();
+    for parsed_file in parsed {
+        collect_file_registrations(parsed_file, &mut registrations);
+    }
+    registrations
+}
+
+fn collect_file_registrations(parsed: &ParsedFile, registrations: &mut HashMap<String, String>) {
+    walk(parsed.tree.root_node(), &mut |node| {
+        if let Some((service, implementation)) = registration(node, &parsed.source) {
+            registrations.insert(service, implementation);
+        }
+    });
+}
+
+fn registration(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let function = node
+        .child_by_field_name("function")
+        .filter(|function| function.kind() == "member_access_expression")?;
+    let name = function
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "generic_name")?;
+    let method = name.named_child(0).map(|node| text(node, source))?;
+    if !REGISTRATIONS.contains(&method) {
+        return None;
+    }
+    let arguments = registration_type_arguments(name, source);
+    match arguments.as_slice() {
+        [only] => Some((only.clone(), only.clone())),
+        [service, implementation] => Some((service.clone(), implementation.clone())),
+        _ => None,
+    }
+}
+
+fn registration_type_arguments(name: Node<'_>, source: &str) -> Vec<String> {
+    let Some(list) = name.named_child(1) else {
+        return Vec::new();
+    };
+    let mut cursor = list.walk();
+    list.named_children(&mut cursor)
+        .filter(|ty| matches!(ty.kind(), "identifier" | "generic_name"))
+        .map(|ty| simple_name(ty, source))
+        .collect()
+}
+
+struct TypeCatalog {
+    types: HashMap<String, Vec<RootRelativePath>>,
+    tables: HashMap<String, String>,
+}
+
+impl TypeCatalog {
+    fn from_parsed(parsed: &[ParsedFile]) -> Self {
+        let mut catalog = Self {
+            types: HashMap::new(),
+            tables: HashMap::new(),
+        };
+        for parsed_file in parsed {
+            for class in classes(parsed_file.tree.root_node(), &parsed_file.source) {
+                catalog
+                    .types
+                    .entry(class.name.clone())
+                    .or_default()
+                    .push(parsed_file.file.clone());
+                if let Some(table) = table_name(&class) {
+                    catalog.tables.insert(class.name, table);
+                }
+            }
+        }
+        catalog
+    }
+
+    fn unique(&self, name: &str) -> Option<RootRelativePath> {
+        let files = self.types.get(name)?;
+        (files.len() == 1).then(|| files[0].clone())
+    }
+}
+
+fn table_name(class: &Class<'_>) -> Option<String> {
+    class
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == "Table")
+        .and_then(|attribute| attribute.first_string.clone())
+}
+
+fn parse_package_files(
+    package: &Package,
+    input: &FrameworkInput<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<ParsedFile>, DiscoveryError> {
+    let mut parsed = Vec::new();
+    for indexed in input.files_of(package) {
+        if cancel.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
+        if indexed
+            .path
+            .as_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("cs")
+        {
+            continue;
+        }
+        let Some(source) = input.read(&indexed.path) else {
+            continue;
+        };
+        let Some(tree) = parse_csharp(&source) else {
+            continue;
+        };
+        parsed.push(ParsedFile {
+            file: indexed.path.clone(),
+            source,
+            tree,
+        });
+    }
+    Ok(parsed)
+}
+
+fn emit_class_relations(
+    package: &Package,
+    parsed: &ParsedFile,
+    class: &Class<'_>,
+    catalog: &TypeCatalog,
+    registrations: &HashMap<String, String>,
+    output: &mut FrameworkOutput,
+) {
+    controller_routes(package, &parsed.file, class, &parsed.source, output);
+    emit_injection_relations(package, parsed, class, catalog, registrations, output);
+    emit_dbset_relations(package, parsed, class, catalog, output);
+}
+
+fn emit_injection_relations(
+    package: &Package,
+    parsed: &ParsedFile,
+    class: &Class<'_>,
+    catalog: &TypeCatalog,
+    registrations: &HashMap<String, String>,
+    output: &mut FrameworkOutput,
+) {
+    for parameter in &class.constructor_types {
+        let Some(implementation) = registrations.get(&parameter.name) else {
+            continue;
+        };
+        let Some(provider) = catalog.unique(implementation) else {
+            continue;
+        };
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&package.id),
+            RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule: DI_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: provider,
+                to: Some(parsed.file.clone()),
+                from_symbol: Some(implementation.clone()),
+                to_symbol: Some(class.name.clone()),
+                label: implementation.clone(),
+                evidence: evidence(&parsed.file, parameter.node, &parsed.source),
+            },
+        ));
+    }
+}
+
+fn emit_dbset_relations(
+    package: &Package,
+    parsed: &ParsedFile,
+    class: &Class<'_>,
+    catalog: &TypeCatalog,
+    output: &mut FrameworkOutput,
+) {
+    if !class.bases.iter().any(|base| base.ends_with("DbContext")) {
+        return;
+    }
+    for (entity, property, node) in &class.db_sets {
+        let Some(entity_file) = catalog.unique(entity) else {
+            continue;
+        };
+        let (label, certainty) = match catalog.tables.get(entity) {
+            Some(table) => (table.clone(), Certainty::Declared),
+            None => (property.clone(), Certainty::Convention),
+        };
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&package.id),
+            RelationDraft {
+                kind: RelationKind::ModelMappedToTable,
+                rule: EF_RULE,
+                rule_version: VERSION,
+                certainty,
+                from: entity_file,
+                to: None,
+                from_symbol: Some(entity.clone()),
+                to_symbol: None,
+                label,
+                evidence: evidence(&parsed.file, *node, &parsed.source),
+            },
+        ));
     }
 }
 
@@ -332,85 +409,121 @@ fn classes<'t>(root: Node<'t>, source: &str) -> Vec<Class<'t>> {
         if node.kind() != "class_declaration" {
             return;
         }
-        let Some(name) = node.child_by_field_name("name") else {
-            return;
-        };
-        let mut cursor = node.walk();
-        let bases: Vec<String> = node
-            .children(&mut cursor)
-            .filter(|c| c.kind() == "base_list")
-            .flat_map(|list| {
-                let mut inner = list.walk();
-                list.named_children(&mut inner)
-                    .map(|b| text(b, source).to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let (mut methods, mut constructor_types, mut db_sets) =
-            (Vec::new(), Vec::new(), Vec::new());
-        if let Some(body) = node.child_by_field_name("body") {
-            let mut inner = body.walk();
-            for member in body.named_children(&mut inner) {
-                match member.kind() {
-                    "method_declaration" => {
-                        if let Some(n) = member.child_by_field_name("name") {
-                            methods.push(Method {
-                                name: text(n, source).to_owned(),
-                                attributes: attributes(member, source),
-                            });
-                        }
-                    }
-                    "constructor_declaration" => {
-                        if let Some(parameters) = member.child_by_field_name("parameters") {
-                            let mut params = parameters.walk();
-                            for parameter in parameters
-                                .named_children(&mut params)
-                                .filter(|p| p.kind() == "parameter")
-                            {
-                                if let Some(ty) = parameter.child_by_field_name("type") {
-                                    constructor_types.push(Parameter {
-                                        name: simple_name(ty, source),
-                                        node: parameter,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    "property_declaration" => {
-                        let ty = member
-                            .child_by_field_name("type")
-                            .filter(|t| t.kind() == "generic_name");
-                        if let (Some(ty), Some(property)) = (ty, member.child_by_field_name("name"))
-                        {
-                            if ty.named_child(0).map(|n| text(n, source)) == Some("DbSet") {
-                                let entity = ty
-                                    .named_child(1)
-                                    .and_then(|l| l.named_child(0))
-                                    .map(|e| simple_name(e, source));
-                                if let Some(entity) = entity {
-                                    db_sets.push((
-                                        entity,
-                                        text(property, source).to_owned(),
-                                        member,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        if let Some(class) = parse_class(node, source) {
+            found.push(class);
         }
-        found.push(Class {
-            name: text(name, source).to_owned(),
-            attributes: attributes(node, source),
-            bases,
-            methods,
-            constructor_types,
-            db_sets,
-        });
     });
     found
+}
+
+fn parse_class<'t>(node: Node<'t>, source: &str) -> Option<Class<'t>> {
+    let name = node.child_by_field_name("name")?;
+    let bases = class_bases(node, source);
+    let (methods, constructor_types, db_sets) = class_members(node, source);
+    Some(Class {
+        name: text(name, source).to_owned(),
+        attributes: attributes(node, source),
+        bases,
+        methods,
+        constructor_types,
+        db_sets,
+    })
+}
+
+fn class_bases(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "base_list")
+        .flat_map(|list| {
+            let mut inner = list.walk();
+            list.named_children(&mut inner)
+                .map(|base| text(base, source).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A class's methods, constructor parameters and fields (name, type, node).
+type ClassMembers<'t> = (
+    Vec<Method>,
+    Vec<Parameter<'t>>,
+    Vec<(String, String, Node<'t>)>,
+);
+
+fn class_members<'t>(node: Node<'t>, source: &str) -> ClassMembers<'t> {
+    let mut methods = Vec::new();
+    let mut constructor_types = Vec::new();
+    let mut db_sets = Vec::new();
+    let Some(body) = node.child_by_field_name("body") else {
+        return (methods, constructor_types, db_sets);
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        match member.kind() {
+            "method_declaration" => add_method(member, source, &mut methods),
+            "constructor_declaration" => {
+                add_constructor_parameters(member, source, &mut constructor_types)
+            }
+            "property_declaration" => add_db_set(member, source, &mut db_sets),
+            _ => {}
+        }
+    }
+    (methods, constructor_types, db_sets)
+}
+
+fn add_method<'t>(member: Node<'t>, source: &str, methods: &mut Vec<Method>) {
+    let Some(name) = member.child_by_field_name("name") else {
+        return;
+    };
+    methods.push(Method {
+        name: text(name, source).to_owned(),
+        attributes: attributes(member, source),
+    });
+}
+
+fn add_constructor_parameters<'t>(
+    member: Node<'t>,
+    source: &str,
+    constructor_types: &mut Vec<Parameter<'t>>,
+) {
+    let Some(parameters) = member.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| parameter.kind() == "parameter")
+    {
+        if let Some(ty) = parameter.child_by_field_name("type") {
+            constructor_types.push(Parameter {
+                name: simple_name(ty, source),
+                node: parameter,
+            });
+        }
+    }
+}
+
+fn add_db_set<'t>(member: Node<'t>, source: &str, db_sets: &mut Vec<(String, String, Node<'t>)>) {
+    let Some(ty) = member
+        .child_by_field_name("type")
+        .filter(|ty| ty.kind() == "generic_name")
+    else {
+        return;
+    };
+    let Some(property) = member.child_by_field_name("name") else {
+        return;
+    };
+    if ty.named_child(0).map(|name| text(name, source)) != Some("DbSet") {
+        return;
+    }
+    let Some(entity) = ty
+        .named_child(1)
+        .and_then(|list| list.named_child(0))
+        .map(|entity| simple_name(entity, source))
+    else {
+        return;
+    };
+    db_sets.push((entity, text(property, source).to_owned(), member));
 }
 
 /// Controller templates: `~/x` and `/x` on an action are absolute, anything else extends the prefix.

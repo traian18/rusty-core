@@ -85,184 +85,294 @@ impl FrameworkAdapter for LaravelAdapter {
             parsed.push((file, source, tree));
         }
         let index = class_index(&parsed);
-        let unique = |name: &str| {
-            index
-                .get(name)
-                .filter(|f| f.len() == 1)
-                .map(|f| f[0].clone())
-        };
-
-        // Container bindings: interface -> implementation.
-        let mut bindings: HashMap<String, String> = HashMap::new();
-        for (_, source, tree) in &parsed {
-            walk(tree.root_node(), &mut |node| {
-                if node.kind() != "member_call_expression" {
-                    return;
-                }
-                let method = node
-                    .child_by_field_name("name")
-                    .map(|n| text(n, source))
-                    .unwrap_or("");
-                if !matches!(method, "bind" | "singleton" | "scoped") {
-                    return;
-                }
-                let object = node
-                    .child_by_field_name("object")
-                    .map(|o| text(o, source).replace(' ', ""))
-                    .unwrap_or_default();
-                if !object.ends_with("app") && !object.ends_with("$this->app") {
-                    return;
-                }
-                let args = arguments(node, "arguments", source);
-                if let (Some((_, interface)), Some((_, concrete))) = (args.first(), args.get(1)) {
-                    if let (Some(i), Some(c)) = (
-                        class_reference(*interface, source),
-                        class_reference(*concrete, source),
-                    ) {
-                        bindings.insert(i, c);
-                    }
-                }
-            });
-        }
-
+        let bindings = container_bindings(&parsed);
         for (file, source, tree) in &parsed {
-            let root = tree.root_node();
-            let in_routes = file
-                .as_path()
-                .components()
-                .any(|c| c.as_os_str() == "routes");
-            if in_routes {
-                routes(package, file, root, source, input, &unique, output);
+            if is_routes_file(file) {
+                let resolver = |name: &str| unique_class(&index, name);
+                routes(
+                    RouteRequest {
+                        package,
+                        file,
+                        root: tree.root_node(),
+                        source,
+                        input,
+                        unique: &resolver,
+                    },
+                    output,
+                );
             }
-            let in_controllers = file
-                .as_path()
-                .to_string_lossy()
-                .contains("Http/Controllers");
-            for class in classes(root, source) {
-                let base = class.base.as_deref().unwrap_or("");
-                if matches!(base, "Model" | "Authenticatable" | "Pivot") {
-                    let (label, certainty) = match class.properties.get("table") {
-                        Some(table) => (table.clone(), Certainty::Declared),
-                        None => (plural(&snake_case(&class.name)), Certainty::Convention),
-                    };
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::ModelMappedToTable,
-                            rule: MODEL_RULE,
-                            rule_version: VERSION,
-                            certainty,
-                            from: file.clone(),
-                            to: None,
-                            from_symbol: Some(class.name.clone()),
-                            to_symbol: None,
-                            label,
-                            evidence: evidence(
-                                file,
-                                class.node.child_by_field_name("name").unwrap_or(class.node),
-                                source,
-                            ),
-                        },
-                    ));
-                }
-                if base == "Command" {
-                    if let Some(signature) = class.properties.get("signature") {
-                        let name = signature.split_whitespace().next().unwrap_or("").to_owned();
-                        if !name.is_empty() {
-                            output.relate(FrameworkRelation::new(
-                                ID,
-                                Some(&package.id),
-                                RelationDraft {
-                                    kind: RelationKind::CommandExposedAs,
-                                    rule: COMMAND_RULE,
-                                    rule_version: VERSION,
-                                    certainty: Certainty::Declared,
-                                    from: file.clone(),
-                                    to: Some(file.clone()),
-                                    from_symbol: None,
-                                    to_symbol: Some(class.name.clone()),
-                                    label: name,
-                                    evidence: evidence(
-                                        file,
-                                        class
-                                            .node
-                                            .child_by_field_name("name")
-                                            .unwrap_or(class.node),
-                                        source,
-                                    ),
-                                },
-                            ));
-                        }
-                    }
-                }
-                if let Some(constructor) = class.constructor() {
-                    for parameter in &constructor.parameters {
-                        let (provider_name, rule, certainty) = match bindings
-                            .get(&parameter.type_name)
-                        {
-                            Some(concrete) => (concrete.clone(), BINDING_RULE, Certainty::Declared),
-                            None if in_controllers => (
-                                parameter.type_name.clone(),
-                                AUTOWIRE_RULE,
-                                Certainty::Convention,
-                            ),
-                            None => continue,
-                        };
-                        let Some(provider) = unique(&provider_name) else {
-                            continue;
-                        };
-                        if &provider == file {
-                            continue;
-                        }
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::ProviderInjectedInto,
-                                rule,
-                                rule_version: VERSION,
-                                certainty,
-                                from: provider,
-                                to: Some(file.clone()),
-                                from_symbol: Some(provider_name.clone()),
-                                to_symbol: Some(class.name.clone()),
-                                label: provider_name,
-                                evidence: evidence(file, parameter.node, source),
-                            },
-                        ));
-                    }
-                }
-            }
+            let context = FileRelationContext {
+                package,
+                file,
+                source,
+                in_controllers: is_controller_file(file),
+                bindings: &bindings,
+                index: &index,
+            };
+            emit_file_relations(&context, tree.root_node(), output);
         }
         Ok(())
     }
 }
 
-/// `->prefix('api')` literals in the chain leading to a `->group(...)` call.
+fn container_bindings(
+    parsed: &[(RootRelativePath, String, tree_sitter::Tree)],
+) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    for (_, source, tree) in parsed {
+        walk(tree.root_node(), &mut |node| {
+            collect_container_binding(node, source, &mut bindings);
+        });
+    }
+    bindings
+}
+
+fn collect_container_binding(node: Node<'_>, source: &str, bindings: &mut HashMap<String, String>) {
+    if node.kind() != "member_call_expression" || !is_container_binding_call(node, source) {
+        return;
+    }
+    let args = arguments(node, "arguments", source);
+    let (Some((_, interface)), Some((_, concrete))) = (args.first(), args.get(1)) else {
+        return;
+    };
+    let (Some(interface), Some(concrete)) = (
+        class_reference(*interface, source),
+        class_reference(*concrete, source),
+    ) else {
+        return;
+    };
+    bindings.insert(interface, concrete);
+}
+
+fn is_container_binding_call(node: Node<'_>, source: &str) -> bool {
+    let method = node
+        .child_by_field_name("name")
+        .map(|name| text(name, source))
+        .unwrap_or("");
+    if !matches!(method, "bind" | "singleton" | "scoped") {
+        return false;
+    }
+    let object = node
+        .child_by_field_name("object")
+        .map(|object| text(object, source).replace(' ', ""))
+        .unwrap_or_default();
+    object.ends_with("app") || object.ends_with("$this->app")
+}
+
+fn unique_class(
+    index: &HashMap<String, Vec<RootRelativePath>>,
+    name: &str,
+) -> Option<RootRelativePath> {
+    let files = index.get(name)?;
+    (files.len() == 1).then(|| files[0].clone())
+}
+
+fn is_routes_file(file: &RootRelativePath) -> bool {
+    file.as_path()
+        .components()
+        .any(|component| component.as_os_str() == "routes")
+}
+
+fn is_controller_file(file: &RootRelativePath) -> bool {
+    file.as_path()
+        .to_string_lossy()
+        .contains("Http/Controllers")
+}
+
+struct FileRelationContext<'a> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    source: &'a str,
+    in_controllers: bool,
+    bindings: &'a HashMap<String, String>,
+    index: &'a HashMap<String, Vec<RootRelativePath>>,
+}
+
+fn emit_file_relations(
+    context: &FileRelationContext<'_>,
+    root: Node<'_>,
+    output: &mut FrameworkOutput,
+) {
+    for class in classes(root, context.source) {
+        emit_model_relation(
+            context.package,
+            context.file,
+            context.source,
+            &class,
+            output,
+        );
+        emit_command_relation(
+            context.package,
+            context.file,
+            context.source,
+            &class,
+            output,
+        );
+        emit_constructor_injections(context, &class, output);
+    }
+}
+
+fn emit_model_relation(
+    package: &Package,
+    file: &RootRelativePath,
+    source: &str,
+    class: &crate::php_common::Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    let base = class.base.as_deref().unwrap_or("");
+    if !matches!(base, "Model" | "Authenticatable" | "Pivot") {
+        return;
+    }
+    let (label, certainty) = match class.properties.get("table") {
+        Some(table) => (table.clone(), Certainty::Declared),
+        None => (plural(&snake_case(&class.name)), Certainty::Convention),
+    };
+    output.relate(FrameworkRelation::new(
+        ID,
+        Some(&package.id),
+        RelationDraft {
+            kind: RelationKind::ModelMappedToTable,
+            rule: MODEL_RULE,
+            rule_version: VERSION,
+            certainty,
+            from: file.clone(),
+            to: None,
+            from_symbol: Some(class.name.clone()),
+            to_symbol: None,
+            label,
+            evidence: evidence(
+                file,
+                class.node.child_by_field_name("name").unwrap_or(class.node),
+                source,
+            ),
+        },
+    ));
+}
+
+fn emit_command_relation(
+    package: &Package,
+    file: &RootRelativePath,
+    source: &str,
+    class: &crate::php_common::Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    if class.base.as_deref() != Some("Command") {
+        return;
+    }
+    let Some(name) = class
+        .properties
+        .get("signature")
+        .and_then(|signature| signature.split_whitespace().next())
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    output.relate(FrameworkRelation::new(
+        ID,
+        Some(&package.id),
+        RelationDraft {
+            kind: RelationKind::CommandExposedAs,
+            rule: COMMAND_RULE,
+            rule_version: VERSION,
+            certainty: Certainty::Declared,
+            from: file.clone(),
+            to: Some(file.clone()),
+            from_symbol: None,
+            to_symbol: Some(class.name.clone()),
+            label: name.to_owned(),
+            evidence: evidence(
+                file,
+                class.node.child_by_field_name("name").unwrap_or(class.node),
+                source,
+            ),
+        },
+    ));
+}
+
+fn emit_constructor_injections(
+    context: &FileRelationContext<'_>,
+    class: &crate::php_common::Class<'_>,
+    output: &mut FrameworkOutput,
+) {
+    let Some(constructor) = class
+        .methods
+        .iter()
+        .find(|method| method.name == "__construct")
+    else {
+        return;
+    };
+    for parameter in &constructor.parameters {
+        let (provider_name, rule, certainty) = match context.bindings.get(&parameter.type_name) {
+            Some(concrete) => (concrete.clone(), BINDING_RULE, Certainty::Declared),
+            None if context.in_controllers => (
+                parameter.type_name.clone(),
+                AUTOWIRE_RULE,
+                Certainty::Convention,
+            ),
+            None => continue,
+        };
+        let Some(provider) = unique_class(context.index, &provider_name) else {
+            continue;
+        };
+        if &provider == context.file {
+            continue;
+        }
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&context.package.id),
+            RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule,
+                rule_version: VERSION,
+                certainty,
+                from: provider,
+                to: Some(context.file.clone()),
+                from_symbol: Some(provider_name.clone()),
+                to_symbol: Some(class.name.clone()),
+                label: provider_name,
+                evidence: evidence(context.file, parameter.node, context.source),
+            },
+        ));
+    }
+}
+
 fn chain_prefix(call: Node<'_>, source: &str) -> String {
     let mut prefix = String::new();
     let mut current = Some(call);
     while let Some(node) = current {
-        let name = node
-            .child_by_field_name("name")
-            .map(|n| text(n, source))
-            .unwrap_or("");
-        if name == "prefix" {
-            if let Some((_, value)) = arguments(node, "arguments", source).first() {
-                if let Some(part) = string_value(*value, source) {
-                    prefix = format!("{}/{}", part.trim_matches('/'), prefix);
-                }
-            }
-        }
-        current = node.child_by_field_name("object").filter(|o| {
-            matches!(
-                o.kind(),
-                "member_call_expression" | "scoped_call_expression"
-            )
-        });
+        collect_prefix(node, source, &mut prefix);
+        current = chained_object(node);
     }
     prefix
+}
+
+fn collect_prefix(node: Node<'_>, source: &str, prefix: &mut String) {
+    if !is_prefix_call(node, source) {
+        return;
+    }
+    let arguments = arguments(node, "arguments", source);
+    let Some((_, value)) = arguments.first() else {
+        return;
+    };
+    let Some(part) = string_value(*value, source) else {
+        return;
+    };
+    *prefix = format!("{}/{}", part.trim_matches('/'), prefix);
+}
+
+fn is_prefix_call(node: Node<'_>, source: &str) -> bool {
+    node.child_by_field_name("name")
+        .map(|name| text(name, source))
+        == Some("prefix")
+}
+
+fn chained_object(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("object").filter(|object| {
+        matches!(
+            object.kind(),
+            "member_call_expression" | "scoped_call_expression"
+        )
+    })
 }
 
 fn group_prefix(node: Node<'_>, source: &str) -> String {
@@ -297,121 +407,226 @@ fn join(prefix: &str, path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
-fn routes(
-    package: &Package,
-    file: &RootRelativePath,
-    root: Node<'_>,
-    source: &str,
-    input: &FrameworkInput<'_>,
-    unique: &dyn Fn(&str) -> Option<RootRelativePath>,
-    output: &mut FrameworkOutput,
-) {
-    let bindings = import_bindings(input, file);
-    let resolve = |name: &str| bindings.get(name).cloned().or_else(|| unique(name));
-    walk(root, &mut |node| {
-        if node.kind() != "scoped_call_expression" {
-            return;
-        }
-        let scope = node
-            .child_by_field_name("scope")
-            .map(|s| text(s, source))
-            .unwrap_or("");
-        if scope != "Route" {
-            return;
-        }
-        let method = node
-            .child_by_field_name("name")
-            .map(|n| text(n, source).to_owned())
-            .unwrap_or_default();
-        let args = arguments(node, "arguments", source);
-        let prefix = group_prefix(node, source);
-        let (verbs, path_at, handler_at): (Vec<String>, usize, usize) =
-            if VERBS.contains(&method.as_str()) {
-                (vec![method.to_uppercase()], 0, 1)
-            } else if method == "match" {
-                let verbs = args.first().map(|(_, v)| {
-                    let mut cursor = v.walk();
-                    v.named_children(&mut cursor)
-                        .filter_map(|e| e.named_child(0))
-                        .filter_map(|s| string_value(s, source))
-                        .map(|s| s.to_uppercase())
-                        .collect::<Vec<_>>()
-                });
-                (verbs.unwrap_or_default(), 1, 2)
-            } else if matches!(method.as_str(), "resource" | "apiResource") {
-                (vec!["RESOURCE".into()], 0, 1)
-            } else {
-                return;
-            };
-        let Some((_, path_node)) = args.get(path_at) else {
-            return;
-        };
-        let Some(path) = string_value(*path_node, source) else {
-            output.unresolved(
-                file,
-                format!(
-                    "`Route::{method}({}, …)` has a computed path; no relation emitted",
-                    text(*path_node, source)
-                ),
-            );
-            return;
-        };
-        let (target, symbol) = match args.get(handler_at).map(|(_, v)| *v) {
-            Some(handler) if handler.kind() == "array_creation_expression" => {
-                let mut cursor = handler.walk();
-                let elements: Vec<Node<'_>> = handler
-                    .named_children(&mut cursor)
-                    .filter_map(|e| e.named_child(0))
-                    .collect();
-                let class = elements.first().and_then(|c| class_reference(*c, source));
-                let action = elements.get(1).and_then(|a| string_value(*a, source));
-                (
-                    class.as_deref().and_then(&resolve),
-                    class.map(|c| action.map_or(c.clone(), |a| format!("{c}.{a}"))),
-                )
-            }
-            Some(handler) if handler.kind() == "string" => {
-                let value = string_value(handler, source).unwrap_or_default();
-                let (class, action) = value
-                    .split_once('@')
-                    .map_or((value.as_str(), None), |(c, a)| (c, Some(a)));
-                let class = class.rsplit('\\').next().unwrap_or(class);
-                (
-                    resolve(class),
-                    Some(action.map_or(class.to_owned(), |a| format!("{class}.{a}"))),
-                )
-            }
-            Some(handler) if matches!(handler.kind(), "anonymous_function" | "arrow_function") => {
-                (Some(file.clone()), None)
-            }
-            Some(handler) => {
-                let class = class_reference(handler, source);
-                (class.as_deref().and_then(&resolve), class)
-            }
-            None => (None, None),
-        };
-        for verb in verbs {
-            output.relate(FrameworkRelation::new(
-                ID,
-                Some(&package.id),
-                RelationDraft {
-                    kind: RelationKind::RouteRegisteredTo,
-                    rule: ROUTE_RULE,
-                    rule_version: VERSION,
-                    certainty: Certainty::Declared,
-                    from: file.clone(),
-                    to: target.clone(),
-                    from_symbol: None,
-                    to_symbol: symbol.clone(),
-                    label: format!("{verb} {}", join(&prefix, &path)),
-                    evidence: evidence(file, node, source),
-                },
-            ));
-        }
+struct RouteRequest<'a, 'b> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    root: Node<'b>,
+    source: &'a str,
+    input: &'a FrameworkInput<'a>,
+    unique: &'a dyn Fn(&str) -> Option<RootRelativePath>,
+}
+
+fn routes(request: RouteRequest<'_, '_>, output: &mut FrameworkOutput) {
+    let bindings = import_bindings(request.input, request.file);
+    let context = RouteContext {
+        package: request.package,
+        file: request.file,
+        source: request.source,
+        bindings: &bindings,
+        unique: request.unique,
+    };
+    walk(request.root, &mut |node| {
+        emit_route_call(&context, node, output)
     });
 }
 
-/// Imported simple class name -> the file its `use` resolved to.
+struct RouteContext<'a> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    source: &'a str,
+    bindings: &'a HashMap<String, RootRelativePath>,
+    unique: &'a dyn Fn(&str) -> Option<RootRelativePath>,
+}
+
+fn emit_route_call(context: &RouteContext<'_>, node: Node<'_>, output: &mut FrameworkOutput) {
+    if node.kind() != "scoped_call_expression" || !is_route_scope(node, context.source) {
+        return;
+    }
+    let method = call_name(node, context.source);
+    let args = arguments(node, "arguments", context.source);
+    let Some((verbs, path_index, handler_index)) = route_shape(&method, &args, context.source)
+    else {
+        return;
+    };
+    let Some((_, path_node)) = args.get(path_index) else {
+        return;
+    };
+    let Some(path) = string_value(*path_node, context.source) else {
+        context_error(context, &method, *path_node, output);
+        return;
+    };
+    let (target, symbol) = args
+        .get(handler_index)
+        .map(|(_, handler)| route_handler(*handler, context))
+        .unwrap_or((None, None));
+    let route = RouteRecord {
+        node,
+        verbs,
+        path,
+        target,
+        symbol,
+    };
+    emit_route_relations(context, &route, output);
+}
+
+fn context_error(
+    context: &RouteContext<'_>,
+    method: &str,
+    path_node: Node<'_>,
+    output: &mut FrameworkOutput,
+) {
+    output.unresolved(
+        context.file,
+        format!(
+            "`Route::{method}({}, …)` has a computed path; no relation emitted",
+            text(path_node, context.source)
+        ),
+    );
+}
+
+struct RouteRecord<'a> {
+    node: Node<'a>,
+    verbs: Vec<String>,
+    path: String,
+    target: Option<RootRelativePath>,
+    symbol: Option<String>,
+}
+
+fn is_route_scope(node: Node<'_>, source: &str) -> bool {
+    node.child_by_field_name("scope")
+        .map(|scope| text(scope, source))
+        == Some("Route")
+}
+
+fn call_name(node: Node<'_>, source: &str) -> String {
+    node.child_by_field_name("name")
+        .map(|name| text(name, source).to_owned())
+        .unwrap_or_default()
+}
+
+fn route_shape(
+    method: &str,
+    args: &[(Option<String>, Node<'_>)],
+    source: &str,
+) -> Option<(Vec<String>, usize, usize)> {
+    if VERBS.contains(&method) {
+        return Some((vec![method.to_uppercase()], 0, 1));
+    }
+    if method == "match" {
+        return Some((match_verbs(args, source), 1, 2));
+    }
+    matches!(method, "resource" | "apiResource").then(|| (vec!["RESOURCE".into()], 0, 1))
+}
+
+fn match_verbs(args: &[(Option<String>, Node<'_>)], source: &str) -> Vec<String> {
+    let Some((_, values)) = args.first() else {
+        return Vec::new();
+    };
+    let mut cursor = values.walk();
+    values
+        .named_children(&mut cursor)
+        .filter_map(|element| element.named_child(0))
+        .filter_map(|value| string_value(value, source))
+        .map(|verb| verb.to_uppercase())
+        .collect()
+}
+
+fn route_handler(
+    handler: Node<'_>,
+    context: &RouteContext<'_>,
+) -> (Option<RootRelativePath>, Option<String>) {
+    match handler.kind() {
+        "array_creation_expression" => array_route_handler(handler, context),
+        "string" => string_route_handler(handler, context),
+        "anonymous_function" | "arrow_function" => (Some(context.file.clone()), None),
+        _ => class_route_handler(handler, context),
+    }
+}
+
+fn array_route_handler(
+    handler: Node<'_>,
+    context: &RouteContext<'_>,
+) -> (Option<RootRelativePath>, Option<String>) {
+    let mut cursor = handler.walk();
+    let elements: Vec<_> = handler
+        .named_children(&mut cursor)
+        .filter_map(|element| element.named_child(0))
+        .collect();
+    let Some(class_node) = elements.first() else {
+        return (None, None);
+    };
+    let Some(class) = class_reference(*class_node, context.source) else {
+        return (None, None);
+    };
+    let action = elements
+        .get(1)
+        .and_then(|action| string_value(*action, context.source));
+    let target = resolve_route_class(&class, context);
+    let symbol = Some(action.map_or(class.clone(), |action| format!("{class}.{action}")));
+    (target, symbol)
+}
+
+fn string_route_handler(
+    handler: Node<'_>,
+    context: &RouteContext<'_>,
+) -> (Option<RootRelativePath>, Option<String>) {
+    let value = string_value(handler, context.source).unwrap_or_default();
+    let (class, action) = value
+        .split_once('@')
+        .map_or((value.as_str(), None), |(class, action)| {
+            (class, Some(action))
+        });
+    let class = class.rsplit('\\').next().unwrap_or(class);
+    let target = resolve_route_class(class, context);
+    let symbol = Some(action.map_or(class.to_owned(), |action| format!("{class}.{action}")));
+    (target, symbol)
+}
+
+fn class_route_handler(
+    handler: Node<'_>,
+    context: &RouteContext<'_>,
+) -> (Option<RootRelativePath>, Option<String>) {
+    let class = class_reference(handler, context.source);
+    let target = class
+        .as_deref()
+        .and_then(|name| resolve_route_class(name, context));
+    (target, class)
+}
+
+fn resolve_route_class(name: &str, context: &RouteContext<'_>) -> Option<RootRelativePath> {
+    context
+        .bindings
+        .get(name)
+        .cloned()
+        .or_else(|| (context.unique)(name))
+}
+
+fn emit_route_relations(
+    context: &RouteContext<'_>,
+    route: &RouteRecord<'_>,
+    output: &mut FrameworkOutput,
+) {
+    let prefix = group_prefix(route.node, context.source);
+    for verb in &route.verbs {
+        output.relate(FrameworkRelation::new(
+            ID,
+            Some(&context.package.id),
+            RelationDraft {
+                kind: RelationKind::RouteRegisteredTo,
+                rule: ROUTE_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: context.file.clone(),
+                to: route.target.clone(),
+                from_symbol: None,
+                to_symbol: route.symbol.clone(),
+                label: format!("{verb} {}", join(&prefix, &route.path)),
+                evidence: evidence(context.file, route.node, context.source),
+            },
+        ));
+    }
+}
+
 fn import_bindings(
     input: &FrameworkInput<'_>,
     file: &RootRelativePath,
