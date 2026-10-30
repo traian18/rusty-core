@@ -92,6 +92,9 @@ struct Progress {
 }
 
 /// Added to every reviewer's instructions: what a task review judges.
+/// Marks a failure reason that is the step planner's design gap, not a failed build.
+const DESIGN_GAP: &str = "[design gap]";
+
 const REVIEW_SCOPE: &str = "Judge only workflow_input.task: its own criteria and what its instructions ask of it. Something the task itself leaves to another repository's change, a later task, a prerequisite or a follow-up is not this task's to deliver: mention it in summary, but it is never a reason for needs_repair. Use needs_repair only for a defect in what this task had to do. workflow_input.host_checks, when present, is the workflow's own typecheck after this build: errors it says were there before this task are not this task's.";
 
 /// Why a round of attempts at a task ended without an accepted task.
@@ -671,7 +674,7 @@ impl IsolatedSessionAgentExecutor {
                         } else {
                             progress
                                 .completed
-                                .push(json!({"task_id":task.id,"skipped":true,"reason":reason}));
+                                .push(json!({"task_id":task.id,"skipped":true,"reason":reason.strip_prefix(DESIGN_GAP).map_or(reason.as_str(), str::trim_start)}));
                         }
                         progress.current = None;
                         progress.step_plan = None;
@@ -768,7 +771,7 @@ impl IsolatedSessionAgentExecutor {
             // Nothing was built: the person answers, and another try plans with the answer.
             Err(question) => {
                 return Ok(TaskOutcome::Failed(format!(
-                    "Task {} needs a decision before it can be built. The step planner asks:\n{question}\nTry again with your answer as guidance, or revise the design and the task list",
+                    "{DESIGN_GAP} Task {} needs a decision before it can be built. The step planner asks:\n{question}\nTry again with your answer as guidance, or revise the design and the task list",
                     task.id
                 )))
             }
@@ -1222,6 +1225,10 @@ impl IsolatedSessionAgentExecutor {
         context: &mut StepContext,
     ) -> Result<AfterFailure, AgentExecutionError> {
         let queue = request.task_queue.as_ref().expect("task queue");
+        let design_gap = reason.starts_with(DESIGN_GAP);
+        let reason = reason
+            .strip_prefix(DESIGN_GAP)
+            .map_or(reason, str::trim_start);
         match queue.on_task_failure {
             TaskFailurePolicy::Stop => {
                 return Err(AgentExecutionError::new("task_failed", reason));
@@ -1254,7 +1261,13 @@ impl IsolatedSessionAgentExecutor {
                     task.id,
                     if request.plan_revisable { "revise the plan, " } else { "" }
                 ),
-                subject: json!({"task": format!("{}: {}", task.id, task.instructions), "problem": reason}),
+                // A design gap is not a failed build: skipping it skips every task built on it, so
+                // the host is told it is one (Auto mode revises the plan instead of skipping).
+                subject: json!({
+                    "task": format!("{}: {}", task.id, task.instructions),
+                    "problem": reason,
+                    "design_gap": design_gap,
+                }),
                 decisions,
             })
             .await?;

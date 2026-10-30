@@ -1910,6 +1910,10 @@ mod isolated_session {
             result.contains("Where does `routeId` come from?"),
             "{result}"
         );
+        assert!(
+            !result.contains("[design gap]"),
+            "the marker is internal: {result}"
+        );
     }
 
     /// Runs the default workflow with its agent step in `mode`, against a
@@ -2632,6 +2636,10 @@ mod isolated_session {
             .as_str()
             .unwrap()
             .contains("needs the staging API key"));
+        assert_eq!(
+            question.subject["design_gap"], false,
+            "a failed build is not a design gap"
+        );
         let offered: Vec<_> = question.decisions.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             offered,
