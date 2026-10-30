@@ -778,6 +778,56 @@ fn a_waivable_check_does_not_excuse_one_that_is_not() {
     assert!(!completed(&effects));
 }
 
+/// The Build profile's check: a checkpoint needs at least one edit first.
+fn attempted_gate() -> Value {
+    json!({
+        "checks": [{
+            "id": "attempted",
+            "require": { "any": [
+                { "not": { "final_status": "checkpoint" } },
+                { "not": { "tool_offered": "write_file" } },
+                { "calls": { "tool": "write_file", "outcome": "succeeded", "gte": 1 } }
+            ] },
+            "feedback": "Make the first change."
+        }],
+        "max_continuations": 2
+    })
+}
+
+#[test]
+fn a_checkpoint_before_any_edit_is_sent_back_and_one_after_an_edit_passes() {
+    let mut agent = agent_with_tools(&["read_file", "write_file"], attempted_gate(), json!({}));
+    let run_id = start(&mut agent);
+    use_tool(&mut agent, run_id, "read_file");
+    let effects = answer(
+        &mut agent,
+        run_id,
+        "No files were changed.\n\nStatus: checkpoint",
+    );
+    assert_eq!(
+        gate_event(&effects),
+        Some((false, true, vec!["attempted".into()]))
+    );
+    assert!(last_user_text(&agent).contains("Make the first change."));
+
+    use_tool(&mut agent, run_id, "write_file");
+    let effects = answer(
+        &mut agent,
+        run_id,
+        "Stuck on the lifetime.\n\nStatus: checkpoint",
+    );
+    assert_eq!(gate_event(&effects), Some((true, false, vec![])));
+
+    let mut read_only = agent_with_tools(&["read_file"], attempted_gate(), json!({}));
+    let run_id = start(&mut read_only);
+    let effects = answer(&mut read_only, run_id, "Status: checkpoint");
+    assert_eq!(
+        gate_event(&effects),
+        Some((true, false, vec![])),
+        "a session that cannot edit may report checkpoint"
+    );
+}
+
 #[test]
 fn the_final_status_is_read_from_the_last_status_line() {
     use harness_core::behavior::final_status;
