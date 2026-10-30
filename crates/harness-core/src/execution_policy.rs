@@ -51,6 +51,8 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
     tool_permission(name).is_some_and(|permission| enabled(policy, permission))
 }
 
+/// `agent_spawn` is here, not behind a skill grant: delegating to a read-only child is part of every
+/// run. What a child may do is bounded by the spawn tool itself (read-only by default, not delegatable).
 fn is_unconditionally_allowed(name: &str) -> bool {
     matches!(
         name,
@@ -60,6 +62,7 @@ fn is_unconditionally_allowed(name: &str) -> bool {
             | "update_todos"
             | "job_output"
             | "spec_tasks_check"
+            | "agent_spawn"
     ) || crate::tool_alias::ALWAYS_ADMITTED.contains(&name)
 }
 

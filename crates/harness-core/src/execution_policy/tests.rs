@@ -178,6 +178,22 @@ fn decide_is_allowed_without_any_grant_in_every_mode() {
 }
 
 #[test]
+fn agent_spawn_is_allowed_without_any_grant_in_every_mode() {
+    for mode in [
+        ExecutionMode::Execute,
+        ExecutionMode::Plan,
+        ExecutionMode::Virtual,
+    ] {
+        let policy = ExecutionPolicy {
+            mode,
+            enabled_tools: vec![],
+            allowed_mcp_servers: vec![],
+        };
+        assert!(allows_tool(&policy, "agent_spawn"));
+    }
+}
+
+#[test]
 fn update_todos_is_allowed_without_any_grant_in_every_mode() {
     for mode in [
         ExecutionMode::Execute,

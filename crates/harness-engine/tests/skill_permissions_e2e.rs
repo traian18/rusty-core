@@ -120,7 +120,6 @@ async fn custom_refactor_skill_allows_writes_but_never_dispatches_network_or_unl
         "run_command",
         "shell.exec",
         "mcp__other__search",
-        "agent_spawn",
         "unknown",
     ] {
         attempt(name, refactor(), false).await;
