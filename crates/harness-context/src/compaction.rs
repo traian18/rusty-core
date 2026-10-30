@@ -15,6 +15,26 @@ use harness_protocol::messages::{AgentMessage, ContentBlock, MessageRole};
 const ELIDE_MIN_CHARS: usize = 256;
 /// Head of the original output kept in the stub so the gist survives.
 const ELIDE_HEAD_CHARS: usize = 120;
+/// Words every elision stub contains, so a stub is never elided again.
+const ELIDED_MARK: &str = "result elided to save context";
+/// A recovery stamp: one line a host puts on output it already shortened,
+/// naming how to read the original back, such as
+/// `[rusty:condensed git-log · 18,294->4,960 chars · full output: job_output id="out-…"]`.
+/// The grammar is shared with rusty-ide's `tokenOptimizations/safeguards/stamps.ts`.
+const STAMP_PREFIX: &str = "[rusty:";
+/// Longer lines are not taken for a stamp.
+const MAX_STAMP_CHARS: usize = 400;
+
+/// The last recovery stamp in `output`, if it has one.
+fn recovery_stamp(output: &str) -> Option<&str> {
+    output.lines().rev().map(str::trim_end).find(|line| {
+        line.starts_with(STAMP_PREFIX) && line.ends_with(']') && line.len() <= MAX_STAMP_CHARS
+    })
+}
+
+fn is_elision_stub(output: &str) -> bool {
+    output.starts_with('[') && output.contains(ELIDED_MARK)
+}
 
 /// Messages that must survive compaction regardless of age.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +69,10 @@ fn is_summary(message: &AgentMessage) -> bool {
 
 /// Replaces large tool results outside the last `protect_tail` messages with a
 /// stub naming the tool and size. Returns how many results were elided.
+///
+/// A stub keeps the output's recovery stamp, so output a host already
+/// shortened stays recoverable after it is elided, and a stub is never
+/// elided again: two lossy passes do not stack.
 pub fn elide_tool_results(
     messages: &mut [AgentMessage],
     protect_tail: usize,
@@ -74,7 +98,7 @@ pub fn elide_tool_results(
                 continue;
             };
             let len = result.output_preview.len();
-            if len <= ELIDE_MIN_CHARS {
+            if len <= ELIDE_MIN_CHARS || is_elision_stub(&result.output_preview) {
                 continue;
             }
             let tool = names.get(call_id).map_or("tool", String::as_str);
@@ -83,8 +107,11 @@ pub fn elide_tool_results(
                 .chars()
                 .take(ELIDE_HEAD_CHARS)
                 .collect();
+            let stamp = recovery_stamp(&result.output_preview)
+                .map(|stamp| format!("\n{stamp}"))
+                .unwrap_or_default();
             result.output_preview = format!(
-                "[{tool} result elided to save context — {len} chars{}] {head}…",
+                "[{tool} {ELIDED_MARK} — {len} chars{}] {head}…{stamp}",
                 if result.has_error { ", error" } else { "" }
             );
             elided += 1;
@@ -198,3 +225,6 @@ pub fn truncation_note(dropped: usize) -> AgentMessage {
         created_at: Timestamp::now(),
     }
 }
+
+#[cfg(test)]
+mod tests;
