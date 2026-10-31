@@ -1,8 +1,80 @@
-# Running the Harness TUI Locally
+# harness
+
+The standalone terminal UI for the Rusty agent harness. It runs the engine in the same process, so
+neither `harnessd` nor `harnessctl` is needed. It is the quickest way to try a provider, a model, or a
+change to the core with a real conversation.
+
+## Why it exists
+
+Every other host (IDE, daemon, SDK) needs a program around it to be exercised. This TUI is the
+smallest complete host: pick a provider, account and model, chat, approve tools, and watch the activity
+log. Because it links the engine directly it also shows exactly what an embedder gets.
+
+## How it works
+
+1. `main` parses the launch options (`--integration`, `--config-json`, `--mcp-server`,
+   `--skills-dir`, and the like) and builds the engine through `harness_setup`: integrations
+   registered, a JSONL session store under `.harness/sessions`, the tool set, skills and MCP servers.
+2. `providers` runs the provider, account and model picker and keeps the model catalog cached.
+3. `controller` owns the running session: it sends prompts, steers, cancels, resolves permissions and
+   switches provider or model by starting a fresh session while keeping the earlier ones.
+4. `app_state` turns engine events into what the screen shows (`events`, `runtime_events`,
+   `transcript`, `activity_log`, `modal`); `render`, `markdown` and `input` draw it and read keys.
+
+## Key types and concepts
+
+- **Launch directory = workspace.** Start it from the repository the agent should work on.
+- **Provider pill and status dot** in the header: the active provider and model, and idle, running,
+  connecting or error.
+- **Activity log**: a raw chronological record of every event, independent of the transcript.
+
+## A worked example
+
+```console
+cargo run -p harness -- --integration codex
+cargo run -p harness -- --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp'
+```
+
+The full guide (providers, commands, shortcuts, tools and permissions, storage, troubleshooting)
+follows below.
+
+## Public API
+
+A binary. Its options are `--integration`, `--config-json`, `--mcp-server`, `--skills-dir` and the
+session-store location; its commands are `/new`, `/login`, `/models`, `/context`, `/log` and `/exit`.
+
+## Errors
+
+Provider problems (missing key, missing CLI) are shown as a health error and never discard the active
+session. Engine errors are shown in the transcript.
+
+## Design decisions
+
+- **In-process engine**, so there is nothing to start first.
+- **Keys from the environment**, never written to session metadata.
+- **Terminal restored on exit**; `reset` is the fallback after a forced kill.
+
+## Testing
+
+State and rendering helpers have unit tests; the engine is tested elsewhere. Run
+`cargo test -p harness`.
+
+## In the workspace
+
+- **Depends on:** `rusty-engine`, `rusty-protocol`, `rusty-provider-anthropic`, `rusty-provider-codex`, `rusty-provider-github-copilot`, `rusty-provider-openai`, `rusty-session-store`
+- **Used by:** nothing else in the workspace
+
+## Must never
+
+- Persist API keys.
+- Run a tool without the permission the session policy requires.
+- Reimplement engine behavior: it only drives and displays it.
+
+## Usage guide
 
 The `harness` app is the standalone terminal UI for testing the Rusty agent harness. It runs the engine in-process, so neither `harnessd` nor `harnessctl` is required.
 
-## Prerequisites
+### Prerequisites
 
 - A Rust toolchain with `cargo`
 - A terminal that supports an alternate screen and color
@@ -10,7 +82,7 @@ The `harness` app is the standalone terminal UI for testing the Rusty agent harn
 
 Run commands from the repository root unless stated otherwise.
 
-## Verify the workspace
+### Verify the workspace
 
 Run the complete workspace test suite without filtering tests:
 
@@ -24,7 +96,7 @@ Optionally check formatting:
 cargo fmt --all -- --check
 ```
 
-## Start the TUI
+### Start the TUI
 
 To start with the provider picker and the default Anthropic selection:
 
@@ -47,7 +119,7 @@ Supported integration values are:
 
 The directory from which the TUI is launched becomes its workspace. Start it from the repository root to let the agent work with this repository.
 
-## Provider setup
+### Provider setup
 
 | Provider | Local requirement | Example |
 |---|---|---|
@@ -68,7 +140,7 @@ cargo run -p harness -- \
 
 For ordinary use, select the provider and model in the TUI instead.
 
-## TUI flow
+### TUI flow
 
 On startup, select:
 
@@ -80,7 +152,7 @@ An unavailable API key or missing CLI executable is shown as a provider health e
 
 The current provider and model are always shown as a highlighted pill in the header, alongside a colored status dot (green = idle/ready, blue = running, amber = connecting, red = error).
 
-## Switching provider or model on the fly
+### Switching provider or model on the fly
 
 You are never locked into your first choice. At any point during a conversation:
 
@@ -90,7 +162,7 @@ You are never locked into your first choice. At any point during a conversation:
 
 This works mid-conversation, not just at startup — the header pill and sidebar update immediately to reflect the active provider/model.
 
-## Commands
+### Commands
 
 Enter these commands in the prompt composer:
 
@@ -103,7 +175,7 @@ Enter these commands in the prompt composer:
 | `/log` or `/logs` | Toggle the activity log — a raw, chronological record of every event the agent emitted (state transitions, backend request timing, tool-call lifecycles with arguments, permission requests, usage updates), independent of the curated transcript. Also reachable from the command palette (`Ctrl+P`) as "Activity log" |
 | `/exit` or `/quit` | Exit the TUI |
 
-## Keyboard shortcuts
+### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
@@ -125,7 +197,7 @@ Enter these commands in the prompt composer:
 
 When a permission request is visible, `Ctrl+N` rejects it; otherwise, the same shortcut opens the provider/model picker.
 
-## Tools and permissions
+### Tools and permissions
 
 The TUI exposes these workspace tools:
 
@@ -147,7 +219,7 @@ cargo run -p harness -- \
 
 Every tool the server advertises is registered as `mcp.<name>.<tool>`, applies to every session for the rest of the run (including ones started later via the provider picker), and shows up in the transcript/activity log like any other tool call. This flag can't express environment variables, a working directory, or a non-default timeout — see the main [README's MCP servers section](../../README.md#mcp-servers) for the embedding API that can.
 
-## Session storage
+### Session storage
 
 Sessions are stored relative to the launch directory:
 
@@ -157,7 +229,7 @@ Sessions are stored relative to the launch directory:
 
 Restarting the TUI from the same directory makes those sessions available for restore and navigation. Session metadata records provider and exact model selection, but not API keys.
 
-## Troubleshooting
+### Troubleshooting
 
 ### A provider is unavailable
 
