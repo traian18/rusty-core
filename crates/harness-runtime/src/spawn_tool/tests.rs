@@ -259,3 +259,17 @@ fn descriptor_has_the_stable_tool_name_and_requires_task() {
         serde_json::json!(["task"])
     );
 }
+
+#[test]
+fn a_child_is_asked_to_end_with_where_it_found_things() {
+    let read_tool = tool_capability("fs.read", false, true);
+    let parent = parent_agent(vec![read_tool], AgentBudget::default());
+    let (spec, _) = build_spawn_spec(
+        &serde_json::json!({"task": "find the reading code"}),
+        &parent,
+    )
+    .unwrap();
+    let task = spec.task.unwrap();
+    assert!(task.starts_with("find the reading code\n\n"));
+    assert!(task.ends_with(CHILD_REPORT_NOTE));
+}

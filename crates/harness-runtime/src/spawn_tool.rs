@@ -111,6 +111,10 @@ pub struct SpawnToolArgs {
 /// `AgentSupervisor::spawn_child` (reached via `AgentRunner::spawn_agent`)
 /// is the single place all of that is actually enforced, exactly as for
 /// every other spawn path.
+/// Added to every child's task: the parent cannot see what the child read,
+/// so the child names where things are, and the parent need not search again.
+pub const CHILD_REPORT_NOTE: &str = "When you finish, end your reply with a line `Locations:` followed by where the code your answer is about lives, one `path:start-end` (and the symbol) per line, so the agent that asked does not have to search for it again.";
+
 pub fn build_spawn_spec(
     arguments: &serde_json::Value,
     parent: &Agent,
@@ -170,7 +174,7 @@ pub fn build_spawn_spec(
         workspace,
         budget,
         mode,
-        task: Some(args.task),
+        task: Some(format!("{}\n\n{CHILD_REPORT_NOTE}", args.task)),
         execution_params,
     };
 
@@ -258,7 +262,10 @@ pub fn agent_spawn_tool_descriptor(id: ToolId) -> ToolDescriptor {
             independently-scoped pieces (e.g. a focused research task, a code-review pass) \
             rather than doing everything in this conversation. The child starts with a \
             least-privilege, read-only tool set and a read-only view of the workspace unless \
-            you explicitly request otherwise."
+            you explicitly request otherwise. The child sees nothing of this conversation: \
+            put in `task` what you already know (the files and lines involved, what you found \
+            and ruled out), so it does not explore that again. Its reply ends with where it \
+            found things."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
