@@ -1,5 +1,5 @@
 use super::*;
-use crate::task_queue::{Criterion, Requirement};
+use crate::task_queue::model::{Criterion, Requirement};
 use rusty_agent_core::behavior::ProfileRef;
 use rusty_workflow_core::{
     AgentContextMode, OrchestrationNodeId, OrchestrationRunId, StructuredOutputMode,
