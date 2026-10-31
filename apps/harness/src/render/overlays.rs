@@ -24,149 +24,14 @@ pub(super) fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppSta
     frame.render_widget(Clear, area);
 
     let (title, lines) = match modal {
-        ModalState::Commands { selected } => {
-            let commands = [
-                "New session / switch provider · model",
-                "Context inspector",
-                "Activity log",
-                "Quit",
-            ];
-            (
-                " Command palette ",
-                commands
-                    .iter()
-                    .enumerate()
-                    .map(|(index, command)| selectable_line(command, index == *selected))
-                    .collect(),
-            )
-        }
-        ModalState::Provider { selected } => (
-            " Select provider ",
-            state
-                .providers
-                .iter()
-                .enumerate()
-                .flat_map(|(index, provider)| {
-                    let status = if provider.ready { "●" } else { "○" };
-                    let status_color = if provider.ready { SUCCESS } else { ERROR };
-                    vec![
-                        Line::from(vec![
-                            Span::styled(
-                                if index == *selected { "› " } else { "  " },
-                                Style::default().fg(ACCENT),
-                            ),
-                            Span::styled(format!("{status} "), Style::default().fg(status_color)),
-                            Span::styled(
-                                provider.name.clone(),
-                                Style::default()
-                                    .fg(if index == *selected { TEXT } else { MUTED })
-                                    .add_modifier(if index == *selected {
-                                        Modifier::BOLD
-                                    } else {
-                                        Modifier::empty()
-                                    }),
-                            ),
-                        ]),
-                        Line::from(Span::styled(
-                            format!(
-                                "      {} · {} models",
-                                provider.account_hint,
-                                provider.models.len()
-                            ),
-                            Style::default().fg(SUBTLE),
-                        )),
-                    ]
-                })
-                .collect(),
-        ),
-        ModalState::Account { provider } => {
-            let provider = &state.providers[*provider];
-            (
-                " Select account ",
-                vec![
-                    Line::from(Span::styled(
-                        provider.name.clone(),
-                        Style::default().fg(ACCENT).bold(),
-                    )),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled("Profile      ", Style::default().fg(MUTED)),
-                        Span::styled(provider.account_hint.clone(), Style::default().fg(TEXT)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Connection   ", Style::default().fg(MUTED)),
-                        Span::styled(
-                            provider.credential_state.clone(),
-                            Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Health       ", Style::default().fg(MUTED)),
-                        Span::styled(
-                            provider.health_message.clone(),
-                            Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        if provider.ready {
-                            "Authentication is owned by this profile or its official CLI."
-                        } else {
-                            "Resolve the connection issue before starting this provider."
-                        },
-                        Style::default().fg(SUBTLE),
-                    )),
-                ],
-            )
-        }
+        ModalState::Commands { selected } => command_lines(*selected),
+        ModalState::Provider { selected } => provider_lines(state, *selected),
+        ModalState::Account { provider } => account_lines(&state.providers[*provider]),
         ModalState::Model {
             provider,
             selected,
             value,
-        } => {
-            let provider = &state.providers[*provider];
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    provider.name.clone(),
-                    Style::default().fg(ACCENT).bold(),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    provider.model_hint.clone(),
-                    Style::default().fg(SUBTLE),
-                )),
-            ];
-            let selected_index = if *selected == usize::MAX {
-                0
-            } else {
-                *selected
-            };
-            let start = selected_index.saturating_sub(3);
-            lines.extend(
-                provider
-                    .models
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(7)
-                    .map(|(index, model)| selectable_line(model, index == *selected)),
-            );
-            if provider.models.len() > 7 {
-                lines.push(Line::from(Span::styled(
-                    format!("  {} models available", provider.models.len()),
-                    Style::default().fg(SUBTLE),
-                )));
-            }
-            lines.extend([
-                Line::from(""),
-                Line::from(Span::styled("Model ID", Style::default().fg(MUTED))),
-                Line::from(Span::styled(
-                    format!("  {value}_"),
-                    Style::default().fg(TEXT).bg(Color::Rgb(30, 34, 43)),
-                )),
-            ]);
-            (" Select model ", lines)
-        }
+        } => model_lines(&state.providers[*provider], *selected, value),
     };
 
     let mut lines = lines;
@@ -200,6 +65,151 @@ pub(super) fn render_modal(frame: &mut Frame, modal: &ModalState, state: &AppSta
             ),
         area,
     );
+}
+
+type ModalLines = (&'static str, Vec<Line<'static>>);
+
+fn command_lines(selected: usize) -> ModalLines {
+    let commands = [
+        "New session / switch provider · model",
+        "Context inspector",
+        "Activity log",
+        "Quit",
+    ];
+    (
+        " Command palette ",
+        commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| selectable_line(command, index == selected))
+            .collect(),
+    )
+}
+
+fn provider_lines(state: &AppState, selected: usize) -> ModalLines {
+    (
+        " Select provider ",
+        state
+            .providers
+            .iter()
+            .enumerate()
+            .flat_map(|(index, provider)| {
+                let status = if provider.ready { "●" } else { "○" };
+                let status_color = if provider.ready { SUCCESS } else { ERROR };
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            if index == selected { "› " } else { "  " },
+                            Style::default().fg(ACCENT),
+                        ),
+                        Span::styled(format!("{status} "), Style::default().fg(status_color)),
+                        Span::styled(
+                            provider.name.clone(),
+                            Style::default()
+                                .fg(if index == selected { TEXT } else { MUTED })
+                                .add_modifier(if index == selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        format!(
+                            "      {} · {} models",
+                            provider.account_hint,
+                            provider.models.len()
+                        ),
+                        Style::default().fg(SUBTLE),
+                    )),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn account_lines(provider: &crate::providers::ProviderOption) -> ModalLines {
+    (
+        " Select account ",
+        vec![
+            Line::from(Span::styled(
+                provider.name.clone(),
+                Style::default().fg(ACCENT).bold(),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Profile      ", Style::default().fg(MUTED)),
+                Span::styled(provider.account_hint.clone(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("Connection   ", Style::default().fg(MUTED)),
+                Span::styled(
+                    provider.credential_state.clone(),
+                    Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Health       ", Style::default().fg(MUTED)),
+                Span::styled(
+                    provider.health_message.clone(),
+                    Style::default().fg(if provider.ready { SUCCESS } else { ERROR }),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                if provider.ready {
+                    "Authentication is owned by this profile or its official CLI."
+                } else {
+                    "Resolve the connection issue before starting this provider."
+                },
+                Style::default().fg(SUBTLE),
+            )),
+        ],
+    )
+}
+
+fn model_lines(
+    provider: &crate::providers::ProviderOption,
+    selected: usize,
+    value: &str,
+) -> ModalLines {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            provider.name.clone(),
+            Style::default().fg(ACCENT).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            provider.model_hint.clone(),
+            Style::default().fg(SUBTLE),
+        )),
+    ];
+    let selected_index = if selected == usize::MAX { 0 } else { selected };
+    let start = selected_index.saturating_sub(3);
+    lines.extend(
+        provider
+            .models
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(7)
+            .map(|(index, model)| selectable_line(model, index == selected)),
+    );
+    if provider.models.len() > 7 {
+        lines.push(Line::from(Span::styled(
+            format!("  {} models available", provider.models.len()),
+            Style::default().fg(SUBTLE),
+        )));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled("Model ID", Style::default().fg(MUTED))),
+        Line::from(Span::styled(
+            format!("  {value}_"),
+            Style::default().fg(TEXT).bg(Color::Rgb(30, 34, 43)),
+        )),
+    ]);
+    (" Select model ", lines)
 }
 
 pub(super) fn render_context_inspector(frame: &mut Frame, state: &AppState) {
