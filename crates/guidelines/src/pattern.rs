@@ -1,6 +1,6 @@
 //! Pattern rules: a regex over each line, or a tree-sitter query over the syntax.
-use harness_code_analysis::{metrics, LanguageId};
 use regex::Regex;
+use rusty_code_analysis::{metrics, LanguageId};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 pub(crate) enum Pattern {

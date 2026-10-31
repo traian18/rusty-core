@@ -1,5 +1,5 @@
 //! Size and complexity limits over a file's measurements.
-use harness_code_analysis::metrics::FileMetrics;
+use rusty_code_analysis::metrics::{FileMetrics, FunctionKind};
 
 use crate::config::MetricLimits;
 
@@ -33,6 +33,24 @@ pub(crate) fn excesses(
     let Some(metrics) = metrics else {
         return out;
     };
+    let function_count = metrics
+        .functions
+        .iter()
+        .filter(|f| !f.test_code && f.kind != FunctionKind::Closure)
+        .count() as u32;
+    if let Some(limit) = limits
+        .max_functions_per_file
+        .filter(|limit| function_count > *limit)
+    {
+        out.push(Excess {
+            function: None,
+            start_line: 1,
+            end_line: line_count,
+            what: "functions in the file",
+            value: function_count,
+            limit,
+        });
+    }
     for function in metrics.functions.iter().filter(|f| !f.test_code) {
         let checks = [
             ("lines of code", function.nloc, limits.max_function_lines),

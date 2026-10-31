@@ -1,7 +1,7 @@
 //! The rules file parsed and validated, with globs and patterns compiled once.
 use std::collections::BTreeSet;
 
-use harness_code_health::DetectorConfig;
+use rusty_code_health::DetectorConfig;
 use serde::Serialize;
 
 use crate::{

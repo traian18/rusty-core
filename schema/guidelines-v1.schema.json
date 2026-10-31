@@ -64,6 +64,15 @@
           "format": "uint32",
           "minimum": 0.0
         },
+        "max_functions_per_file": {
+          "description": "Functions and methods declared in one file; closures and test code are not counted.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "max_nesting": {
           "description": "Deepest nesting of control blocks in one function.",
           "type": [
@@ -156,6 +165,15 @@
             },
             "max_function_lines": {
               "description": "Lines of code in one function.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "max_functions_per_file": {
+              "description": "Functions and methods declared in one file; closures and test code are not counted.",
               "type": [
                 "integer",
                 "null"

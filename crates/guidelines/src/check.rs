@@ -1,5 +1,5 @@
 //! One file through every rule that applies to it.
-use harness_code_analysis::metrics::FileMetrics;
+use rusty_code_analysis::metrics::FileMetrics;
 use serde::Serialize;
 
 use crate::{

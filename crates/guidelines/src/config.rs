@@ -1,5 +1,5 @@
 //! The rules file as a person writes it.
-use harness_code_health::DetectorConfig;
+use rusty_code_health::DetectorConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -129,6 +129,9 @@ pub struct MetricLimits {
     /// Declared parameters of one function.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_params: Option<u32>,
+    /// Functions and methods declared in one file; closures and test code are not counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_functions_per_file: Option<u32>,
 }
 
 impl MetricLimits {
@@ -144,6 +147,7 @@ impl MetricLimits {
             max_complexity: other.max_complexity.or(self.max_complexity),
             max_nesting: other.max_nesting.or(self.max_nesting),
             max_params: other.max_params.or(self.max_params),
+            max_functions_per_file: other.max_functions_per_file.or(self.max_functions_per_file),
         }
     }
 }

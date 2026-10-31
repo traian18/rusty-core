@@ -4,7 +4,7 @@ Repository maintenance tasks, kept outside the workspace (`exclude = ["xtask"]`)
 
 ## What's inside
 
-- `check-deps` — enforces the dependency direction. `harness-core` and `harness-protocol` are protected: neither may depend on I/O, HTTP, database, UI, transport or provider crates (`reqwest`, `rusqlite`, `ratatui`, `tungstenite`, `rmcp`, …) or on `harness-skills`, which walks the filesystem.
+- `check-deps` — enforces the dependency direction. `rusty-agent-core` and `rusty-protocol` are protected: neither may depend on I/O, HTTP, database, UI, transport or provider crates (`reqwest`, `rusqlite`, `ratatui`, `tungstenite`, `rmcp`, …) or on `rusty-skills`, which walks the filesystem.
 
 Run it from the repository root:
 

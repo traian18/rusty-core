@@ -15,6 +15,15 @@
       "fix": "Split the function or file by responsibility behind a small interface; keep behaviour and the public API unchanged."
     },
     {
+      "id": "few-functions-per-file",
+      "kind": "metric",
+      "severity": "warn",
+      "max_functions_per_file": 12,
+      "exclude": ["**/tests/**", "**/tests.rs"],
+      "message": "A file holds one type and its methods, or one step of an operation: this one holds too many functions.",
+      "fix": "Cut the file by operation: a folder with a presenter in mod.rs (the steps, in order) and one small file per step."
+    },
+    {
       "id": "no-unwrap-outside-tests",
       "kind": "pattern",
       "regex": "\\.unwrap\\(\\)",
@@ -83,11 +92,9 @@
     },
     {
       "id": "unsafe-needs-a-safety-comment",
-      "kind": "pattern",
-      "regex": "\\bunsafe\\s*\\{",
-      "severity": "warn",
-      "message": "Treat unsafe code as a contract (style guide, section 10).",
-      "fix": "Keep the block as small as possible and put a `// SAFETY:` comment above it saying why each assumption holds."
+      "kind": "prose",
+      "severity": "info",
+      "text": "Treat unsafe code as a contract (style guide, section 10): keep each unsafe block as small as possible and put a `// SAFETY:` comment above it saying why each assumption holds. A pattern rule cannot see comments, so this is enforced by clippy: crates with unsafe code carry #![warn(clippy::undocumented_unsafe_blocks)]."
     },
     {
       "id": "no-glob-reexports",

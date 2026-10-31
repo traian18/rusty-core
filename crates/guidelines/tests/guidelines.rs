@@ -1,5 +1,5 @@
-use harness_code_analysis::{metrics::measure_file, LanguageId};
-use harness_guidelines::{
+use rusty_code_analysis::{metrics::measure_file, LanguageId};
+use rusty_guidelines::{
     check_file, guidelines_json_schema, retain_introduced, ChangedLines, FileInput, Guidelines,
     Import, Kinds, Severity,
 };
@@ -29,11 +29,7 @@ fn guidelines() -> Guidelines {
     .expect("valid rules")
 }
 
-fn check(
-    path: &str,
-    source: &str,
-    imports: Option<&[Import]>,
-) -> Vec<harness_guidelines::Violation> {
+fn check(path: &str, source: &str, imports: Option<&[Import]>) -> Vec<rusty_guidelines::Violation> {
     let metrics = measure_file(&LanguageId::Rust, path, source.as_bytes()).ok();
     let input = FileInput {
         path,
@@ -189,7 +185,7 @@ fn published_json_schema_is_current() {
     assert!(
         published == generated,
         "schema/guidelines-v1.schema.json is out of date; \
-         regenerate with RUSTY_UPDATE_SCHEMAS=1 cargo test -p harness-guidelines published_json_schema"
+         regenerate with RUSTY_UPDATE_SCHEMAS=1 cargo test -p rusty-guidelines published_json_schema"
     );
 }
 
@@ -199,4 +195,22 @@ fn a_misspelt_field_in_a_rule_is_refused() {
     assert!(Guidelines::parse(Some(typo), None).is_err());
     let limits = r#"{"version": 1, "rules": [{"id": "a", "kind": "metric", "max_lines": 3}]}"#;
     assert!(Guidelines::parse(Some(limits), None).is_err());
+}
+
+#[test]
+fn a_file_with_too_many_functions_is_reported_once_for_the_whole_file() {
+    let rules = r#"{ "version": 1, "limits": { "max_functions_per_file": 2 }, "rules": [] }"#;
+    let guidelines = Guidelines::parse(Some(rules), None).expect("valid rules");
+    let source = "fn one() {}\nfn two() {}\nfn three() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn four() {}\n}\n";
+    let metrics = measure_file(&LanguageId::Rust, "src/many.rs", source.as_bytes()).ok();
+    let input = FileInput {
+        path: "src/many.rs",
+        source,
+        metrics: metrics.as_ref(),
+        imports: None,
+    };
+    let found = check_file(&guidelines, &input, Kinds::ALL);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(found[0].file_wide());
+    assert_eq!(found[0].measured, Some(3), "test functions are not counted");
 }
