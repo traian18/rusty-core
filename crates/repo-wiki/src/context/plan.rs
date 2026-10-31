@@ -183,50 +183,48 @@ impl<'a> ContextPlanner<'a> {
         self.facts.file(&path).map(|f| f.path.clone())
     }
 
+    /// The pages worth showing for a message: what it names, what is being worked on, and the
+    /// neighbours of both, ranked. With nothing to anchor on, only ambiguous name matches are
+    /// offered, as pointers.
     pub fn plan(&self, input: &PlanInput<'_>) -> Plan {
-        let mut chosen: Vec<ContextItem> = Vec::new();
-        let mut anchors: Vec<RootRelativePath> = Vec::new();
-        let add = |chosen: &mut Vec<ContextItem>, item: ContextItem| match chosen
-            .iter_mut()
-            .find(|c| c.page == item.page)
-        {
-            Some(existing) if (item.tier, item.signal) < (existing.tier, existing.signal) => {
-                *existing = item
-            }
-            Some(_) => {}
-            None => chosen.push(item),
-        };
+        let mut draft = Draft::default();
+        self.mentioned(input, &mut draft);
+        self.name_matches(input, &mut draft);
+        self.focused(input, &mut draft);
+        if draft.anchors.is_empty() {
+            return draft.abstain();
+        }
+        self.widen(input, &mut draft);
+        self.surroundings(input, &mut draft);
+        self.ranked(draft)
+    }
 
-        // 1. Anchors named in the message: exact paths and folders.
+    /// 1. Anchors named in the message: exact paths and folders.
+    fn mentioned(&self, input: &PlanInput<'_>, draft: &mut Draft) {
         for token in tokens(input.message) {
             let token = strip_location(token);
             if let Some(file) = self.file(token) {
-                if !anchors.contains(&file) {
-                    anchors.push(file.clone());
-                }
-                add(
-                    &mut chosen,
-                    ContextItem {
-                        page: PageId::file(&path_text(&file)),
-                        tier: Tier::High,
-                        signal: Signal::Mentioned,
-                        reason: format!("you mentioned `{}`", path_text(&file)),
-                    },
-                );
+                draft.anchor(&file);
+                draft.add(ContextItem {
+                    page: PageId::file(&path_text(&file)),
+                    tier: Tier::High,
+                    signal: Signal::Mentioned,
+                    reason: format!("you mentioned `{}`", path_text(&file)),
+                });
             } else if self.folders.contains(token.trim_end_matches('/')) {
                 let folder = token.trim_end_matches('/');
-                add(
-                    &mut chosen,
-                    ContextItem {
-                        page: PageId::folder(&format!("dir:{folder}")),
-                        tier: Tier::High,
-                        signal: Signal::Mentioned,
-                        reason: format!("you mentioned the folder `{folder}`"),
-                    },
-                );
+                draft.add(ContextItem {
+                    page: PageId::folder(&format!("dir:{folder}")),
+                    tier: Tier::High,
+                    signal: Signal::Mentioned,
+                    reason: format!("you mentioned the folder `{folder}`"),
+                });
             }
         }
-        // 2. Identifiers that match a file name.
+    }
+
+    /// 2. Identifiers that match a file name.
+    fn name_matches(&self, input: &PlanInput<'_>, draft: &mut Draft) {
         for token in
             tokens(input.message).filter(|t| self.options.names && looks_like_identifier(t))
         {
@@ -242,23 +240,23 @@ impl<'a> ContextPlanner<'a> {
                 Tier::Medium
             };
             for file in matches {
-                if tier == Tier::High && !anchors.contains(file) {
-                    anchors.push((*file).clone());
+                if tier == Tier::High {
+                    draft.anchor(file);
                 }
-                add(
-                    &mut chosen,
-                    ContextItem {
-                        page: PageId::file(&path_text(file)),
-                        tier,
-                        signal: Signal::NameMatch,
-                        reason: format!("`{token}` matches the file name"),
-                    },
-                );
+                draft.add(ContextItem {
+                    page: PageId::file(&path_text(file)),
+                    tier,
+                    signal: Signal::NameMatch,
+                    reason: format!("`{token}` matches the file name"),
+                });
             }
         }
-        // 3. What is being worked on.
+    }
+
+    /// 3. What is being worked on: the open file, and files touched, handed off or changed.
+    fn focused(&self, input: &PlanInput<'_>, draft: &mut Draft) {
         let focus = input.focus;
-        let focus_files = |names: &[String]| {
+        let files = |names: &[String]| {
             names
                 .iter()
                 .filter_map(|n| self.file(n))
@@ -273,147 +271,112 @@ impl<'a> ContextPlanner<'a> {
                 Tier::High,
             ));
         }
-        focused.extend(focus_files(&focus.touched).into_iter().map(|f| {
-            (
-                f,
+        for file in files(&focus.touched) {
+            focused.push((
+                file,
                 Signal::Touched,
                 "it was read or edited in this chat",
                 Tier::High,
-            )
-        }));
-        focused.extend(focus_files(&focus.handoff).into_iter().map(|f| {
-            (
-                f,
+            ));
+        }
+        for file in files(&focus.handoff) {
+            focused.push((
+                file,
                 Signal::Handoff,
                 "an earlier step of this workflow handled it",
                 Tier::High,
-            )
-        }));
-        focused.extend(
-            focus_files(&focus.dirty)
-                .into_iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    (
-                        f,
-                        Signal::Dirty,
-                        "it has uncommitted changes",
-                        if i < DIRTY_ANCHORS {
-                            Tier::High
-                        } else {
-                            Tier::Medium
-                        },
-                    )
-                }),
-        );
-        for (file, signal, why, tier) in focused {
-            if tier == Tier::High && !anchors.contains(&file) {
-                anchors.push(file.clone());
-            }
-            add(
-                &mut chosen,
-                ContextItem {
-                    page: PageId::file(&path_text(&file)),
-                    tier,
-                    signal,
-                    reason: why.to_owned(),
-                },
-            );
+            ));
         }
-
-        // Nothing anchored: no excerpts. Ambiguous matches may still be offered as pointers.
-        if anchors.is_empty() {
-            chosen.retain(|item| item.tier == Tier::Medium);
-            chosen.sort_by(|a, b| a.signal.cmp(&b.signal).then(a.page.cmp(&b.page)));
-            chosen.truncate(MAX_ITEMS);
-            return Plan {
-                items: chosen,
-                abstained: true,
-            };
-        }
-
-        // 4. Widen along the import graph, by task.
-        for anchor in anchors.iter().take(if self.options.expand {
-            EXPANDED_ANCHORS
-        } else {
-            0
-        }) {
-            let (importers, imported) = (self.importers(anchor), self.imported(anchor));
-            let name = path_text(anchor);
-            let (promote_importers, promote_imports) = match if self.options.route {
-                input.task
+        for (i, file) in files(&focus.dirty).into_iter().enumerate() {
+            let tier = if i < DIRTY_ANCHORS {
+                Tier::High
             } else {
-                TaskKind::General
-            } {
-                TaskKind::Refactor | TaskKind::Review => (true, false),
-                TaskKind::Debug => (false, true),
-                _ => (false, false),
+                Tier::Medium
             };
-            for file in importers.into_iter().take(NEIGHBOURS) {
-                let (tier, signal) = if promote_importers {
-                    (Tier::High, Signal::Routed)
-                } else {
-                    (Tier::Medium, Signal::Neighbour)
-                };
+            focused.push((file, Signal::Dirty, "it has uncommitted changes", tier));
+        }
+        for (file, signal, why, tier) in focused {
+            if tier == Tier::High {
+                draft.anchor(&file);
+            }
+            draft.add(ContextItem {
+                page: PageId::file(&path_text(&file)),
+                tier,
+                signal,
+                reason: why.to_owned(),
+            });
+        }
+    }
+
+    /// 4. Widen along the import graph, by task.
+    fn widen(&self, input: &PlanInput<'_>, draft: &mut Draft) {
+        let anchors: Vec<_> = draft
+            .anchors
+            .iter()
+            .take(if self.options.expand {
+                EXPANDED_ANCHORS
+            } else {
+                0
+            })
+            .cloned()
+            .collect();
+        let task = if self.options.route {
+            input.task
+        } else {
+            TaskKind::General
+        };
+        let (promote_importers, promote_imports) = match task {
+            TaskKind::Refactor | TaskKind::Review => (true, false),
+            TaskKind::Debug => (false, true),
+            _ => (false, false),
+        };
+        for anchor in &anchors {
+            let name = path_text(anchor);
+            for file in self.importers(anchor).into_iter().take(NEIGHBOURS) {
                 let reason = if promote_importers {
                     format!("it imports `{name}`, so a change there may break it")
                 } else {
                     format!("it imports `{name}`")
                 };
-                add(
-                    &mut chosen,
-                    ContextItem {
-                        page: PageId::file(&path_text(&file)),
-                        tier,
-                        signal,
-                        reason,
-                    },
-                );
+                draft.add(neighbour(&file, promote_importers, reason));
             }
-            for file in imported.into_iter().take(NEIGHBOURS) {
-                let (tier, signal) = if promote_imports {
-                    (Tier::High, Signal::Routed)
-                } else {
-                    (Tier::Medium, Signal::Neighbour)
-                };
+            for file in self.imported(anchor).into_iter().take(NEIGHBOURS) {
                 let reason = if promote_imports {
                     format!("`{name}` calls into it")
                 } else {
                     format!("`{name}` imports it")
                 };
-                add(
-                    &mut chosen,
-                    ContextItem {
-                        page: PageId::file(&path_text(&file)),
-                        tier,
-                        signal,
-                        reason,
-                    },
-                );
+                draft.add(neighbour(&file, promote_imports, reason));
             }
         }
-        // 5. The folder around the first anchor.
-        if let Some(parent) = anchors
+    }
+
+    /// 5. The folder around the first anchor.
+    fn surroundings(&self, input: &PlanInput<'_>, draft: &mut Draft) {
+        let Some(parent) = draft
+            .anchors
             .first()
             .and_then(|a| a.as_path().parent())
             .filter(|p| self.options.expand && !p.as_os_str().is_empty())
-        {
-            let (tier, why) = if matches!(input.task, TaskKind::Plan | TaskKind::Document) {
-                (Tier::High, "the folder of the file you are working on")
-            } else {
-                (Tier::Medium, "the folder of the file you are working on")
-            };
-            add(
-                &mut chosen,
-                ContextItem {
-                    page: PageId::folder(&format!("dir:{}", parent.display())),
-                    tier,
-                    signal: Signal::Surroundings,
-                    reason: why.to_owned(),
-                },
-            );
-        }
+        else {
+            return;
+        };
+        let tier = if matches!(input.task, TaskKind::Plan | TaskKind::Document) {
+            Tier::High
+        } else {
+            Tier::Medium
+        };
+        let item = ContextItem {
+            page: PageId::folder(&format!("dir:{}", parent.display())),
+            tier,
+            signal: Signal::Surroundings,
+            reason: "the folder of the file you are working on".to_owned(),
+        };
+        draft.add(item);
+    }
 
+    fn ranked(&self, draft: Draft) -> Plan {
+        let mut chosen = draft.chosen;
         chosen.sort_by(|a, b| {
             a.tier
                 .cmp(&b.tier)
@@ -498,5 +461,57 @@ mod tests {
         assert_eq!(strip_location("src/a.rs#L12"), "src/a.rs");
         assert_eq!(strip_location("src/a.rs"), "src/a.rs");
         assert_eq!(strip_location("c:"), "c:");
+    }
+}
+
+/// The items chosen so far and the files they are anchored on.
+#[derive(Default)]
+struct Draft {
+    chosen: Vec<ContextItem>,
+    anchors: Vec<RootRelativePath>,
+}
+
+impl Draft {
+    fn anchor(&mut self, file: &RootRelativePath) {
+        if !self.anchors.contains(file) {
+            self.anchors.push(file.clone());
+        }
+    }
+
+    /// Adds `item`, or replaces the page's earlier item when this one is stronger.
+    fn add(&mut self, item: ContextItem) {
+        match self.chosen.iter_mut().find(|c| c.page == item.page) {
+            Some(existing) if (item.tier, item.signal) < (existing.tier, existing.signal) => {
+                *existing = item
+            }
+            Some(_) => {}
+            None => self.chosen.push(item),
+        }
+    }
+
+    /// Nothing anchored: no excerpts. Ambiguous matches may still be offered as pointers.
+    fn abstain(mut self) -> Plan {
+        self.chosen.retain(|item| item.tier == Tier::Medium);
+        self.chosen
+            .sort_by(|a, b| a.signal.cmp(&b.signal).then(a.page.cmp(&b.page)));
+        self.chosen.truncate(MAX_ITEMS);
+        Plan {
+            items: self.chosen,
+            abstained: true,
+        }
+    }
+}
+
+fn neighbour(file: &RootRelativePath, promoted: bool, reason: String) -> ContextItem {
+    let (tier, signal) = if promoted {
+        (Tier::High, Signal::Routed)
+    } else {
+        (Tier::Medium, Signal::Neighbour)
+    };
+    ContextItem {
+        page: PageId::file(&path_text(file)),
+        tier,
+        signal,
+        reason,
     }
 }
