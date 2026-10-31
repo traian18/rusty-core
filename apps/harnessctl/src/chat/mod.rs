@@ -21,7 +21,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 
 use rusty_protocol::admission::{CommandId, MutationMetadata};
@@ -52,171 +52,171 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// What the chat session is created with.
+pub struct ChatArgs {
+    pub workspace: PathBuf,
+    pub integration: String,
+    pub integration_config: serde_json::Value,
+    pub toolset: AgentToolset,
+    pub mcp_servers: Vec<rusty_protocol::mcp::McpServerSpec>,
+    pub skills: Option<rusty_protocol::skills::SkillsSpec>,
+}
+
 /// Creates a session against `socket`, subscribes to it, and runs the
 /// interactive chat loop until the user quits.
-pub async fn run(
-    socket: &std::path::Path,
-    workspace: PathBuf,
-    integration: String,
-    integration_config: serde_json::Value,
-    toolset: AgentToolset,
-    mcp_servers: Vec<rusty_protocol::mcp::McpServerSpec>,
-    skills: Option<rusty_protocol::skills::SkillsSpec>,
-) -> Result<()> {
-    // `HarnessClient::connect` performs the `Hello` protocol-version
-    // handshake before returning, so a version-mismatched daemon fails here
-    // with a clear error rather than later during session interaction.
-    let mut client = HarnessClient::connect(socket).await?;
-
-    let session_id = match client
-        .request(
-            None,
-            RpcRequestBody::CreateSession {
-                execution_policy: None,
-                workspace_root: workspace,
-                integration,
-                integration_config,
-                toolset,
-                mcp_servers,
-                skills,
-            },
-        )
-        .await?
-    {
-        RpcResponseBody::SessionCreated { session_id } => session_id,
-        other => anyhow::bail!("create session failed: {other:?}"),
-    };
-    // A freshly created session has no history to resume, so `since_seq` is
-    // `None` — this is a live-only subscription, matching pre-resume
-    // behavior. A future reconnect flow for this same session would pass
-    // the highest `session_sequence` observed before the disconnect.
-    client.subscribe(session_id, None).await?;
-
-    // From here on, reads and writes happen concurrently: a background task
-    // owns the read half and forwards every frame (pushed events as well as
-    // responses to requests sent below) into a channel the render loop
-    // drains non-blockingly; the foreground loop owns the write half.
-    let (read_half, mut write_half) = client.into_stream().into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<RpcResponse>();
-    tokio::spawn(async move {
-        let mut read_half = read_half;
-        while let Ok(Some(bytes)) = read_frame(&mut read_half).await {
-            let Ok(response) = serde_json::from_slice::<RpcResponse>(&bytes) else {
-                continue;
-            };
-            if tx.send(response).is_err() {
-                break;
-            }
-        }
-        // Loop exits on a closed/errored connection or a dropped receiver.
-    });
-
+pub async fn run(socket: &std::path::Path, args: ChatArgs) -> Result<()> {
+    let (session_id, mut responses, mut writer) = open_session(socket, args).await?;
     let mut state = ChatState::new(session_id);
-    let mut next_id: u64 = 1;
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     while !state.should_quit {
-        while let Ok(response) = rx.try_recv() {
-            match response.body {
-                RpcResponseBody::Event(envelope) => state.fold_event(envelope),
-
-                RpcResponseBody::Failure(error) => {
-                    state.push_log(format!("● error: {}", error.message))
-                }
-                _ => {}
-            }
-        }
-
+        fold_responses(&mut state, &mut responses);
         terminal.draw(|frame| render::render(frame, &state))?;
-
         if event::poll(Duration::from_millis(40))? {
             if let Event::Key(key) = event::read()? {
-                match input::map_key(key) {
-                    InputAction::Insert(character) => state.input.push(character),
-                    InputAction::Backspace => {
-                        state.input.pop();
-                    }
-                    InputAction::Submit if !state.input.trim().is_empty() => {
-                        let prompt = std::mem::take(&mut state.input);
-                        state.push_log(format!("> {prompt}"));
-                        send(
-                            &mut write_half,
-                            &mut next_id,
-                            session_id,
-                            mutation(
-                                session_id,
-                                MutationCommand::Prompt(UserInput {
-                                    text: prompt,
-                                    attachments: vec![],
-                                }),
-                            ),
-                        )
-                        .await?;
-                    }
-                    InputAction::Cancel => {
-                        send(
-                            &mut write_half,
-                            &mut next_id,
-                            session_id,
-                            mutation(session_id, MutationCommand::Cancel),
-                        )
-                        .await?;
-                        state.push_log("● cancellation requested".to_string());
-                    }
-                    InputAction::Approve if state.pending_permission.is_some() => {
-                        let id = state.pending_permission.take().expect("checked");
-                        send(
-                            &mut write_half,
-                            &mut next_id,
-                            session_id,
-                            mutation(
-                                session_id,
-                                MutationCommand::ResolvePermission {
-                                    id,
-                                    decision: PermissionDecision::Approved,
-                                },
-                            ),
-                        )
-                        .await?;
-                        state.push_log("● permission approved".to_string());
-                    }
-                    InputAction::Reject if state.pending_permission.is_some() => {
-                        let id = state.pending_permission.take().expect("checked");
-                        send(
-                            &mut write_half,
-                            &mut next_id,
-                            session_id,
-                            mutation(
-                                session_id,
-                                MutationCommand::ResolvePermission {
-                                    id,
-                                    decision: PermissionDecision::Denied,
-                                },
-                            ),
-                        )
-                        .await?;
-                        state.push_log("● permission rejected".to_string());
-                    }
-                    InputAction::Quit => state.should_quit = true,
-                    InputAction::Submit
-                    | InputAction::Approve
-                    | InputAction::Reject
-                    | InputAction::Ignore => {}
-                }
+                handle_key(&mut state, &mut writer, input::map_key(key)).await?;
             }
         }
     }
-
     // Best-effort — the terminal is about to be restored either way.
-    let _ = send(
-        &mut write_half,
-        &mut next_id,
-        session_id,
-        mutation(session_id, MutationCommand::CloseSession),
-    )
-    .await;
+    let _ = writer.mutate(MutationCommand::CloseSession).await;
     Ok(())
+}
+
+/// Connects, creates the session and subscribes. `HarnessClient::connect` performs the `Hello`
+/// handshake first, so a version-mismatched daemon fails here with a clear error. From then on
+/// reads and writes are concurrent: a background task owns the read half and forwards every frame
+/// into the returned channel, which the render loop drains without blocking; the returned writer
+/// owns the write half.
+async fn open_session(
+    socket: &std::path::Path,
+    args: ChatArgs,
+) -> Result<(SessionId, mpsc::UnboundedReceiver<RpcResponse>, Writer)> {
+    let mut client = HarnessClient::connect(socket).await?;
+    let created = client
+        .request(
+            None,
+            RpcRequestBody::CreateSession {
+                execution_policy: None,
+                workspace_root: args.workspace,
+                integration: args.integration,
+                integration_config: args.integration_config,
+                toolset: args.toolset,
+                mcp_servers: args.mcp_servers,
+                skills: args.skills,
+            },
+        )
+        .await?;
+    let session_id = match created {
+        RpcResponseBody::SessionCreated { session_id } => session_id,
+        other => anyhow::bail!("create session failed: {other:?}"),
+    };
+    // A freshly created session has no history to resume, so `since_seq` is `None`: a live-only
+    // subscription. A reconnect flow would pass the highest `session_sequence` seen before.
+    client.subscribe(session_id, None).await?;
+    let (read_half, write_half) = client.into_stream().into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<RpcResponse>();
+    tokio::spawn(forward_frames(read_half, tx));
+    let writer = Writer {
+        half: write_half,
+        next_id: 1,
+        session_id,
+    };
+    Ok((session_id, rx, writer))
+}
+
+/// Forwards every frame to the render loop until the connection or the receiver closes.
+async fn forward_frames(mut read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<RpcResponse>) {
+    while let Ok(Some(bytes)) = read_frame(&mut read_half).await {
+        let Ok(response) = serde_json::from_slice::<RpcResponse>(&bytes) else {
+            continue;
+        };
+        if tx.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+/// Folds everything the daemon sent since the last frame into the chat state.
+fn fold_responses(state: &mut ChatState, responses: &mut mpsc::UnboundedReceiver<RpcResponse>) {
+    while let Ok(response) = responses.try_recv() {
+        match response.body {
+            RpcResponseBody::Event(envelope) => state.fold_event(envelope),
+            RpcResponseBody::Failure(error) => {
+                state.push_log(format!("● error: {}", error.message))
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What one key press does.
+async fn handle_key(state: &mut ChatState, writer: &mut Writer, action: InputAction) -> Result<()> {
+    match action {
+        InputAction::Insert(character) => state.input.push(character),
+        InputAction::Backspace => {
+            state.input.pop();
+        }
+        InputAction::Submit if !state.input.trim().is_empty() => {
+            let prompt = std::mem::take(&mut state.input);
+            state.push_log(format!("> {prompt}"));
+            let input = UserInput {
+                text: prompt,
+                attachments: vec![],
+            };
+            writer.mutate(MutationCommand::Prompt(input)).await?;
+        }
+        InputAction::Cancel => {
+            writer.mutate(MutationCommand::Cancel).await?;
+            state.push_log("● cancellation requested".to_string());
+        }
+        InputAction::Approve if state.pending_permission.is_some() => {
+            answer_permission(state, writer, PermissionDecision::Approved).await?;
+            state.push_log("● permission approved".to_string());
+        }
+        InputAction::Reject if state.pending_permission.is_some() => {
+            answer_permission(state, writer, PermissionDecision::Denied).await?;
+            state.push_log("● permission rejected".to_string());
+        }
+        InputAction::Quit => state.should_quit = true,
+        InputAction::Submit | InputAction::Approve | InputAction::Reject | InputAction::Ignore => {}
+    }
+    Ok(())
+}
+
+async fn answer_permission(
+    state: &mut ChatState,
+    writer: &mut Writer,
+    decision: PermissionDecision,
+) -> Result<()> {
+    let Some(id) = state.pending_permission.take() else {
+        return Ok(());
+    };
+    writer
+        .mutate(MutationCommand::ResolvePermission { id, decision })
+        .await
+}
+
+/// The write half of the connection and the request counter.
+struct Writer {
+    half: OwnedWriteHalf,
+    next_id: u64,
+    session_id: SessionId,
+}
+
+impl Writer {
+    async fn mutate(&mut self, command: MutationCommand) -> Result<()> {
+        let body = mutation(self.session_id, command);
+        let request = RpcRequest {
+            id: RequestCorrelationId(self.next_id),
+            session_id: Some(self.session_id),
+            body,
+        };
+        self.next_id += 1;
+        write_frame(&mut self.half, &serde_json::to_vec(&request)?).await?;
+        Ok(())
+    }
 }
 
 fn mutation(session_id: SessionId, command: MutationCommand) -> RpcRequestBody {
@@ -230,20 +230,4 @@ fn mutation(session_id: SessionId, command: MutationCommand) -> RpcRequestBody {
         },
         command,
     }
-}
-
-async fn send(
-    write_half: &mut OwnedWriteHalf,
-    next_id: &mut u64,
-    session_id: SessionId,
-    body: RpcRequestBody,
-) -> Result<()> {
-    let request = RpcRequest {
-        id: RequestCorrelationId(*next_id),
-        session_id: Some(session_id),
-        body,
-    };
-    *next_id += 1;
-    write_frame(write_half, &serde_json::to_vec(&request)?).await?;
-    Ok(())
 }

@@ -395,16 +395,15 @@ async fn main() -> Result<()> {
                 serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
             let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
             let mcp_servers = parse_mcp_servers(&mcp_servers)?;
-            chat::run(
-                &cli.socket,
+            let args = chat::ChatArgs {
                 workspace,
                 integration,
                 integration_config,
                 toolset,
                 mcp_servers,
-                skills_spec(skills, skills_dirs, user_skills),
-            )
-            .await
+                skills: skills_spec(skills, skills_dirs, user_skills),
+            };
+            chat::run(&cli.socket, args).await
         }
         Command::Session { command } => {
             let mut client = HarnessClient::connect(&cli.socket).await?;
@@ -430,136 +429,137 @@ async fn run_session_command(client: &mut HarnessClient, command: SessionCommand
             skills_dirs,
             user_skills,
         } => {
-            let integration_config: serde_json::Value =
-                serde_json::from_str(&config_json).context("--config-json must be valid JSON")?;
-            let toolset = build_toolset(&resolve_tool_names(tools, all_tools))?;
-            let mcp_servers = parse_mcp_servers(&mcp_servers)?;
-            let response = client
-                .request(
-                    None,
-                    RpcRequestBody::CreateSession {
-                        execution_policy: None,
-                        workspace_root: workspace,
-                        integration,
-                        integration_config,
-                        toolset,
-                        mcp_servers,
-                        skills: skills_spec(skills, skills_dirs, user_skills),
-                    },
-                )
-                .await?;
-            match response {
-                RpcResponseBody::SessionCreated { session_id } => {
-                    println!("{session_id}");
-                    Ok(())
-                }
-                other => Err(anyhow::anyhow!("create session failed: {other:?}")),
-            }
+            let args = CreateArgs {
+                workspace,
+                integration,
+                config_json,
+                tool_names: resolve_tool_names(tools, all_tools),
+                mcp_servers,
+                skills: skills_spec(skills, skills_dirs, user_skills),
+            };
+            create_session(client, args).await
         }
-
         SessionCommand::Send { session_id, prompt } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(
-                    Some(session_id),
-                    mutation(
-                        session_id,
-                        MutationCommand::Prompt(UserInput {
-                            text: prompt,
-                            attachments: vec![],
-                        }),
-                    ),
-                )
-                .await?;
-            print_ack_or_error(response)
+            let input = UserInput {
+                text: prompt,
+                attachments: vec![],
+            };
+            send_mutation(client, &session_id, MutationCommand::Prompt(input)).await
         }
-
         SessionCommand::Events {
             session_id,
             json,
             since_seq,
-        } => {
-            let session_id = parse_session_id(&session_id)?;
-            client.subscribe(session_id, since_seq).await?;
-            loop {
-                match client.next_event().await? {
-                    Some(RpcResponseBody::Event(envelope)) => {
-                        if json {
-                            println!("{}", serde_json::to_string(&envelope)?);
-                        } else {
-                            println!("[{}] {:?}", envelope.agent_sequence, envelope.event);
-                        }
-                    }
-                    Some(other) => {
-                        // Not expected once subscribed, but don't crash on it.
-                        eprintln!("unexpected frame while subscribed: {other:?}");
-                    }
-                    None => {
-                        println!("(connection closed)");
-                        break;
-                    }
-                }
-            }
+        } => stream_events(client, &session_id, json, since_seq).await,
+        SessionCommand::Snapshot { session_id } => print_snapshot(client, &session_id).await,
+        SessionCommand::Cancel { session_id } => {
+            send_mutation(client, &session_id, MutationCommand::Cancel).await
+        }
+        SessionCommand::Pause { session_id } => {
+            send_mutation(client, &session_id, MutationCommand::Pause).await
+        }
+        SessionCommand::Resume { session_id } => {
+            send_mutation(client, &session_id, MutationCommand::Resume).await
+        }
+        SessionCommand::Close { session_id } => {
+            send_mutation(client, &session_id, MutationCommand::CloseSession).await
+        }
+    }
+}
+
+/// What `session create` asks for, once its flags are read.
+struct CreateArgs {
+    workspace: PathBuf,
+    integration: String,
+    config_json: String,
+    tool_names: Vec<String>,
+    mcp_servers: Vec<String>,
+    skills: Option<rusty_protocol::skills::SkillsSpec>,
+}
+
+/// Creates a session and prints its id.
+async fn create_session(client: &mut HarnessClient, args: CreateArgs) -> Result<()> {
+    let integration_config: serde_json::Value =
+        serde_json::from_str(&args.config_json).context("--config-json must be valid JSON")?;
+    let toolset = build_toolset(&args.tool_names)?;
+    let mcp_servers = parse_mcp_servers(&args.mcp_servers)?;
+    let response = client
+        .request(
+            None,
+            RpcRequestBody::CreateSession {
+                execution_policy: None,
+                workspace_root: args.workspace,
+                integration: args.integration,
+                integration_config,
+                toolset,
+                mcp_servers,
+                skills: args.skills,
+            },
+        )
+        .await?;
+    match response {
+        RpcResponseBody::SessionCreated { session_id } => {
+            println!("{session_id}");
             Ok(())
         }
+        other => Err(anyhow::anyhow!("create session failed: {other:?}")),
+    }
+}
 
-        SessionCommand::Snapshot { session_id } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(Some(session_id), RpcRequestBody::Snapshot)
-                .await?;
-            match response {
-                RpcResponseBody::Snapshot(snapshot) => {
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                    Ok(())
+/// Sends one mutation to a session and reports the acknowledgement or the error.
+async fn send_mutation(
+    client: &mut HarnessClient,
+    session_id: &str,
+    command: MutationCommand,
+) -> Result<()> {
+    let session_id = parse_session_id(session_id)?;
+    let response = client
+        .request(Some(session_id), mutation(session_id, command))
+        .await?;
+    print_ack_or_error(response)
+}
+
+/// Prints a session's events until the connection closes.
+async fn stream_events(
+    client: &mut HarnessClient,
+    session_id: &str,
+    json: bool,
+    since_seq: Option<u64>,
+) -> Result<()> {
+    let session_id = parse_session_id(session_id)?;
+    client.subscribe(session_id, since_seq).await?;
+    loop {
+        match client.next_event().await? {
+            Some(RpcResponseBody::Event(envelope)) => {
+                if json {
+                    println!("{}", serde_json::to_string(&envelope)?);
+                } else {
+                    println!("[{}] {:?}", envelope.agent_sequence, envelope.event);
                 }
-                other => Err(anyhow::anyhow!("snapshot failed: {other:?}")),
+            }
+            Some(other) => {
+                // Not expected once subscribed, but don't crash on it.
+                eprintln!("unexpected frame while subscribed: {other:?}");
+            }
+            None => {
+                println!("(connection closed)");
+                return Ok(());
             }
         }
+    }
+}
 
-        SessionCommand::Cancel { session_id } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(
-                    Some(session_id),
-                    mutation(session_id, MutationCommand::Cancel),
-                )
-                .await?;
-            print_ack_or_error(response)
+async fn print_snapshot(client: &mut HarnessClient, session_id: &str) -> Result<()> {
+    let session_id = parse_session_id(session_id)?;
+    let response = client
+        .request(Some(session_id), RpcRequestBody::Snapshot)
+        .await?;
+    match response {
+        RpcResponseBody::Snapshot(snapshot) => {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            Ok(())
         }
-
-        SessionCommand::Pause { session_id } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(
-                    Some(session_id),
-                    mutation(session_id, MutationCommand::Pause),
-                )
-                .await?;
-            print_ack_or_error(response)
-        }
-
-        SessionCommand::Resume { session_id } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(
-                    Some(session_id),
-                    mutation(session_id, MutationCommand::Resume),
-                )
-                .await?;
-            print_ack_or_error(response)
-        }
-
-        SessionCommand::Close { session_id } => {
-            let session_id = parse_session_id(&session_id)?;
-            let response = client
-                .request(
-                    Some(session_id),
-                    mutation(session_id, MutationCommand::CloseSession),
-                )
-                .await?;
-            print_ack_or_error(response)
-        }
+        other => Err(anyhow::anyhow!("snapshot failed: {other:?}")),
     }
 }
 
