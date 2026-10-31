@@ -1,54 +1,70 @@
-# `rusty-harness-sdk` (Rust)
+# rusty-harness-sdk
 
-Stable, application-agnostic Rust facade over the Rusty agent harness engine.
+A stable, application-agnostic Rust facade over the harness engine. Alpha: it compiles against the
+current workspace `rusty-engine` and is safe for prototyping and internal integration, but is not yet a
+semver-guaranteed release.
 
-## Status
+## Why it exists
 
-Alpha. This crate compiles against the current workspace `rusty-engine`
-API and is safe to depend on for prototyping and internal integration.
-It is **not yet** a semver-guaranteed public release: see
-[`../../sdk_plan.md`](../../sdk_plan.md) for the governance and release
-gates this crate must pass before a 1.0.
+Applications embedding the harness would otherwise depend on `rusty-engine` plus the internal crates
+for types (`rusty-protocol`, `rusty-runtime`, `rusty-session-store`), which can change shape between
+versions. The SDK re-exports a curated, documented subset under one name and adds small wrappers.
 
-Known, tracked runtime limitations that this SDK inherits from the engine
-(not fixed by this facade layer) are documented inline on `Client` and
-`Session` and summarized in [`../../upgrade_rusty.md`](../../upgrade_rusty.md):
+## How it works
 
-- Busy-session prompt admission (steer/follow-up/queue) is not yet a stable
-  contract (`upgrade_rusty.md` RST-002/RST-003).
-- Session restore rebuilds from the last snapshot only; trailing durable
-  events are not yet replayed, and restored sessions do not yet reattach a
-  real workspace/tool/credential environment (RST-008/RST-009).
+1. `Client` / `ClientBuilder` wrap `Harness` / `HarnessBuilder`.
+2. `Session` wraps `SessionHandle`, converts engine errors to `SdkError`, and exposes an `EventStream`
+   instead of a raw broadcast receiver.
+3. `EventStream` implements `futures::Stream` and a plain `next`, and turns broadcast lag into a typed
+   error instead of a silent gap.
+4. The `protocol`, `providers`, `integration` and `store` modules re-export what consumers need, so
+   they rarely add the internal crates themselves.
 
-## Why this crate exists
+## Key types and concepts
 
-Applications embedding the harness today depend directly on
-`rusty-engine` plus whichever internal crates they need for types
-(`rusty-protocol`, `rusty-runtime`, `rusty-session-store`). Those
-crates are workspace-internal and can change shape between versions.
+- **`Client`**: builds sessions and reaches the engine for provider discovery.
+- **`Session`**: send a prompt, subscribe to events.
+- **`SdkError`**: the one error type.
+- **Wire alternative**: non-Rust applications, or ones that want the engine in another process, run
+  `harnessd` and speak the protocol (`sdk/typescript`, `schema/protocol-v2.schema.json`).
 
-`rusty-harness-sdk` re-exports a curated, documented subset of that surface
-under one crate name and adds small ergonomic wrappers:
+## A worked example
 
-- [`Client`] / [`ClientBuilder`] — thin wrapper over `Harness`/`HarnessBuilder`.
-- [`Session`] — wraps `SessionHandle`, converts engine errors into
-  [`SdkError`], and exposes an `EventStream` instead of a raw
-  `tokio::sync::broadcast::Receiver`.
-- [`EventStream`] — implements `futures::Stream` and a plain `async fn next`,
-  and turns broadcast lag into a typed, catchable error instead of a panic
-  or silent gap.
-- `protocol`, `providers`, `integration`, and `store` modules — curated
-  re-exports so consumers rarely need to add `rusty-protocol` /
-  `rusty-runtime` / `rusty-session-store` as direct dependencies.
+See the quick start below; `examples/basic_chat.rs` is a runnable version.
 
-Applications that are not Rust, or that want the engine in a separate
-process/sandbox, should run `harnessd` and speak the wire protocol instead
-— see [`../typescript`](../typescript) and
-[`../../schema/protocol-v2.schema.json`](../../schema/protocol-v2.schema.json).
-Both integration modes are meant to expose equivalent session/event/
-permission semantics (see `sdk_plan.md` §2, "One behavioral contract").
+## Public API
 
-## Quick start
+- `Client`, `ClientBuilder`, `Session`, `EventStream`, `SdkError`, `McpServerConfig`,
+  `McpTransportConfig`, and the `protocol`, `providers`, `integration` and `store` modules.
+
+## Errors
+
+`SdkError` wraps engine errors and event-stream problems (including lag) in one catchable type.
+
+## Design decisions
+
+- **Real behavior, not promises.** Gaps in the engine (steer, follow-up, close, command ids) are not
+  papered over; they are listed under "What this SDK does not yet do".
+- **`client.session()` is the engine's `SessionBuilder`**, so every builder option works unchanged.
+
+## Testing
+
+Facade tests cover event streaming and lag. Run `cargo test -p rusty-harness-sdk`.
+
+## In the workspace
+
+- **Depends on:** `rusty-engine`, `rusty-protocol`, `rusty-runtime`, `rusty-session-store`, `rusty-workspace`
+- **Used by:** nothing else in the workspace
+
+## Must never
+
+- Promise behavior the engine does not deliver.
+- Drop events silently.
+- Add logic of its own beyond wrapping.
+
+## Usage guide
+
+### Quick start
 
 ```rust,no_run
 use rusty_harness_sdk::{Client, Session};
@@ -75,7 +91,7 @@ while let Some(event) = events.next().await {
 See `examples/basic_chat.rs` for a runnable version that registers a real
 integration and prints streamed text.
 
-## MCP servers
+### MCP servers
 
 `client.session()` returns `rusty_engine::SessionBuilder` directly (see
 "Why this crate exists" above), so [MCP](https://modelcontextprotocol.io)
@@ -103,7 +119,7 @@ let session = Session::from(handle);
 # }
 ```
 
-## What this SDK does not yet do
+### What this SDK does not yet do
 
 - No `steer`, `follow_up`, or `close_session` operations (engine gap, not
   just an SDK gap — see `sdk_plan.md` SDK-101).

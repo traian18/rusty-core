@@ -160,15 +160,21 @@ async fn main() -> Result<()> {
 
     let app_harness = AppHarness::new(workspace_root, mcp_servers, skills).await?;
     let mut controller = AppController::new(app_harness, options, initial_selection).await?;
-    let mut needs_draw = true;
+    run(&mut terminal, &mut controller).await
+}
 
+/// Draws and handles input until the user quits.
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    controller: &mut AppController,
+) -> Result<()> {
+    let mut needs_draw = true;
     while !controller.state().should_quit {
         needs_draw |= controller.tick();
         if needs_draw {
             terminal.draw(|frame| render::render(frame, controller.state()))?;
             needs_draw = false;
         }
-
         if event::poll(Duration::from_millis(40))? {
             let terminal_event = event::read()?;
             needs_draw = true;
@@ -178,125 +184,133 @@ async fn main() -> Result<()> {
                     controller.state().active_permission().is_some(),
                     controller.state().modal.is_some(),
                 );
-                match action {
-                    InputAction::Insert(character) if controller.state().modal.is_some() => {
-                        controller.state_mut().modal_insert(character);
-                    }
-                    InputAction::Insert(character) => controller.state_mut().input.push(character),
-                    InputAction::Newline => controller.state_mut().input.push('\n'),
-                    InputAction::Backspace if controller.state().modal.is_some() => {
-                        controller.state_mut().modal_backspace();
-                    }
-                    InputAction::Backspace => {
-                        controller.state_mut().input.pop();
-                    }
-                    InputAction::OpenCommands => controller.state_mut().open_commands(),
-                    InputAction::ToggleInspector => {
-                        controller.state_mut().toggle_context_inspector()
-                    }
-                    InputAction::ToggleLog => controller.state_mut().toggle_log(),
-                    InputAction::NewSession => controller.state_mut().open_new_session(),
-                    InputAction::PreviousSession => {
-                        if let Err(error) = controller.previous_session().await {
-                            controller.state_mut().set_start_error(error.to_string());
-                        }
-                    }
-                    InputAction::NextSession => {
-                        if let Err(error) = controller.next_session().await {
-                            controller.state_mut().set_start_error(error.to_string());
-                        }
-                    }
-                    InputAction::NavigateUp => controller.state_mut().modal_up(),
-                    InputAction::NavigateDown => controller.state_mut().modal_down(),
-                    InputAction::Confirm => {
-                        let result = controller.state_mut().confirm_modal();
-                        if let ModalResult::StartSession(selection) = result {
-                            controller.state_mut().status = "Connecting".to_owned();
-                            terminal.draw(|frame| render::render(frame, controller.state()))?;
-                            if let Err(error) = controller.start_selected(selection).await {
-                                controller.state_mut().open_new_session();
-                                controller.state_mut().set_start_error(format!(
-                                    "Could not start provider session: {error}"
-                                ));
-                            }
-                        }
-                    }
-                    InputAction::Submit if !controller.state().input.trim().is_empty() => {
-                        let prompt = std::mem::take(&mut controller.state_mut().input);
-                        match prompt.trim() {
-                            "/exit" | "/quit" => controller.state_mut().should_quit = true,
-                            "/context" => controller.state_mut().toggle_context_inspector(),
-                            "/log" | "/logs" => controller.state_mut().toggle_log(),
-                            "/login" | "/connect" => match controller.auth_instruction() {
-                                Ok(instruction) => {
-                                    controller.state_mut().system_notice(instruction)
-                                }
-                                Err(error) => {
-                                    controller.state_mut().set_start_error(error.to_string())
-                                }
-                            },
-                            "/models" => {
-                                controller.state_mut().status = "Refreshing models".into();
-                                match controller.refresh_active_models().await {
-                                    Ok(()) => controller.state_mut().open_new_session(),
-                                    Err(error) => controller.state_mut().set_start_error(format!(
-                                        "Could not refresh models: {error}"
-                                    )),
-                                }
-                            }
-                            "/new" | "/providers" => {
-                                controller.state_mut().open_new_session();
-                            }
-                            _ => match controller.send(&prompt).await {
-                                Ok(()) => {
-                                    controller.state_mut().submit_user_message(prompt);
-                                    controller.sync_session_lists();
-                                }
-                                Err(error) => {
-                                    controller
-                                        .state_mut()
-                                        .set_start_error(format!("Could not send prompt: {error}"));
-                                }
-                            },
-                        }
-                    }
-                    InputAction::Cancel if controller.state().modal.is_some() => {
-                        controller.state_mut().cancel_modal();
-                    }
-                    InputAction::Cancel => {
-                        if let Err(error) = controller.cancel().await {
-                            controller
-                                .state_mut()
-                                .set_start_error(format!("Could not cancel session: {error}"));
-                        }
-                    }
-                    InputAction::Approve => {
-                        if let Some(id) = controller.state().active_permission() {
-                            controller
-                                .resolve_permission(id, PermissionDecision::Approved)
-                                .await?;
-                            controller.state_mut().resolve_permission(id, true);
-                        }
-                    }
-                    InputAction::Reject => {
-                        if let Some(id) = controller.state().active_permission() {
-                            controller
-                                .resolve_permission(id, PermissionDecision::Denied)
-                                .await?;
-                            controller.state_mut().resolve_permission(id, false);
-                        }
-                    }
-                    InputAction::ScrollUp => controller.state_mut().scroll_up(8),
-                    InputAction::ScrollDown => controller.state_mut().scroll_down(8),
-                    InputAction::Follow => controller.state_mut().follow_bottom(),
-                    InputAction::Quit => controller.state_mut().should_quit = true,
-                    InputAction::Submit | InputAction::Ignore => {}
-                }
+                handle_action(terminal, controller, action).await?;
             }
         }
     }
-
     Ok(())
+}
+
+/// What one key press does.
+async fn handle_action(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    controller: &mut AppController,
+    action: InputAction,
+) -> Result<()> {
+    match action {
+        InputAction::Insert(character) if controller.state().modal.is_some() => {
+            controller.state_mut().modal_insert(character);
+        }
+        InputAction::Insert(character) => controller.state_mut().input.push(character),
+        InputAction::Newline => controller.state_mut().input.push('\n'),
+        InputAction::Backspace if controller.state().modal.is_some() => {
+            controller.state_mut().modal_backspace();
+        }
+        InputAction::Backspace => {
+            controller.state_mut().input.pop();
+        }
+        InputAction::OpenCommands => controller.state_mut().open_commands(),
+        InputAction::ToggleInspector => controller.state_mut().toggle_context_inspector(),
+        InputAction::ToggleLog => controller.state_mut().toggle_log(),
+        InputAction::NewSession => controller.state_mut().open_new_session(),
+        InputAction::PreviousSession => {
+            if let Err(error) = controller.previous_session().await {
+                controller.state_mut().set_start_error(error.to_string());
+            }
+        }
+        InputAction::NextSession => {
+            if let Err(error) = controller.next_session().await {
+                controller.state_mut().set_start_error(error.to_string());
+            }
+        }
+        InputAction::NavigateUp => controller.state_mut().modal_up(),
+        InputAction::NavigateDown => controller.state_mut().modal_down(),
+        InputAction::Confirm => {
+            let result = controller.state_mut().confirm_modal();
+            if let ModalResult::StartSession(selection) = result {
+                controller.state_mut().status = "Connecting".to_owned();
+                terminal.draw(|frame| render::render(frame, controller.state()))?;
+                if let Err(error) = controller.start_selected(selection).await {
+                    controller.state_mut().open_new_session();
+                    controller
+                        .state_mut()
+                        .set_start_error(format!("Could not start provider session: {error}"));
+                }
+            }
+        }
+        InputAction::Submit if !controller.state().input.trim().is_empty() => {
+            let prompt = std::mem::take(&mut controller.state_mut().input);
+            run_prompt(controller, prompt).await;
+        }
+        InputAction::Cancel if controller.state().modal.is_some() => {
+            controller.state_mut().cancel_modal();
+        }
+        InputAction::Cancel => {
+            if let Err(error) = controller.cancel().await {
+                controller
+                    .state_mut()
+                    .set_start_error(format!("Could not cancel session: {error}"));
+            }
+        }
+        InputAction::Approve => {
+            if let Some(id) = controller.state().active_permission() {
+                controller
+                    .resolve_permission(id, PermissionDecision::Approved)
+                    .await?;
+                controller.state_mut().resolve_permission(id, true);
+            }
+        }
+        InputAction::Reject => {
+            if let Some(id) = controller.state().active_permission() {
+                controller
+                    .resolve_permission(id, PermissionDecision::Denied)
+                    .await?;
+                controller.state_mut().resolve_permission(id, false);
+            }
+        }
+        InputAction::ScrollUp => controller.state_mut().scroll_up(8),
+        InputAction::ScrollDown => controller.state_mut().scroll_down(8),
+        InputAction::Follow => controller.state_mut().follow_bottom(),
+        InputAction::Quit => controller.state_mut().should_quit = true,
+        InputAction::Submit | InputAction::Ignore => {}
+    }
+    Ok(())
+}
+
+/// A line typed in the composer: a slash command, or a prompt for the agent.
+async fn run_prompt(controller: &mut AppController, prompt: String) {
+    match prompt.trim() {
+        "/exit" | "/quit" => controller.state_mut().should_quit = true,
+        "/context" => controller.state_mut().toggle_context_inspector(),
+        "/log" | "/logs" => controller.state_mut().toggle_log(),
+        "/login" | "/connect" => match controller.auth_instruction() {
+            Ok(instruction) => controller.state_mut().system_notice(instruction),
+            Err(error) => controller.state_mut().set_start_error(error.to_string()),
+        },
+        "/models" => {
+            controller.state_mut().status = "Refreshing models".into();
+            match controller.refresh_active_models().await {
+                Ok(()) => controller.state_mut().open_new_session(),
+                Err(error) => controller
+                    .state_mut()
+                    .set_start_error(format!("Could not refresh models: {error}")),
+            }
+        }
+        "/new" | "/providers" => {
+            controller.state_mut().open_new_session();
+        }
+        _ => match controller.send(&prompt).await {
+            Ok(()) => {
+                controller.state_mut().submit_user_message(prompt);
+                controller.sync_session_lists();
+            }
+            Err(error) => {
+                controller
+                    .state_mut()
+                    .set_start_error(format!("Could not send prompt: {error}"));
+            }
+        },
+    }
 }
 
 #[cfg(test)]
