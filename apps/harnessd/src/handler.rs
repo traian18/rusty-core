@@ -1,5 +1,6 @@
 //! harnessd RPC dispatcher for the transport-neutral protocol.
 
+use rusty_runtime::locks::MutexExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -156,11 +157,7 @@ impl HarnessRpcHandler {
     }
 
     fn lookup(&self, session_id: SessionId) -> Option<Arc<SessionHandle>> {
-        self.sessions
-            .lock()
-            .expect("sessions mutex poisoned")
-            .get(&session_id)
-            .cloned()
+        self.sessions.lock_or_recover().get(&session_id).cloned()
     }
 
     fn error(
@@ -172,18 +169,16 @@ impl HarnessRpcHandler {
         RpcResponseBody::Failure(RpcError::new(code, category, retryable, message))
     }
 
-    // One parameter per field of the `CreateSession` wire request.
-    #[allow(clippy::too_many_arguments)]
-    async fn create_session(
-        &self,
-        execution_policy: Option<rusty_protocol::tools::ExecutionPolicy>,
-        workspace_root: std::path::PathBuf,
-        integration: String,
-        integration_config: serde_json::Value,
-        toolset: rusty_protocol::tools::AgentToolset,
-        mcp_servers: Vec<McpServerSpec>,
-        skills: Option<SkillsSpec>,
-    ) -> RpcResponseBody {
+    async fn create_session(&self, request: NewSession) -> RpcResponseBody {
+        let NewSession {
+            execution_policy,
+            workspace_root,
+            integration,
+            integration_config,
+            toolset,
+            mcp_servers,
+            skills,
+        } = request;
         let mut builder = match self
             .harness
             .session()
@@ -213,13 +208,9 @@ impl HarnessRpcHandler {
             Ok(handle) => {
                 let session_id = handle.session_id();
                 self.sessions
-                    .lock()
-                    .expect("sessions mutex poisoned")
+                    .lock_or_recover()
                     .insert(session_id, Arc::new(handle));
-                self.revisions
-                    .lock()
-                    .expect("revisions mutex poisoned")
-                    .insert(session_id, 0);
+                self.revisions.lock_or_recover().insert(session_id, 0);
                 RpcResponseBody::SessionCreated { session_id }
             }
             // E1: a bounded-wait admission timeout surfaces as its own
@@ -244,6 +235,49 @@ impl HarnessRpcHandler {
         }
     }
 
+    async fn list_sessions(&self) -> RpcResponseBody {
+        match self.harness.list_sessions().await {
+            Ok(sessions) => RpcResponseBody::SessionsListed {
+                sessions: sessions
+                    .into_iter()
+                    .map(|summary| SessionSummaryWire {
+                        session_id: summary.session_id,
+                        title: summary.title,
+                        backend_name: summary.backend_name,
+                        updated_at: summary.updated_at,
+                        restorable: summary.restorable,
+                    })
+                    .collect(),
+            },
+            Err(error) => Self::error(
+                "session.list_failed",
+                RpcErrorCategory::Persistence,
+                true,
+                error.to_string(),
+            ),
+        }
+    }
+
+    fn snapshot(&self, session_id: Option<SessionId>) -> RpcResponseBody {
+        let Some(session_id) = session_id else {
+            return Self::error(
+                "request.missing_session_id",
+                RpcErrorCategory::Validation,
+                false,
+                "Snapshot requires a session_id",
+            );
+        };
+        match self.lookup(session_id) {
+            Some(handle) => RpcResponseBody::Snapshot(wire_snapshot(handle.snapshot())),
+            None => Self::error(
+                "session.not_open",
+                RpcErrorCategory::NotFound,
+                false,
+                "session is not open",
+            ),
+        }
+    }
+
     async fn restore_session(
         &self,
         session_id: SessionId,
@@ -254,8 +288,7 @@ impl HarnessRpcHandler {
             let _ = handle;
             let session_revision = *self
                 .revisions
-                .lock()
-                .expect("revisions mutex poisoned")
+                .lock_or_recover()
                 .get(&session_id)
                 .unwrap_or(&0);
             return RpcResponseBody::SessionRestored {
@@ -274,8 +307,7 @@ impl HarnessRpcHandler {
         {
             Ok(handle) => {
                 self.sessions
-                    .lock()
-                    .expect("sessions mutex poisoned")
+                    .lock_or_recover()
                     .insert(session_id, Arc::new(handle));
                 let revision = self
                     .harness
@@ -284,8 +316,7 @@ impl HarnessRpcHandler {
                     .await
                     .unwrap_or(0);
                 self.revisions
-                    .lock()
-                    .expect("revisions mutex poisoned")
+                    .lock_or_recover()
                     .insert(session_id, revision);
                 RpcResponseBody::SessionRestored {
                     session_id,
@@ -307,107 +338,86 @@ impl HarnessRpcHandler {
         metadata: MutationMetadata,
         command: MutationCommand,
     ) -> RpcResponseBody {
+        let (handle, current_revision) = match self.admit(outer_session_id, &metadata) {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
+        let is_close = matches!(&command, MutationCommand::CloseSession);
+        let result = apply_mutation(&handle, command).await;
+        self.settle(metadata, result, current_revision, is_close)
+    }
+
+    /// Decides whether a mutation may run: its session must match, it must not be a repeat of an
+    /// answered command or conflict with the expected revision, and the session must be open.
+    /// `Err` is the answer to send instead.
+    fn admit(
+        &self,
+        outer_session_id: Option<SessionId>,
+        metadata: &MutationMetadata,
+    ) -> Result<(Arc<SessionHandle>, u64), RpcResponseBody> {
         if outer_session_id != Some(metadata.session_id) {
-            return Self::error(
+            return Err(Self::error(
                 "mutation.session_mismatch",
                 RpcErrorCategory::Validation,
                 false,
                 "request session_id must match mutation metadata session_id",
-            );
+            ));
         }
-
         if let Some((original, revision)) = self
             .admissions
-            .lock()
-            .expect("admissions mutex poisoned")
+            .lock_or_recover()
             .get(metadata.session_id, metadata.command_id)
         {
-            return RpcResponseBody::Admission {
-                metadata,
+            return Err(RpcResponseBody::Admission {
+                metadata: metadata.clone(),
                 result: AdmissionResult::Duplicate {
                     original: Box::new(original),
                 },
                 session_revision: revision,
-            };
+            });
         }
 
         let session_id = metadata.session_id;
         let current_revision = *self
             .revisions
-            .lock()
-            .expect("revisions mutex poisoned")
+            .lock_or_recover()
             .get(&session_id)
             .unwrap_or(&0);
         if metadata
             .expected_session_revision
             .is_some_and(|expected| expected != current_revision)
         {
-            return RpcResponseBody::Admission {
-                metadata,
+            return Err(RpcResponseBody::Admission {
+                metadata: metadata.clone(),
                 result: AdmissionResult::RejectedConflict {
                     current_session_revision: current_revision,
                 },
                 session_revision: current_revision,
-            };
+            });
         }
 
         let Some(handle) = self.lookup(session_id) else {
-            return Self::error(
+            return Err(Self::error(
                 "session.not_open",
                 RpcErrorCategory::NotFound,
                 false,
                 "session is not open; restore it before sending mutations",
-            );
+            ));
         };
 
-        let is_close = matches!(&command, MutationCommand::CloseSession);
-        // M1 re-verification (2026-08-07): `AdmissionResult` has distinct
-        // `AcceptedStarted`/`AcceptedQueued`/`AcceptedApplied` variants, but
-        // this handler previously collapsed every success to the generic
-        // `Accepted` regardless of which kind of mutation it was — the
-        // variants existed and round-tripped over the wire (see
-        // `admission.rs`'s own tests) but were never actually produced by
-        // the one real admission path. `Cancel`/`ResolvePermission`/
-        // `CloseSession` never start a run, so their success is
-        // unambiguously `AcceptedApplied` — cheap to get right with no new
-        // information needed. `Prompt`/`Steer`/`FollowUp` genuinely can
-        // start immediately *or* queue FIFO behind an active run, and
-        // `SessionClient`'s current methods don't return which (or a
-        // `run_id`) — distinguishing `AcceptedStarted`/`AcceptedQueued`
-        // correctly needs that plumbing added first, so they still report
-        // the honest, less specific `Accepted` rather than a made-up guess.
-        let is_run_less_mutation = matches!(
-            &command,
-            MutationCommand::Cancel
-                | MutationCommand::Pause
-                | MutationCommand::Resume
-                | MutationCommand::ResolvePermission { .. }
-                | MutationCommand::ConfigureExecution { .. }
-                | MutationCommand::CloseSession
-        );
-        let operation = match command {
-            MutationCommand::Prompt(input) => handle.send_input(input).await,
-            MutationCommand::Steer(input) => handle.steer_input(input).await,
-            MutationCommand::FollowUp(input) => handle.follow_up_input(input).await,
-            MutationCommand::Cancel => handle.cancel().await,
-            MutationCommand::Pause => handle.pause().await,
-            MutationCommand::Resume => handle.resume().await,
-            MutationCommand::ResolvePermission { id, decision } => {
-                handle.resolve_permission(id, decision).await
-            }
-            MutationCommand::ConfigureExecution { params } => {
-                handle.set_execution_params(*params).await
-            }
-            MutationCommand::CloseSession => handle.close().await,
-        };
+        Ok((handle, current_revision))
+    }
 
-        let result = match operation {
-            Ok(()) if is_run_less_mutation => AdmissionResult::AcceptedApplied,
-            Ok(()) => AdmissionResult::Accepted,
-            Err(error) => AdmissionResult::RejectedInvalidState {
-                reason: error.to_string(),
-            },
-        };
+    /// Records the outcome: a new revision when accepted, a closed session forgotten, the answer
+    /// remembered for a repeat of the command.
+    fn settle(
+        &self,
+        metadata: MutationMetadata,
+        result: AdmissionResult,
+        current_revision: u64,
+        is_close: bool,
+    ) -> RpcResponseBody {
+        let session_id = metadata.session_id;
         let accepted = matches!(
             result,
             AdmissionResult::Accepted | AdmissionResult::AcceptedApplied
@@ -420,20 +430,18 @@ impl HarnessRpcHandler {
 
         if accepted {
             self.revisions
-                .lock()
-                .expect("revisions mutex poisoned")
+                .lock_or_recover()
                 .insert(session_id, revision);
             if is_close {
-                self.sessions
-                    .lock()
-                    .expect("sessions mutex poisoned")
-                    .remove(&session_id);
+                self.sessions.lock_or_recover().remove(&session_id);
             }
         }
-        self.admissions
-            .lock()
-            .expect("admissions mutex poisoned")
-            .insert(session_id, metadata.command_id, result.clone(), revision);
+        self.admissions.lock_or_recover().insert(
+            session_id,
+            metadata.command_id,
+            result.clone(),
+            revision,
+        );
 
         RpcResponseBody::Admission {
             metadata,
@@ -500,6 +508,58 @@ fn wire_status(status: SessionStatus) -> SessionStatusWire {
     }
 }
 
+/// Runs the mutation on the session and says how it was admitted.
+///
+/// `Cancel`, `ResolvePermission`, `CloseSession` and the like never start a run, so their success is
+/// unambiguously `AcceptedApplied`. `Prompt`, `Steer` and `FollowUp` can start immediately or queue
+/// behind an active run, and the session client does not say which, so they report the less
+/// specific `Accepted` rather than a guess.
+async fn apply_mutation(handle: &SessionHandle, command: MutationCommand) -> AdmissionResult {
+    let is_run_less_mutation = matches!(
+        &command,
+        MutationCommand::Cancel
+            | MutationCommand::Pause
+            | MutationCommand::Resume
+            | MutationCommand::ResolvePermission { .. }
+            | MutationCommand::ConfigureExecution { .. }
+            | MutationCommand::CloseSession
+    );
+    let operation = match command {
+        MutationCommand::Prompt(input) => handle.send_input(input).await,
+        MutationCommand::Steer(input) => handle.steer_input(input).await,
+        MutationCommand::FollowUp(input) => handle.follow_up_input(input).await,
+        MutationCommand::Cancel => handle.cancel().await,
+        MutationCommand::Pause => handle.pause().await,
+        MutationCommand::Resume => handle.resume().await,
+        MutationCommand::ResolvePermission { id, decision } => {
+            handle.resolve_permission(id, decision).await
+        }
+        MutationCommand::ConfigureExecution { params } => {
+            handle.set_execution_params(*params).await
+        }
+        MutationCommand::CloseSession => handle.close().await,
+    };
+
+    match operation {
+        Ok(()) if is_run_less_mutation => AdmissionResult::AcceptedApplied,
+        Ok(()) => AdmissionResult::Accepted,
+        Err(error) => AdmissionResult::RejectedInvalidState {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// The fields of the `CreateSession` wire request.
+struct NewSession {
+    execution_policy: Option<rusty_protocol::tools::ExecutionPolicy>,
+    workspace_root: std::path::PathBuf,
+    integration: String,
+    integration_config: serde_json::Value,
+    toolset: rusty_protocol::tools::AgentToolset,
+    mcp_servers: Vec<McpServerSpec>,
+    skills: Option<SkillsSpec>,
+}
+
 fn wire_snapshot(snapshot: rusty_runtime::session_client::SessionSnapshot) -> SessionSnapshotWire {
     SessionSnapshotWire {
         session_id: snapshot.session_id,
@@ -530,7 +590,7 @@ impl RpcHandler for HarnessRpcHandler {
                 mcp_servers,
                 skills,
             } => {
-                self.create_session(
+                let request = NewSession {
                     execution_policy,
                     workspace_root,
                     integration,
@@ -538,32 +598,13 @@ impl RpcHandler for HarnessRpcHandler {
                     toolset,
                     mcp_servers,
                     skills,
-                )
-                .await
+                };
+                self.create_session(request).await
             }
             RpcRequestBody::Mutate { metadata, command } => {
                 self.mutate(session_id, metadata, command).await
             }
-            RpcRequestBody::ListSessions => match self.harness.list_sessions().await {
-                Ok(sessions) => RpcResponseBody::SessionsListed {
-                    sessions: sessions
-                        .into_iter()
-                        .map(|summary| SessionSummaryWire {
-                            session_id: summary.session_id,
-                            title: summary.title,
-                            backend_name: summary.backend_name,
-                            updated_at: summary.updated_at,
-                            restorable: summary.restorable,
-                        })
-                        .collect(),
-                },
-                Err(error) => Self::error(
-                    "session.list_failed",
-                    RpcErrorCategory::Persistence,
-                    true,
-                    error.to_string(),
-                ),
-            },
+            RpcRequestBody::ListSessions => self.list_sessions().await,
             RpcRequestBody::RestoreSession {
                 session_id,
                 workspace_root,
@@ -572,25 +613,7 @@ impl RpcHandler for HarnessRpcHandler {
                 self.restore_session(session_id, workspace_root, toolset)
                     .await
             }
-            RpcRequestBody::Snapshot => {
-                let Some(session_id) = session_id else {
-                    return Self::error(
-                        "request.missing_session_id",
-                        RpcErrorCategory::Validation,
-                        false,
-                        "Snapshot requires a session_id",
-                    );
-                };
-                match self.lookup(session_id) {
-                    Some(handle) => RpcResponseBody::Snapshot(wire_snapshot(handle.snapshot())),
-                    None => Self::error(
-                        "session.not_open",
-                        RpcErrorCategory::NotFound,
-                        false,
-                        "session is not open",
-                    ),
-                }
-            }
+            RpcRequestBody::Snapshot => self.snapshot(session_id),
             RpcRequestBody::Subscribe { .. } => Self::error(
                 "protocol.invalid_dispatch",
                 RpcErrorCategory::Protocol,

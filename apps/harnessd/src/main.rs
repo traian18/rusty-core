@@ -138,13 +138,35 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    require_a_transport(&args)?;
+    let harness = Arc::new(build_harness(&args).await?);
+    let handler: Arc<dyn RpcHandler> = Arc::new(HarnessRpcHandler::new_with_metrics(
+        harness.clone(),
+        install_metrics_recorder(),
+    ));
 
+    let shutdown = CancellationToken::new();
+    spawn_shutdown_listener(shutdown.clone());
+    let tasks = start_transports(args, handler, &shutdown)?;
+
+    drain_sessions_on_shutdown(&harness, &shutdown).await;
+    for task in tasks {
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+fn require_a_transport(args: &Args) -> Result<()> {
     if args.unix_socket.is_none() && args.tcp.is_none() && !args.stdio && !args.mcp_stdio {
         bail!(
             "at least one transport must be selected; pass --unix-socket <path>, --tcp <addr>, --stdio, and/or --mcp-stdio"
         );
     }
+    Ok(())
+}
 
+/// The harness with every provider integration and the JSONL session store.
+async fn build_harness(args: &Args) -> Result<Harness> {
     let sessions_dir = args
         .sessions_dir
         .clone()
@@ -152,7 +174,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("creating sessions dir {}", sessions_dir.display()))?;
 
-    let harness = Harness::builder()
+    Harness::builder()
         .register_integration(Arc::new(AnthropicFactory))
         .register_integration(Arc::new(OpenAiFactory))
         .register_integration(Arc::new(OpenAiCompatibleFactory))
@@ -162,35 +184,28 @@ async fn main() -> Result<()> {
         .session_store(Arc::new(JsonlSessionStore::new(sessions_dir)))
         .build()
         .await
-        .context("building Harness")?;
+        .context("building Harness")
+}
 
-    // M6: install the process-wide Prometheus recorder once, here, at
-    // startup. Everywhere else in the workspace only depends on the
-    // lightweight `metrics` facade crate and calls `metrics::counter!`/
-    // `histogram!`/`gauge!` — none of it needs to know a Prometheus
-    // recorder specifically exists, only this binary does. The resulting
-    // handle is rendered on demand by the `GetDiagnostics` RPC rather than
-    // served over its own HTTP listener — see that RPC variant's doc
-    // comment for why.
-    let metrics_handle = match metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()
-    {
+/// Installs the process-wide Prometheus recorder once, at startup. Everywhere else only the
+/// lightweight `metrics` facade is used; the handle is rendered on demand by the `GetDiagnostics`
+/// RPC rather than served over its own HTTP listener.
+fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
         Ok(handle) => Some(handle),
         Err(error) => {
             tracing::warn!(%error, "failed to install the Prometheus metrics recorder; GetDiagnostics will report empty metrics text");
             None
         }
-    };
+    }
+}
 
-    let harness = Arc::new(harness);
-    let handler: Arc<dyn RpcHandler> = Arc::new(HarnessRpcHandler::new_with_metrics(
-        harness.clone(),
-        metrics_handle,
-    ));
-
-    let shutdown = CancellationToken::new();
-    spawn_shutdown_listener(shutdown.clone());
-
+/// Starts each transport the arguments ask for on its own task.
+fn start_transports(
+    args: Args,
+    handler: Arc<dyn RpcHandler>,
+    shutdown: &CancellationToken,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut tasks = Vec::new();
 
     if let Some(socket_path) = args.unix_socket {
@@ -252,16 +267,13 @@ async fn main() -> Result<()> {
             shutdown.cancel();
         }));
     }
+    Ok(tasks)
+}
 
-    // E3: previously nothing walked active sessions on shutdown at all —
-    // `spawn_shutdown_listener` only cancelled the token that stops
-    // transports from accepting new work, leaving whatever sessions were
-    // active at that instant torn down without their final checkpoint ever
-    // being committed. Wait for the same shutdown signal here, then drain
-    // every active session through `close_session` (checkpoint-then-
-    // shutdown, exactly once — see `SessionManager::close_all_sessions`)
-    // before the transports are allowed to finish exiting, bounded by a
-    // grace period so one stuck session can't hang the whole process.
+/// Waits for the shutdown signal, then drains every active session through `close_session`
+/// (checkpoint then shutdown, exactly once) before the transports finish exiting, bounded by a
+/// grace period so one stuck session cannot hang the process.
+async fn drain_sessions_on_shutdown(harness: &Harness, shutdown: &CancellationToken) {
     shutdown.cancelled().await;
     let drain_grace_period = Duration::from_secs(10);
     let unclosed = harness
@@ -277,12 +289,6 @@ async fn main() -> Result<()> {
              shutdown time may not be"
         );
     }
-
-    for task in tasks {
-        let _ = task.await;
-    }
-
-    Ok(())
 }
 
 /// Cancels `shutdown` on Ctrl-C or SIGTERM so every running transport's
