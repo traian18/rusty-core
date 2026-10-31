@@ -144,26 +144,51 @@ impl ActionRecorder {
 /// The `## Evidence` lines of a research answer that name a place in the
 /// project (`path:lines`, not a URL), as the research step was told to write them.
 fn evidence_locations(output: &str) -> Vec<String> {
+    // The research step's reply reaches the tool result as `{"findings": "..."}`.
+    let findings = serde_json::from_str::<Value>(output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("findings")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| output.to_owned());
     let mut in_evidence = false;
     let mut found = Vec::new();
-    for line in output.lines() {
+    for line in findings.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("## ") {
             in_evidence = trimmed.eq_ignore_ascii_case("## Evidence");
             continue;
         }
-        let item = trimmed.trim_start_matches(['-', '*', ' ']).trim();
-        let names_a_place = item.contains(':')
-            && !item.contains("://")
-            && item
-                .split([':', ' '])
-                .next()
-                .is_some_and(|path| path.contains('/') || path.contains('.'));
-        if in_evidence && names_a_place {
-            found.push(clip(item, MAX_LOCATION_CHARS));
+        if in_evidence
+            && trimmed
+                .split([' ', '`', ',', ';', '(', ')'])
+                .any(is_file_location)
+        {
+            let item = trimmed
+                .trim_start_matches(['-', '*', ' '])
+                .replace("**", "");
+            found.push(clip(item.trim(), MAX_LOCATION_CHARS));
         }
     }
     found
+}
+
+/// `path/to/file.ext:12` or `file.ext:12-30`: a file with an extension, then line numbers.
+fn is_file_location(token: &str) -> bool {
+    let Some((path, lines)) = token.trim_end_matches(['.', ':']).split_once(':') else {
+        return false;
+    };
+    let file = path.rsplit('/').next().unwrap_or(path);
+    !path.contains("//")
+        && file.contains('.')
+        && !file.starts_with('.')
+        && lines.starts_with(|c: char| c.is_ascii_digit())
+        && lines
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | ',' | '–'))
 }
 
 fn path_of(arguments: &Value) -> Option<String> {
@@ -564,6 +589,17 @@ mod tests {
         );
         assert!(render_actions(&actions)
             .contains("- Research found (read these lines rather than searching again): rusty-core/crates/harness-context/src/policy.rs:128-150"));
+    }
+
+    #[test]
+    fn evidence_is_read_from_the_research_reply_as_it_really_arrives() {
+        let findings = "## Answer\nIt is cumulative.\n\n## Evidence\n\n- **Badge:** `rusty-ide/src/features/agent-chat/ui/AgentTabHeader.tsx:119` renders `runUsage`; `rusty-ide/src/lib/ui/TokenBadge/TokenBadge.tsx:21-46` displays totals.\n- **Budget:** `rusty-core/crates/harness-context/src/policy.rs:55-65,82-123` applies a 90% window.\n- The SDK docs at https://example.com/a.ts:3 say so.\n\n## Unknowns\nNone";
+        let reply = json!({ "findings": findings }).to_string();
+        let found = evidence_locations(&reply);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0]
+            .starts_with("Badge: `rusty-ide/src/features/agent-chat/ui/AgentTabHeader.tsx:119`"));
+        assert!(found[1].contains("policy.rs:55-65,82-123"));
     }
 
     #[test]
