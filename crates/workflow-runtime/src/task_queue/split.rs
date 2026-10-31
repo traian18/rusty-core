@@ -151,8 +151,11 @@ impl IsolatedSessionAgentExecutor {
         context: &mut StepContext,
         usage: &mut HashMap<AgentId, AgentUsageMetrics>,
     ) -> Result<Option<Vec<String>>, AgentExecutionError> {
-        let queue = request.task_queue.as_ref().expect("task queue");
-        let Some(planner) = &queue.task_planner else {
+        let Some(planner) = request
+            .task_queue
+            .as_ref()
+            .and_then(|queue| queue.task_planner.as_ref())
+        else {
             return Ok(None);
         };
         let mut child = request.clone();

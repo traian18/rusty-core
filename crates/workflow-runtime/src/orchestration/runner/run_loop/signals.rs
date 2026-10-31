@@ -78,10 +78,10 @@ impl RunLoop {
         value: Value,
         committed: oneshot::Sender<Result<(), String>>,
     ) -> Result<(), OrchestrationRuntimeError> {
-        let active = self
-            .active
-            .as_ref()
-            .expect("checkpoint from the active step");
+        let Some(active) = self.active.as_ref() else {
+            let _ = committed.send(Err("no step is running".into()));
+            return Ok(());
+        };
         let command = OrchestrationCommand::RecordCheckpoint {
             node_id: active.node_id.clone(),
             attempt: active.attempt,

@@ -97,6 +97,13 @@ impl InMemoryOrchestrationStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The runs, usable even if a holder panicked: the map is plain data that stays consistent.
+    fn runs(&self) -> std::sync::MutexGuard<'_, BTreeMap<OrchestrationRunId, MemoryRun>> {
+        self.runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 fn check_sequence(
@@ -124,7 +131,7 @@ impl OrchestrationStore for InMemoryOrchestrationStore {
         events: &[OrchestrationEventEnvelope],
         snapshot: &OrchestrationSnapshot,
     ) -> Result<(), OrchestrationStoreError> {
-        let mut runs = self.runs.lock().expect("store lock poisoned");
+        let mut runs = self.runs();
         let run = runs.entry(snapshot.state.run_id.clone()).or_default();
         let last = run.events.last().map_or(0, |event| event.sequence);
         check_sequence(&snapshot.state.run_id, last, events)?;
@@ -137,7 +144,7 @@ impl OrchestrationStore for InMemoryOrchestrationStore {
         &self,
         run_id: &OrchestrationRunId,
     ) -> Result<Option<OrchestrationSnapshot>, OrchestrationStoreError> {
-        let runs = self.runs.lock().expect("store lock poisoned");
+        let runs = self.runs();
         Ok(runs.get(run_id).and_then(|run| run.snapshot.clone()))
     }
 
@@ -145,7 +152,7 @@ impl OrchestrationStore for InMemoryOrchestrationStore {
         &self,
         run_id: &OrchestrationRunId,
     ) -> Result<Vec<OrchestrationEventEnvelope>, OrchestrationStoreError> {
-        let runs = self.runs.lock().expect("store lock poisoned");
+        let runs = self.runs();
         Ok(runs
             .get(run_id)
             .map(|run| run.events.clone())

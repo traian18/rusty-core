@@ -8,7 +8,8 @@ use rusty_protocol::backend::{
     ExecutionResult,
 };
 use rusty_protocol::commands::UserInput;
-use rusty_protocol::events::AgentOutcome;
+use rusty_protocol::effects::ToolRequest;
+use rusty_protocol::events::{AgentEvent, AgentOutcome};
 use rusty_protocol::ids::{BackendId, ConfigurationId, IntegrationId, RequestId, SessionId};
 use rusty_protocol::tools::AgentToolset;
 use rusty_protocol::usage::AgentBudget;
