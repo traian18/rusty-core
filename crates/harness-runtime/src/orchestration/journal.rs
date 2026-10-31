@@ -26,6 +26,9 @@ const MAX_FILES_CHANGED: usize = 60;
 const MAX_FILES_READ: usize = 40;
 const MAX_COMMANDS: usize = 30;
 const MAX_RESEARCH: usize = 10;
+/// Research evidence lines kept per step, and how long each may be.
+const MAX_LOCATIONS: usize = 30;
+const MAX_LOCATION_CHARS: usize = 200;
 /// How much of a step's hand-off the journal quotes. Steps whose output is
 /// bound to the reader are not quoted at all: the reader has them in full.
 const JOURNAL_HANDOFF_CHARS: usize = 1_500;
@@ -123,6 +126,11 @@ impl ActionRecorder {
                         actions.research.push(question.trim().to_owned());
                     }
                 }
+                if !failed {
+                    for location in evidence_locations(output) {
+                        push_unique(&mut actions.locations, location, MAX_LOCATIONS);
+                    }
+                }
             }
             _ => {}
         }
@@ -131,6 +139,31 @@ impl ActionRecorder {
     pub(crate) fn finish(self) -> StepActions {
         self.actions
     }
+}
+
+/// The `## Evidence` lines of a research answer that name a place in the
+/// project (`path:lines`, not a URL), as the research step was told to write them.
+fn evidence_locations(output: &str) -> Vec<String> {
+    let mut in_evidence = false;
+    let mut found = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            in_evidence = trimmed.eq_ignore_ascii_case("## Evidence");
+            continue;
+        }
+        let item = trimmed.trim_start_matches(['-', '*', ' ']).trim();
+        let names_a_place = item.contains(':')
+            && !item.contains("://")
+            && item
+                .split([':', ' '])
+                .next()
+                .is_some_and(|path| path.contains('/') || path.contains('.'));
+        if in_evidence && names_a_place {
+            found.push(clip(item, MAX_LOCATION_CHARS));
+        }
+    }
+    found
 }
 
 fn path_of(arguments: &Value) -> Option<String> {
@@ -192,6 +225,12 @@ pub(crate) fn render_actions(actions: &StepActions) -> String {
         lines.push(format!(
             "- Asked for research: {}",
             actions.research.join(" | ")
+        ));
+    }
+    if !actions.locations.is_empty() {
+        lines.push(format!(
+            "- Research found (read these lines rather than searching again): {}",
+            actions.locations.join(" | ")
         ));
     }
     if !actions.files_read.is_empty() {
@@ -382,6 +421,9 @@ fn merge(into: &mut StepActions, from: &StepActions) {
             into.research.push(question.clone());
         }
     }
+    for location in &from.locations {
+        push_unique(&mut into.locations, location.clone(), MAX_LOCATIONS);
+    }
     into.tool_errors += from.tool_errors;
 }
 
@@ -502,6 +544,26 @@ mod tests {
         let rendered = render_actions(&actions);
         assert!(rendered.contains("- Changed: src/a.rs"));
         assert!(rendered.contains("`cargo test` (failed)"));
+    }
+
+    #[test]
+    fn research_evidence_becomes_locations_the_later_steps_see() {
+        let mut recorder = ActionRecorder::default();
+        let answer = "## Answer\nIn the policy.\n## Evidence\n- rusty-core/crates/harness-context/src/policy.rs:128-150 computes the reading\n- https://docs.rs/serde explains it\n- see the design\n## Unknowns\nNone";
+        call(
+            &mut recorder,
+            "request_research",
+            json!({"question": "Where is pressure computed?"}),
+            false,
+            answer,
+        );
+        let actions = recorder.finish();
+        assert_eq!(
+            actions.locations,
+            vec!["rusty-core/crates/harness-context/src/policy.rs:128-150 computes the reading"]
+        );
+        assert!(render_actions(&actions)
+            .contains("- Research found (read these lines rather than searching again): rusty-core/crates/harness-context/src/policy.rs:128-150"));
     }
 
     #[test]

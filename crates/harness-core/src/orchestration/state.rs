@@ -285,6 +285,10 @@ pub struct StepActions {
     /// Questions it sent out for research.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub research: Vec<String>,
+    /// Where its research found things (`path:lines` evidence lines), so the
+    /// steps after it read those lines instead of searching again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<String>,
     /// Tool calls that returned an error.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tool_errors: u32,
