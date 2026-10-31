@@ -1,4 +1,4 @@
-use harness_protocol::events::AgentEvent;
+use rusty_protocol::events::AgentEvent;
 
 pub(super) fn log_runtime_event(event: &AgentEvent) -> Option<String> {
     match event {

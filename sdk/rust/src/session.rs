@@ -1,15 +1,15 @@
 //! Ergonomic wrapper around an active or restored session handle.
 
-use harness_engine::SessionHandle;
-use harness_protocol::commands::PermissionDecision;
-use harness_protocol::ids::{PermissionId, SessionId};
+use rusty_engine::SessionHandle;
+use rusty_protocol::commands::PermissionDecision;
+use rusty_protocol::ids::{PermissionId, SessionId};
 
 use crate::error::SdkError;
 use crate::events::EventStream;
 
 /// A live handle to one session's root agent.
 ///
-/// `Session` re-exposes [`harness_engine::SessionHandle`]'s control surface
+/// `Session` re-exposes [`rusty_engine::SessionHandle`]'s control surface
 /// (`send`, `cancel`, `resolve_permission`, `events`) with SDK error types,
 /// and derefs to the underlying handle for engine-native calls
 /// (`snapshot()`, `context_inspection()`) that this SDK does not yet wrap

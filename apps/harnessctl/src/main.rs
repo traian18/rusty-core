@@ -3,7 +3,7 @@
 //! `harnessctl`: a reference CLI client for a running `harnessd` over the
 //! IPC transport. Doubles as an operational tool for debugging/scripting and
 //! as a worked example for anyone writing a real IDE-side client against the
-//! same wire protocol (see `harness_protocol::rpc`).
+//! same wire protocol (see `rusty_protocol::rpc`).
 
 mod chat;
 mod client;
@@ -15,11 +15,11 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use harness_protocol::admission::{CommandId, MutationMetadata};
-use harness_protocol::commands::{PermissionDecision, UserInput};
-use harness_protocol::ids::{PermissionId, SessionId, ToolId};
-use harness_protocol::rpc::{MutationCommand, RpcRequestBody, RpcResponseBody};
-use harness_protocol::tools::{
+use rusty_protocol::admission::{CommandId, MutationMetadata};
+use rusty_protocol::commands::{PermissionDecision, UserInput};
+use rusty_protocol::ids::{PermissionId, SessionId, ToolId};
+use rusty_protocol::rpc::{MutationCommand, RpcRequestBody, RpcResponseBody};
+use rusty_protocol::tools::{
     AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy,
 };
 
@@ -208,7 +208,7 @@ fn parse_session_id(raw: &str) -> Result<SessionId> {
 }
 
 /// Every tool `SessionBuilder::build_executor_for`
-/// (crates/harness-engine/src/session_builder.rs) knows how to construct,
+/// (crates/rusty-engine/src/session_builder.rs) knows how to construct,
 /// with the description and default permission used when building the
 /// toolset from `--tools`/`--all-tools`. Kept in one place so this list and
 /// that match statement don't silently drift apart.
@@ -271,7 +271,7 @@ fn resolve_tool_names(tools: Vec<String>, all_tools: bool) -> Vec<String> {
 /// the common case (a named server plus its launch command/args); env
 /// vars, a working directory, and a non-default timeout aren't
 /// expressible through this flag — construct `McpServerSpec` directly
-/// (over the wire, or via `harness-engine`'s `SessionBuilder::mcp_server`
+/// (over the wire, or via `rusty-engine`'s `SessionBuilder::mcp_server`
 /// when embedding) for those.
 /// Parses one `--mcp-server` value.
 ///
@@ -282,8 +282,8 @@ fn resolve_tool_names(tools: Vec<String>, all_tools: bool) -> Vec<String> {
 ///
 /// A URL is never a plausible executable name, so the discrimination is
 /// unambiguous and needs no extra flag.
-fn parse_mcp_server_spec(raw: &str) -> Result<harness_protocol::mcp::McpServerSpec> {
-    use harness_protocol::mcp::{McpServerSpec, McpTransportSpec};
+fn parse_mcp_server_spec(raw: &str) -> Result<rusty_protocol::mcp::McpServerSpec> {
+    use rusty_protocol::mcp::{McpServerSpec, McpTransportSpec};
 
     let (name, rest) = raw.split_once('=').with_context(|| {
         format!("--mcp-server value {raw:?} must be name=command[,arg,...] or name=URL")
@@ -312,7 +312,7 @@ fn parse_mcp_server_spec(raw: &str) -> Result<harness_protocol::mcp::McpServerSp
     Ok(spec)
 }
 
-fn parse_mcp_servers(raw: &[String]) -> Result<Vec<harness_protocol::mcp::McpServerSpec>> {
+fn parse_mcp_servers(raw: &[String]) -> Result<Vec<rusty_protocol::mcp::McpServerSpec>> {
     raw.iter()
         .map(|value| parse_mcp_server_spec(value))
         .collect()
@@ -328,11 +328,11 @@ fn skills_spec(
     enabled: bool,
     dirs: Vec<PathBuf>,
     user: bool,
-) -> Option<harness_protocol::skills::SkillsSpec> {
+) -> Option<rusty_protocol::skills::SkillsSpec> {
     if !enabled && dirs.is_empty() && !user {
         return None;
     }
-    Some(harness_protocol::skills::SkillsSpec {
+    Some(rusty_protocol::skills::SkillsSpec {
         include_user_dir: user,
         include_workspace_dir: true,
         roots: dirs,

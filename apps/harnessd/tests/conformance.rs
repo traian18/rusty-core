@@ -33,15 +33,15 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
-use harness_engine::Harness;
-use harness_integration_anthropic::AnthropicConfig;
-use harness_protocol::admission::{CommandId, MutationMetadata};
-use harness_protocol::rpc::{
+use rusty_engine::Harness;
+use rusty_protocol::admission::{CommandId, MutationMetadata};
+use rusty_protocol::rpc::{
     MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse,
     RpcResponseBody, PROTOCOL_VERSION,
 };
-use harness_protocol::tools::AgentToolset;
-use harness_runtime::rpc::RpcHandler;
+use rusty_protocol::tools::AgentToolset;
+use rusty_provider_anthropic::AnthropicConfig;
+use rusty_runtime::rpc::RpcHandler;
 
 #[path = "../src/handler.rs"]
 mod handler;
@@ -253,7 +253,7 @@ fn variant_name(body: &RpcResponseBody) -> &'static str {
 
 async fn build_handler() -> Arc<dyn RpcHandler> {
     let harness = Harness::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
         .build()
         .await
         .expect("build harness");
@@ -273,7 +273,7 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
         let serve_path = socket_path.clone();
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = harness_transport_ipc::serve(&serve_path, handler, serve_shutdown).await;
+            let _ = rusty_transport_ipc::serve(&serve_path, handler, serve_shutdown).await;
         });
         let mut stream = None;
         for _ in 0..50 {
@@ -299,7 +299,7 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
         let (server_reader, client_writer) = tokio::io::duplex(64 * 1024);
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = harness_transport_stdio::serve_io(
+            let _ = rusty_transport_stdio::serve_io(
                 server_reader,
                 server_writer,
                 handler,
@@ -326,8 +326,8 @@ async fn ipc_and_stdio_and_websocket_produce_the_same_response_sequence() {
         let addr = listener.local_addr().expect("local addr");
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = harness_transport_websocket::serve_listener(listener, handler, serve_shutdown)
-                .await;
+            let _ =
+                rusty_transport_websocket::serve_listener(listener, handler, serve_shutdown).await;
         });
         let (socket, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
             .await

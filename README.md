@@ -6,7 +6,7 @@ The repository is a Cargo workspace of small crates with explicit responsibility
 
 This README covers what the engine does, how it works, every integration and tool it ships with, and the three ways to use it: **embedding the crates in a Rust application**, **talking to a `harnessd` daemon over a socket/stdio/WebSocket** (directly or via an SDK), or **running one of the ready-made apps** (`harness`, `harnessd` + `harnessctl`).
 
-New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where each feature starts and which function does the next step. The [source module guide](crates/harness-core/src/README.md) explains the layout of the deterministic core implementation.
+New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where each feature starts and which function does the next step. The [source module guide](crates/rusty-agent-core/src/README.md) explains the layout of the deterministic core implementation.
 
 ## Contents
 
@@ -31,13 +31,13 @@ New to the code? Read [ARCHITECTURE.md](ARCHITECTURE.md) first: it shows where e
 
 ## Capabilities at a glance
 
-- **Deterministic agent state machine** — `harness-core` models an `Agent` as pure state with a single `apply()` transition function. Same inputs, same transitions, regardless of timing or transport; the async runtime only *executes* what the state machine decides.
-- **Multi-session, multi-agent runtime** — `harness-runtime` runs any number of sessions concurrently (each with a root agent that can spawn child agents), with a shared scheduler, resource manager, and per-backend rate limiting.
+- **Deterministic agent state machine** — `rusty-agent-core` models an `Agent` as pure state with a single `apply()` transition function. Same inputs, same transitions, regardless of timing or transport; the async runtime only *executes* what the state machine decides.
+- **Multi-session, multi-agent runtime** — `rusty-runtime` runs any number of sessions concurrently (each with a root agent that can spawn child agents), with a shared scheduler, resource manager, and per-backend rate limiting.
 - **Streaming event model** — every observable occurrence is an `AgentEventEnvelope` carrying routing metadata (`session_id`, `agent_id`, `parent_agent_id`, `run_id`) and two monotonic sequence numbers for exact ordering. Subscribers get a live push stream; reconnecting clients can **resume from a sequence number without gaps or duplicates**.
 - **Durable session persistence** — every durable event is written to a `SessionStore` (JSONL or WAL-mode SQLite) as it happens, plus periodic state snapshots. Sessions survive daemon restarts and can be restored via `Harness::restore_session`. Raw streaming deltas stay ephemeral by design (see [Durability](#durability-and-resume)).
 - **Pluggable model backends** — Anthropic Messages API, OpenAI Chat Completions, any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, …), Gemini, and the ChatGPT (Codex) and GitHub Copilot subscription inference APIs; seven integration crates in all, six registered by `harnessd`. They only return proposed tool calls: every tool executes through the harness. All share one provider-neutral backend adapter. See [Integrations](#integrations) for exact config shapes and where each one is wired up.
 - **Built-in resilience** — every HTTP model call goes through retry with exponential backoff + jitter, a shared deadline across attempts, and a circuit breaker. Settings are configurable per provider (see [Provider resilience](#provider-resilience)).
-- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), skill loading, and model-initiated subagent delegation (`agent_spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio or HTTP; `harness-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
+- **Pluggable tools** — filesystem read/edit/search, shell execution, read-only git, web fetch (with a built-in SSRF guard), skill loading, and model-initiated subagent delegation (`agent_spawn`) ship out of the box, plus any tool an [MCP](#mcp-servers) server advertises over stdio or HTTP; `rusty-extension-api` is the stable surface for writing your own tools and backends (see [Extending the harness](#extending-the-harness)).
 - **Permission gating** — tool calls can be configured `Allow` / `Ask` / (deny); pending requests surface as events and are resolved per-call (`y`/`n` in the TUIs, `ResolvePermission` on the wire). A session's `execution_policy` (application skill grants intersected with harness-owned mode limits) can only narrow what is allowed, never widen it.
 - **Behavior profiles** — every agent runs under a profile: its instructions, tool scope, limits, rules that inject context or deny or ask on matching tool calls, and a completion gate that checks the work before the agent may finish (see [Behavior profiles](#behavior-profiles)).
 - **Workflows** — deterministic orchestration graphs of input, agent, verify, approval, subflow and output steps, with retries, send-back edges and a persisted task queue (see [Workflows](#workflows-orchestration)).
@@ -62,32 +62,32 @@ The workspace is split into five layers, each depending only on the ones below i
 │               (CLI + chat TUI)                                  │
 ├────────────────────────────────────────────────────────────────┤
 │ Transports    ipc · websocket · stdio · mcp (server mode)      │
-│               (one RPC contract: harness_protocol::rpc)        │
+│               (one RPC contract: rusty_protocol::rpc)        │
 ├────────────────────────────────────────────────────────────────┤
 │ Integrations  anthropic · openai · openai-responses · gemini   │
 │               · openai-compatible · codex · github-copilot     │
 │ Tools         filesystem · shell · git · web · mcp · skills    │
 │               · agent_spawn                                     │
 ├────────────────────────────────────────────────────────────────┤
-│ Engine        harness-engine (public Harness/SessionBuilder)   │
-│               harness-runtime (async orchestration)            │
-│               harness-core (deterministic agent state machine) │
+│ Engine        rusty-engine (public Harness/SessionBuilder)   │
+│               rusty-runtime (async orchestration)            │
+│               rusty-agent-core (deterministic agent state machine) │
 ├────────────────────────────────────────────────────────────────┤
-│ Protocol      harness-protocol (pure types, no I/O)            │
-│               harness-model · harness-generic-backend          │
-│               harness-context · harness-workspace              │
-│               harness-session-store · harness-extension-api    │
+│ Protocol      rusty-protocol (pure types, no I/O)            │
+│               harness-model · rusty-model-backend          │
+│               rusty-context · rusty-workspace              │
+│               rusty-session-store · rusty-extension-api    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-- **`harness-protocol`** — pure serializable types only (no runtime, no I/O policy): requests/responses, events, commands, ids, usage, tools. This is the contract every transport and every wire client speaks. Versioned wire schemas are published as JSON Schema in [`schema/`](schema) (`protocol-v1.schema.json`, `protocol-v2.schema.json`).
-- **`harness-core`** — the `Agent` domain entity, behavior profiles and the orchestration (workflow) compiler and reducer. All transitions are deterministic functions of current state + input; the integration test suite in `harness-core/tests/transitions.rs` pins this behavior.
-- **`harness-runtime`** — the async layer: `SessionRuntime` (per-session event bus + command loop), `AgentRunner` (dispatches backend/tool/permission effects), `AgentSupervisor` (enforces capability non-escalation on every spawned child), `SessionManager` (multi-session lifecycle), cancellation tree, permissions module, scheduler and resource manager, plus the workflow runner, the persisted task queue and the completion-gate evaluators.
-- **`harness-engine`** — the public, stable API (`Harness`, `SessionBuilder`, `SessionHandle`) that composes the runtime and the integration/tool registries. **This is the crate third-party Rust applications depend on.**
-- **`harness-model` + `harness-generic-backend`** — the provider-neutral `ModelClient` trait and the `GenericModelBackend` adapter that adds retry/backoff/circuit-breaking on top of any client.
-- **`harness-context`** — a backend decorator that injects the system prompt / workspace summary and keeps the transcript inside the model's window (see [Context management](#context-management-and-compaction)).
-- **`harness-session-store`** — the `SessionStore` trait with `JsonlSessionStore` and `SqliteSessionStore` implementations.
-- **`harness-extension-api`** — the semver-stable surface for third-party tools and backends (see [Extending the harness](#extending-the-harness)).
+- **`rusty-protocol`** — pure serializable types only (no runtime, no I/O policy): requests/responses, events, commands, ids, usage, tools. This is the contract every transport and every wire client speaks. Versioned wire schemas are published as JSON Schema in [`schema/`](schema) (`protocol-v1.schema.json`, `protocol-v2.schema.json`).
+- **`rusty-agent-core`** — the `Agent` domain entity, behavior profiles and the orchestration (workflow) compiler and reducer. All transitions are deterministic functions of current state + input; the integration test suite in `rusty-agent-core/tests/transitions.rs` pins this behavior.
+- **`rusty-runtime`** — the async layer: `SessionRuntime` (per-session event bus + command loop), `AgentRunner` (dispatches backend/tool/permission effects), `AgentSupervisor` (enforces capability non-escalation on every spawned child), `SessionManager` (multi-session lifecycle), cancellation tree, permissions module, scheduler and resource manager, plus the workflow runner, the persisted task queue and the completion-gate evaluators.
+- **`rusty-engine`** — the public, stable API (`Harness`, `SessionBuilder`, `SessionHandle`) that composes the runtime and the integration/tool registries. **This is the crate third-party Rust applications depend on.**
+- **`harness-model` + `rusty-model-backend`** — the provider-neutral `ModelClient` trait and the `GenericModelBackend` adapter that adds retry/backoff/circuit-breaking on top of any client.
+- **`rusty-context`** — a backend decorator that injects the system prompt / workspace summary and keeps the transcript inside the model's window (see [Context management](#context-management-and-compaction)).
+- **`rusty-session-store`** — the `SessionStore` trait with `JsonlSessionStore` and `SqliteSessionStore` implementations.
+- **`rusty-extension-api`** — the semver-stable surface for third-party tools and backends (see [Extending the harness](#extending-the-harness)).
 
 ### Sessions, agents, and runs
 
@@ -133,7 +133,7 @@ Rationale: raw keystrokes are cheap to broadcast and expensive to store — only
 
 ### Protocol capabilities
 
-Every `Hello` handshake response carries a `ProtocolCapabilities` struct so a client never has to guess what the daemon it just connected to actually supports. Current defaults, straight from `harness_protocol::rpc::ProtocolCapabilities`:
+Every `Hello` handshake response carries a `ProtocolCapabilities` struct so a client never has to guess what the daemon it just connected to actually supports. Current defaults, straight from `rusty_protocol::rpc::ProtocolCapabilities`:
 
 | Capability | Value | Meaning |
 |---|---|---|
@@ -179,14 +179,14 @@ Model integrations use direct inference APIs. They return proposed function call
 
 | Integration | Crate | Kind | Credential source | Registered in `harnessd` | Registered in `apps/harness` (standalone TUI) |
 |---|---|---|---|:---:|:---:|
-| `anthropic` | `harness-integration-anthropic` | HTTP (Messages API) | `ANTHROPIC_API_KEY` or `api_key` in config | ✅ | ✅ |
-| `openai` | `harness-integration-openai` | HTTP (Chat Completions) | `OPENAI_API_KEY` or `api_key` in config | ✅ | ✅ |
-| `gemini` | `harness-integration-gemini` | HTTP | `GEMINI_API_KEY` or `api_key` in config | ✅ | not wired |
-| `openai-compatible` | `harness-integration-openai-compatible` | HTTP (OpenAI-shaped) | optional `api_key` (some local servers need none) | ✅ | not wired |
-| `codex` | `harness-integration-codex` | HTTP (ChatGPT Responses) | Codex OAuth credential store | ✅ | ✅ |
-| `github-copilot` | `harness-integration-github-copilot` | HTTP (Copilot model APIs) | Copilot token environment/configuration/Keychain | ✅ | ✅ |
+| `anthropic` | `rusty-provider-anthropic` | HTTP (Messages API) | `ANTHROPIC_API_KEY` or `api_key` in config | ✅ | ✅ |
+| `openai` | `rusty-provider-openai` | HTTP (Chat Completions) | `OPENAI_API_KEY` or `api_key` in config | ✅ | ✅ |
+| `gemini` | `rusty-provider-gemini` | HTTP | `GEMINI_API_KEY` or `api_key` in config | ✅ | not wired |
+| `openai-compatible` | `rusty-provider-openai-compatible` | HTTP (OpenAI-shaped) | optional `api_key` (some local servers need none) | ✅ | not wired |
+| `codex` | `rusty-provider-codex` | HTTP (ChatGPT Responses) | Codex OAuth credential store | ✅ | ✅ |
+| `github-copilot` | `rusty-provider-github-copilot` | HTTP (Copilot model APIs) | Copilot token environment/configuration/Keychain | ✅ | ✅ |
 
-All six are registered in `harnessd`, so every one is reachable over the daemon/`harnessctl` path. The standalone TUI registers four (`anthropic`, `openai`, `codex`, `github-copilot`). A seventh crate, `harness-integration-openai-responses` (the OpenAI Responses API), is not registered on its own: it is the transport the `codex` adapter builds on, and `github-copilot` uses it for the models that need it.
+All six are registered in `harnessd`, so every one is reachable over the daemon/`harnessctl` path. The standalone TUI registers four (`anthropic`, `openai`, `codex`, `github-copilot`). A seventh crate, `rusty-provider-openai-responses` (the OpenAI Responses API), is not registered on its own: it is the transport the `codex` adapter builds on, and `github-copilot` uses it for the models that need it.
 
 ### Config shapes
 
@@ -256,18 +256,18 @@ An agent's toolset is assembled explicitly per session (`--tools ...` on the CLI
 
 | Tool ID | Crate | What it does | Mutates / executes? |
 |---|---|---|:---:|
-| `fs.read` | `harness-tool-filesystem` | Read a file from the bound workspace | no |
-| `fs.edit` | `harness-tool-filesystem` | Create or modify a file | **yes** |
-| `workspace.search` | `harness-tool-filesystem` | Search file contents/names in the workspace | no |
-| `shell.exec` | `harness-tool-shell` | Run a shell command in the workspace | **yes** |
-| `git.status` | `harness-tool-git` | `git status` | no |
-| `git.diff` | `harness-tool-git` | `git diff` | no |
-| `git.log` | `harness-tool-git` | `git log` | no |
-| `git.show` | `harness-tool-git` | `git show` | no |
-| `web_fetch` | `harness-tool-web` | Fetch a URL, with a built-in SSRF guard (blocks loopback, link-local, cloud-metadata, and RFC1918 targets by default — see `crates/tools/web/src/ssrf.rs`) | no |
+| `fs.read` | `rusty-tool-filesystem` | Read a file from the bound workspace | no |
+| `fs.edit` | `rusty-tool-filesystem` | Create or modify a file | **yes** |
+| `workspace.search` | `rusty-tool-filesystem` | Search file contents/names in the workspace | no |
+| `shell.exec` | `rusty-tool-shell` | Run a shell command in the workspace | **yes** |
+| `git.status` | `rusty-tool-git` | `git status` | no |
+| `git.diff` | `rusty-tool-git` | `git diff` | no |
+| `git.log` | `rusty-tool-git` | `git log` | no |
+| `git.show` | `rusty-tool-git` | `git show` | no |
+| `web_fetch` | `rusty-tool-web` | Fetch a URL, with a built-in SSRF guard (blocks loopback, link-local, cloud-metadata, and RFC1918 targets by default — see `crates/tools/web/src/ssrf.rs`) | no |
 | `skill.load` | `harness-tool-skills` | One skill's full instructions and the files it bundles (see [Skills](#skills)) | no |
 | `skill.read` | `harness-tool-skills` | One file bundled with a skill | no |
-| `agent_spawn` | `harness-runtime` (not a separate crate) | Model-facing subagent delegation (see below) | spawns a child agent |
+| `agent_spawn` | `rusty-runtime` (not a separate crate) | Model-facing subagent delegation (see below) | spawns a child agent |
 
 Every integration relays tool calls through this registry: backends only propose calls, and the harness authorizes and runs them, so `--tools` and permission gating apply to all of them.
 
@@ -287,7 +287,7 @@ Every integration relays tool calls through this registry: backends only propose
 
 ### MCP servers
 
-Beyond the built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `harness-tool-mcp` (`crates/tools/mcp`):
+Beyond the built-in tools, a session can connect any number of [MCP](https://modelcontextprotocol.io) servers — every tool the server advertises is discovered at session start and registered as `mcp.<server-name>.<tool-name>`, so it's indistinguishable from a built-in tool to the model and to `--tools`/permission gating. Implemented in `rusty-tool-mcp` (`crates/tools/mcp`):
 
 - **Two transports**, behind one internal trait so everything above the client is written once:
   - **stdio** — spawn a local process, newline-delimited JSON over its pipes.
@@ -313,18 +313,18 @@ harnessctl session create --workspace ./repo --integration anthropic \
 # the provider picker, which has no other way to carry config:
 cargo run -p harness -- --mcp-server 'filesystem=npx,-y,@modelcontextprotocol/server-filesystem,/tmp'
 
-# Embedding harness-engine directly: the real McpServerConfig builder.
+# Embedding rusty-engine directly: the real McpServerConfig builder.
 ```
 ```rust
 let session = harness
     .session()
     .integration("anthropic", serde_json::json!({}))?
     .mcp_server(
-        harness_engine::McpServerConfig::new("filesystem", "npx")
+        rusty_engine::McpServerConfig::new("filesystem", "npx")
             .args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
     )
     .mcp_server(
-        harness_engine::McpServerConfig::http("remote", "https://example.com/mcp")
+        rusty_engine::McpServerConfig::http("remote", "https://example.com/mcp")
             .header("Authorization", "Bearer ..."),
     )
     .toolset(my_toolset, workspace)
@@ -332,13 +332,13 @@ let session = harness
     .await?;
 ```
 
-The CLI flag is a convenience for the common case; it can't express environment variables, a working directory, request headers, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/harness-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `harness-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
+The CLI flag is a convenience for the common case; it can't express environment variables, a working directory, request headers, or a non-default request timeout. For those, use `RpcRequestBody::CreateSession.mcp_servers` directly over the wire (see [`McpServerSpec`](crates/rusty-protocol/src/mcp.rs) — a plain serializable mirror of `McpServerConfig`, since `rusty-protocol` can't depend on an I/O-bearing `harness-tool-*` crate) or `SessionBuilder::mcp_server` when embedding.
 
 On the wire, `McpServerSpec` carries an optional tagged `transport` member (`{"kind":"stdio",...}` or `{"kind":"http",...}`). Its absence means the flat `command`/`args`/`env`/`cwd` fields describe a stdio server — the original shape — so an existing client keeps working unchanged and no `PROTOCOL_VERSION` bump was needed. Read it via `McpServerSpec::resolve_transport()` rather than either representation directly.
 
 ### MCP server mode
 
-The reverse direction: `harnessd` can present itself as an MCP server, so any MCP-capable client — Claude Desktop, Cursor, VS Code — drives real harness sessions with no harness-specific SDK. Implemented in `harness-transport-mcp` (`crates/transports/mcp`).
+The reverse direction: `harnessd` can present itself as an MCP server, so any MCP-capable client — Claude Desktop, Cursor, VS Code — drives real harness sessions with no harness-specific SDK. Implemented in `rusty-transport-mcp` (`crates/transports/mcp`).
 
 ```console
 harnessd --mcp-stdio --mcp-integration anthropic --mcp-workspace-root ./repo
@@ -369,7 +369,7 @@ Four tools and one resource family:
 
 `harness://session/{id}` renders a session's transcript, built from `events_since(id, 0)` — no protocol addition was needed, since the durable event stream already holds the full history.
 
-**It's built on `Arc<dyn RpcHandler>`, exactly like the other three transports**, not on `Harness` directly. So it depends only on `harness-protocol` + `harness-runtime`, `harnessd` gains it with one flag, and MCP-created sessions flow through the same typed contract, admission cache, and revision tracking as every other client.
+**It's built on `Arc<dyn RpcHandler>`, exactly like the other three transports**, not on `Harness` directly. So it depends only on `rusty-protocol` + `rusty-runtime`, `harnessd` gains it with one flag, and MCP-created sessions flow through the same typed contract, admission cache, and revision tracking as every other client.
 
 Three things worth knowing:
 
@@ -381,7 +381,7 @@ Three things worth knowing:
 
 ### Skills
 
-A **skill** is a directory containing a `SKILL.md` — YAML frontmatter naming and describing it, then a markdown body of instructions — plus any files those instructions reference. Dropping one into `.harness/skills/` gives an agent a new capability **without recompiling anything**, which is the gap the compile-time `Plugin` trait leaves open. Implemented in `harness-skills` (discovery, parsing, the context provider) and `harness-tool-skills` (the two tools).
+A **skill** is a directory containing a `SKILL.md` — YAML frontmatter naming and describing it, then a markdown body of instructions — plus any files those instructions reference. Dropping one into `.harness/skills/` gives an agent a new capability **without recompiling anything**, which is the gap the compile-time `Plugin` trait leaves open. Implemented in `rusty-skills` (discovery, parsing, the context provider) and `harness-tool-skills` (the two tools).
 
 ```text
 .harness/skills/pdf-report/
@@ -408,7 +408,7 @@ allowed-tools: [fs.read, shell.exec]
 | `skill.load` | One skill's full instructions plus a listing of the files it bundles |
 | `skill.read` | One of those bundled files, scoped to that skill's own directory |
 
-So thirty installed skills cost thirty lines per request, not thirty documents. That is the difference between skills being free to install and being something you ration. `crates/harness-engine/tests/skills_e2e.rs` asserts the negative directly: instruction bodies must *not* appear in the assembled `ExecutionRequest`.
+So thirty installed skills cost thirty lines per request, not thirty documents. That is the difference between skills being free to install and being something you ration. `crates/rusty-engine/tests/skills_e2e.rs` asserts the negative directly: instruction bodies must *not* appear in the assembled `ExecutionRequest`.
 
 Discovery scans, in increasing precedence (later wins on a name collision):
 
@@ -416,7 +416,7 @@ Discovery scans, in increasing precedence (later wins on a name collision):
 2. `<workspace_root>/.harness/skills` — the project's own
 3. any explicitly named root (`--skills-dir`, or `SkillsConfig::root`)
 
-Frontmatter requires `name` (which must equal the directory name) and `description`; `version`, `license`, and `allowed-tools` are optional and unknown keys are ignored, so a skill written for a future field still loads today. The parser is a hand-rolled flat-YAML subset in `crates/harness-skills/src/frontmatter.rs` — deliberately not a YAML dependency, for the same supply-chain reason the MCP client is hand-rolled rather than pulling `rmcp`.
+Frontmatter requires `name` (which must equal the directory name) and `description`; `version`, `license`, and `allowed-tools` are optional and unknown keys are ignored, so a skill written for a future field still loads today. The parser is a hand-rolled flat-YAML subset in `crates/rusty-skills/src/frontmatter.rs` — deliberately not a YAML dependency, for the same supply-chain reason the MCP client is hand-rolled rather than pulling `rmcp`.
 
 A malformed `SKILL.md` is **never fatal**: it's logged at `warn` and skipped, and its siblings still load. `skill.read` refuses absolute paths, `..` traversal, and — via canonicalization — symlinks that escape the skill directory, which a component check alone would miss.
 
@@ -434,13 +434,13 @@ harnessctl session create --workspace ./repo --integration anthropic \
 let session = harness
     .session()
     .integration("anthropic", serde_json::json!({}))?
-    .skills(harness_engine::SkillsConfig::new().workspace_root("./repo"))
+    .skills(rusty_engine::SkillsConfig::new().workspace_root("./repo"))
     .toolset(my_toolset, workspace)
     .start()
     .await?;
 ```
 
-Architecturally, skills add **no new seams**. The catalog reaches the model through `harness_context::ContextProvider` — the same decorator seam compaction already uses, composed via `ChainedContextProvider` so a caller-supplied provider is never clobbered — and the two tools are ordinary `ToolExecutor`s in the session's normal registry. Nothing touches `harness-core`'s state machine.
+Architecturally, skills add **no new seams**. The catalog reaches the model through `rusty_context::ContextProvider` — the same decorator seam compaction already uses, composed via `ChainedContextProvider` so a caller-supplied provider is never clobbered — and the two tools are ordinary `ToolExecutor`s in the session's normal registry. Nothing touches `rusty-agent-core`'s state machine.
 
 ---
 
@@ -457,22 +457,22 @@ Every agent runs under a **behavior profile**: a versioned JSON document that de
 | `rules` | Triggers on a tool name, its arguments, a result containing some text, or the turn count; each can **inject context**, **deny** the call, or **ask** the user |
 | `completion_gate` | Checks run when the agent proposes a final answer: a tool is run or a model is asked. A failed check sends the agent back to revise, up to `max_continuations` (default 3). When checks still fail the run completes and `CompletionGateEvaluated` reports `passed: false`, unless `on_exhausted` says otherwise; workflow steps treat an unpassed gate as a failed attempt |
 
-The deterministic half (when a gate must run, what a rule decides) lives in `harness-core::behavior`; the I/O half (running a tool or asking a model for a verdict) is the completion-gate evaluators in `harness-runtime`. Profile activity is visible as events: `BehaviorRuleFired`, `ContextInjected`, `ToolCallDenied`, `ProfileChanged`, `CompletionGateEvaluated`.
+The deterministic half (when a gate must run, what a rule decides) lives in `rusty-agent-core::behavior`; the I/O half (running a tool or asking a model for a verdict) is the completion-gate evaluators in `rusty-runtime`. Profile activity is visible as events: `BehaviorRuleFired`, `ContextInjected`, `ToolCallDenied`, `ProfileChanged`, `CompletionGateEvaluated`.
 
-Profiles come from the host's registry (`Harness::profiles()`) or from `<workspace>/.rusty/profiles/*.json`, loaded with `SessionBuilder::workspace_profiles(root)` and chosen with `SessionBuilder::profile(...)`. Shell-command evaluators are opt-in (`allow_command_evaluators`, and `trust_workspace_commands` for a workspace's own profiles). Editors can check documents that may not even parse yet with `harness_engine::validation::validate_profile`, which never fails: every problem comes back as an issue.
+Profiles come from the host's registry (`Harness::profiles()`) or from `<workspace>/.rusty/profiles/*.json`, loaded with `SessionBuilder::workspace_profiles(root)` and chosen with `SessionBuilder::profile(...)`. Shell-command evaluators are opt-in (`allow_command_evaluators`, and `trust_workspace_commands` for a workspace's own profiles). Editors can check documents that may not even parse yet with `rusty_engine::validation::validate_profile`, which never fails: every problem comes back as an issue.
 
 ---
 
 ## Workflows (orchestration)
 
-A **workflow** is a deterministic graph that decides which steps run, in what order, what each step may use, and what must be checked. The graph, its compiler and the run-state reducer are pure (`harness-core::orchestration`); `harness-runtime` executes the steps and feeds outcomes back.
+A **workflow** is a deterministic graph that decides which steps run, in what order, what each step may use, and what must be checked. The graph, its compiler and the run-state reducer are pure (`rusty-agent-core::orchestration`); `rusty-runtime` executes the steps and feeds outcomes back.
 
 - **Steps (nodes):** `input`, `agent`, `verify`, `approval`, `subflow` and `output`. An agent step runs in its own isolated session that shares the parent's backend, workspace and tools, under the behavior profile it names.
 - **Edges and bindings:** edges carry a condition (success or failure); input and output bindings and output contracts say what flows between steps.
 - **Retries and send-back:** a retry policy per step, plus failure edges that send work back to an earlier step with the findings.
 - **Policies:** limits such as `max_total_attempts` and `stall_timeout_ms` bound a whole run.
 - **Task queue:** a persisted, serial queue for planned work. Every task gets fresh builder and reviewer sessions, and a retry keeps completed tasks rather than a prose handoff.
-- **Embedding:** orchestration is opt-in (`HarnessBuilder::orchestration`) and additive; direct sessions never go through it. `Harness::run_orchestration` runs a definition, and `harness_engine::validation::validate_orchestration` checks a raw JSON document the same never-fails way as profiles.
+- **Embedding:** orchestration is opt-in (`HarnessBuilder::orchestration`) and additive; direct sessions never go through it. `Harness::run_orchestration` runs a definition, and `rusty_engine::validation::validate_orchestration` checks a raw JSON document the same never-fails way as profiles.
 
 ---
 
@@ -486,7 +486,7 @@ Compaction is driven by `ContextPolicy` against the model's real window: 90% of 
 2. **Drop** the oldest turns, only at cut points that keep every tool call with its result. The opening request and pinned messages are kept.
 3. **Summarize** (optional): `SummarizingCompactionProvider` writes an incremental summary of aged-out history in the background, one per conversation, and applies it on a later request, so no request ever waits for a model call. If the summarizer fails, tiers 1 and 2 cover the request.
 
-An optional `ImportanceJudge` can rate each old message as essential (kept word for word), useful (summarized) or disposable (dropped). `JevImportanceJudge` does this with the JEV Decisions API; the `jev-http` feature of `harness-context` adds an OpenRouter transport. Without a judge nothing leaves the process.
+An optional `ImportanceJudge` can rate each old message as essential (kept word for word), useful (summarized) or disposable (dropped). `JevImportanceJudge` does this with the JEV Decisions API; the `jev-http` feature of `rusty-context` adds an OpenRouter transport. Without a judge nothing leaves the process.
 
 ---
 
@@ -496,13 +496,13 @@ Every crate and app has its own `README.md` explaining why it exists, what is in
 
 | Area | Crates | What it does |
 |---|---|---|
-| Core | `harness-protocol`, `harness-core`, `harness-runtime`, `harness-engine` | Wire types, the deterministic agent state machine, async orchestration, and the public `Harness`/`SessionBuilder` API |
-| Context | `harness-context` | Injects a system prompt / workspace summary and keeps the transcript within the model's window: trims old tool output, drops the oldest turns at tool-pair-safe cuts, and optionally replaces them with a background summary guided by JEV importance ratings |
-| Skills | `harness-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
+| Core | `rusty-protocol`, `rusty-agent-core`, `rusty-runtime`, `rusty-engine` | Wire types, the deterministic agent state machine, async orchestration, and the public `Harness`/`SessionBuilder` API |
+| Context | `rusty-context` | Injects a system prompt / workspace summary and keeps the transcript within the model's window: trims old tool output, drops the oldest turns at tool-pair-safe cuts, and optionally replaces them with a background summary guided by JEV importance ratings |
+| Skills | `rusty-skills` | Discovers `SKILL.md` directories and puts their one-line descriptions in the system prompt (see [Skills](#skills)) |
 | Model backends | `crates/integrations/{anthropic,openai,openai-responses,openai-compatible,gemini}` | Direct HTTP API clients |
 | Subscription inference | `crates/integrations/{codex,github-copilot}` | Authenticate model API requests; the harness owns tools and context |
-| Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web_fetch`, an MCP client, `skill.load`/`skill.read` (`agent_spawn` lives in `harness-runtime` itself, see [Tools](#tools)) |
-| Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`harness_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
+| Tools | `crates/tools/{filesystem,shell,git,web,mcp,skills}` | `fs.read`/`fs.edit`/`workspace.search`, `shell.exec`, read-only `git.*`, `web_fetch`, an MCP client, `skill.load`/`skill.read` (`agent_spawn` lives in `rusty-runtime` itself, see [Tools](#tools)) |
+| Transports | `crates/transports/{ipc,websocket,stdio,mcp}` | Unix socket, WebSocket, and stdin/stdout framings of the same RPC contract (`rusty_protocol::rpc`), plus an MCP server frontend (see [MCP server mode](#mcp-server-mode)) |
 | Apps | `apps/harnessd`, `apps/harnessctl`, `apps/harness` | The daemon, a reference CLI client, and a standalone interactive TUI |
 | SDKs | `sdk/rust`, `sdk/typescript` | Application-agnostic client facades — see [SDKs](#sdks) |
 
@@ -624,19 +624,19 @@ There are three integration shapes, depending on whether your application is Rus
 
 ### 1. Embed the crates directly (Rust applications)
 
-Depend on `harness-engine` (plus whichever integration/tool crates you need) and drive the same builder API `apps/harness`'s TUI uses. This is the full pattern, adapted from the working example at [`sdk/rust/examples/basic_chat.rs`](sdk/rust/examples/basic_chat.rs):
+Depend on `rusty-engine` (plus whichever integration/tool crates you need) and drive the same builder API `apps/harness`'s TUI uses. This is the full pattern, adapted from the working example at [`sdk/rust/examples/basic_chat.rs`](sdk/rust/examples/basic_chat.rs):
 
 ```rust
 use std::sync::Arc;
 
-use harness_engine::Harness;
-use harness_protocol::events::AgentEvent;
-use harness_protocol::events::AgentOutcome;
+use rusty_engine::Harness;
+use rusty_protocol::events::AgentEvent;
+use rusty_protocol::events::AgentOutcome;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let harness = Harness::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
         .build()
         .await?;
 
@@ -668,14 +668,14 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Add `.session_store(Arc::new(JsonlSessionStore::new(sessions_dir)))` to the builder for durable persistence across restarts, `.tools(...)`/`.toolset(...)` for a tool registry (see [Tools](#tools)), and `.context_provider(...)` to wire in transcript compaction (`harness-context`). Prefer the curated `rusty-harness-sdk` facade over depending on `harness-engine` directly if you don't need the full internal surface — see [SDKs](#sdks) below.
+Add `.session_store(Arc::new(JsonlSessionStore::new(sessions_dir)))` to the builder for durable persistence across restarts, `.tools(...)`/`.toolset(...)` for a tool registry (see [Tools](#tools)), and `.context_provider(...)` to wire in transcript compaction (`rusty-context`). Prefer the curated `rusty-harness-sdk` facade over depending on `rusty-engine` directly if you don't need the full internal surface — see [SDKs](#sdks) below.
 
 ### 2. Talk to `harnessd` over the wire (any language, or a sandboxed/out-of-process Rust host)
 
 Start `harnessd` with `--unix-socket`, `--tcp`, and/or `--stdio` (see [Quick start](#quick-start-run-it-and-make-a-real-request)) and speak the shared RPC contract directly, or through:
 
 - **The TypeScript SDK** (`@rusty/harness-sdk`, in [`sdk/typescript`](sdk/typescript)) — the reference client for the wire protocol today: handshake, session lifecycle, prompt/steer/follow-up/cancel/permission mutations, typed structured errors, and resumable event subscription with explicit gap callbacks.
-- **The raw protocol** — `harnessctl`'s own source (`apps/harnessctl/src`) is a second working reference client. The wire shapes are published as JSON Schema in [`schema/protocol-v2.schema.json`](schema/protocol-v2.schema.json); the Rust types in `harness-protocol` are the authoritative source of truth the schema mirrors.
+- **The raw protocol** — `harnessctl`'s own source (`apps/harnessctl/src`) is a second working reference client. The wire shapes are published as JSON Schema in [`schema/protocol-v2.schema.json`](schema/protocol-v2.schema.json); the Rust types in `rusty-protocol` are the authoritative source of truth the schema mirrors.
 
 This is the integration shape an IDE would normally use: spawn `harnessd --stdio` as a child process (or connect to an already-running `--unix-socket`/`--tcp` instance) and never link Rust into the host process at all.
 
@@ -693,12 +693,12 @@ Both existing SDKs document their own real, current gaps inline rather than hidi
 
 ## Extending the harness
 
-`harness-extension-api` is the one crate third-party tool/backend authors should depend on — `harness-tools`, `harness-runtime`, `harness-model`, and `harness-generic-backend` are implementation details that can change shape between workspace versions without warning; this crate follows semver strictly instead.
+`rusty-extension-api` is the one crate third-party tool/backend authors should depend on — `rusty-tool-api`, `rusty-runtime`, `harness-model`, and `rusty-model-backend` are implementation details that can change shape between workspace versions without warning; this crate follows semver strictly instead.
 
 Implement the `Plugin` trait to contribute tools and/or integrations:
 
 ```rust
-use harness_extension_api::{Plugin, ToolExecutor, IntegrationFactory};
+use rusty_extension_api::{Plugin, ToolExecutor, IntegrationFactory};
 use std::sync::Arc;
 
 struct MyPlugin;
@@ -745,9 +745,9 @@ CI (`.github/workflows/ci.yml`) runs all of the above, plus a 3-OS × 3-toolchai
 
 ## Project status
 
-Versions across the workspace are `0.1.x` — nothing here is published to crates.io or npm yet, and no crate makes a semver promise except `harness-extension-api`. Known, current limitations worth knowing before depending on this:
+Versions across the workspace are `0.1.x` — nothing here is published to crates.io or npm yet, and no crate makes a semver promise except `rusty-extension-api`. Known, current limitations worth knowing before depending on this:
 
-- **Unix-like platforms only (Linux, macOS) — no Windows support.** `harness-transport-ipc` and `harnessctl`'s client (its only way to reach a daemon) use `tokio::net::UnixListener`/`UnixStream` unconditionally, which don't exist on Windows; the workspace does not currently build there. CI's test matrix reflects this (`ubuntu-latest`/`macos-latest` only). The `stdio` and WebSocket transports have no such dependency — a Windows host embedding `harness-engine` directly, or driving `harnessd --stdio`/`--tcp` from a non-Rust client, isn't affected by this; only `harnessd --unix-socket` and `harnessctl` are.
+- **Unix-like platforms only (Linux, macOS) — no Windows support.** `rusty-transport-ipc` and `harnessctl`'s client (its only way to reach a daemon) use `tokio::net::UnixListener`/`UnixStream` unconditionally, which don't exist on Windows; the workspace does not currently build there. CI's test matrix reflects this (`ubuntu-latest`/`macos-latest` only). The `stdio` and WebSocket transports have no such dependency — a Windows host embedding `rusty-engine` directly, or driving `harnessd --stdio`/`--tcp` from a non-Rust client, isn't affected by this; only `harnessd --unix-socket` and `harnessctl` are.
 - MCP support covers `tools/*` only — no resources, prompts, sampling, or roots, in either direction (see [MCP servers](#mcp-servers)).
 - The WebSocket transport is unauthenticated and loopback-only by deliberate scope decision (see `crates/transports/websocket/src/lib.rs`) — a remote/multi-tenant deployment needs an auth/TLS layer built on top, not just a different bind address.
 - Extension loading is compile-time only (see [Extending the harness](#extending-the-harness)) — no third-party plugin ecosystem without recompiling the host.

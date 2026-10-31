@@ -10,11 +10,11 @@ description = "Stable, application-agnostic Rust SDK facade over the Rusty agent
 publish = false
 
 [dependencies]
-harness-engine = { path = "../../crates/harness-engine" }
-harness-protocol = { path = "../../crates/harness-protocol" }
-harness-runtime = { path = "../../crates/harness-runtime" }
-harness-session-store = { path = "../../crates/harness-session-store" }
-harness-workspace = { path = "../../crates/harness-workspace" }
+rusty-engine = { path = "../../crates/engine" }
+rusty-protocol = { path = "../../crates/protocol" }
+rusty-runtime = { path = "../../crates/runtime" }
+rusty-session-store = { path = "../../crates/session-store" }
+rusty-workspace = { path = "../../crates/workspace" }
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = { workspace = true }
@@ -27,4 +27,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { workspace = true }
-harness-integration-anthropic = { path = "../../crates/integrations/anthropic" }
+rusty-provider-anthropic = { path = "../../crates/provider-anthropic" }

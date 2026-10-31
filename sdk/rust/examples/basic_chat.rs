@@ -17,7 +17,7 @@ async fn main() -> Result<(), SdkError> {
     tracing_subscriber::fmt::init();
 
     let client = Client::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
         .build()
         .await?;
 

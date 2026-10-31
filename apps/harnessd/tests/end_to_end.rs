@@ -1,4 +1,4 @@
-//! End-to-end confidence test: a real `harness_transport_ipc::serve()` over a
+//! End-to-end confidence test: a real `rusty_transport_ipc::serve()` over a
 //! real Unix socket, dispatching into a real `HarnessRpcHandler` wrapping a
 //! real `Harness`. Everything below this (framing round-trips, handler
 //! dispatch in isolation) is covered by faster unit tests in their own
@@ -13,15 +13,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 
-use harness_engine::Harness;
-use harness_integration_anthropic::AnthropicConfig;
-use harness_protocol::admission::{CommandId, MutationMetadata};
-use harness_protocol::rpc::{
+use rusty_engine::Harness;
+use rusty_protocol::admission::{CommandId, MutationMetadata};
+use rusty_protocol::rpc::{
     MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse,
     RpcResponseBody, PROTOCOL_VERSION,
 };
-use harness_protocol::tools::AgentToolset;
-use harness_runtime::rpc::RpcHandler;
+use rusty_protocol::tools::AgentToolset;
+use rusty_provider_anthropic::AnthropicConfig;
+use rusty_runtime::rpc::RpcHandler;
 
 #[path = "../src/handler.rs"]
 mod handler;
@@ -50,8 +50,8 @@ async fn full_stack_create_session_snapshot_close() {
     let socket_path: PathBuf = socket_dir.path().join("harness.sock");
 
     let harness = Harness::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
-        .session_store(Arc::new(harness_session_store::JsonlSessionStore::new(
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
+        .session_store(Arc::new(rusty_session_store::JsonlSessionStore::new(
             sessions_dir.path(),
         )))
         .build()
@@ -65,7 +65,7 @@ async fn full_stack_create_session_snapshot_close() {
     let serve_handler = rpc_handler.clone();
     let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let _ = harness_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
+        let _ = rusty_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
     });
 
     let mut stream = None;
@@ -147,7 +147,7 @@ async fn full_stack_create_session_snapshot_close() {
     // (yet) get an equally specific `AcceptedStarted`/`AcceptedQueued`.
     match response.body {
         RpcResponseBody::Admission {
-            result: harness_protocol::admission::AdmissionResult::AcceptedApplied,
+            result: rusty_protocol::admission::AdmissionResult::AcceptedApplied,
             ..
         } => {}
         other => panic!("expected Admission{{AcceptedApplied}}, got {other:?}"),
@@ -173,8 +173,8 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     let socket_path: PathBuf = socket_dir.path().join("harness.sock");
 
     let harness = Harness::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
-        .session_store(Arc::new(harness_session_store::JsonlSessionStore::new(
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
+        .session_store(Arc::new(rusty_session_store::JsonlSessionStore::new(
             sessions_dir.path(),
         )))
         .build()
@@ -188,7 +188,7 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     let serve_handler = rpc_handler.clone();
     let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let _ = harness_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
+        let _ = rusty_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
     });
 
     let mut stream = None;
@@ -278,7 +278,7 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     .await;
     match read_frame(&mut stream).await.body {
         RpcResponseBody::Admission {
-            result: harness_protocol::admission::AdmissionResult::Duplicate { original },
+            result: rusty_protocol::admission::AdmissionResult::Duplicate { original },
             session_revision,
             ..
         } => {
@@ -314,7 +314,7 @@ async fn mutation_admission_deduplicates_and_rejects_stale_revisions() {
     match read_frame(&mut stream).await.body {
         RpcResponseBody::Admission {
             result:
-                harness_protocol::admission::AdmissionResult::RejectedConflict {
+                rusty_protocol::admission::AdmissionResult::RejectedConflict {
                     current_session_revision,
                 },
             ..
@@ -343,8 +343,8 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
     let socket_path: PathBuf = socket_dir.path().join("harness.sock");
 
     let harness = Harness::builder()
-        .register_integration(Arc::new(harness_integration_anthropic::AnthropicFactory))
-        .session_store(Arc::new(harness_session_store::JsonlSessionStore::new(
+        .register_integration(Arc::new(rusty_provider_anthropic::AnthropicFactory))
+        .session_store(Arc::new(rusty_session_store::JsonlSessionStore::new(
             sessions_dir.path(),
         )))
         .build()
@@ -375,7 +375,7 @@ async fn get_diagnostics_reports_real_scheduler_and_metrics_state() {
     let serve_handler = rpc_handler.clone();
     let serve_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let _ = harness_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
+        let _ = rusty_transport_ipc::serve(&serve_path, serve_handler, serve_shutdown).await;
     });
 
     let mut stream = None;

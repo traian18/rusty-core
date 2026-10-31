@@ -57,7 +57,7 @@ for what's replayable.
 
 Connect [MCP](https://modelcontextprotocol.io) servers over stdio by passing
 `mcpServers` to `createSession` — the wire-shaped mirror of Rust's
-`McpServerSpec` (see `crates/harness-protocol/src/mcp.rs` and the main
+`McpServerSpec` (see `crates/rusty-protocol/src/mcp.rs` and the main
 [README's MCP servers section](../../README.md#mcp-servers)):
 
 ```ts

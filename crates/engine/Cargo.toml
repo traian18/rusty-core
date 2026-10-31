@@ -1,0 +1,51 @@
+[package]
+name = "rusty-engine"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-agent-core = { path = "../agent-core" }
+rusty-workflow-core = { path = "../workflow-core" }
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+rusty-workflow-runtime = { path = "../workflow-runtime" }
+rusty-context = { path = "../context" }
+rusty-session-store = { path = "../session-store", default-features = false }
+rusty-workspace = { path = "../workspace" }
+rusty-repo-model = { path = "../repo-model" }
+rusty-tool-api = { path = "../tool-api" }
+rusty-code-analysis = { path = "../code-analysis" }
+rusty-tool-repo = { path = "../tool-repo" }
+rusty-tool-code = { path = "../tool-code" }
+rusty-tool-filesystem = { path = "../tool-filesystem" }
+rusty-tool-shell = { path = "../tool-shell" }
+rusty-tool-git = { path = "../tool-git" }
+rusty-tool-web = { path = "../tool-web" }
+rusty-tool-mcp = { path = "../tool-mcp" }
+rusty-skills = { path = "../skills" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "fs"] }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# `testing` belongs here, not in [dependencies]: Cargo unifies features across
+# the graph, so enabling it for the library turned FakeBackend/FakeToolRegistry
+# on for every downstream consumer's release build. Only this crate's own
+# integration tests (tests/real_tools_e2e.rs) actually use them.
+rusty-runtime = { path = "../runtime", features = ["testing"] }
+tempfile = "3"
+rusty-lang-api = { path = "../lang-api" }
+rusty-git-analysis = { path = "../git-analysis" }
+rusty-findings = { path = "../findings" }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

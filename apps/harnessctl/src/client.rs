@@ -1,4 +1,4 @@
-//! Thin client for the `harness-transport-ipc` wire protocol.
+//! Thin client for the `rusty-transport-ipc` wire protocol.
 //!
 //! Reuses that crate's frame read/write helpers directly rather than
 //! reimplementing them — both sides of one wire protocol should share one
@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{anyhow, bail, Result};
 use tokio::net::UnixStream;
 
-use harness_protocol::ids::SessionId;
-use harness_protocol::rpc::{
+use rusty_protocol::ids::SessionId;
+use rusty_protocol::rpc::{
     RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
     PROTOCOL_VERSION,
 };
-use harness_transport_ipc::framing::{read_frame, write_frame};
+use rusty_transport_ipc::framing::{read_frame, write_frame};
 
 pub struct HarnessClient {
     stream: UnixStream,

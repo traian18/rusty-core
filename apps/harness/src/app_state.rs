@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use harness_protocol::{
+use rusty_protocol::{
     events::AgentEventEnvelope,
     ids::{AgentId, PermissionId, SessionId},
     messages::{AgentMessage, ContentBlock, MessageRole},
@@ -48,7 +48,7 @@ pub struct AppState {
     pub error_banner: Option<String>,
     pub providers: Vec<ProviderOption>,
     pub context_inspector_open: bool,
-    pub context: Option<harness_engine::ContextInspection>,
+    pub context: Option<rusty_engine::ContextInspection>,
     pub log: Vec<LogEntry>,
     pub log_open: bool,
     events: EventTranscript,
@@ -389,7 +389,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_protocol::{
+    use rusty_protocol::{
         events::{AgentEvent, EventVisibility},
         ids::{AgentId, EventId, MessageId, RunId, Timestamp},
     };
@@ -458,7 +458,7 @@ mod tests {
             EventId::new(),
             agent_id,
             AgentEvent::BackendRequestStarted {
-                request_id: harness_protocol::ids::RequestId::new(),
+                request_id: rusty_protocol::ids::RequestId::new(),
             },
         ));
 
@@ -505,7 +505,7 @@ mod tests {
             EventId::new(),
             agent_id,
             AgentEvent::Failed {
-                error: harness_protocol::commands::AgentError {
+                error: rusty_protocol::commands::AgentError {
                     code: "spawn_failed".to_owned(),
                     message: "failed to spawn Claude Code CLI".to_owned(),
                     details: None,

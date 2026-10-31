@@ -1,0 +1,19 @@
+[package]
+name = "rusty-lang-csharp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-repo-model = { path = "../repo-model" }
+tree-sitter = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-util = { workspace = true }

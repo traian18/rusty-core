@@ -10,5 +10,5 @@ A reference command-line client for a running `harnessd` over the IPC transport.
 
 ## In the workspace
 
-- **Depends on:** `harness-protocol`, `harness-transport-ipc`
+- **Depends on:** `rusty-protocol`, `rusty-transport-ipc`
 - **Used by:** applications and external embedders (a leaf of the workspace)

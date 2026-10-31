@@ -15,5 +15,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-
 serde_json = { workspace = true }
 crossterm = "0.28"
 ratatui = "0.29"
-harness-protocol = { path = "../../crates/harness-protocol" }
-harness-transport-ipc = { path = "../../crates/transports/ipc" }
+rusty-protocol = { path = "../../crates/protocol" }
+rusty-transport-ipc = { path = "../../crates/transport-ipc" }

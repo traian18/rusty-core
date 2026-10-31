@@ -2,19 +2,19 @@
 
 use std::sync::Arc;
 
-use harness_engine::{Harness, HarnessBuilder, SessionBuilder};
-use harness_protocol::ids::SessionId;
-use harness_runtime::integration::IntegrationFactory;
-use harness_session_store::store::{SessionStore, SessionSummary};
+use rusty_engine::{Harness, HarnessBuilder, SessionBuilder};
+use rusty_protocol::ids::SessionId;
+use rusty_runtime::integration::IntegrationFactory;
+use rusty_session_store::store::{SessionStore, SessionSummary};
 
 use crate::error::SdkError;
 use crate::session::Session;
 
 /// Fluent builder for constructing an embedded [`Client`].
 ///
-/// Mirrors [`harness_engine::HarnessBuilder`]'s registration order
+/// Mirrors [`rusty_engine::HarnessBuilder`]'s registration order
 /// guarantees, but returns SDK types so applications depend on this crate
-/// instead of importing `harness-engine` directly.
+/// instead of importing `rusty-engine` directly.
 pub struct ClientBuilder {
     inner: HarnessBuilder,
 }
@@ -54,11 +54,11 @@ impl ClientBuilder {
 
 /// Embedded entry point into the harness engine.
 ///
-/// `Client` is the SDK-facing equivalent of [`harness_engine::Harness`]: it
+/// `Client` is the SDK-facing equivalent of [`rusty_engine::Harness`]: it
 /// composes provider/model discovery, session creation, and session restore
 /// behind one stable type. Applications that embed the harness directly in
 /// a Rust process should depend on `rusty-harness-sdk` rather than
-/// `harness-engine` and its transitive internal crates.
+/// `rusty-engine` and its transitive internal crates.
 ///
 /// Applications that are not Rust, or that want the engine in a separate
 /// process, should instead run `harnessd` and speak the wire protocol
@@ -78,7 +78,7 @@ impl Client {
     ///
     /// Returns the engine's native [`SessionBuilder`] directly — this SDK
     /// does not yet wrap session construction, only the resulting handle
-    /// (via [`Session::from`]). See [`harness_engine::SessionBuilder`] for
+    /// (via [`Session::from`]). See [`rusty_engine::SessionBuilder`] for
     /// the full configuration surface (integration config, toolset,
     /// workspace, context provider).
     pub fn session(&self) -> SessionBuilder {
@@ -107,7 +107,7 @@ impl Client {
 
     /// Direct access to the underlying engine, for capabilities this SDK
     /// does not yet wrap (provider/model discovery, credential profiles,
-    /// auth flows). See [`harness_engine::Harness`].
+    /// auth flows). See [`rusty_engine::Harness`].
     pub fn engine(&self) -> &Harness {
         &self.inner
     }

@@ -1,18 +1,18 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use harness_engine::{
+use rusty_engine::{
     BackendSelection, FsWorkspace, Harness, McpServerConfig, SessionHandle, SkillsConfig,
 };
-use harness_integration_anthropic::AnthropicFactory;
-use harness_integration_codex::CodexFactory;
-use harness_integration_github_copilot::GitHubCopilotFactory;
-use harness_integration_openai::OpenAiFactory;
-use harness_protocol::{
+use rusty_protocol::{
     ids::ToolId,
     tools::{AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy},
 };
-use harness_session_store::{JsonlSessionStore, SessionSummary, StoredSession};
+use rusty_provider_anthropic::AnthropicFactory;
+use rusty_provider_codex::CodexFactory;
+use rusty_provider_github_copilot::GitHubCopilotFactory;
+use rusty_provider_openai::OpenAiFactory;
+use rusty_session_store::{JsonlSessionStore, SessionSummary, StoredSession};
 use serde_json::{json, Value};
 
 use crate::providers::{option_from_descriptor, ProviderOption, SessionSelection};
@@ -33,9 +33,9 @@ use crate::providers::{option_from_descriptor, ProviderOption, SessionSelection}
 /// `reasoning_effort` is requested against a backend whose
 /// `reasoning_stream` capability is `false` — it doesn't silently ignore
 /// the request.
-fn reasoning_params_for(integration: &str) -> Option<harness_protocol::backend::ExecutionParams> {
+fn reasoning_params_for(integration: &str) -> Option<rusty_protocol::backend::ExecutionParams> {
     if integration == "anthropic" {
-        Some(harness_protocol::backend::ExecutionParams {
+        Some(rusty_protocol::backend::ExecutionParams {
             extended_thinking: Some(true),
             ..Default::default()
         })
@@ -143,7 +143,7 @@ impl AppHarness {
 
     pub async fn refresh_provider(
         &self,
-        provider_key: &harness_engine::ProviderKey,
+        provider_key: &rusty_engine::ProviderKey,
     ) -> Result<ProviderOption> {
         let provider = self
             .harness
@@ -169,8 +169,8 @@ impl AppHarness {
 
     pub fn auth_flow(
         &self,
-        provider: &harness_engine::ProviderKey,
-    ) -> Result<harness_engine::AuthFlowHandle> {
+        provider: &rusty_engine::ProviderKey,
+    ) -> Result<rusty_engine::AuthFlowHandle> {
         let descriptor = self
             .harness
             .list_providers()?
@@ -187,14 +187,11 @@ impl AppHarness {
         Ok(self.harness.list_sessions().await?)
     }
 
-    pub async fn load_session(
-        &self,
-        id: harness_protocol::ids::SessionId,
-    ) -> Result<StoredSession> {
+    pub async fn load_session(&self, id: rusty_protocol::ids::SessionId) -> Result<StoredSession> {
         Ok(self.harness.session_store().load_session(id).await?)
     }
 
-    pub async fn restore(&self, id: harness_protocol::ids::SessionId) -> Result<SessionHandle> {
+    pub async fn restore(&self, id: rusty_protocol::ids::SessionId) -> Result<SessionHandle> {
         Ok(self
             .harness
             .restore_session_with_toolset(id, default_toolset(), self.workspace.clone())
@@ -208,7 +205,7 @@ impl AppHarness {
         if let Some(object) = config.as_object_mut() {
             object.insert(
                 "_backend_selection".into(),
-                serde_json::to_value(harness_protocol::backend::PersistedBackendSelection::v1(
+                serde_json::to_value(rusty_protocol::backend::PersistedBackendSelection::v1(
                     selection.provider_id.to_string(),
                     selection.credential_profile.0,
                     selection.model,

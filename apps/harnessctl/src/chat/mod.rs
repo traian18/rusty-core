@@ -24,14 +24,14 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::mpsc;
 
-use harness_protocol::admission::{CommandId, MutationMetadata};
-use harness_protocol::commands::{PermissionDecision, UserInput};
-use harness_protocol::ids::SessionId;
-use harness_protocol::rpc::{
+use rusty_protocol::admission::{CommandId, MutationMetadata};
+use rusty_protocol::commands::{PermissionDecision, UserInput};
+use rusty_protocol::ids::SessionId;
+use rusty_protocol::rpc::{
     MutationCommand, RequestCorrelationId, RpcRequest, RpcRequestBody, RpcResponse, RpcResponseBody,
 };
-use harness_protocol::tools::AgentToolset;
-use harness_transport_ipc::framing::{read_frame, write_frame};
+use rusty_protocol::tools::AgentToolset;
+use rusty_transport_ipc::framing::{read_frame, write_frame};
 
 use crate::client::HarnessClient;
 use input::InputAction;
@@ -60,8 +60,8 @@ pub async fn run(
     integration: String,
     integration_config: serde_json::Value,
     toolset: AgentToolset,
-    mcp_servers: Vec<harness_protocol::mcp::McpServerSpec>,
-    skills: Option<harness_protocol::skills::SkillsSpec>,
+    mcp_servers: Vec<rusty_protocol::mcp::McpServerSpec>,
+    skills: Option<rusty_protocol::skills::SkillsSpec>,
 ) -> Result<()> {
     // `HarnessClient::connect` performs the `Hello` protocol-version
     // handshake before returning, so a version-mismatched daemon fails here

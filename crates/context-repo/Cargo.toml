@@ -1,0 +1,26 @@
+[package]
+name = "rusty-context-repo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-context = { path = "../context" }
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+rusty-repo-model = { path = "../repo-model" }
+rusty-git-analysis = { path = "../git-analysis" }
+rusty-findings = { path = "../findings" }
+rusty-repo-wiki = { path = "../repo-wiki" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+rusty-lang-api = { path = "../lang-api" }
+git2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-util = { workspace = true }

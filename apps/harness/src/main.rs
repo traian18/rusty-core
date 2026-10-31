@@ -19,10 +19,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use harness_protocol::commands::PermissionDecision;
 use harness_setup::{AppHarness, SessionOptions};
 use input::InputAction;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use rusty_protocol::commands::PermissionDecision;
 use std::{io, path::PathBuf, time::Duration};
 
 #[derive(Parser, Debug)]
@@ -43,7 +43,7 @@ struct Args {
     /// built-in toolset, for every session this TUI starts (including ones
     /// created later via the provider picker). Env vars, a working
     /// directory, request headers, or a non-default timeout aren't
-    /// expressible through this flag — embed `harness-engine` directly and
+    /// expressible through this flag — embed `rusty-engine` directly and
     /// use `SessionBuilder::mcp_server` for those.
     #[arg(long = "mcp-server")]
     mcp_servers: Vec<String>,
@@ -73,7 +73,7 @@ struct Args {
 ///
 /// A URL is never a plausible executable name, so the discrimination is
 /// unambiguous and needs no extra flag.
-fn parse_mcp_server(raw: &str) -> Result<harness_engine::McpServerConfig> {
+fn parse_mcp_server(raw: &str) -> Result<rusty_engine::McpServerConfig> {
     let (name, rest) = raw.split_once('=').ok_or_else(|| {
         anyhow::anyhow!("--mcp-server value {raw:?} must be name=command[,arg,...] or name=URL")
     })?;
@@ -82,7 +82,7 @@ fn parse_mcp_server(raw: &str) -> Result<harness_engine::McpServerConfig> {
     }
 
     if rest.starts_with("http://") || rest.starts_with("https://") {
-        return Ok(harness_engine::McpServerConfig::http(name, rest));
+        return Ok(rusty_engine::McpServerConfig::http(name, rest));
     }
 
     let mut parts = rest.split(',');
@@ -92,7 +92,7 @@ fn parse_mcp_server(raw: &str) -> Result<harness_engine::McpServerConfig> {
         .ok_or_else(|| {
             anyhow::anyhow!("--mcp-server value {raw:?} is missing a command after '='")
         })?;
-    Ok(harness_engine::McpServerConfig::new(name, command).args(parts))
+    Ok(rusty_engine::McpServerConfig::new(name, command).args(parts))
 }
 
 struct TerminalGuard {
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
     })?;
 
     let skills = (!args.no_skills).then(|| {
-        let mut config = harness_engine::SkillsConfig::new().workspace_root(workspace_root.clone());
+        let mut config = rusty_engine::SkillsConfig::new().workspace_root(workspace_root.clone());
         config.extra_roots = args.skills_dirs.clone();
         config
     });

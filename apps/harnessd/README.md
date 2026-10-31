@@ -13,5 +13,5 @@ Logging goes to stderr unconditionally so the stdio transport's stdout stays a c
 
 ## In the workspace
 
-- **Depends on:** `harness-engine`, `harness-integration-anthropic`, `harness-integration-codex`, `harness-integration-gemini`, `harness-integration-github-copilot`, `harness-integration-openai`, `harness-integration-openai-compatible`, `harness-protocol`, `harness-runtime`, `harness-session-store`, `harness-transport-ipc`, `harness-transport-mcp`, `harness-transport-stdio`, `harness-transport-websocket`
+- **Depends on:** `rusty-engine`, `rusty-provider-anthropic`, `rusty-provider-codex`, `rusty-provider-gemini`, `rusty-provider-github-copilot`, `rusty-provider-openai`, `rusty-provider-openai-compatible`, `rusty-protocol`, `rusty-runtime`, `rusty-session-store`, `rusty-transport-ipc`, `rusty-transport-mcp`, `rusty-transport-stdio`, `rusty-transport-websocket`
 - **Used by:** applications and external embedders (a leaf of the workspace)

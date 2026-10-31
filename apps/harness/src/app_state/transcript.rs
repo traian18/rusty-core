@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use harness_protocol::{
+use rusty_protocol::{
     effects::PermissionRequest,
     events::{AgentEvent, AgentOutcome},
     ids::{AgentId, EventId, MessageId, PermissionId, ToolCallId},

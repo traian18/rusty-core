@@ -873,850 +873,18 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
- "harness-engine",
- "harness-integration-anthropic",
- "harness-integration-codex",
- "harness-integration-github-copilot",
- "harness-integration-openai",
- "harness-protocol",
- "harness-session-store",
  "pulldown-cmark",
  "ratatui",
+ "rusty-engine",
+ "rusty-protocol",
+ "rusty-provider-anthropic",
+ "rusty-provider-codex",
+ "rusty-provider-github-copilot",
+ "rusty-provider-openai",
+ "rusty-session-store",
  "serde_json",
  "tokio",
  "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "harness-code-analysis"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "libc",
- "serde",
- "sha2",
- "tokio",
- "tokio-util",
- "tracing",
- "tree-sitter",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "uuid",
-]
-
-[[package]]
-name = "harness-code-health"
-version = "0.1.0"
-dependencies = [
- "git2",
- "harness-code-analysis",
- "harness-git-analysis",
- "harness-workspace",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-context"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "harness-runtime",
- "reqwest",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-context-repository"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "git2",
- "harness-context",
- "harness-findings",
- "harness-git-analysis",
- "harness-protocol",
- "harness-repository-imports",
- "harness-repository-wiki",
- "harness-runtime",
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-core"
-version = "0.3.0"
-dependencies = [
- "harness-protocol",
- "rust_decimal",
- "rust_decimal_macros",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "harness-engine"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-code-analysis",
- "harness-context",
- "harness-core",
- "harness-findings",
- "harness-git-analysis",
- "harness-protocol",
- "harness-repository-imports",
- "harness-runtime",
- "harness-session-store",
- "harness-skills",
- "harness-tool-code-analysis",
- "harness-tool-filesystem",
- "harness-tool-git",
- "harness-tool-mcp",
- "harness-tool-repository-intelligence",
- "harness-tool-shell",
- "harness-tool-skills",
- "harness-tool-web",
- "harness-tools",
- "harness-workspace",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "harness-extension-api"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-generic-backend",
- "harness-model",
- "harness-runtime",
- "harness-tools",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "harness-findings"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "git2",
- "harness-git-analysis",
- "harness-repository-imports",
- "harness-workspace",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-generic-backend"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-generic-backend",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "metrics",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-git-analysis"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "git2",
- "harness-workspace",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-goals"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "harness-guidelines"
-version = "0.1.0"
-dependencies = [
- "harness-code-analysis",
- "harness-code-health",
- "regex",
- "schemars",
- "serde",
- "serde_json",
- "tree-sitter",
-]
-
-[[package]]
-name = "harness-infra-analysis"
-version = "0.1.0"
-dependencies = [
- "harness-code-analysis",
- "harness-code-health",
- "harness-git-analysis",
- "harness-workspace",
- "serde",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-hcl",
- "tree-sitter-yaml",
-]
-
-[[package]]
-name = "harness-integration-anthropic"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "base64",
- "harness-engine",
- "harness-generic-backend",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-integration-codex"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "harness-context",
- "harness-engine",
- "harness-generic-backend",
- "harness-integration-openai-responses",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "security-framework",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-integration-gemini"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "base64",
- "harness-engine",
- "harness-generic-backend",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-integration-github-copilot"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-generic-backend",
- "harness-integration-anthropic",
- "harness-integration-openai",
- "harness-integration-openai-responses",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "reqwest",
- "security-framework",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-integration-openai"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "base64",
- "harness-engine",
- "harness-generic-backend",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-integration-openai-compatible"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-engine",
- "harness-generic-backend",
- "harness-integration-openai",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "harness-integration-openai-responses"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "base64",
- "harness-engine",
- "harness-generic-backend",
- "harness-model",
- "harness-protocol",
- "harness-runtime",
- "harness-tools",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-model"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "http",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-protocol"
-version = "0.3.0"
-dependencies = [
- "base64",
- "chrono",
- "rust_decimal",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "uuid",
-]
-
-[[package]]
-name = "harness-repository-frameworks"
-version = "0.1.0"
-dependencies = [
- "harness-repository-imports",
- "harness-repository-imports-csharp",
- "harness-repository-imports-go",
- "harness-repository-imports-java",
- "harness-repository-imports-php",
- "harness-repository-imports-python",
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-c-sharp",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "harness-repository-imports"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "libc",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-rust",
- "tree-sitter-typescript",
-]
-
-[[package]]
-name = "harness-repository-imports-csharp"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-c-sharp",
-]
-
-[[package]]
-name = "harness-repository-imports-go"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-go",
-]
-
-[[package]]
-name = "harness-repository-imports-java"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-java",
- "tree-sitter-kotlin-ng",
-]
-
-[[package]]
-name = "harness-repository-imports-native"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-cpp",
-]
-
-[[package]]
-name = "harness-repository-imports-php"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "tree-sitter-php",
-]
-
-[[package]]
-name = "harness-repository-imports-python"
-version = "0.1.0"
-dependencies = [
- "harness-workspace",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "tree-sitter",
- "tree-sitter-python",
-]
-
-[[package]]
-name = "harness-repository-wiki"
-version = "0.1.0"
-dependencies = [
- "git2",
- "harness-code-analysis",
- "harness-code-health",
- "harness-findings",
- "harness-git-analysis",
- "harness-infra-analysis",
- "harness-repository-frameworks",
- "harness-repository-imports",
- "harness-workspace",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-runtime"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "chrono",
- "futures",
- "git2",
- "harness-core",
- "harness-protocol",
- "harness-runtime",
- "harness-session-store",
- "harness-specs",
- "harness-tools",
- "harness-workspace",
- "metrics",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-session-store"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "harness-session-store",
- "metrics",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-skills"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-context",
- "harness-protocol",
- "harness-workspace",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-specs"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harness-tool-code-analysis"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "harness-code-analysis",
- "harness-tools",
- "serde_json",
- "tokio",
- "tokio-util",
- "uuid",
-]
-
-[[package]]
-name = "harness-tool-filesystem"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-tools",
- "harness-workspace",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tool-git"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "git2",
- "harness-tools",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tool-mcp"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "futures",
- "harness-protocol",
- "harness-tools",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tool-repository-intelligence"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "git2",
- "harness-findings",
- "harness-git-analysis",
- "harness-repository-frameworks",
- "harness-repository-imports",
- "harness-repository-wiki",
- "harness-tools",
- "harness-workspace",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "harness-tool-shell"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-tools",
- "harness-workspace",
- "libc",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tool-skills"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-skills",
- "harness-tools",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tool-web"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "harness-tools",
- "html2text",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "harness-tools"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "harness-transport-ipc"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "harness-runtime",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-transport-mcp"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "harness-runtime",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-transport-stdio"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "harness-protocol",
- "harness-runtime",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-transport-websocket"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "futures",
- "harness-protocol",
- "harness-runtime",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "harness-workspace"
-version = "0.3.0"
-dependencies = [
- "async-trait",
- "futures",
- "git2",
- "libc",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1726,9 +894,9 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
- "harness-protocol",
- "harness-transport-ipc",
  "ratatui",
+ "rusty-protocol",
+ "rusty-transport-ipc",
  "serde_json",
  "tokio",
 ]
@@ -1741,22 +909,22 @@ dependencies = [
  "async-trait",
  "clap",
  "futures",
- "harness-engine",
- "harness-integration-anthropic",
- "harness-integration-codex",
- "harness-integration-gemini",
- "harness-integration-github-copilot",
- "harness-integration-openai",
- "harness-integration-openai-compatible",
- "harness-protocol",
- "harness-runtime",
- "harness-session-store",
- "harness-transport-ipc",
- "harness-transport-mcp",
- "harness-transport-stdio",
- "harness-transport-websocket",
  "metrics",
  "metrics-exporter-prometheus",
+ "rusty-engine",
+ "rusty-protocol",
+ "rusty-provider-anthropic",
+ "rusty-provider-codex",
+ "rusty-provider-gemini",
+ "rusty-provider-github-copilot",
+ "rusty-provider-openai",
+ "rusty-provider-openai-compatible",
+ "rusty-runtime",
+ "rusty-session-store",
+ "rusty-transport-ipc",
+ "rusty-transport-mcp",
+ "rusty-transport-stdio",
+ "rusty-transport-websocket",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3094,17 +2262,236 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty-agent-core"
+version = "0.3.0"
+dependencies = [
+ "rust_decimal",
+ "rust_decimal_macros",
+ "rusty-protocol",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rusty-code-analysis"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "serde",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "uuid",
+]
+
+[[package]]
+name = "rusty-code-health"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "rusty-code-analysis",
+ "rusty-git-analysis",
+ "rusty-repo-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-context"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-context-repo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "git2",
+ "rusty-context",
+ "rusty-findings",
+ "rusty-git-analysis",
+ "rusty-lang-api",
+ "rusty-protocol",
+ "rusty-repo-model",
+ "rusty-repo-wiki",
+ "rusty-runtime",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-engine"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "rusty-agent-core",
+ "rusty-code-analysis",
+ "rusty-context",
+ "rusty-findings",
+ "rusty-git-analysis",
+ "rusty-lang-api",
+ "rusty-protocol",
+ "rusty-repo-model",
+ "rusty-runtime",
+ "rusty-session-store",
+ "rusty-skills",
+ "rusty-tool-api",
+ "rusty-tool-code",
+ "rusty-tool-filesystem",
+ "rusty-tool-git",
+ "rusty-tool-mcp",
+ "rusty-tool-repo",
+ "rusty-tool-shell",
+ "rusty-tool-web",
+ "rusty-workflow-core",
+ "rusty-workflow-runtime",
+ "rusty-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "rusty-extension-api"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-model-backend",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rusty-findings"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "git2",
+ "rusty-git-analysis",
+ "rusty-lang-api",
+ "rusty-repo-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-frameworks"
+version = "0.1.0"
+dependencies = [
+ "rusty-lang-api",
+ "rusty-lang-csharp",
+ "rusty-lang-go",
+ "rusty-lang-java",
+ "rusty-lang-php",
+ "rusty-lang-python",
+ "rusty-repo-model",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "rusty-git-analysis"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "git2",
+ "rusty-repo-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-goals"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-guidelines"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "rusty-code-analysis",
+ "rusty-code-health",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tree-sitter",
+]
+
+[[package]]
 name = "rusty-harness-sdk"
 version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
- "harness-engine",
- "harness-integration-anthropic",
- "harness-protocol",
- "harness-runtime",
- "harness-session-store",
- "harness-workspace",
+ "rusty-engine",
+ "rusty-protocol",
+ "rusty-provider-anthropic",
+ "rusty-runtime",
+ "rusty-session-store",
+ "rusty-workspace",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3112,6 +2499,641 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rusty-infra-analysis"
+version = "0.1.0"
+dependencies = [
+ "rusty-code-analysis",
+ "rusty-code-health",
+ "rusty-git-analysis",
+ "rusty-repo-model",
+ "serde",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-hcl",
+ "tree-sitter-yaml",
+]
+
+[[package]]
+name = "rusty-lang-api"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rusty-repo-model",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "rusty-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+]
+
+[[package]]
+name = "rusty-lang-go"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-go",
+]
+
+[[package]]
+name = "rusty-lang-java"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-java",
+ "tree-sitter-kotlin-ng",
+]
+
+[[package]]
+name = "rusty-lang-native"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-cpp",
+]
+
+[[package]]
+name = "rusty-lang-php"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "tree-sitter-php",
+]
+
+[[package]]
+name = "rusty-lang-python"
+version = "0.1.0"
+dependencies = [
+ "rusty-repo-model",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-python",
+]
+
+[[package]]
+name = "rusty-model-backend"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "metrics",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-protocol"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "rust_decimal",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "rusty-provider-anthropic"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "reqwest",
+ "rust_decimal",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-provider-codex"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "reqwest",
+ "rusty-context",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-provider-openai-responses",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-provider-gemini"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "reqwest",
+ "rust_decimal",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-provider-github-copilot"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "reqwest",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-provider-anthropic",
+ "rusty-provider-openai",
+ "rusty-provider-openai-responses",
+ "rusty-runtime",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-provider-openai"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "reqwest",
+ "rust_decimal",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-provider-openai-compatible"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-provider-openai",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rusty-provider-openai-responses"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "reqwest",
+ "rust_decimal",
+ "rusty-engine",
+ "rusty-model-backend",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-repo-model"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-repo-wiki"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "rusty-code-analysis",
+ "rusty-code-health",
+ "rusty-findings",
+ "rusty-frameworks",
+ "rusty-git-analysis",
+ "rusty-infra-analysis",
+ "rusty-lang-api",
+ "rusty-repo-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-runtime"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "git2",
+ "metrics",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "rusty-agent-core",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-session-store",
+ "rusty-tool-api",
+ "rusty-workflow-core",
+ "rusty-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-session-store"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "metrics",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "rusty-protocol",
+ "rusty-session-store",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-skills"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-context",
+ "rusty-protocol",
+ "rusty-tool-api",
+ "rusty-workspace",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-specs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "rusty-tool-api"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rusty-tool-code"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rusty-code-analysis",
+ "rusty-tool-api",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "rusty-tool-filesystem"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-tool-api",
+ "rusty-workspace",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-tool-git"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "git2",
+ "rusty-tool-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-tool-mcp"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "rusty-protocol",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-tool-repo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "git2",
+ "rusty-findings",
+ "rusty-frameworks",
+ "rusty-git-analysis",
+ "rusty-lang-api",
+ "rusty-repo-model",
+ "rusty-repo-wiki",
+ "rusty-tool-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rusty-tool-shell"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "rusty-tool-api",
+ "rusty-workspace",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-tool-web"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "html2text",
+ "reqwest",
+ "rusty-tool-api",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-transport-ipc"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-transport-mcp"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-transport-stdio"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-transport-websocket"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "rusty-protocol",
+ "rusty-runtime",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-workflow-core"
+version = "0.3.0"
+dependencies = [
+ "rusty-agent-core",
+ "rusty-protocol",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rusty-workflow-runtime"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "git2",
+ "metrics",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "rusty-agent-core",
+ "rusty-protocol",
+ "rusty-runtime",
+ "rusty-session-store",
+ "rusty-specs",
+ "rusty-tool-api",
+ "rusty-workflow-core",
+ "rusty-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rusty-workspace"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "git2",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

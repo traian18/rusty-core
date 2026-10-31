@@ -1,4 +1,4 @@
-use harness_engine::{
+use rusty_engine::{
     CredentialProfileId, CredentialProfileSummary, ProviderDescriptor, ProviderKey,
 };
 use serde_json::Value;
@@ -30,8 +30,8 @@ pub struct SessionSelection {
 pub fn option_from_descriptor(
     provider: ProviderDescriptor,
     profile: CredentialProfileSummary,
-    health: harness_engine::ProviderHealth,
-    models: Vec<harness_engine::ModelDescriptor>,
+    health: rusty_engine::ProviderHealth,
+    models: Vec<rusty_engine::ModelDescriptor>,
 ) -> ProviderOption {
     let default_model = models
         .iter()

@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use harness_protocol::events::AgentEventEnvelope;
+use rusty_protocol::events::AgentEventEnvelope;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
@@ -16,7 +16,7 @@ use crate::error::SdkError;
 ///
 /// Wraps the engine's internal `tokio::sync::broadcast::Receiver` so SDK
 /// consumers depend only on this crate's public API, not on `tokio` channel
-/// internals or `harness-runtime`.
+/// internals or `rusty-runtime`.
 ///
 /// If a consumer falls behind the broadcast buffer, the stream yields one
 /// [`SdkError::Lagged`] item reporting how many events were skipped, then

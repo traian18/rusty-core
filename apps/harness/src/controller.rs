@@ -1,9 +1,7 @@
 use anyhow::{anyhow, Result};
-use harness_engine::SessionHandle;
-use harness_protocol::{
-    commands::PermissionDecision, events::AgentEventEnvelope, ids::PermissionId,
-};
-use harness_session_store::SessionSummary;
+use rusty_engine::SessionHandle;
+use rusty_protocol::{commands::PermissionDecision, events::AgentEventEnvelope, ids::PermissionId};
+use rusty_session_store::SessionSummary;
 use tokio::sync::broadcast;
 
 use crate::{
@@ -253,17 +251,17 @@ impl AppController {
             .ok_or_else(|| anyhow!("active provider is not in the catalog"))?;
         let flow = self.harness.auth_flow(&provider.id)?;
         Ok(match flow.current() {
-            Some(harness_engine::AuthFlowState::WaitingForExternalCommand { program, args }) => {
+            Some(rusty_engine::AuthFlowState::WaitingForExternalCommand { program, args }) => {
                 format!(
                     "Connect in a foreground terminal: {} {}",
                     program,
                     args.join(" ")
                 )
             }
-            Some(harness_engine::AuthFlowState::Connected { profile }) => {
+            Some(rusty_engine::AuthFlowState::Connected { profile }) => {
                 format!("Connected as {}", profile.label)
             }
-            Some(harness_engine::AuthFlowState::Failed { safe_message }) => safe_message.clone(),
+            Some(rusty_engine::AuthFlowState::Failed { safe_message }) => safe_message.clone(),
             Some(state) => format!("Authentication state: {state:?}"),
             None => "Authentication flow returned no state".into(),
         })

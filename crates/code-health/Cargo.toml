@@ -1,0 +1,23 @@
+[package]
+name = "rusty-code-health"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-code-analysis = { path = "../code-analysis" }
+rusty-git-analysis = { path = "../git-analysis" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+rusty-repo-model = { path = "../repo-model" }
+git2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio-util = { workspace = true }

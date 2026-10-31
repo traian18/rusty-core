@@ -17,15 +17,15 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use harness_engine::Harness;
-use harness_integration_anthropic::AnthropicFactory;
-use harness_integration_codex::CodexFactory;
-use harness_integration_gemini::GeminiFactory;
-use harness_integration_github_copilot::GitHubCopilotFactory;
-use harness_integration_openai::OpenAiFactory;
-use harness_integration_openai_compatible::OpenAiCompatibleFactory;
-use harness_runtime::rpc::RpcHandler;
-use harness_session_store::JsonlSessionStore;
+use rusty_engine::Harness;
+use rusty_provider_anthropic::AnthropicFactory;
+use rusty_provider_codex::CodexFactory;
+use rusty_provider_gemini::GeminiFactory;
+use rusty_provider_github_copilot::GitHubCopilotFactory;
+use rusty_provider_openai::OpenAiFactory;
+use rusty_provider_openai_compatible::OpenAiCompatibleFactory;
+use rusty_runtime::rpc::RpcHandler;
+use rusty_session_store::JsonlSessionStore;
 use tokio_util::sync::CancellationToken;
 
 use handler::HarnessRpcHandler;
@@ -92,9 +92,9 @@ struct Args {
 /// prompt, so an `Ask` policy would park the run until it timed out.
 /// `harness_prompt` detects and reports that case rather than hanging, but
 /// the correct configuration is simply not to create it.
-fn mcp_toolset() -> harness_protocol::tools::AgentToolset {
-    use harness_protocol::ids::ToolId;
-    use harness_protocol::tools::{
+fn mcp_toolset() -> rusty_protocol::tools::AgentToolset {
+    use rusty_protocol::ids::ToolId;
+    use rusty_protocol::tools::{
         AgentToolset, PermissionMode, ToolCapability, ToolDescriptor, ToolPolicy,
     };
 
@@ -197,8 +197,7 @@ async fn main() -> Result<()> {
         let handler = handler.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(error) = harness_transport_ipc::serve(&socket_path, handler, shutdown).await
-            {
+            if let Err(error) = rusty_transport_ipc::serve(&socket_path, handler, shutdown).await {
                 tracing::error!(%error, "ipc transport exited with an error");
             }
         }));
@@ -208,7 +207,7 @@ async fn main() -> Result<()> {
         let handler = handler.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(error) = harness_transport_websocket::serve(addr, handler, shutdown).await {
+            if let Err(error) = rusty_transport_websocket::serve(addr, handler, shutdown).await {
                 tracing::error!(%error, "websocket transport exited with an error");
             }
         }));
@@ -218,7 +217,7 @@ async fn main() -> Result<()> {
         let handler = handler.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(error) = harness_transport_stdio::serve(handler, shutdown).await {
+            if let Err(error) = rusty_transport_stdio::serve(handler, shutdown).await {
                 tracing::error!(%error, "stdio transport exited with an error");
             }
         }));
@@ -232,18 +231,15 @@ async fn main() -> Result<()> {
             Some(root) => root,
             None => std::env::current_dir().context("resolving the MCP workspace root")?,
         };
-        let config = harness_transport_mcp::McpServeConfig::new(
-            args.mcp_integration.clone(),
-            workspace_root,
-        )
-        .integration_config(integration_config)
-        .toolset(mcp_toolset());
+        let config =
+            rusty_transport_mcp::McpServeConfig::new(args.mcp_integration.clone(), workspace_root)
+                .integration_config(integration_config)
+                .toolset(mcp_toolset());
 
         let handler = handler.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(error) =
-                harness_transport_mcp::serve(handler, config, shutdown.clone()).await
+            if let Err(error) = rusty_transport_mcp::serve(handler, config, shutdown.clone()).await
             {
                 tracing::error!(%error, "mcp server transport exited with an error");
             }

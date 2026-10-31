@@ -3,7 +3,7 @@
 //! # `rusty-harness-sdk`
 //!
 //! Stable, application-agnostic Rust facade over the Rusty agent harness
-//! engine (`harness-engine`).
+//! engine (`rusty-engine`).
 //!
 //! This crate exists so Rust applications embedding the harness depend on
 //! one small, documented surface instead of the internal `harness-*`
@@ -48,36 +48,36 @@ mod session;
 pub use client::{Client, ClientBuilder};
 pub use error::SdkError;
 pub use events::EventStream;
-pub use harness_engine::{McpServerConfig, McpTransportConfig};
+pub use rusty_engine::{McpServerConfig, McpTransportConfig};
 pub use session::Session;
 
 /// Wire-protocol types shared with non-Rust SDKs and `harnessd` clients.
 ///
 /// Re-exported here so SDK consumers can reference IDs, events, and command
-/// payloads without depending on `harness-protocol` directly. See
+/// payloads without depending on `rusty-protocol` directly. See
 /// `schema/protocol-v2.schema.json` for the language-neutral description of
 /// the same shapes.
 pub mod protocol {
-    pub use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
-    pub use harness_protocol::commands::{Attachment, PermissionDecision, UserInput};
-    pub use harness_protocol::events::{
+    pub use rusty_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
+    pub use rusty_protocol::commands::{Attachment, PermissionDecision, UserInput};
+    pub use rusty_protocol::events::{
         AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility,
     };
-    pub use harness_protocol::ids::{
+    pub use rusty_protocol::ids::{
         AgentId, EventId, MessageId, PermissionId, RequestId, RunId, SessionId, Timestamp,
         ToolCallId,
     };
-    pub use harness_protocol::rpc::{
+    pub use rusty_protocol::rpc::{
         MutationCommand, ProtocolCapabilities, RpcError, RpcErrorCategory, SessionSummaryWire,
     };
 }
 
 /// Provider, model, and credential discovery types.
 ///
-/// Re-exported from `harness-engine` so applications can inspect available
+/// Re-exported from `rusty-engine` so applications can inspect available
 /// providers/models/credentials through this crate alone.
 pub mod providers {
-    pub use harness_engine::{
+    pub use rusty_engine::{
         AdapterKind, AuthFlowHandle, AuthFlowState, AuthMethod, BackendSelection,
         CredentialProfileId, CredentialProfileSummary, CredentialState, CredentialStore,
         EnvironmentCredentialStore, ModelCapabilities, ModelDescriptor, ProviderDescriptor,
@@ -88,15 +88,15 @@ pub mod providers {
 /// Traits needed to author a custom integration (model backend) registered
 /// via [`ClientBuilder::register_integration`].
 pub mod integration {
-    pub use harness_runtime::integration::IntegrationFactory;
+    pub use rusty_runtime::integration::IntegrationFactory;
 }
 
 /// Session persistence types needed to configure or implement a custom
 /// store via [`ClientBuilder::session_store`].
 pub mod store {
-    pub use harness_session_store::jsonl::JsonlSessionStore;
-    pub use harness_session_store::sqlite::SqliteSessionStore;
-    pub use harness_session_store::store::{
+    pub use rusty_session_store::jsonl::JsonlSessionStore;
+    pub use rusty_session_store::sqlite::SqliteSessionStore;
+    pub use rusty_session_store::store::{
         DurableSessionEvent, DurableSessionSnapshot, SessionStore, SessionSummary, StoreError,
         StoredSession,
     };

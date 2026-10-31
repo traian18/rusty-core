@@ -4,7 +4,7 @@ Stable, application-agnostic Rust facade over the Rusty agent harness engine.
 
 ## Status
 
-Alpha. This crate compiles against the current workspace `harness-engine`
+Alpha. This crate compiles against the current workspace `rusty-engine`
 API and is safe to depend on for prototyping and internal integration.
 It is **not yet** a semver-guaranteed public release: see
 [`../../sdk_plan.md`](../../sdk_plan.md) for the governance and release
@@ -23,8 +23,8 @@ Known, tracked runtime limitations that this SDK inherits from the engine
 ## Why this crate exists
 
 Applications embedding the harness today depend directly on
-`harness-engine` plus whichever internal crates they need for types
-(`harness-protocol`, `harness-runtime`, `harness-session-store`). Those
+`rusty-engine` plus whichever internal crates they need for types
+(`rusty-protocol`, `rusty-runtime`, `rusty-session-store`). Those
 crates are workspace-internal and can change shape between versions.
 
 `rusty-harness-sdk` re-exports a curated, documented subset of that surface
@@ -38,8 +38,8 @@ under one crate name and adds small ergonomic wrappers:
   and turns broadcast lag into a typed, catchable error instead of a panic
   or silent gap.
 - `protocol`, `providers`, `integration`, and `store` modules — curated
-  re-exports so consumers rarely need to add `harness-protocol` /
-  `harness-runtime` / `harness-session-store` as direct dependencies.
+  re-exports so consumers rarely need to add `rusty-protocol` /
+  `rusty-runtime` / `rusty-session-store` as direct dependencies.
 
 Applications that are not Rust, or that want the engine in a separate
 process/sandbox, should run `harnessd` and speak the wire protocol instead
@@ -77,7 +77,7 @@ integration and prints streamed text.
 
 ## MCP servers
 
-`client.session()` returns `harness_engine::SessionBuilder` directly (see
+`client.session()` returns `rusty_engine::SessionBuilder` directly (see
 "Why this crate exists" above), so [MCP](https://modelcontextprotocol.io)
 server support needs no wrapper here — `SessionBuilder::mcp_server` already
 works exactly as documented in the main

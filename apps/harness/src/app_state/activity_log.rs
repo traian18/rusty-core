@@ -1,4 +1,4 @@
-use harness_protocol::{
+use rusty_protocol::{
     events::AgentEvent,
     ids::{AgentId, ToolCallId},
     tools::ToolCall,

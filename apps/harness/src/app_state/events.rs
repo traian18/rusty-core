@@ -1,10 +1,10 @@
-use harness_protocol::events::AgentEvent;
+use rusty_protocol::events::AgentEvent;
 
 #[derive(Debug)]
 pub(super) enum EventAction {
     StateChanged(String),
     Notice(String),
-    UsageUpdated(harness_protocol::usage::AgentUsageSnapshot),
+    UsageUpdated(rusty_protocol::usage::AgentUsageSnapshot),
     Failed { code: String, message: String },
     Ignore,
 }

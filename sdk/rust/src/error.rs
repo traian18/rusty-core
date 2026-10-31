@@ -16,11 +16,11 @@ pub enum SdkError {
     /// An error surfaced by the embedded harness engine (unknown provider,
     /// invalid integration config, session/runtime failure, store failure).
     #[error(transparent)]
-    Engine(#[from] harness_engine::HarnessError),
+    Engine(#[from] rusty_engine::HarnessError),
 
     /// An error surfaced directly by the configured session store.
     #[error(transparent)]
-    Store(#[from] harness_session_store::store::StoreError),
+    Store(#[from] rusty_session_store::store::StoreError),
 
     /// The event stream consumer fell behind the broadcast buffer and lost
     /// `count` events. The stream resumes with the next available event;

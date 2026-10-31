@@ -7,21 +7,21 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use harness_engine::{
+use rusty_engine::{
     FsWorkspace, Harness, McpServerConfig, McpTransportConfig, SessionHandle, SkillsConfig,
 };
-use harness_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
-use harness_protocol::events::AgentEventEnvelope;
-use harness_protocol::ids::SessionId;
-use harness_protocol::mcp::{McpServerSpec, McpTransportSpec};
-use harness_protocol::rpc::{
+use rusty_protocol::admission::{AdmissionResult, CommandId, MutationMetadata};
+use rusty_protocol::events::AgentEventEnvelope;
+use rusty_protocol::ids::SessionId;
+use rusty_protocol::mcp::{McpServerSpec, McpTransportSpec};
+use rusty_protocol::rpc::{
     DiagnosticsSnapshot, MutationCommand, PermitDiagnostic, RpcError, RpcErrorCategory,
     RpcRequestBody, RpcResponseBody, SessionSnapshotWire, SessionStatusWire, SessionSummaryWire,
     StoreScanSummary,
 };
-use harness_protocol::skills::SkillsSpec;
-use harness_runtime::rpc::RpcHandler;
-use harness_runtime::session_runtime::SessionStatus;
+use rusty_protocol::skills::SkillsSpec;
+use rusty_runtime::rpc::RpcHandler;
+use rusty_runtime::session_runtime::SessionStatus;
 
 const DEDUPLICATION_WINDOW: usize = 1024;
 
@@ -125,7 +125,7 @@ impl HarnessRpcHandler {
 
         let store_scan = if include_store_scan {
             let diagnostics =
-                harness_session_store::diagnose_store(self.harness.session_store().as_ref()).await;
+                rusty_session_store::diagnose_store(self.harness.session_store().as_ref()).await;
             let sessions_with_issues = diagnostics
                 .sessions
                 .iter()
@@ -176,11 +176,11 @@ impl HarnessRpcHandler {
     #[allow(clippy::too_many_arguments)]
     async fn create_session(
         &self,
-        execution_policy: Option<harness_protocol::tools::ExecutionPolicy>,
+        execution_policy: Option<rusty_protocol::tools::ExecutionPolicy>,
         workspace_root: std::path::PathBuf,
         integration: String,
         integration_config: serde_json::Value,
-        toolset: harness_protocol::tools::AgentToolset,
+        toolset: rusty_protocol::tools::AgentToolset,
         mcp_servers: Vec<McpServerSpec>,
         skills: Option<SkillsSpec>,
     ) -> RpcResponseBody {
@@ -227,8 +227,8 @@ impl HarnessRpcHandler {
             // generic integration failure, so a caller can tell "the
             // server is full right now, back off and retry" apart from
             // "this request is fundamentally broken."
-            Err(harness_engine::HarnessError::SessionManager(
-                harness_runtime::session_manager::SessionManagerError::AtCapacity(capacity_error),
+            Err(rusty_engine::HarnessError::SessionManager(
+                rusty_runtime::session_manager::SessionManagerError::AtCapacity(capacity_error),
             )) => Self::error(
                 "session.at_capacity",
                 RpcErrorCategory::Capacity,
@@ -248,7 +248,7 @@ impl HarnessRpcHandler {
         &self,
         session_id: SessionId,
         workspace_root: std::path::PathBuf,
-        toolset: harness_protocol::tools::AgentToolset,
+        toolset: rusty_protocol::tools::AgentToolset,
     ) -> RpcResponseBody {
         if let Some(handle) = self.lookup(session_id) {
             let _ = handle;
@@ -448,7 +448,7 @@ impl HarnessRpcHandler {
 /// connects with. Plain field mapping — the only non-trivial bits are
 /// `request_timeout_secs: Option<u64>` becoming a `Duration`, and going
 /// through `resolve_transport()` so the legacy flat-field shape is handled
-/// in exactly one place (`harness_protocol::mcp`).
+/// in exactly one place (`rusty_protocol::mcp`).
 fn mcp_config_from_spec(spec: McpServerSpec) -> McpServerConfig {
     let transport = match spec.resolve_transport() {
         McpTransportSpec::Stdio {
@@ -500,9 +500,7 @@ fn wire_status(status: SessionStatus) -> SessionStatusWire {
     }
 }
 
-fn wire_snapshot(
-    snapshot: harness_runtime::session_client::SessionSnapshot,
-) -> SessionSnapshotWire {
+fn wire_snapshot(snapshot: rusty_runtime::session_client::SessionSnapshot) -> SessionSnapshotWire {
     SessionSnapshotWire {
         session_id: snapshot.session_id,
         status: wire_status(snapshot.status),
@@ -625,7 +623,7 @@ impl RpcHandler for HarnessRpcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_protocol::commands::UserInput;
+    use rusty_protocol::commands::UserInput;
 
     #[test]
     fn admission_cache_is_bounded_and_deduplicates() {
