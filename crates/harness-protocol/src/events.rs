@@ -191,6 +191,16 @@ pub enum AgentEvent {
         request: PermissionRequest,
     },
 
+    /// A request's cacheable prefix (system prompt, tools) differs from the
+    /// previous request of the same run, so a provider's prompt cache cannot
+    /// reuse it. Diagnostic only; never durable.
+    PromptPrefixChanged {
+        run_id: RunId,
+        request_id: RequestId,
+        /// `"system_prompt"` and/or `"tools"`.
+        changed: Vec<String>,
+    },
+
     /// An update on the agent's token usage and cost.
     UsageUpdated {
         /// A snapshot of the agent's current usage.

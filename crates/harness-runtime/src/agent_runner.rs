@@ -7,6 +7,7 @@
 mod backend_run;
 mod children;
 mod mailbox;
+mod prompt_prefix;
 mod publishing;
 mod tool_run;
 
@@ -132,6 +133,7 @@ pub struct AgentRunner {
     /// this `false` so an awaited child still terminates promptly after its
     /// single assigned task completes.
     long_lived: bool,
+    prompt_prefix: prompt_prefix::PromptPrefixWatch,
 }
 
 impl AgentRunner {
@@ -169,6 +171,7 @@ impl AgentRunner {
             session_store: None,
             fatal_error: false,
             long_lived: false,
+            prompt_prefix: Default::default(),
         }
     }
 
@@ -595,6 +598,17 @@ impl AgentRunner {
                 request: Box::new(request.clone()),
             };
             if !self.emit(prepared).await {
+                return;
+            }
+        }
+        let changed = self.prompt_prefix.observe(&request);
+        if !changed.is_empty() {
+            let event = AgentEvent::PromptPrefixChanged {
+                run_id: request.run_id,
+                request_id: request.request_id,
+                changed,
+            };
+            if !self.emit(event).await {
                 return;
             }
         }

@@ -228,6 +228,7 @@ fn event_variant_name(event: &AgentEvent) -> &'static str {
         AgentEvent::ToolCallCompleted { .. } => "ToolCallCompleted",
         AgentEvent::PermissionRequested { .. } => "PermissionRequested",
         AgentEvent::UsageUpdated { .. } => "UsageUpdated",
+        AgentEvent::PromptPrefixChanged { .. } => "PromptPrefixChanged",
         AgentEvent::ChildAgentSpawned { .. } => "ChildAgentSpawned",
         AgentEvent::ChildAgentCompleted { .. } => "ChildAgentCompleted",
         AgentEvent::Failed { .. } => "Failed",
@@ -300,6 +301,7 @@ fn event_matches_pattern(event: &AgentEvent, pattern: &EventPattern) -> bool {
         | AgentEvent::ToolCallCompleted { .. }
         | AgentEvent::PermissionRequested { .. }
         | AgentEvent::UsageUpdated { .. }
+        | AgentEvent::PromptPrefixChanged { .. }
         | AgentEvent::ChildAgentSpawned { .. }
         | AgentEvent::ChildAgentCompleted { .. }
         | AgentEvent::Failed { .. }

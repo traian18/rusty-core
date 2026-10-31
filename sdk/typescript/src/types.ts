@@ -185,6 +185,8 @@ export type AgentEvent =
   | { ToolCallProgress: { call_id: ToolCallId; progress: ToolProgress } }
   | { ToolCallCompleted: { call_id: ToolCallId; result: ToolResultSummary } }
   | { PermissionRequested: { request: PermissionRequest } }
+  /** The request's system prompt and/or tools differ from the previous request of the run, so its prompt cache missed. */
+  | { PromptPrefixChanged: { run_id: RunId; request_id: RequestId; changed: ("system_prompt" | "tools")[] } }
   | { UsageUpdated: { usage: AgentUsageSnapshot } }
   | { ChildAgentSpawned: { agent_id: AgentId } }
   | { ChildAgentCompleted: { agent_id: AgentId; outcome: AgentOutcome } }

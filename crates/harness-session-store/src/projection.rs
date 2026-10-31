@@ -94,6 +94,7 @@ pub fn replay_snapshot(
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ChildAgentCompleted { .. }
             | AgentEvent::UsageUpdated { .. }
+            | AgentEvent::PromptPrefixChanged { .. }
             | AgentEvent::BackendRequestStarted { .. }
             | AgentEvent::AssistantMessageStarted { .. }
             | AgentEvent::AssistantTextDelta { .. }
