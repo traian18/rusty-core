@@ -18,6 +18,8 @@ use crate::traits::EventSink;
 use crate::workspace::FakeWorkspace;
 
 use super::*;
+use rusty_protocol::commands::AgentStatus;
+
 use crate::session_runtime::SessionHost;
 
 // -----------------------------------------------------------------------

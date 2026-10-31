@@ -51,8 +51,12 @@
 
 mod assembly;
 mod checkpoint;
+mod commands;
 mod construction;
+mod delegation;
 mod event_bus;
+mod inspect;
+mod lifecycle;
 mod live_state;
 mod projection;
 mod restoration;
@@ -71,25 +75,21 @@ pub(crate) use projection::stored_agent_state;
 #[cfg(test)]
 mod tests;
 
-use crate::locks::MutexExt;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use rusty_agent_core::agent::Agent;
-use rusty_protocol::commands::{AgentCommand, AgentStatus, PermissionDecision, UserInput};
-use rusty_protocol::events::AgentOutcome;
-use rusty_protocol::ids::{AgentId, PermissionId, SessionId};
-use rusty_session_store::{SessionCommitter, SessionStore, StoreError};
+use rusty_protocol::commands::AgentCommand;
+
+use rusty_protocol::ids::SessionId;
+use rusty_session_store::{SessionCommitter, SessionStore};
 
 use crate::agent_supervisor::AgentSupervisor;
 use crate::cancellation::SessionCancellation;
 use crate::integration::IntegrationRegistry;
 use crate::scheduler::Scheduler;
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
-
-use runner_spawn::{spawn_runner, RunnerSpawnArgs};
 
 // ---------------------------------------------------------------------------
 // SessionRuntime
@@ -176,339 +176,7 @@ pub struct SessionRuntime {
     delegated: Mutex<std::collections::HashMap<SessionId, std::sync::Weak<SessionRuntime>>>,
 }
 
-impl SessionRuntime {
-    /// Make `session` reachable through [`delegated_session`](Self::delegated_session)
-    /// while it runs work on this session's behalf.
-    pub fn register_delegated(&self, session: &Arc<SessionRuntime>) {
-        let mut delegated = self.delegated.lock_or_recover();
-        delegated.retain(|_, weak| weak.strong_count() > 0);
-        delegated.insert(session.session_id, Arc::downgrade(session));
-    }
-
-    pub fn unregister_delegated(&self, session_id: SessionId) {
-        self.delegated.lock_or_recover().remove(&session_id);
-    }
-
-    /// A live delegated session (see [`register_delegated`](Self::register_delegated)).
-    pub fn delegated_session(&self, session_id: SessionId) -> Option<Arc<SessionRuntime>> {
-        self.delegated
-            .lock_or_recover()
-            .get(&session_id)
-            .and_then(std::sync::Weak::upgrade)
-    }
-
-    /// Cancel only the root agent's active run.
-    ///
-    /// This is intentionally mailbox-scoped rather than using the session
-    /// cancellation root: `AgentCommand::Cancel` cancels the active backend,
-    /// tools, and children through their run-scoped tokens, while the
-    /// long-lived root runner remains available to process queued follow-ups
-    /// and future prompts.
-    pub async fn cancel_run(&self) -> Result<(), SessionError> {
-        self.root_agent_tx
-            .send(AgentCommand::Cancel)
-            .await
-            .map_err(|_| SessionError::ChannelClosed)
-    }
-
-    /// Send steering input to the root agent.
-    ///
-    /// Delivery is serialized through the root agent mailbox, preserving
-    /// transcript ordering with backend and tool events.
-    pub async fn steer(&self, input: UserInput) -> Result<(), SessionError> {
-        self.root_agent_tx
-            .send(AgentCommand::Steer { input })
-            .await
-            .map_err(|_| SessionError::ChannelClosed)
-    }
-
-    /// Queue a follow-up prompt for the root agent.
-    pub async fn follow_up(&self, input: UserInput) -> Result<(), SessionError> {
-        self.root_agent_tx
-            .send(AgentCommand::FollowUp { input })
-            .await
-            .map_err(|_| SessionError::ChannelClosed)
-    }
-
-    /// Resolve a pending root-agent permission request.
-    pub async fn resolve_permission(
-        &self,
-        id: PermissionId,
-        decision: PermissionDecision,
-    ) -> Result<(), SessionError> {
-        self.root_agent_tx
-            .send(AgentCommand::PermissionResolved { id, decision })
-            .await
-            .map_err(|_| SessionError::ChannelClosed)
-    }
-
-    /// Take the root task's [`JoinHandle`](tokio::task::JoinHandle), if it has not been taken already.
-    ///
-    /// This allows a supervisor (e.g. [`SessionManager`](crate::session_manager::SessionManager)) to await the root
-    /// task and detect panics or unexpected terminations. The handle can only
-    /// be taken once; subsequent calls return `None`.
-    pub fn take_root_task_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
-        self.root_task_handle.lock_or_recover().take()
-    }
-
-    /// Mark the session as failed with the given error message.
-    ///
-    /// This transitions the session's status to [`SessionStatus::Failed`] and
-    /// stores the error description. It is called by the supervisor task when
-    /// the root task's `JoinHandle` produces a [`JoinError`](tokio::task::JoinError).
-    pub fn mark_failed(&self, error_msg: String) {
-        let mut state = self.state.lock_or_recover();
-        state.status = SessionStatus::Failed;
-        state.error = Some(error_msg);
-    }
-
-    /// Spawn an agent runner, register its event stream with the session bus,
-    /// and return the runner's command sender.
-    ///
-    /// This is the common lifecycle path for additional agents.  The root
-    /// runner is created inline during construction so its sender can be
-    /// retained by the runtime; later agents use this method.
-    pub fn spawn_agent_runner(&self, agent: Agent) -> mpsc::Sender<AgentCommand> {
-        let is_root = agent.parent_id.is_none();
-        let (command_tx, _join) = spawn_runner(RunnerSpawnArgs {
-            agent,
-            is_root,
-            backend: self.default_backend.clone(),
-            tool_registry: self.tool_registry.clone(),
-            workspace: self.workspace.clone(),
-            event_sink: self.event_sink.clone(),
-            scheduler: self.scheduler.clone(),
-            cancellation: self.cancellation.clone(),
-            agent_supervisor: self.agent_supervisor.clone(),
-            integrations: self.integrations.clone(),
-            live_state: self.live_state.clone(),
-            projection: self.projection.clone(),
-            event_bus: self.event_bus.clone(),
-            session_store: self.session_store.clone(),
-            committer: self.committer.clone(),
-        });
-        command_tx
-    }
-
-    /// Send a command to the root agent's task channel.
-    ///
-    /// In this Phase 2 implementation, only the root agent is supported.
-    ///
-    /// When a [`SessionCommand::Prompt`] is sent, the session-level status
-    /// transitions to [`SessionStatus::Running`] optimistically (the agent
-    /// runner processes the `StartRun` asynchronously).  This ensures that
-    /// [`state_snapshot`](SessionRuntime::state_snapshot) returns an accurate
-    /// active status from the moment the command is issued.
-    pub async fn send_command(&self, command: SessionCommand) -> Result<(), SessionError> {
-        let agent_command = match command {
-            SessionCommand::Prompt(input) => {
-                if self.cancellation.is_cancelled() {
-                    return Err(SessionError::Cancelled);
-                }
-                // Optimistically transition to Running so that state_snapshot
-                // reflects the session as active immediately.
-                let mut state = self.state.lock_or_recover();
-                if matches!(
-                    state.status,
-                    SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Cancelled
-                ) {
-                    state.status = SessionStatus::Running;
-                    state.error = None;
-                }
-                drop(state);
-                AgentCommand::StartRun { input }
-            }
-            SessionCommand::SpawnChild(spec) => AgentCommand::SpawnChild { spec },
-            SessionCommand::Cancel => AgentCommand::Cancel,
-            SessionCommand::Pause => AgentCommand::Pause,
-            SessionCommand::Resume => AgentCommand::Resume,
-            SessionCommand::ConfigureExecution(params) => {
-                AgentCommand::ConfigureExecution { params }
-            }
-            SessionCommand::SetBehaviorProfile(profile) => AgentCommand::SetBehaviorProfile {
-                profile,
-                library: Vec::new(),
-                allow_commands: false,
-            },
-            SessionCommand::SetBehaviorBundle {
-                profile,
-                library,
-                allow_commands,
-            } => AgentCommand::SetBehaviorProfile {
-                profile,
-                library,
-                allow_commands,
-            },
-        };
-
-        self.root_agent_tx
-            .send(agent_command)
-            .await
-            .map_err(|_| SessionError::ChannelClosed)
-    }
-
-    /// Cancel the entire session.
-    ///
-    /// Triggers the hierarchical cancellation root (stopping all agent
-    /// runners and spawned backend/tool tasks) and sends
-    /// [`AgentCommand::Cancel`] to the root agent.
-    ///
-    /// The session status immediately transitions to [`SessionStatus::Cancelled`]
-    /// (this is an optimistic update — cancellation is deterministic once
-    /// the token fires, even though the agent runner processes it
-    /// asynchronously).
-    ///
-    /// The event bus is **not** shut down by this call — subscribers can
-    /// still receive terminal events (e.g. `Completed { Cancelled }`) after
-    /// cancellation returns.
-    pub async fn cancel(&self) {
-        self.cancellation.cancel();
-        let _ = self.root_agent_tx.send(AgentCommand::Cancel).await;
-
-        // Optimistically transition the session-level status so that
-        // state_snapshot() returns Cancelled immediately.
-        let mut state = self.state.lock_or_recover();
-        if state.status != SessionStatus::Failed {
-            state.status = SessionStatus::Cancelled;
-        }
-    }
-
-    /// Shutdown the entire session, including the event bus.
-    ///
-    /// This is the final teardown — called by
-    /// [`SessionManager::close_session`](crate::session_manager::SessionManager::close_session)
-    /// and [`Drop`].  After this, no further events will be forwarded to
-    /// subscribers.
-    pub fn shutdown(&self) {
-        self.cancellation.cancel();
-        self.bus_cancel.cancel();
-    }
-
-    /// Returns a [`SessionSnapshot`] of the current session state.
-    ///
-    /// This is a pure read — no stored copy, just a point-in-time projection
-    /// of live state.
-    pub fn state_snapshot(&self) -> SessionSnapshot {
-        let state = self.state.lock_or_recover();
-        let live = self
-            .live_state
-            .lock_or_recover()
-            .get(&state.root_agent_id)
-            .cloned()
-            .unwrap_or_default();
-        let status = if state.status == SessionStatus::Failed {
-            SessionStatus::Failed
-        } else if self.cancellation.is_cancelled() {
-            SessionStatus::Cancelled
-        } else {
-            match live.status {
-                AgentStatus::Failed => SessionStatus::Failed,
-                AgentStatus::Cancelled => SessionStatus::Cancelled,
-                AgentStatus::Idle if live.last_outcome == Some(AgentOutcome::Success) => {
-                    SessionStatus::Completed
-                }
-                AgentStatus::Idle => state.status,
-                _ => SessionStatus::Running,
-            }
-        };
-        let error = state
-            .error
-            .clone()
-            .or_else(|| live.last_error.map(|error| error.message));
-        SessionSnapshot {
-            session_id: self.session_id,
-            status,
-            root_agent_id: state.root_agent_id,
-            agent_count: state.agents.len(),
-            error,
-        }
-    }
-
-    /// The root agent's current execution parameters (model, max tokens,
-    /// reasoning, ...), including any `ConfigureExecution` applied since
-    /// construction.
-    pub fn root_execution_params(&self) -> rusty_protocol::backend::ExecutionParams {
-        let root = self.state.lock_or_recover().root_agent_id;
-        self.projection
-            .lock_or_recover()
-            .get(&root)
-            .map(|stored| stored.execution_params.clone())
-            .unwrap_or_default()
-    }
-
-    /// The root agent's current behavior (profile and run counters), as last
-    /// published by its runner.
-    pub fn root_behavior(&self) -> rusty_agent_core::behavior::BehaviorState {
-        let root = self.state.lock_or_recover().root_agent_id;
-        let stored = self
-            .projection
-            .lock_or_recover()
-            .get(&root)
-            .and_then(|stored| stored.behavior.clone());
-        rusty_agent_core::behavior::BehaviorState::from_stored(stored.as_ref()).unwrap_or_default()
-    }
-
-    /// Replace how this session's child agents get their behavior profile.
-    pub fn set_child_behavior_resolver(
-        &self,
-        resolver: Arc<dyn rusty_agent_core::behavior::ChildBehaviorResolver>,
-    ) {
-        self.agent_supervisor.set_child_behavior_resolver(resolver);
-    }
-
-    /// The root agent's toolset: every tool it can see and its policy.
-    pub fn root_toolset(&self) -> rusty_protocol::tools::AgentToolset {
-        let state = self.state.lock_or_recover();
-        state
-            .agents
-            .get(&state.root_agent_id)
-            .map(|agent| agent.capabilities.tools.clone())
-            .unwrap_or_else(|| rusty_protocol::tools::AgentToolset {
-                tools: Default::default(),
-            })
-    }
-
-    /// Returns the current live status/usage projection for `agent_id`.
-    ///
-    /// Returns [`AgentLiveState::default`] if the agent is unknown (e.g. it
-    /// has not been spawned yet).
-    pub fn agent_live_state(&self, agent_id: AgentId) -> AgentLiveState {
-        self.live_state
-            .lock_or_recover()
-            .get(&agent_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Writes a truthful snapshot of the session at its last committed
-    /// durable sequence (RC-302).
-    ///
-    /// The snapshot is built from the live per-agent projections (never a
-    /// stale construction-time copy), versioned with the current
-    /// [`SCHEMA_VERSION`](rusty_session_store::SCHEMA_VERSION), and
-    /// recorded with the workspace identity and integration references it
-    /// was taken under (RC-304). Returns `Ok(())` when no store is
-    /// configured (nothing to checkpoint).
-    pub async fn checkpoint(&self) -> Result<(), StoreError> {
-        let Some(store) = &self.session_store else {
-            return Ok(());
-        };
-        // The snapshot point is the store's own last committed sequence —
-        // authoritative and gap-free from the committer's perspective.
-        let sequence = store.current_sequence(self.session_id).await?;
-        let root_agent_id = self.state.lock_or_recover().root_agent_id;
-        let snapshot = projection::build_snapshot(
-            self.session_id,
-            root_agent_id,
-            &self.projection,
-            self.workspace.as_ref(),
-            sequence,
-            false,
-            0,
-        );
-        store.save_snapshot(snapshot).await
-    }
-}
+impl SessionRuntime {}
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
