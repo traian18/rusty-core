@@ -43,34 +43,9 @@ impl Syntax for Rust {
                 }
                 Action::Skip
             }
-            "mod_item" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Skip;
-                };
-                if node.child_by_field_name("body").is_none() {
-                    return Action::Skip;
-                }
-                let full = if c.namespace().is_empty() {
-                    c.text(name).to_owned()
-                } else {
-                    format!("{}::{}", c.namespace(), c.text(name))
-                };
-                Action::Namespace(full)
-            }
+            "mod_item" => self.visit_mod_item(node, c),
             "struct_item" | "enum_item" | "union_item" | "trait_item" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Descend;
-                };
-                Action::Type(TypeSpec {
-                    name: c.text(name).to_owned(),
-                    name_range: (name.start_byte(), name.end_byte()),
-                    kind: match node.kind() {
-                        "enum_item" => TypeKind::Enum,
-                        "trait_item" => TypeKind::Trait,
-                        _ => TypeKind::Struct,
-                    },
-                    bases: Vec::new(),
-                })
+                self.visit_struct_item(node, c)
             }
             "impl_item" => match node
                 .child_by_field_name("type")
@@ -79,22 +54,7 @@ impl Syntax for Rust {
                 Some(name) => Action::Container(last_segment(&name).to_owned()),
                 None => Action::Descend,
             },
-            "function_item" => {
-                let name = node.child_by_field_name("name");
-                let in_impl = c.current_type().is_some() && !c.in_callable();
-                Action::Callable(CallableSpec {
-                    name: name.map(|n| c.text(n).to_owned()),
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind: if in_impl {
-                        CallableKind::Method
-                    } else {
-                        CallableKind::Function
-                    },
-                    container: None,
-                    namespace: None,
-                    params: fn_params(node, c),
-                })
-            }
+            "function_item" => self.visit_function_item(node, c),
             "closure_expression" => Action::Callable(CallableSpec {
                 name: None,
                 name_range: None,
@@ -107,16 +67,7 @@ impl Syntax for Rust {
                 self.let_binding(node, c);
                 Action::Descend
             }
-            "for_expression" | "let_condition" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    let mut names = Vec::new();
-                    binding_names(pattern, c.src, &mut names);
-                    for name in names {
-                        c.declare(&name, false);
-                    }
-                }
-                Action::Descend
-            }
+            "for_expression" | "let_condition" => self.visit_for_expression(node, c),
             "macro_invocation" => Action::Skip,
             "call_expression" => {
                 self.call(node, c);
@@ -124,6 +75,67 @@ impl Syntax for Rust {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Rust {
+    fn visit_mod_item(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Skip;
+        };
+        if node.child_by_field_name("body").is_none() {
+            return Action::Skip;
+        }
+        let full = if c.namespace().is_empty() {
+            c.text(name).to_owned()
+        } else {
+            format!("{}::{}", c.namespace(), c.text(name))
+        };
+        Action::Namespace(full)
+    }
+
+    fn visit_struct_item(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Descend;
+        };
+        Action::Type(TypeSpec {
+            name: c.text(name).to_owned(),
+            name_range: (name.start_byte(), name.end_byte()),
+            kind: match node.kind() {
+                "enum_item" => TypeKind::Enum,
+                "trait_item" => TypeKind::Trait,
+                _ => TypeKind::Struct,
+            },
+            bases: Vec::new(),
+        })
+    }
+
+    fn visit_function_item(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        let in_impl = c.current_type().is_some() && !c.in_callable();
+        Action::Callable(CallableSpec {
+            name: name.map(|n| c.text(n).to_owned()),
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind: if in_impl {
+                CallableKind::Method
+            } else {
+                CallableKind::Function
+            },
+            container: None,
+            namespace: None,
+            params: fn_params(node, c),
+        })
+    }
+
+    fn visit_for_expression(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        if let Some(pattern) = node.child_by_field_name("pattern") {
+            let mut names = Vec::new();
+            binding_names(pattern, c.src, &mut names);
+            for name in names {
+                c.declare(&name, false);
+            }
+        }
+        Action::Descend
     }
 }
 

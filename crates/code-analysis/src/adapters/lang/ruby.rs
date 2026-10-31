@@ -52,69 +52,8 @@ impl Syntax for Ruby {
 
     fn visit(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
         match node.kind() {
-            "class" | "module" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Descend;
-                };
-                let Some(segments) = path_segments(name, c.src) else {
-                    return Action::Descend;
-                };
-                let simple = segments.last().cloned().unwrap_or_default();
-                let mut bases = Vec::new();
-                if let Some(superclass) = node.child_by_field_name("superclass") {
-                    let mut cursor = superclass.walk();
-                    for base in superclass.named_children(&mut cursor) {
-                        if let Some(path) = path_segments(base, c.src) {
-                            bases.extend(path.last().cloned());
-                        }
-                    }
-                }
-                if let Some(body) = node.child_by_field_name("body") {
-                    mixins(body, c.src, &mut bases);
-                }
-                let leaf = match name.kind() {
-                    "scope_resolution" => name.child_by_field_name("name").unwrap_or(name),
-                    _ => name,
-                };
-                Action::Type(TypeSpec {
-                    name: simple,
-                    name_range: (leaf.start_byte(), leaf.end_byte()),
-                    kind: if node.kind() == "module" {
-                        TypeKind::Module
-                    } else {
-                        TypeKind::Class
-                    },
-                    bases,
-                })
-            }
-            "method" | "singleton_method" => {
-                let name = node.child_by_field_name("name");
-                let text = name.map(|n| c.text(n).to_owned());
-                let in_type = c.current_type().is_some() && !c.in_callable();
-                let container = if node.kind() == "singleton_method" {
-                    node.child_by_field_name("object")
-                        .filter(|object| object.kind() == "constant")
-                        .map(|object| c.text(object).to_owned())
-                } else {
-                    None
-                };
-                let kind = match (
-                    in_type || node.kind() == "singleton_method",
-                    text.as_deref(),
-                ) {
-                    (true, Some("initialize")) => CallableKind::Constructor,
-                    (true, _) => CallableKind::Method,
-                    _ => CallableKind::Function,
-                };
-                Action::Callable(CallableSpec {
-                    name: text,
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind,
-                    container,
-                    namespace: None,
-                    params: method_params(node.child_by_field_name("parameters"), c),
-                })
-            }
+            "class" | "module" => self.visit_class(node, c),
+            "method" | "singleton_method" => self.visit_method(node, c),
             "block" | "do_block" => Action::Callable(CallableSpec {
                 name: None,
                 name_range: None,
@@ -135,16 +74,7 @@ impl Syntax for Ruby {
                 self.assignment(node, c);
                 Action::Descend
             }
-            "for" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    let mut names = Vec::new();
-                    binding_names(pattern, c.src, &mut names);
-                    for name in names {
-                        c.declare(&name, false);
-                    }
-                }
-                Action::Descend
-            }
+            "for" => self.visit_for(node, c),
             "call" => {
                 self.call(node, c);
                 Action::Descend
@@ -155,6 +85,84 @@ impl Syntax for Ruby {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Ruby {
+    fn visit_class(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Descend;
+        };
+        let Some(segments) = path_segments(name, c.src) else {
+            return Action::Descend;
+        };
+        let simple = segments.last().cloned().unwrap_or_default();
+        let mut bases = Vec::new();
+        if let Some(superclass) = node.child_by_field_name("superclass") {
+            let mut cursor = superclass.walk();
+            for base in superclass.named_children(&mut cursor) {
+                if let Some(path) = path_segments(base, c.src) {
+                    bases.extend(path.last().cloned());
+                }
+            }
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            mixins(body, c.src, &mut bases);
+        }
+        let leaf = match name.kind() {
+            "scope_resolution" => name.child_by_field_name("name").unwrap_or(name),
+            _ => name,
+        };
+        Action::Type(TypeSpec {
+            name: simple,
+            name_range: (leaf.start_byte(), leaf.end_byte()),
+            kind: if node.kind() == "module" {
+                TypeKind::Module
+            } else {
+                TypeKind::Class
+            },
+            bases,
+        })
+    }
+
+    fn visit_method(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        let text = name.map(|n| c.text(n).to_owned());
+        let in_type = c.current_type().is_some() && !c.in_callable();
+        let container = if node.kind() == "singleton_method" {
+            node.child_by_field_name("object")
+                .filter(|object| object.kind() == "constant")
+                .map(|object| c.text(object).to_owned())
+        } else {
+            None
+        };
+        let kind = match (
+            in_type || node.kind() == "singleton_method",
+            text.as_deref(),
+        ) {
+            (true, Some("initialize")) => CallableKind::Constructor,
+            (true, _) => CallableKind::Method,
+            _ => CallableKind::Function,
+        };
+        Action::Callable(CallableSpec {
+            name: text,
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind,
+            container,
+            namespace: None,
+            params: method_params(node.child_by_field_name("parameters"), c),
+        })
+    }
+
+    fn visit_for(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        if let Some(pattern) = node.child_by_field_name("pattern") {
+            let mut names = Vec::new();
+            binding_names(pattern, c.src, &mut names);
+            for name in names {
+                c.declare(&name, false);
+            }
+        }
+        Action::Descend
     }
 }
 

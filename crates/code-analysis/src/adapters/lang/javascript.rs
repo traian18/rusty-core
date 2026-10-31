@@ -80,35 +80,10 @@ impl Syntax for Js {
                 Action::Skip
             }
             "class_declaration" | "abstract_class_declaration" | "class" => {
-                match node.child_by_field_name("name") {
-                    Some(name) => {
-                        let mut bases = Vec::new();
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            if child.kind() == "class_heritage" {
-                                collect_names(child, c.src, &mut bases);
-                            }
-                        }
-                        Action::Type(TypeSpec {
-                            name: c.text(name).to_owned(),
-                            name_range: (name.start_byte(), name.end_byte()),
-                            kind: TypeKind::Class,
-                            bases,
-                        })
-                    }
-                    None => Action::Descend,
-                }
+                self.visit_class_declaration(node, c)
             }
             "function_declaration" | "generator_function_declaration" => {
-                let name = node.child_by_field_name("name");
-                Action::Callable(CallableSpec {
-                    name: name.map(|n| c.text(n).to_owned()),
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind: CallableKind::Function,
-                    container: None,
-                    namespace: None,
-                    params: params(node, c),
-                })
+                self.visit_function_declaration(node, c)
             }
             "method_definition" => {
                 let name = node.child_by_field_name("name");
@@ -141,27 +116,10 @@ impl Syntax for Js {
                 params: params(node, c),
             }),
             "public_field_definition" | "field_definition" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .or_else(|| node.child_by_field_name("property"));
-                if let (Some(name), Some(value)) = (name, node.child_by_field_name("value")) {
-                    if CLOSURE_KINDS.contains(&value.kind()) {
-                        c.name_closure_as(value, c.text(name), CallableKind::Method);
-                    }
-                }
-                Action::Descend
+                self.visit_public_field_definition(node, c)
             }
             "variable_declarator" => self.declarator(node, c),
-            "catch_clause" => {
-                if let Some(parameter) = node.child_by_field_name("parameter") {
-                    let mut names = Vec::new();
-                    binding_names(parameter, c.src, &mut names);
-                    for name in names {
-                        c.declare(&name, true);
-                    }
-                }
-                Action::Descend
-            }
+            "catch_clause" => self.visit_catch_clause(node, c),
             "call_expression" => {
                 self.call(node, c);
                 Action::Descend
@@ -172,6 +130,64 @@ impl Syntax for Js {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Js {
+    fn visit_class_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        match node.child_by_field_name("name") {
+            Some(name) => {
+                let mut bases = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "class_heritage" {
+                        collect_names(child, c.src, &mut bases);
+                    }
+                }
+                Action::Type(TypeSpec {
+                    name: c.text(name).to_owned(),
+                    name_range: (name.start_byte(), name.end_byte()),
+                    kind: TypeKind::Class,
+                    bases,
+                })
+            }
+            None => Action::Descend,
+        }
+    }
+
+    fn visit_function_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        Action::Callable(CallableSpec {
+            name: name.map(|n| c.text(n).to_owned()),
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind: CallableKind::Function,
+            container: None,
+            namespace: None,
+            params: params(node, c),
+        })
+    }
+
+    fn visit_public_field_definition(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"));
+        if let (Some(name), Some(value)) = (name, node.child_by_field_name("value")) {
+            if CLOSURE_KINDS.contains(&value.kind()) {
+                c.name_closure_as(value, c.text(name), CallableKind::Method);
+            }
+        }
+        Action::Descend
+    }
+
+    fn visit_catch_clause(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        if let Some(parameter) = node.child_by_field_name("parameter") {
+            let mut names = Vec::new();
+            binding_names(parameter, c.src, &mut names);
+            for name in names {
+                c.declare(&name, true);
+            }
+        }
+        Action::Descend
     }
 }
 

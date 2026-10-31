@@ -35,17 +35,7 @@ impl Syntax for Kotlin {
 
     fn visit(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
         match node.kind() {
-            "class_declaration" | "object_declaration" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Descend;
-                };
-                Action::Type(TypeSpec {
-                    name: c.text(name).to_owned(),
-                    name_range: (name.start_byte(), name.end_byte()),
-                    kind: type_kind(node, c.src),
-                    bases: bases(node, c.src),
-                })
-            }
+            "class_declaration" | "object_declaration" => self.visit_class_declaration(node, c),
             "package_header" => {
                 if let Some(name) =
                     child_of(node, "qualified_identifier").or_else(|| child_of(node, "identifier"))
@@ -58,73 +48,16 @@ impl Syntax for Kotlin {
                 import(node, c);
                 Action::Skip
             }
-            "function_declaration" => {
-                let name = node.child_by_field_name("name");
-                let in_type = c.current_type().is_some() && !c.in_callable();
-                Action::Callable(CallableSpec {
-                    name: name.map(|n| c.text(n).to_owned()),
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind: if in_type {
-                        CallableKind::Method
-                    } else {
-                        CallableKind::Function
-                    },
-                    container: None,
-                    namespace: None,
-                    params: params(child_of(node, "function_value_parameters"), c),
-                })
-            }
+            "function_declaration" => self.visit_function_declaration(node, c),
             "primary_constructor" | "secondary_constructor" => {
-                let keyword = if node.kind() == "secondary_constructor" {
-                    first_token(node, "constructor")
-                } else {
-                    None
-                };
-                let list = child_of(node, "class_parameters")
-                    .or_else(|| child_of(node, "function_value_parameters"));
-                Action::Callable(CallableSpec {
-                    name: c.current_type().map(str::to_owned),
-                    name_range: Some(keyword.map_or((node.start_byte(), node.end_byte()), |k| {
-                        (k.start_byte(), k.end_byte())
-                    })),
-                    kind: CallableKind::Constructor,
-                    container: None,
-                    namespace: None,
-                    params: params(list, c),
-                })
+                self.visit_primary_constructor(node, c)
             }
-            "lambda_literal" | "anonymous_function" => {
-                let list = child_of(node, "lambda_parameters")
-                    .or_else(|| child_of(node, "function_value_parameters"));
-                let mut params = params(list, c);
-                if params.is_empty() && node.kind() == "lambda_literal" {
-                    params.push(("it".into(), None));
-                }
-                Action::Callable(CallableSpec {
-                    name: None,
-                    name_range: None,
-                    kind: CallableKind::Closure,
-                    container: None,
-                    namespace: None,
-                    params,
-                })
-            }
+            "lambda_literal" | "anonymous_function" => self.visit_lambda_literal(node, c),
             "property_declaration" => {
                 locals(node, c);
                 Action::Descend
             }
-            "for_statement" => {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if matches!(
-                        child.kind(),
-                        "variable_declaration" | "multi_variable_declaration"
-                    ) {
-                        declare_variables(child, c);
-                    }
-                }
-                Action::Descend
-            }
+            "for_statement" => self.visit_for_statement(node, c),
             "catch_block" => {
                 if let Some(name) = child_of(node, "identifier") {
                     let ty = child_of(node, "user_type").and_then(|t| simple_type(c.text(t)));
@@ -138,6 +71,87 @@ impl Syntax for Kotlin {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Kotlin {
+    fn visit_class_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Descend;
+        };
+        Action::Type(TypeSpec {
+            name: c.text(name).to_owned(),
+            name_range: (name.start_byte(), name.end_byte()),
+            kind: type_kind(node, c.src),
+            bases: bases(node, c.src),
+        })
+    }
+
+    fn visit_function_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        let in_type = c.current_type().is_some() && !c.in_callable();
+        Action::Callable(CallableSpec {
+            name: name.map(|n| c.text(n).to_owned()),
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind: if in_type {
+                CallableKind::Method
+            } else {
+                CallableKind::Function
+            },
+            container: None,
+            namespace: None,
+            params: params(child_of(node, "function_value_parameters"), c),
+        })
+    }
+
+    fn visit_primary_constructor(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let keyword = if node.kind() == "secondary_constructor" {
+            first_token(node, "constructor")
+        } else {
+            None
+        };
+        let list = child_of(node, "class_parameters")
+            .or_else(|| child_of(node, "function_value_parameters"));
+        Action::Callable(CallableSpec {
+            name: c.current_type().map(str::to_owned),
+            name_range: Some(keyword.map_or((node.start_byte(), node.end_byte()), |k| {
+                (k.start_byte(), k.end_byte())
+            })),
+            kind: CallableKind::Constructor,
+            container: None,
+            namespace: None,
+            params: params(list, c),
+        })
+    }
+
+    fn visit_lambda_literal(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let list = child_of(node, "lambda_parameters")
+            .or_else(|| child_of(node, "function_value_parameters"));
+        let mut params = params(list, c);
+        if params.is_empty() && node.kind() == "lambda_literal" {
+            params.push(("it".into(), None));
+        }
+        Action::Callable(CallableSpec {
+            name: None,
+            name_range: None,
+            kind: CallableKind::Closure,
+            container: None,
+            namespace: None,
+            params,
+        })
+    }
+
+    fn visit_for_statement(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(
+                child.kind(),
+                "variable_declaration" | "multi_variable_declaration"
+            ) {
+                declare_variables(child, c);
+            }
+        }
+        Action::Descend
     }
 }
 

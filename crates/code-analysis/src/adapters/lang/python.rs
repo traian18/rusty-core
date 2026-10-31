@@ -43,44 +43,8 @@ impl Syntax for Python {
                 self.import_from(node, c);
                 Action::Skip
             }
-            "class_definition" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Descend;
-                };
-                let mut bases = Vec::new();
-                if let Some(superclasses) = node.child_by_field_name("superclasses") {
-                    let mut cursor = superclasses.walk();
-                    for base in superclasses.named_children(&mut cursor) {
-                        if let Some(path) = path_segments(base, c.src) {
-                            bases.extend(path.last().cloned());
-                        }
-                    }
-                }
-                Action::Type(TypeSpec {
-                    name: c.text(name).to_owned(),
-                    name_range: (name.start_byte(), name.end_byte()),
-                    kind: TypeKind::Class,
-                    bases,
-                })
-            }
-            "function_definition" => {
-                let name = node.child_by_field_name("name");
-                let text = name.map(|n| c.text(n).to_owned());
-                let in_class = c.current_type().is_some() && !c.in_callable();
-                let kind = match (in_class, text.as_deref()) {
-                    (true, Some("__init__")) => CallableKind::Constructor,
-                    (true, _) => CallableKind::Method,
-                    (false, _) => CallableKind::Function,
-                };
-                Action::Callable(CallableSpec {
-                    name: text,
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind,
-                    container: None,
-                    namespace: None,
-                    params: params(node, c),
-                })
-            }
+            "class_definition" => self.visit_class_definition(node, c),
+            "function_definition" => self.visit_function_definition(node, c),
             "lambda" => Action::Callable(CallableSpec {
                 name: None,
                 name_range: None,
@@ -117,6 +81,48 @@ impl Syntax for Python {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Python {
+    fn visit_class_definition(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Descend;
+        };
+        let mut bases = Vec::new();
+        if let Some(superclasses) = node.child_by_field_name("superclasses") {
+            let mut cursor = superclasses.walk();
+            for base in superclasses.named_children(&mut cursor) {
+                if let Some(path) = path_segments(base, c.src) {
+                    bases.extend(path.last().cloned());
+                }
+            }
+        }
+        Action::Type(TypeSpec {
+            name: c.text(name).to_owned(),
+            name_range: (name.start_byte(), name.end_byte()),
+            kind: TypeKind::Class,
+            bases,
+        })
+    }
+
+    fn visit_function_definition(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        let text = name.map(|n| c.text(n).to_owned());
+        let in_class = c.current_type().is_some() && !c.in_callable();
+        let kind = match (in_class, text.as_deref()) {
+            (true, Some("__init__")) => CallableKind::Constructor,
+            (true, _) => CallableKind::Method,
+            (false, _) => CallableKind::Function,
+        };
+        Action::Callable(CallableSpec {
+            name: text,
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind,
+            container: None,
+            namespace: None,
+            params: params(node, c),
+        })
     }
 }
 

@@ -36,80 +36,15 @@ impl Syntax for Cpp {
 
     fn visit(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
         match node.kind() {
-            "preproc_include" => {
-                if let Some(path) = node.child_by_field_name("path") {
-                    if path.kind() == "string_literal" {
-                        c.import(ImportFact {
-                            local: "*".into(),
-                            imported: "*".into(),
-                            module: unquote(c.text(path)).to_owned(),
-                            kind: ImportKind::Include,
-                            type_only: false,
-                            start: node.start_byte() as u32,
-                            end: node.end_byte() as u32,
-                        });
-                    }
-                }
-                Action::Skip
-            }
+            "preproc_include" => self.visit_preproc_include(node, c),
             "using_declaration" => {
                 self.using(node, c);
                 Action::Skip
             }
-            "namespace_definition" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .map(|n| c.text(n).to_owned());
-                match name {
-                    Some(name) if c.namespace().is_empty() => Action::Namespace(name),
-                    Some(name) => Action::Namespace(format!("{}::{name}", c.namespace())),
-                    None => Action::Descend,
-                }
-            }
-            "class_specifier" | "struct_specifier" => {
-                let (Some(name), Some(_)) = (
-                    node.child_by_field_name("name"),
-                    node.child_by_field_name("body"),
-                ) else {
-                    return Action::Skip;
-                };
-                let mut bases = Vec::new();
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "base_class_clause" {
-                        let mut inner = child.walk();
-                        for base in child.named_children(&mut inner) {
-                            if let Some(segments) = path_segments(base, c.src) {
-                                bases.extend(segments.last().cloned());
-                            }
-                        }
-                    }
-                }
-                let text = c.text(name);
-                let simple = last_segment(text).to_owned();
-                Action::Type(TypeSpec {
-                    name: simple,
-                    name_range: (name.start_byte(), name.end_byte()),
-                    kind: if node.kind() == "struct_specifier" {
-                        TypeKind::Struct
-                    } else {
-                        TypeKind::Class
-                    },
-                    bases,
-                })
-            }
+            "namespace_definition" => self.visit_namespace_definition(node, c),
+            "class_specifier" | "struct_specifier" => self.visit_class_specifier(node, c),
             "function_definition" => self.function(node, c),
-            "lambda_expression" => Action::Callable(CallableSpec {
-                name: None,
-                name_range: None,
-                kind: CallableKind::Closure,
-                container: None,
-                namespace: None,
-                params: node
-                    .child_by_field_name("declarator")
-                    .map(|d| params(d, c))
-                    .unwrap_or_default(),
-            }),
+            "lambda_expression" => self.visit_lambda_expression(node, c),
             "declaration" => {
                 self.declaration(node, c);
                 Action::Descend
@@ -124,6 +59,83 @@ impl Syntax for Cpp {
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Cpp {
+    fn visit_preproc_include(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        if let Some(path) = node.child_by_field_name("path") {
+            if path.kind() == "string_literal" {
+                c.import(ImportFact {
+                    local: "*".into(),
+                    imported: "*".into(),
+                    module: unquote(c.text(path)).to_owned(),
+                    kind: ImportKind::Include,
+                    type_only: false,
+                    start: node.start_byte() as u32,
+                    end: node.end_byte() as u32,
+                });
+            }
+        }
+        Action::Skip
+    }
+
+    fn visit_namespace_definition(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| c.text(n).to_owned());
+        match name {
+            Some(name) if c.namespace().is_empty() => Action::Namespace(name),
+            Some(name) => Action::Namespace(format!("{}::{name}", c.namespace())),
+            None => Action::Descend,
+        }
+    }
+
+    fn visit_class_specifier(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let (Some(name), Some(_)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("body"),
+        ) else {
+            return Action::Skip;
+        };
+        let mut bases = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "base_class_clause" {
+                let mut inner = child.walk();
+                for base in child.named_children(&mut inner) {
+                    if let Some(segments) = path_segments(base, c.src) {
+                        bases.extend(segments.last().cloned());
+                    }
+                }
+            }
+        }
+        let text = c.text(name);
+        let simple = last_segment(text).to_owned();
+        Action::Type(TypeSpec {
+            name: simple,
+            name_range: (name.start_byte(), name.end_byte()),
+            kind: if node.kind() == "struct_specifier" {
+                TypeKind::Struct
+            } else {
+                TypeKind::Class
+            },
+            bases,
+        })
+    }
+
+    fn visit_lambda_expression(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        Action::Callable(CallableSpec {
+            name: None,
+            name_range: None,
+            kind: CallableKind::Closure,
+            container: None,
+            namespace: None,
+            params: node
+                .child_by_field_name("declarator")
+                .map(|d| params(d, c))
+                .unwrap_or_default(),
+        })
     }
 }
 

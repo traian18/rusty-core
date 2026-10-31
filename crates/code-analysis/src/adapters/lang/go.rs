@@ -47,64 +47,9 @@ impl Syntax for Go {
                 self.import(node, c);
                 Action::Skip
             }
-            "type_spec" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return Action::Descend;
-                };
-                let ty = node.child_by_field_name("type");
-                let kind = match ty.map(|t| t.kind()) {
-                    Some("interface_type") => TypeKind::Interface,
-                    _ => TypeKind::Struct,
-                };
-                let mut bases = Vec::new();
-                if let Some(ty) = ty.filter(|t| t.kind() == "struct_type") {
-                    embedded(ty, c.src, &mut bases);
-                }
-                Action::Type(TypeSpec {
-                    name: c.text(name).to_owned(),
-                    name_range: (name.start_byte(), name.end_byte()),
-                    kind,
-                    bases,
-                })
-            }
-            "function_declaration" => {
-                let name = node.child_by_field_name("name");
-                Action::Callable(CallableSpec {
-                    name: name.map(|n| c.text(n).to_owned()),
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind: CallableKind::Function,
-                    container: None,
-                    namespace: None,
-                    params: params(node.child_by_field_name("parameters"), c),
-                })
-            }
-            "method_declaration" => {
-                let name = node.child_by_field_name("name");
-                let mut all = Vec::new();
-                let mut container = None;
-                if let Some(receiver) = node.child_by_field_name("receiver") {
-                    let mut cursor = receiver.walk();
-                    for declaration in receiver.named_children(&mut cursor) {
-                        let ty = declaration
-                            .child_by_field_name("type")
-                            .and_then(|t| simple_type(c.text(t)))
-                            .map(|t| last_segment(&t).to_owned());
-                        container = ty.clone();
-                        if let Some(var) = declaration.child_by_field_name("name") {
-                            all.push((c.text(var).to_owned(), ty));
-                        }
-                    }
-                }
-                all.extend(params(node.child_by_field_name("parameters"), c));
-                Action::Callable(CallableSpec {
-                    name: name.map(|n| c.text(n).to_owned()),
-                    name_range: name.map(|n| (n.start_byte(), n.end_byte())),
-                    kind: CallableKind::Method,
-                    container,
-                    namespace: None,
-                    params: all,
-                })
-            }
+            "type_spec" => self.visit_type_spec(node, c),
+            "function_declaration" => self.visit_function_declaration(node, c),
+            "method_declaration" => self.visit_method_declaration(node, c),
             "func_literal" => Action::Callable(CallableSpec {
                 name: None,
                 name_range: None,
@@ -113,52 +58,121 @@ impl Syntax for Go {
                 namespace: None,
                 params: params(node.child_by_field_name("parameters"), c),
             }),
-            "short_var_declaration" => {
-                declare_pairs(
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                    None,
-                    c,
-                );
-                Action::Descend
-            }
-            "var_spec" => {
-                let ty = node
-                    .child_by_field_name("type")
-                    .and_then(|t| simple_type(c.text(t)));
-                let mut cursor = node.walk();
-                let names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
-                for name in names {
-                    c.declare_typed(c.text(name), ty.clone(), false, false);
-                }
-                if let Some(values) = node.child_by_field_name("value") {
-                    let mut cursor = node.walk();
-                    let names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
-                    let mut inner = values.walk();
-                    for (name, value) in names.iter().zip(values.named_children(&mut inner)) {
-                        if value.kind() == "func_literal" {
-                            c.name_closure(value, c.text(*name));
-                        }
-                    }
-                }
-                Action::Descend
-            }
-            "range_clause" => {
-                if let Some(left) = node.child_by_field_name("left") {
-                    let mut names = Vec::new();
-                    binding_names(left, c.src, &mut names);
-                    for name in names {
-                        c.declare(&name, false);
-                    }
-                }
-                Action::Descend
-            }
+            "short_var_declaration" => self.visit_short_var_declaration(node, c),
+            "var_spec" => self.visit_var_spec(node, c),
+            "range_clause" => self.visit_range_clause(node, c),
             "call_expression" => {
                 self.call(node, c);
                 Action::Descend
             }
             _ => Action::Descend,
         }
+    }
+}
+
+impl Go {
+    fn visit_type_spec(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let Some(name) = node.child_by_field_name("name") else {
+            return Action::Descend;
+        };
+        let ty = node.child_by_field_name("type");
+        let kind = match ty.map(|t| t.kind()) {
+            Some("interface_type") => TypeKind::Interface,
+            _ => TypeKind::Struct,
+        };
+        let mut bases = Vec::new();
+        if let Some(ty) = ty.filter(|t| t.kind() == "struct_type") {
+            embedded(ty, c.src, &mut bases);
+        }
+        Action::Type(TypeSpec {
+            name: c.text(name).to_owned(),
+            name_range: (name.start_byte(), name.end_byte()),
+            kind,
+            bases,
+        })
+    }
+
+    fn visit_function_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        Action::Callable(CallableSpec {
+            name: name.map(|n| c.text(n).to_owned()),
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind: CallableKind::Function,
+            container: None,
+            namespace: None,
+            params: params(node.child_by_field_name("parameters"), c),
+        })
+    }
+
+    fn visit_method_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let name = node.child_by_field_name("name");
+        let mut all = Vec::new();
+        let mut container = None;
+        if let Some(receiver) = node.child_by_field_name("receiver") {
+            let mut cursor = receiver.walk();
+            for declaration in receiver.named_children(&mut cursor) {
+                let ty = declaration
+                    .child_by_field_name("type")
+                    .and_then(|t| simple_type(c.text(t)))
+                    .map(|t| last_segment(&t).to_owned());
+                container = ty.clone();
+                if let Some(var) = declaration.child_by_field_name("name") {
+                    all.push((c.text(var).to_owned(), ty));
+                }
+            }
+        }
+        all.extend(params(node.child_by_field_name("parameters"), c));
+        Action::Callable(CallableSpec {
+            name: name.map(|n| c.text(n).to_owned()),
+            name_range: name.map(|n| (n.start_byte(), n.end_byte())),
+            kind: CallableKind::Method,
+            container,
+            namespace: None,
+            params: all,
+        })
+    }
+
+    fn visit_short_var_declaration(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        declare_pairs(
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+            None,
+            c,
+        );
+        Action::Descend
+    }
+
+    fn visit_var_spec(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        let ty = node
+            .child_by_field_name("type")
+            .and_then(|t| simple_type(c.text(t)));
+        let mut cursor = node.walk();
+        let names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
+        for name in names {
+            c.declare_typed(c.text(name), ty.clone(), false, false);
+        }
+        if let Some(values) = node.child_by_field_name("value") {
+            let mut cursor = node.walk();
+            let names: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
+            let mut inner = values.walk();
+            for (name, value) in names.iter().zip(values.named_children(&mut inner)) {
+                if value.kind() == "func_literal" {
+                    c.name_closure(value, c.text(*name));
+                }
+            }
+        }
+        Action::Descend
+    }
+
+    fn visit_range_clause(&self, node: Node<'_>, c: &mut Collector<'_>) -> Action {
+        if let Some(left) = node.child_by_field_name("left") {
+            let mut names = Vec::new();
+            binding_names(left, c.src, &mut names);
+            for name in names {
+                c.declare(&name, false);
+            }
+        }
+        Action::Descend
     }
 }
 
