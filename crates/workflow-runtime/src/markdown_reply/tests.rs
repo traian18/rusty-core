@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn plan_schema() -> Value {
     json!({"type":"object","required":["status","requirements","tasks","summary"],"properties":{
