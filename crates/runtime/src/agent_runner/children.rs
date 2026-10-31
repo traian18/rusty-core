@@ -7,16 +7,13 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use rusty_agent_core::agent::Agent;
 use rusty_protocol::commands::{AgentCommand, AgentResult, UserInput};
 use rusty_protocol::effects::SpawnAgentSpec;
 use rusty_protocol::ids::{AgentId, ToolCallId};
 use rusty_protocol::tools::ToolResult;
 
-use crate::agent_supervisor::{AgentSupervisor, SupervisorError};
+use crate::agent_supervisor::{AgentSupervisor, SpawnHost, SupervisorError};
 use crate::integration::IntegrationRegistry;
-use crate::scheduler::Scheduler;
-use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
 /// Session-scoped services required to interpret child-agent effects.
 #[derive(Clone)]
@@ -36,17 +33,9 @@ impl AgentSupervision {
 
 #[async_trait]
 pub(super) trait SupervisorControl: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_child(
         &self,
-        parent: &Agent,
-        parent_backend: Arc<dyn ExecutionBackend>,
-        integration_registry: &IntegrationRegistry,
-        tool_registry: Arc<dyn ToolRegistry>,
-        workspace: Arc<dyn Workspace>,
-        event_sink: Arc<dyn EventSink>,
-        scheduler: Arc<Scheduler>,
-        parent_commands_tx: mpsc::Sender<AgentCommand>,
+        host: SpawnHost<'_>,
         spec: SpawnAgentSpec,
     ) -> Result<AgentId, SupervisorError>;
 
@@ -85,29 +74,10 @@ pub(crate) struct ToolSpawnOutcome {
 impl SupervisorControl for AgentSupervisor {
     async fn spawn_child(
         &self,
-        parent: &Agent,
-        parent_backend: Arc<dyn ExecutionBackend>,
-        integration_registry: &IntegrationRegistry,
-        tool_registry: Arc<dyn ToolRegistry>,
-        workspace: Arc<dyn Workspace>,
-        event_sink: Arc<dyn EventSink>,
-        scheduler: Arc<Scheduler>,
-        parent_commands_tx: mpsc::Sender<AgentCommand>,
+        host: SpawnHost<'_>,
         spec: SpawnAgentSpec,
     ) -> Result<AgentId, SupervisorError> {
-        AgentSupervisor::spawn_child(
-            self,
-            parent,
-            parent_backend,
-            integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
-            spec,
-        )
-        .await
+        AgentSupervisor::spawn_child(self, host, spec).await
     }
 
     async fn await_child(&self, child_id: AgentId) -> Result<AgentResult, SupervisorError> {

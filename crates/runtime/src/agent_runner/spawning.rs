@@ -9,6 +9,7 @@ use super::children::{
 };
 
 use super::{AgentRunner, AgentSupervision};
+use crate::agent_supervisor::SpawnHost;
 
 impl AgentRunner {
     pub(super) async fn cancel_child(&self, agent_id: AgentId) {
@@ -33,14 +34,16 @@ impl AgentRunner {
         let child_id = supervision
             .supervisor
             .spawn_child(
-                &self.agent,
-                self.backend.clone(),
-                supervision.integrations.as_ref(),
-                self.tool_registry.clone(),
-                self.workspace.clone(),
-                self.event_sink.clone(),
-                self.scheduler.clone(),
-                self.task.commands_tx.clone(),
+                SpawnHost {
+                    parent: &self.agent,
+                    backend: self.backend.clone(),
+                    integrations: supervision.integrations.as_ref(),
+                    tools: self.tool_registry.clone(),
+                    workspace: self.workspace.clone(),
+                    events: self.event_sink.clone(),
+                    scheduler: self.scheduler.clone(),
+                    parent_commands: self.task.commands_tx.clone(),
+                },
                 spec,
             )
             .await

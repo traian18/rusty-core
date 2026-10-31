@@ -1,4 +1,11 @@
+use super::budget::validate_child_budget;
 use super::*;
+use crate::integration::IntegrationRegistry;
+use crate::scheduler::Scheduler;
+use crate::traits::{ExecutionBackend, ToolRegistry};
+use rusty_protocol::backend::BackendBinding;
+use rusty_protocol::effects::{BackendPolicy, SpawnAgentSpec, SpawnMode, WorkspacePolicy};
+use rusty_protocol::ids::BackendId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -152,9 +159,15 @@ async fn max_children_gate_rejects_third_child() {
         let join = tokio::spawn(async {});
         let (commands, _) = mpsc::channel(1);
         let (_, result) = oneshot::channel();
-        supervisor
-            .register(Some(parent_id), child_id, 1, cancel, join, commands, result)
-            .await;
+        let handle = AgentHandle {
+            parent_id: Some(parent_id),
+            depth: 1,
+            cancel,
+            join,
+            commands,
+            result,
+        };
+        supervisor.register(child_id, handle).await;
     }
 
     let error = supervisor
@@ -268,14 +281,16 @@ async fn spawn_child_inherits_only_delegatable_tools() {
 
     let child_id = supervisor
         .spawn_child(
-            &parent,
-            parent_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: parent_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             spec,
         )
         .await
@@ -338,14 +353,16 @@ async fn spawn_and_drive_await_result_blocks_until_children_finish() {
         let integration_registry = IntegrationRegistry::new();
         let outcome = supervisor
             .spawn_and_drive(
-                &parent,
-                parent_backend,
-                &integration_registry,
-                tool_registry,
-                workspace,
-                event_sink,
-                scheduler,
-                parent_commands_tx,
+                SpawnHost {
+                    parent: &parent,
+                    backend: parent_backend,
+                    integrations: &integration_registry,
+                    tools: tool_registry,
+                    workspace,
+                    events: event_sink,
+                    scheduler,
+                    parent_commands: parent_commands_tx,
+                },
                 SpawnAgentSpec {
                     origin_tool_call_id: None,
                     role: Some("child".into()),
@@ -448,14 +465,16 @@ async fn spawn_and_drive_concurrent_returns_detached_immediately() {
     // This must return immediately (not block on the child).
     let outcome = supervisor
         .spawn_and_drive(
-            &parent,
-            parent_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: parent_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             spec,
         )
         .await
@@ -530,14 +549,16 @@ async fn spawn_child_emits_child_agent_spawned_event() {
 
     let child_id = supervisor
         .spawn_child(
-            &parent,
-            parent_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: parent_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             spec,
         )
         .await
@@ -596,14 +617,16 @@ async fn spawn_child_is_bounded_by_max_active_agents() {
         Arc::new(FakeBackend::new().blocking_until_cancelled());
     supervisor
         .spawn_child(
-            &parent,
-            long_lived_backend,
-            &integration_registry,
-            tool_registry.clone(),
-            workspace.clone(),
-            event_sink.clone(),
-            scheduler.clone(),
-            parent_commands_tx.clone(),
+            SpawnHost {
+                parent: &parent,
+                backend: long_lived_backend,
+                integrations: &integration_registry,
+                tools: tool_registry.clone(),
+                workspace: workspace.clone(),
+                events: event_sink.clone(),
+                scheduler: scheduler.clone(),
+                parent_commands: parent_commands_tx.clone(),
+            },
             spec(),
         )
         .await
@@ -615,14 +638,16 @@ async fn spawn_child_is_bounded_by_max_active_agents() {
     let result = tokio::time::timeout(
         Duration::from_millis(300),
         supervisor.spawn_child(
-            &parent,
-            second_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: second_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             spec(),
         ),
     )
@@ -694,14 +719,16 @@ async fn root_spawns_child_event_stream_matches_section_73_order() {
 
     let outcome = supervisor
         .spawn_and_drive(
-            &parent,
-            child_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: child_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             spec,
         )
         .await

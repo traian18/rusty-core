@@ -49,7 +49,7 @@ use rusty_protocol::usage::AgentBudget;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use rusty_runtime::agent_supervisor::{AgentSupervisor, SpawnOutcome};
+use rusty_runtime::agent_supervisor::{AgentSupervisor, SpawnHost, SpawnOutcome};
 use rusty_runtime::cancellation::SessionCancellation;
 use rusty_runtime::integration::{IntegrationFactory, IntegrationRegistry};
 use rusty_runtime::scheduler::{Scheduler, SchedulerConfig};
@@ -261,14 +261,16 @@ async fn test_root_spawns_two_concurrent_children() {
     // Spawn child A (Concurrent — must return immediately).
     let outcome_a = supervisor
         .spawn_and_drive(
-            &parent,
-            backend_a,
-            &integration_registry,
-            Arc::clone(&tool_registry),
-            Arc::clone(&workspace),
-            Arc::clone(&event_sink),
-            Arc::clone(&scheduler),
-            parent_commands_tx.clone(),
+            SpawnHost {
+                parent: &parent,
+                backend: backend_a,
+                integrations: &integration_registry,
+                tools: Arc::clone(&tool_registry),
+                workspace: Arc::clone(&workspace),
+                events: Arc::clone(&event_sink),
+                scheduler: Arc::clone(&scheduler),
+                parent_commands: parent_commands_tx.clone(),
+            },
             concurrent_spec(
                 "child-A",
                 BackendPolicy::Inherit,
@@ -286,14 +288,16 @@ async fn test_root_spawns_two_concurrent_children() {
     // Spawn child B (Concurrent — must return immediately, root not blocked).
     let outcome_b = supervisor
         .spawn_and_drive(
-            &parent,
-            backend_b,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: backend_b,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             concurrent_spec(
                 "child-B",
                 BackendPolicy::Inherit,
@@ -455,14 +459,16 @@ async fn test_heterogeneous_backends() {
 
     let outcome = supervisor
         .spawn_and_drive(
-            &parent,
-            root_backend,
-            &integration_registry,
-            tool_registry,
-            workspace,
-            event_sink,
-            scheduler,
-            parent_commands_tx,
+            SpawnHost {
+                parent: &parent,
+                backend: root_backend,
+                integrations: &integration_registry,
+                tools: tool_registry,
+                workspace,
+                events: event_sink,
+                scheduler,
+                parent_commands: parent_commands_tx,
+            },
             concurrent_spec(
                 "child",
                 BackendPolicy::Explicit(child_reference),
