@@ -1,0 +1,37 @@
+[package]
+name = "rusty-provider-codex"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "macros", "sync"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+rusty-model-backend = { path = "../model-backend" }
+rusty-provider-openai-responses = { path = "../provider-openai-responses" }
+serde = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+base64 = { workspace = true }
+chrono = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tempfile = "3"
+rusty-engine = { path = "../engine" }
+rusty-tool-api = { path = "../tool-api" }
+rusty-context = { path = "../context" }

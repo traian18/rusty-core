@@ -1,0 +1,30 @@
+[package]
+name = "rusty-tool-mcp"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-protocol = { path = "../protocol" }
+rusty-tool-api = { path = "../tool-api" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "sync", "rt", "time", "macros", "io-util"] }
+tracing = { workspace = true }
+
+[[bin]]
+name = "fake_mcp_server"
+path = "tests/fixtures/fake_mcp_server.rs"
+test = false
+doc = false
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

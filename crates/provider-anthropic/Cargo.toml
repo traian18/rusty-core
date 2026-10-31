@@ -1,0 +1,28 @@
+[package]
+name = "rusty-provider-anthropic"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-model-backend = { path = "../model-backend" }
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+rust_decimal.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+rusty-engine = { path = "../engine" }
+rusty-tool-api = { path = "../tool-api" }

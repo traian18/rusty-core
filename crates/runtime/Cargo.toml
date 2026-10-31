@@ -1,0 +1,39 @@
+[package]
+name = "rusty-runtime"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+testing = []
+
+[dependencies]
+rusty-agent-core = { path = "../agent-core" }
+rusty-workflow-core = { path = "../workflow-core" }
+rusty-protocol = { path = "../protocol" }
+rusty-session-store = { path = "../session-store", default-features = false }
+rusty-workspace = { path = "../workspace" }
+rusty-tool-api = { path = "../tool-api" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process", "io-util"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+metrics = { workspace = true }
+futures = { workspace = true }
+git2 = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rusty-runtime = { path = ".", features = ["testing"] }
+# MemoryStore/FaultInjectingStore, used by this crate's own test modules.
+rusty-session-store = { path = "../session-store", default-features = false, features = ["testing"] }
+tempfile = "3"
+rust_decimal_macros = { workspace = true }

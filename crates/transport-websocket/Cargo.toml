@@ -1,0 +1,23 @@
+[package]
+name = "rusty-transport-websocket"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+tokio = { workspace = true, features = ["net", "rt", "sync", "macros"] }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

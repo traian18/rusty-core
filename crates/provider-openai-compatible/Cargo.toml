@@ -1,0 +1,23 @@
+[package]
+name = "rusty-provider-openai-compatible"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rusty-model-backend = { path = "../model-backend" }
+rusty-protocol = { path = "../protocol" }
+rusty-runtime = { path = "../runtime" }
+rusty-provider-openai = { path = "../provider-openai" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+rusty-engine = { path = "../engine" }
+rusty-tool-api = { path = "../tool-api" }
