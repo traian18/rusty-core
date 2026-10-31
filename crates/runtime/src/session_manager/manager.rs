@@ -18,7 +18,7 @@ use crate::session_manager::errors::SessionManagerError;
 use crate::session_manager::registry::ActiveSessionRegistry;
 use crate::session_manager::restorer::SessionRestorerEngine;
 use crate::session_manager::supervisor::SessionSupervisor;
-use crate::session_runtime::SessionRuntime;
+use crate::session_runtime::{SessionHost, SessionRuntime};
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
 /// Central session coordinator managing multi-session lifecycle, durable restoration,
@@ -187,16 +187,12 @@ impl SessionLifecycle for SessionManager {
     ) -> Result<Arc<SessionRuntime>, SessionManagerError> {
         let session_permit = self.scheduler.try_acquire_session_permit().await?;
         let session_id = SessionId::new();
-        let runtime = Arc::new(SessionRuntime::new_with_scheduler(
-            session_id,
-            backend,
-            tool_registry,
-            workspace,
-            event_sink,
-            root_toolset,
-            self.scheduler.clone(),
-            self.store.clone(),
-        ));
+        let host = SessionHost {
+            scheduler: self.scheduler.clone(),
+            session_store: self.store.clone(),
+            ..SessionHost::new(session_id, backend, tool_registry, workspace, event_sink)
+        };
+        let runtime = Arc::new(SessionRuntime::start(host, root_toolset, None));
 
         self.registry
             .register(session_id, runtime.clone(), session_permit)

@@ -7,6 +7,8 @@
 //! ceilings — a request must hold a permit from *both* systems before it may
 //! proceed.
 
+use super::permits::NeverClosed;
+use crate::locks::{MutexExt, RwLockExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -134,10 +136,7 @@ impl BackendLimiters {
             window: Mutex::new(RateWindow::new()),
             limits,
         });
-        let mut guard = self
-            .limiters
-            .write()
-            .expect("BackendLimiters RwLock poisoned");
+        let mut guard = self.limiters.write_or_recover();
         guard.insert(backend, state);
     }
 
@@ -167,10 +166,7 @@ impl BackendLimiters {
         // Look up the per-backend state.  If none is configured we return
         // a no-op guard immediately.
         let state = {
-            let guard = self
-                .limiters
-                .read()
-                .expect("BackendLimiters RwLock poisoned");
+            let guard = self.limiters.read_or_recover();
             guard.get(&backend).cloned()
         };
 
@@ -191,10 +187,7 @@ impl BackendLimiters {
             }
 
             let can_proceed = {
-                let mut window = state
-                    .window
-                    .lock()
-                    .expect("BackendLimiterState rate window mutex poisoned");
+                let mut window = state.window.lock_or_recover();
                 window.check_and_record(
                     Instant::now(),
                     0, // token count is unknown at permit-acquisition time
@@ -229,7 +222,7 @@ impl BackendLimiters {
         } else {
             concurrency.acquire_owned().await
         }
-        .expect("Backend concurrency semaphore should never be closed");
+        .never_closed();
 
         Some(BackendPermitGuard::new(permit))
     }

@@ -49,6 +49,7 @@
 //!   its steady-state operations (mailbox commands, cancellation, snapshots,
 //!   checkpoints) — everything a session does once it is already running.
 
+mod assembly;
 mod checkpoint;
 mod construction;
 mod event_bus;
@@ -58,9 +59,11 @@ mod restoration;
 mod runner_spawn;
 mod types;
 
+pub use assembly::SessionHost;
 pub use event_bus::SessionEventBus;
 pub use live_state::{AgentLiveState, LiveStateTable};
 pub use projection::AgentProjectionTable;
+pub use restoration::RestoreError;
 pub use types::{SessionCommand, SessionError, SessionSnapshot, SessionState, SessionStatus};
 
 pub(crate) use projection::stored_agent_state;
@@ -68,6 +71,7 @@ pub(crate) use projection::stored_agent_state;
 #[cfg(test)]
 mod tests;
 
+use crate::locks::MutexExt;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -176,23 +180,19 @@ impl SessionRuntime {
     /// Make `session` reachable through [`delegated_session`](Self::delegated_session)
     /// while it runs work on this session's behalf.
     pub fn register_delegated(&self, session: &Arc<SessionRuntime>) {
-        let mut delegated = self.delegated.lock().expect("delegated mutex poisoned");
+        let mut delegated = self.delegated.lock_or_recover();
         delegated.retain(|_, weak| weak.strong_count() > 0);
         delegated.insert(session.session_id, Arc::downgrade(session));
     }
 
     pub fn unregister_delegated(&self, session_id: SessionId) {
-        self.delegated
-            .lock()
-            .expect("delegated mutex poisoned")
-            .remove(&session_id);
+        self.delegated.lock_or_recover().remove(&session_id);
     }
 
     /// A live delegated session (see [`register_delegated`](Self::register_delegated)).
     pub fn delegated_session(&self, session_id: SessionId) -> Option<Arc<SessionRuntime>> {
         self.delegated
-            .lock()
-            .expect("delegated mutex poisoned")
+            .lock_or_recover()
             .get(&session_id)
             .and_then(std::sync::Weak::upgrade)
     }
@@ -248,10 +248,7 @@ impl SessionRuntime {
     /// task and detect panics or unexpected terminations. The handle can only
     /// be taken once; subsequent calls return `None`.
     pub fn take_root_task_handle(&self) -> Option<tokio::task::JoinHandle<()>> {
-        self.root_task_handle
-            .lock()
-            .expect("root_task_handle mutex poisoned")
-            .take()
+        self.root_task_handle.lock_or_recover().take()
     }
 
     /// Mark the session as failed with the given error message.
@@ -260,7 +257,7 @@ impl SessionRuntime {
     /// stores the error description. It is called by the supervisor task when
     /// the root task's `JoinHandle` produces a [`JoinError`](tokio::task::JoinError).
     pub fn mark_failed(&self, error_msg: String) {
-        let mut state = self.state.lock().expect("state mutex poisoned");
+        let mut state = self.state.lock_or_recover();
         state.status = SessionStatus::Failed;
         state.error = Some(error_msg);
     }
@@ -310,7 +307,7 @@ impl SessionRuntime {
                 }
                 // Optimistically transition to Running so that state_snapshot
                 // reflects the session as active immediately.
-                let mut state = self.state.lock().expect("state mutex poisoned");
+                let mut state = self.state.lock_or_recover();
                 if matches!(
                     state.status,
                     SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Cancelled
@@ -370,7 +367,7 @@ impl SessionRuntime {
 
         // Optimistically transition the session-level status so that
         // state_snapshot() returns Cancelled immediately.
-        let mut state = self.state.lock().expect("state mutex poisoned");
+        let mut state = self.state.lock_or_recover();
         if state.status != SessionStatus::Failed {
             state.status = SessionStatus::Cancelled;
         }
@@ -392,11 +389,10 @@ impl SessionRuntime {
     /// This is a pure read — no stored copy, just a point-in-time projection
     /// of live state.
     pub fn state_snapshot(&self) -> SessionSnapshot {
-        let state = self.state.lock().expect("state mutex poisoned");
+        let state = self.state.lock_or_recover();
         let live = self
             .live_state
-            .lock()
-            .expect("live_state mutex poisoned")
+            .lock_or_recover()
             .get(&state.root_agent_id)
             .cloned()
             .unwrap_or_default();
@@ -432,14 +428,9 @@ impl SessionRuntime {
     /// reasoning, ...), including any `ConfigureExecution` applied since
     /// construction.
     pub fn root_execution_params(&self) -> rusty_protocol::backend::ExecutionParams {
-        let root = self
-            .state
-            .lock()
-            .expect("state mutex poisoned")
-            .root_agent_id;
+        let root = self.state.lock_or_recover().root_agent_id;
         self.projection
-            .lock()
-            .expect("projection mutex poisoned")
+            .lock_or_recover()
             .get(&root)
             .map(|stored| stored.execution_params.clone())
             .unwrap_or_default()
@@ -448,15 +439,10 @@ impl SessionRuntime {
     /// The root agent's current behavior (profile and run counters), as last
     /// published by its runner.
     pub fn root_behavior(&self) -> rusty_agent_core::behavior::BehaviorState {
-        let root = self
-            .state
-            .lock()
-            .expect("state mutex poisoned")
-            .root_agent_id;
+        let root = self.state.lock_or_recover().root_agent_id;
         let stored = self
             .projection
-            .lock()
-            .expect("projection mutex poisoned")
+            .lock_or_recover()
             .get(&root)
             .and_then(|stored| stored.behavior.clone());
         rusty_agent_core::behavior::BehaviorState::from_stored(stored.as_ref()).unwrap_or_default()
@@ -472,7 +458,7 @@ impl SessionRuntime {
 
     /// The root agent's toolset: every tool it can see and its policy.
     pub fn root_toolset(&self) -> rusty_protocol::tools::AgentToolset {
-        let state = self.state.lock().expect("state mutex poisoned");
+        let state = self.state.lock_or_recover();
         state
             .agents
             .get(&state.root_agent_id)
@@ -488,8 +474,7 @@ impl SessionRuntime {
     /// has not been spawned yet).
     pub fn agent_live_state(&self, agent_id: AgentId) -> AgentLiveState {
         self.live_state
-            .lock()
-            .expect("live_state mutex poisoned")
+            .lock_or_recover()
             .get(&agent_id)
             .cloned()
             .unwrap_or_default()
@@ -511,11 +496,7 @@ impl SessionRuntime {
         // The snapshot point is the store's own last committed sequence —
         // authoritative and gap-free from the committer's perspective.
         let sequence = store.current_sequence(self.session_id).await?;
-        let root_agent_id = self
-            .state
-            .lock()
-            .expect("state mutex poisoned")
-            .root_agent_id;
+        let root_agent_id = self.state.lock_or_recover().root_agent_id;
         let snapshot = projection::build_snapshot(
             self.session_id,
             root_agent_id,

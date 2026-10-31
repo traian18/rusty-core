@@ -18,6 +18,7 @@ use crate::traits::EventSink;
 use crate::workspace::FakeWorkspace;
 
 use super::*;
+use crate::session_runtime::SessionHost;
 
 // -----------------------------------------------------------------------
 // Helper: drain buffered events from a broadcast receiver non-blockingly
@@ -453,17 +454,22 @@ async fn committed_events_match_stored_order() {
         fn send(&self, _envelope: AgentEventEnvelope) {}
     }
 
-    let runtime = SessionRuntime::new_with_scheduler(
-        session_id,
-        backend,
-        tool_registry,
-        workspace,
-        Arc::new(NoopSink),
+    let runtime = SessionRuntime::start(
+        SessionHost {
+            scheduler: Arc::new(Scheduler::new(SchedulerConfig::default())),
+            session_store: Some(store.clone()),
+            ..SessionHost::new(
+                session_id,
+                backend,
+                tool_registry,
+                workspace,
+                Arc::new(NoopSink),
+            )
+        },
         AgentToolset {
             tools: HashMap::new(),
         },
-        Arc::new(Scheduler::new(SchedulerConfig::default())),
-        Some(store.clone()),
+        None,
     );
 
     let mut subscriber = runtime.event_bus.subscribe();

@@ -1,6 +1,7 @@
 //! Session-wide event aggregation: merges every agent runner's event stream
 //! into one ordered stream for subscribers.
 
+use crate::locks::MutexExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,10 +104,7 @@ impl SessionEventBus {
         sender: broadcast::Sender<AgentEventEnvelope>,
     ) {
         let rx = sender.subscribe();
-        self.receivers
-            .lock()
-            .expect("receivers mutex poisoned")
-            .push(rx);
+        self.receivers.lock_or_recover().push(rx);
     }
 
     /// Return a new subscriber receiver that will receive all session events.
@@ -152,7 +150,7 @@ impl SessionEventBus {
     fn poll_receivers(&self) -> bool {
         let mut had_data = false;
 
-        let mut receivers = self.receivers.lock().expect("receivers mutex poisoned");
+        let mut receivers = self.receivers.lock_or_recover();
 
         // Drain all available events from each receiver.
         // `retain_mut` returns `true` to keep the receiver, `false` to

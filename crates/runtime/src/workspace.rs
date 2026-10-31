@@ -4,6 +4,7 @@
 //! so that [`SessionRuntime`](crate::session_runtime::SessionRuntime) always has a concrete `Arc<dyn Workspace>` to
 //! bind without requiring a real filesystem implementation, which arrives in Phase 4.
 
+use crate::locks::MutexExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -43,8 +44,7 @@ impl FakeWorkspace {
     /// any command is sent.
     pub fn with_file(self, path: impl Into<String>, content: impl Into<String>) -> Self {
         self.files
-            .lock()
-            .expect("files mutex poisoned")
+            .lock_or_recover()
             .insert(path.into(), content.into());
         self
     }
@@ -68,8 +68,7 @@ impl Workspace for FakeWorkspace {
 
     async fn read(&self, relative_path: &str) -> Result<String, WorkspaceError> {
         self.files
-            .lock()
-            .expect("files mutex poisoned")
+            .lock_or_recover()
             .get(relative_path)
             .cloned()
             .ok_or_else(|| {
@@ -85,14 +84,13 @@ impl Workspace for FakeWorkspace {
             return Err(WorkspaceError::Isolated);
         }
         self.files
-            .lock()
-            .expect("files mutex poisoned")
+            .lock_or_recover()
             .insert(relative_path.to_string(), content.to_string());
         Ok(())
     }
 
     async fn search(&self, query: &str) -> Result<SearchResult, WorkspaceError> {
-        let files = self.files.lock().expect("files mutex poisoned");
+        let files = self.files.lock_or_recover();
         let mut matches = Vec::new();
         let mut total_count = 0;
 
@@ -117,7 +115,7 @@ impl Workspace for FakeWorkspace {
     }
 
     async fn list_files(&self, _max_depth: usize) -> Result<Vec<FileInfo>, WorkspaceError> {
-        let files = self.files.lock().expect("files mutex poisoned");
+        let files = self.files.lock_or_recover();
         let file_infos = files
             .iter()
             .map(|(path, content)| FileInfo {

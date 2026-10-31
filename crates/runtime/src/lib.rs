@@ -18,6 +18,7 @@ pub mod agent_supervisor;
 pub mod cancellation;
 mod completion_gate;
 pub mod integration;
+mod locks;
 pub mod permissions;
 pub mod resource_manager;
 pub mod restore;

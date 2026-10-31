@@ -1,6 +1,7 @@
 //! Emitting agent events: sequencing, the session's commit boundary, and
 //! publication to subscribers.
 
+use crate::locks::MutexExt;
 use rusty_protocol::effects::SessionMutation;
 use rusty_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
 use rusty_protocol::ids::{EventId, Timestamp};
@@ -40,7 +41,7 @@ impl AgentRunner {
             AgentEvent::Failed { .. } => AgentOutcome::Failed,
             _ => return,
         };
-        let mut table = self.live_state.lock().expect("live_state mutex poisoned");
+        let mut table = self.live_state.lock_or_recover();
         let entry = table.entry(self.agent.id).or_default();
         entry.last_outcome = Some(outcome);
     }

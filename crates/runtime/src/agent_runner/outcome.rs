@@ -1,5 +1,6 @@
 //! How a run ends and what it leaves behind: the final result, a fatal failure, persisted mutations.
 
+use crate::locks::MutexExt;
 use rusty_agent_core::transcript::validate_transcript;
 
 use rusty_protocol::commands::{AgentError, AgentResult, AgentStatus};
@@ -107,7 +108,7 @@ impl AgentRunner {
         );
 
         {
-            let mut table = self.live_state.lock().expect("live_state mutex poisoned");
+            let mut table = self.live_state.lock_or_recover();
             let entry = table.entry(self.agent.id).or_default();
             entry.status = self.agent.state.status;
             entry.current_operation = self.agent.state.current_operation.clone();
@@ -120,8 +121,7 @@ impl AgentRunner {
         // RC-302: publish the durable projection so checkpoints are truthful.
         if let Some(projection) = &self.projection {
             projection
-                .lock()
-                .expect("projection mutex poisoned")
+                .lock_or_recover()
                 .insert(self.agent.id, stored_agent_state(&self.agent));
         }
     }

@@ -82,12 +82,7 @@ impl GlobalPermits {
     /// [`SchedulerConfig::max_active_sessions`].
     pub(crate) async fn acquire_session(&self) -> OwnedSemaphorePermit {
         let start = Instant::now();
-        let permit = self
-            .sessions
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Scheduler semaphore should never be closed");
+        let permit = self.sessions.clone().acquire_owned().await.never_closed();
         record_acquired(
             PermitKind {
                 label: "session",
@@ -111,7 +106,7 @@ impl GlobalPermits {
         let sem = self.sessions.clone();
         match tokio::time::timeout(self.config.admission_timeout, sem.acquire_owned()).await {
             Ok(permit) => {
-                let permit = permit.expect("Scheduler semaphore should never be closed");
+                let permit = permit.never_closed();
                 record_acquired(kind, &self.sessions, start.elapsed());
                 Ok(permit)
             }
@@ -129,12 +124,7 @@ impl GlobalPermits {
     /// Acquires a permit for spawning a new agent runner.
     pub(crate) async fn acquire_agent(&self) -> OwnedSemaphorePermit {
         let start = Instant::now();
-        let permit = self
-            .agents
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Scheduler semaphore should never be closed");
+        let permit = self.agents.clone().acquire_owned().await.never_closed();
         record_acquired(
             PermitKind {
                 label: "agent",
@@ -157,7 +147,7 @@ impl GlobalPermits {
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed");
+            .never_closed();
         record_acquired(
             PermitKind {
                 label: "backend",
@@ -189,7 +179,7 @@ impl GlobalPermits {
                 None
             }
             permit = sem.acquire_owned() => {
-                let permit = permit.expect("Scheduler semaphore should never be closed");
+                let permit = permit.never_closed();
                 record_acquired(kind, &self.backend_requests, start.elapsed());
                 Some(permit)
             }
@@ -207,7 +197,7 @@ impl GlobalPermits {
             .clone()
             .acquire_owned()
             .await
-            .expect("Scheduler semaphore should never be closed");
+            .never_closed();
         record_acquired(
             PermitKind {
                 label: "tool",
@@ -239,7 +229,7 @@ impl GlobalPermits {
                 None
             }
             permit = sem.acquire_owned() => {
-                let permit = permit.expect("Scheduler semaphore should never be closed");
+                let permit = permit.never_closed();
                 record_acquired(kind, &self.tool_executions, start.elapsed());
                 Some(permit)
             }
@@ -249,12 +239,7 @@ impl GlobalPermits {
     /// Acquires a permit for spawning a child process.
     pub(crate) async fn acquire_process(&self) -> OwnedSemaphorePermit {
         let start = Instant::now();
-        let permit = self
-            .processes
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Scheduler semaphore should never be closed");
+        let permit = self.processes.clone().acquire_owned().await.never_closed();
         record_acquired(
             PermitKind {
                 label: "process",
@@ -286,7 +271,7 @@ impl GlobalPermits {
                 None
             }
             permit = sem.acquire_owned() => {
-                let permit = permit.expect("Scheduler semaphore should never be closed");
+                let permit = permit.never_closed();
                 record_acquired(kind, &self.processes, start.elapsed());
                 Some(permit)
             }
@@ -325,5 +310,16 @@ impl GlobalPermits {
                 ),
             ],
         }
+    }
+}
+
+/// The scheduler never closes its semaphores, so waiting on one always ends in a permit.
+pub(super) trait NeverClosed {
+    fn never_closed(self) -> OwnedSemaphorePermit;
+}
+
+impl NeverClosed for Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+    fn never_closed(self) -> OwnedSemaphorePermit {
+        self.expect("scheduler semaphores are never closed")
     }
 }

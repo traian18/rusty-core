@@ -13,6 +13,7 @@ use crate::traits::EventSink;
 use crate::workspace::FakeWorkspace;
 
 use super::*;
+use crate::session_runtime::SessionHost;
 
 struct NoopSink;
 impl EventSink for NoopSink {
@@ -49,16 +50,20 @@ async fn snapshot_reflects_in_flight_then_completed_status() {
     let tool_registry = Arc::new(FakeToolRegistry::new());
     let workspace = Arc::new(FakeWorkspace::new());
 
-    let runtime = Arc::new(SessionRuntime::new_with_scheduler(
-        session_id,
-        backend,
-        tool_registry,
-        workspace,
-        Arc::new(NoopSink),
+    let runtime = Arc::new(SessionRuntime::start(
+        SessionHost {
+            scheduler,
+            ..SessionHost::new(
+                session_id,
+                backend,
+                tool_registry,
+                workspace,
+                Arc::new(NoopSink),
+            )
+        },
         AgentToolset {
             tools: std::collections::HashMap::new(),
         },
-        scheduler,
         None,
     ));
     let client = SessionClient::new(runtime);
@@ -137,16 +142,20 @@ async fn snapshot_reports_failed_status_truthfully() {
     let tool_registry = Arc::new(FakeToolRegistry::new());
     let workspace = Arc::new(FakeWorkspace::new());
 
-    let runtime = Arc::new(SessionRuntime::new_with_scheduler(
-        session_id,
-        backend,
-        tool_registry,
-        workspace,
-        Arc::new(NoopSink),
+    let runtime = Arc::new(SessionRuntime::start(
+        SessionHost {
+            scheduler,
+            ..SessionHost::new(
+                session_id,
+                backend,
+                tool_registry,
+                workspace,
+                Arc::new(NoopSink),
+            )
+        },
         AgentToolset {
             tools: std::collections::HashMap::new(),
         },
-        scheduler,
         None,
     ));
     let client = SessionClient::new(runtime);

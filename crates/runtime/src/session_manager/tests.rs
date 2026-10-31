@@ -27,7 +27,7 @@ use crate::session_manager::contracts::{
 use crate::session_manager::errors::SessionManagerError;
 use crate::session_manager::manager::SessionManager;
 use crate::session_manager::registry::ActiveSessionRegistry;
-use crate::session_runtime::SessionStatus;
+use crate::session_runtime::{SessionHost, SessionStatus};
 use crate::testing::{FakeBackend, FakeToolRegistry};
 use crate::traits::{EventSink, ExecutionBackend};
 use crate::workspace::FakeWorkspace;
@@ -927,16 +927,20 @@ async fn active_session_registry_operations() {
     let scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
     let permit = scheduler.acquire_session_permit().await;
     let session_id = SessionId::new();
-    let runtime = Arc::new(crate::session_runtime::SessionRuntime::new_with_scheduler(
-        session_id,
-        noop_backend(),
-        Arc::new(FakeToolRegistry::new()),
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+    let runtime = Arc::new(crate::session_runtime::SessionRuntime::start(
+        SessionHost {
+            scheduler,
+            ..SessionHost::new(
+                session_id,
+                noop_backend(),
+                Arc::new(FakeToolRegistry::new()),
+                Arc::new(FakeWorkspace::new()),
+                Arc::new(NoopSink),
+            )
+        },
         AgentToolset {
             tools: HashMap::new(),
         },
-        scheduler,
         None,
     ));
 

@@ -5,6 +5,7 @@
 //! `SessionCommand`s into agent-level commands, while offering lightweight
 //! read projections (snapshots) and an ordered event subscription view.
 
+use crate::locks::MutexExt;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -194,11 +195,7 @@ impl SessionClient {
         };
 
         let context = {
-            let state = self
-                .runtime
-                .state
-                .lock()
-                .expect("session state mutex poisoned");
+            let state = self.runtime.state.lock_or_recover();
             let agent = state.agents.get(&runtime_snapshot.root_agent_id);
             match agent {
                 Some(agent) => ContextSnapshot {

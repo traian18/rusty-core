@@ -12,6 +12,7 @@
 //!   (`AgentCapabilities`, `UsageLedger`) back into their live core types
 //!   during restore.
 
+use crate::locks::MutexExt;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -109,8 +110,7 @@ pub(crate) fn build_snapshot(
     compaction_generation: u64,
 ) -> DurableSessionSnapshot {
     let agents = projection
-        .lock()
-        .expect("projection mutex poisoned")
+        .lock_or_recover()
         .values()
         .cloned()
         .collect::<Vec<_>>();

@@ -11,6 +11,7 @@
 //! triplicated; [`spawn_runner`] is the single place it can drift out of
 //! sync from.
 
+use crate::locks::MutexExt;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -90,12 +91,10 @@ pub(super) fn spawn_runner(
     agent_supervisor.register_agent_token(agent_id, agent_cancel.clone());
 
     live_state
-        .lock()
-        .expect("live_state mutex poisoned")
+        .lock_or_recover()
         .insert(agent_id, AgentLiveState::default());
     projection
-        .lock()
-        .expect("projection mutex poisoned")
+        .lock_or_recover()
         .insert(agent_id, stored_agent_state(&agent));
 
     // Bridge to the external event sink (persistence, logging). The agent
