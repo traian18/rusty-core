@@ -1,0 +1,23 @@
+[package]
+name = "rusty-workspace"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true, features = ["fs", "sync", "io-util", "rt", "macros"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+git2 = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
