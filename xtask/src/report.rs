@@ -1,4 +1,5 @@
-//! How a check reports: findings are printed, and only `--strict` turns them into a failure.
+//! How a check reports: findings are printed and any finding is a failure, unless `--warn` asks
+//! for a report only.
 
 use std::process::ExitCode;
 
@@ -17,7 +18,8 @@ impl Finding {
     }
 }
 
-/// Warn mode lets the rewrite make progress crate by crate; strict mode is for CI at the end.
+/// Strict is the default and what CI runs. Warn prints the findings and succeeds, for looking at
+/// the debt while working on it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Warn,
@@ -26,10 +28,10 @@ pub enum Mode {
 
 impl Mode {
     pub fn from_args(args: &[String]) -> Self {
-        if args.iter().any(|argument| argument == "--strict") {
-            Self::Strict
-        } else {
+        if args.iter().any(|argument| argument == "--warn") {
             Self::Warn
+        } else {
+            Self::Strict
         }
     }
 }
