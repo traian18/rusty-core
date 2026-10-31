@@ -6,7 +6,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub(crate) trait MutexExt<T> {
+pub trait MutexExt<T> {
     fn lock_or_recover(&self) -> MutexGuard<'_, T>;
 }
 
@@ -16,7 +16,7 @@ impl<T> MutexExt<T> for Mutex<T> {
     }
 }
 
-pub(crate) trait RwLockExt<T> {
+pub trait RwLockExt<T> {
     fn read_or_recover(&self) -> RwLockReadGuard<'_, T>;
     fn write_or_recover(&self) -> RwLockWriteGuard<'_, T>;
 }

@@ -146,16 +146,29 @@ pub fn drop_prefix(
     retention: &Retention,
     note: impl FnOnce(usize) -> AgentMessage,
 ) -> usize {
-    let len = messages.len();
-    if len <= keep {
+    if messages.len() <= keep {
         return 0;
     }
-    let mut kept = vec![false; len];
-    for (index, flag) in kept.iter_mut().enumerate() {
-        *flag = index >= len - keep || retention.is_protected(messages, index);
+    let mut kept = initially_kept(messages, keep, retention);
+    close_over_tool_pairs(messages, &mut kept);
+    let dropped = kept.iter().filter(|k| !**k).count();
+    if dropped == 0 {
+        return 0;
     }
+    *messages = without_dropped(std::mem::take(messages), &kept, dropped, note);
+    dropped
+}
 
-    // Close the kept set over tool pairs until stable.
+/// The messages kept before pairing: the last `keep` and every protected one.
+fn initially_kept(messages: &[AgentMessage], keep: usize, retention: &Retention) -> Vec<bool> {
+    let len = messages.len();
+    (0..len)
+        .map(|index| index >= len - keep || retention.is_protected(messages, index))
+        .collect()
+}
+
+/// Keeps both halves of every tool call that has one half kept, until the set is stable.
+fn close_over_tool_pairs(messages: &[AgentMessage], kept: &mut [bool]) {
     let mut owner_of_use: HashMap<ToolCallId, usize> = HashMap::new();
     let mut owner_of_result: HashMap<ToolCallId, usize> = HashMap::new();
     for (index, message) in messages.iter().enumerate() {
@@ -164,13 +177,14 @@ pub fn drop_prefix(
     }
     loop {
         let mut changed = false;
-        for index in 0..len {
+        for index in 0..messages.len() {
             if !kept[index] {
                 continue;
             }
-            let partners = tool_result_ids(&messages[index])
+            let message = &messages[index];
+            let partners = tool_result_ids(message)
                 .filter_map(|id| owner_of_use.get(&id))
-                .chain(tool_use_ids(&messages[index]).filter_map(|id| owner_of_result.get(&id)));
+                .chain(tool_use_ids(message).filter_map(|id| owner_of_result.get(&id)));
             for &partner in partners {
                 if !kept[partner] {
                     kept[partner] = true;
@@ -179,22 +193,23 @@ pub fn drop_prefix(
             }
         }
         if !changed {
-            break;
+            return;
         }
     }
+}
 
-    let dropped = kept.iter().filter(|k| !**k).count();
-    if dropped == 0 {
-        return 0;
-    }
-
-    // Place the note after the last kept message that precedes the first
-    // retained tail message; simplest stable rule: before the first kept
-    // message that follows a dropped one.
-    let mut out = Vec::with_capacity(len - dropped + 1);
+/// The kept messages, with `note(dropped)` before the first kept message that follows a dropped
+/// one (or at the end when the dropped ones were last).
+fn without_dropped(
+    messages: Vec<AgentMessage>,
+    kept: &[bool],
+    dropped: usize,
+    note: impl FnOnce(usize) -> AgentMessage,
+) -> Vec<AgentMessage> {
+    let mut out = Vec::with_capacity(messages.len() - dropped + 1);
     let mut note = Some(note);
     let mut pending_gap = false;
-    for (message, keep_it) in std::mem::take(messages).into_iter().zip(kept) {
+    for (message, keep_it) in messages.into_iter().zip(kept) {
         if !keep_it {
             pending_gap = true;
             continue;
@@ -210,8 +225,7 @@ pub fn drop_prefix(
     if let Some(make) = note.take() {
         out.push(make(dropped));
     }
-    *messages = out;
-    dropped
+    out
 }
 
 /// Builds the synthetic system note marking dropped history.
