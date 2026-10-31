@@ -16,23 +16,25 @@
 //! # let _ = (updates, output); Ok(()) }
 //! ```
 
+mod checks;
+mod run;
+
 use std::sync::{Arc, RwLock};
 
 use rusty_workflow_core::{
     self as orchestration, CompiledOrchestration, DefinitionRef, DefinitionRegistry,
-    OrchestrationDefinition, OrchestrationDefinitionId, OrchestrationNodeId, OrchestrationNodeKind,
-    OrchestrationRunId, RunOptions, SubflowTarget, MAX_SUBFLOW_DEPTH,
+    OrchestrationDefinition, OrchestrationDefinitionId, OrchestrationNodeId, OrchestrationRunId,
+    RunOptions, SubflowTarget, MAX_SUBFLOW_DEPTH,
 };
 use rusty_workflow_runtime::{
     orchestration::{
-        drive_child, AgentExecutionError, InMemorySchemaResolver, OrchestrationHandle,
-        OrchestrationRunOutput, OrchestrationRunner, OrchestrationStore, SchemaResolver,
-        StepContext, SubflowExecutor, SubflowRequest, WorkspaceArtifactResolver,
+        drive_child, AgentExecutionError, InMemorySchemaResolver, OrchestrationRunner,
+        OrchestrationStore, SchemaResolver, StepContext, SubflowExecutor, SubflowRequest,
+        WorkspaceArtifactResolver,
     },
     session_agent_executor::IsolatedSessionAgentExecutor,
 };
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 use crate::{HarnessError, SessionHandle};
 
@@ -155,88 +157,7 @@ impl OrchestrationRequest {
     }
 }
 
-impl SessionHandle {
-    /// Start a workflow. Every agent-step attempt runs in a fresh, isolated,
-    /// tool-scoped session that inherits this session's backend, workspace,
-    /// active model, and tool permission policies. Permission requests are
-    /// surfaced through the returned handle.
-    pub async fn start_orchestration(
-        &self,
-        request: OrchestrationRequest,
-    ) -> Result<OrchestrationHandle, HarnessError> {
-        self.orchestration_runner(&request.definition)
-            .await?
-            .with_options(request.options)
-            .start(request.run_id, request.input)
-            .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
-    }
-
-    /// Start a workflow and wait for its result, cancelling it when
-    /// `cancellation` fires.
-    pub async fn run_orchestration(
-        &self,
-        request: OrchestrationRequest,
-        cancellation: CancellationToken,
-    ) -> Result<OrchestrationRunOutput, HarnessError> {
-        self.orchestration_runner(&request.definition)
-            .await?
-            .with_options(request.options)
-            .run(request.run_id, request.input, cancellation)
-            .await
-            .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
-    }
-
-    /// Resume a run from its last durable step boundary (requires a store on
-    /// the [`OrchestrationConfig`]). `definition` must name the exact
-    /// revision the run started on.
-    pub async fn resume_orchestration(
-        &self,
-        run_id: OrchestrationRunId,
-        definition: DefinitionRef,
-    ) -> Result<OrchestrationHandle, HarnessError> {
-        self.orchestration_runner(&definition)
-            .await?
-            .resume(run_id)
-            .await
-            .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
-    }
-
-    /// Retry only the failed step of a validated checkpoint, on this session's backend.
-    pub async fn retry_orchestration(
-        &self,
-        request: OrchestrationRequest,
-        state: rusty_workflow_core::OrchestrationRunState,
-        guidance: String,
-    ) -> Result<OrchestrationHandle, HarnessError> {
-        self.orchestration_runner(&request.definition)
-            .await?
-            .retry_failed(state, request.run_id, guidance)
-            .map_err(|error| HarnessError::OrchestrationRuntime(error.to_string()))
-    }
-
-    async fn orchestration_runner(
-        &self,
-        definition: &DefinitionRef,
-    ) -> Result<OrchestrationRunner, HarnessError> {
-        let config = self
-            .orchestration
-            .as_ref()
-            .ok_or(HarnessError::OrchestrationNotConfigured)?;
-        let parts = Arc::new(RunnerParts {
-            session_id: self.session_id,
-            session_manager: self.session_manager.clone(),
-            config: config.clone(),
-            profiles: self.profiles.clone(),
-            command_trust: self.command_trust,
-        });
-        let compiled = Arc::new(parts.resolve(definition)?);
-        // Everything the run may reach -- other flows, steps run as flows --
-        // must exist, must not call back into itself and must have profiles
-        // that resolve, before anything runs.
-        parts.check_reachable(&compiled)?;
-        parts.runner(compiled, 0).await
-    }
-}
+impl SessionHandle {}
 
 /// What it takes to build runners for the flows of one session: the session
 /// they borrow tools, workspace and backend from, the registered flows, and
@@ -293,86 +214,6 @@ impl RunnerParts {
                     })
             }
         }
-    }
-
-    /// Every flow `compiled` can reach through subflow nodes must exist and
-    /// the chain must not loop or nest deeper than [`MAX_SUBFLOW_DEPTH`].
-    /// The profiles of all of them must resolve.
-    fn check_reachable(&self, compiled: &Arc<CompiledOrchestration>) -> Result<(), HarnessError> {
-        let mut chain = Vec::new();
-        self.check_flow(compiled, 0, &mut chain)
-    }
-
-    fn check_flow(
-        &self,
-        compiled: &Arc<CompiledOrchestration>,
-        depth: u32,
-        chain: &mut Vec<(String, u64)>,
-    ) -> Result<(), HarnessError> {
-        let key = (compiled.definition_id.to_string(), compiled.revision);
-        if chain.contains(&key) {
-            return Err(HarnessError::OrchestrationDefinition(format!(
-                "flow {}@{} runs itself through its subflows",
-                key.0, key.1
-            )));
-        }
-        chain.push(key);
-        self.check_profiles(compiled)?;
-        for node in compiled.nodes.values() {
-            let targets: Vec<&SubflowTarget> = match &node.kind {
-                OrchestrationNodeKind::Subflow(config) => vec![&config.target],
-                OrchestrationNodeKind::Agent(config) => config
-                    .task_queue
-                    .iter()
-                    .flat_map(|queue| queue.flows.values())
-                    .collect(),
-                _ => continue,
-            };
-            if targets.is_empty() {
-                continue;
-            }
-            if depth + 1 > MAX_SUBFLOW_DEPTH {
-                return Err(HarnessError::OrchestrationDefinition(format!(
-                    "node {}: flows may run flows at most {MAX_SUBFLOW_DEPTH} levels deep",
-                    node.id
-                )));
-            }
-            let inputs: Vec<String> = node
-                .input_bindings
-                .iter()
-                .map(|binding| binding.target.clone())
-                .collect();
-            for target in targets {
-                let child = self.target(&node.id, target, &inputs)?;
-                self.check_flow(&child, depth + 1, chain)?;
-            }
-        }
-        chain.pop();
-        Ok(())
-    }
-
-    /// Every profile a step names must resolve before anything runs.
-    fn check_profiles(&self, compiled: &CompiledOrchestration) -> Result<(), HarnessError> {
-        for node in compiled.nodes.values() {
-            let OrchestrationNodeKind::Agent(config) = &node.kind else {
-                continue;
-            };
-            let queue = config.task_queue.iter().flat_map(|queue| queue.profiles());
-            for reference in config.profile.iter().chain(queue) {
-                let closure = self
-                    .profiles
-                    .resolve(reference)
-                    .and_then(|profile| self.profiles.resolve_closure(&profile))
-                    .map_err(|error| {
-                        HarnessError::OrchestrationDefinition(format!("node {}: {error}", node.id))
-                    })?;
-                crate::profiles::check_command_trust(&self.profiles, &closure, self.command_trust)
-                    .map_err(|error| {
-                        HarnessError::OrchestrationDefinition(format!("node {}: {error}", node.id))
-                    })?;
-            }
-        }
-        Ok(())
     }
 
     /// A runner for `compiled` on this session, `depth` levels down.

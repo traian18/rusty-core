@@ -16,7 +16,12 @@ pub use builder::HarnessBuilder;
 pub use harness::Harness;
 pub use orchestration::{OrchestrationConfig, OrchestrationRequest, DEFAULT_ORCHESTRATION_ID};
 pub use profiles::{import_hooks, CommandTrust, HooksImport, ProfilesConfig};
-pub use providers::*;
+pub use providers::{
+    AdapterKind, AuthFlowHandle, AuthFlowState, AuthMethod, BackendSelection, CredentialProfileId,
+    CredentialProfileSummary, CredentialState, CredentialStore, EnvironmentCredentialStore,
+    ModelCapabilities, ModelDescriptor, ProviderDescriptor, ProviderHealth, ProviderKey,
+    SecretString, SecureCredentialStore,
+};
 pub use rusty_agent_core::behavior::{BehaviorProfile, ProfileRef};
 pub use rusty_workflow_core::{
     InputResponse, OrchestrationRunState, OrchestrationStatus, Responder, RunOptions,

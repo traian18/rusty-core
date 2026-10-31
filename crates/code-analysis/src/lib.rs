@@ -19,7 +19,13 @@ pub use adapters::{
 };
 pub use api::{CallGraph, CallGraphError};
 pub use builder::CallGraphBuilder;
-pub use model::*;
+pub use model::{
+    CallGraphCapabilities, CallSite, CallableKind, CallableResponse, CallableSymbol,
+    CallsFromRequest, CallsResponse, CallsToRequest, Diagnostic, Direction, Evidence,
+    FindCallablesRequest, LanguageCapabilities, LanguageId, Page, QueryMetadata, RefreshRequest,
+    RefreshResponse, RefreshStats, Resolution, SnapshotId, SourceSpan, SymbolId, TraversalLimit,
+    TraversalRequest, TraversalResponse,
+};
 pub use service::DefaultCallGraph;
 pub use snapshot_repository::{GraphSnapshot, InMemorySnapshotRepository, SnapshotRepository};
 pub use source::{AnalysisSource, FileSystemSource, OpenHook, SourceDiscovery, SourceFile};

@@ -194,8 +194,24 @@ fn this_pass(out: &mut String, goal: &Goal, current: &Measurement) {
 
 /// The message pass `goal.passes + 1` is sent, measured as `current`.
 pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
-    let pass = goal.passes + 1;
     let mut out = String::new();
+    pass_header(&mut out, goal);
+    let _ = writeln!(out, "\n## Goal\n{}", goal.instruction.trim());
+    done_when_section(&mut out, goal);
+    scope_section(&mut out, goal);
+    standing_section(&mut out, goal, current);
+    earlier_passes_section(&mut out, goal);
+    if goal.is_task() {
+        task_pass(&mut out, goal);
+    } else {
+        this_pass(&mut out, goal, current);
+    }
+    judge_request(&mut out, goal);
+    out
+}
+
+fn pass_header(out: &mut String, goal: &Goal) {
+    let pass = goal.passes + 1;
     match goal.budget.max_passes {
         Some(max) => {
             let _ = writeln!(out, "Goal pass {pass} of at most {max}.");
@@ -208,9 +224,10 @@ pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
             );
         }
     }
-    let _ = writeln!(out, "\n## Goal\n{}", goal.instruction.trim());
+}
+
+fn done_when_section(out: &mut String, goal: &Goal) {
     let _ = writeln!(out, "\n## Done when");
-    let unmet = unmet(goal, &goal.plan, current);
     if goal.is_task() {
         let _ = writeln!(
             out,
@@ -249,6 +266,9 @@ pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
     if let Some(words) = &goal.targets.done_when {
         let _ = writeln!(out, "- {words}");
     }
+}
+
+fn scope_section(out: &mut String, goal: &Goal) {
     let scope = if goal.scope.is_empty() {
         "the files you change".to_owned()
     } else {
@@ -269,22 +289,29 @@ pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
             let _ = writeln!(out, "\nScope: {scope}.");
         }
     }
+}
+
+fn standing_section(out: &mut String, goal: &Goal, current: &Measurement) {
+    let unmet = unmet(goal, &goal.plan, current);
     let _ = writeln!(out, "\n## Where it stands");
     if goal.is_task() {
-        plan_section(&mut out, goal);
+        plan_section(out, goal);
         if !current.files.is_empty() {
             let _ = writeln!(out, "\nFiles changed so far: {}", current.headline());
         }
     } else {
         let _ = writeln!(out, "{}", current.headline());
     }
-    measurement_section(&mut out, current, &goal.targets);
+    measurement_section(out, current, &goal.targets);
     if !unmet.is_empty() {
         let _ = writeln!(out, "\nNot met yet:");
         for item in &unmet {
             let _ = writeln!(out, "- {}: {}", item.target, item.detail);
         }
     }
+}
+
+fn earlier_passes_section(out: &mut String, goal: &Goal) {
     let recent: Vec<_> = goal.journal.iter().rev().take(JOURNAL_LINES).collect();
     if !recent.is_empty() {
         let _ = writeln!(out, "\n## Earlier passes");
@@ -299,11 +326,10 @@ pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
             let _ = writeln!(out, "\nThe last pass left this for you: {next}");
         }
     }
-    if goal.is_task() {
-        task_pass(&mut out, goal);
-    } else {
-        this_pass(&mut out, goal, current);
-    }
+}
+
+/// Asks for the strict "done when" verdict, when the goal has one in words.
+fn judge_request(out: &mut String, goal: &Goal) {
     if let Some(words) = goal.done_when() {
         let what = if goal.targets.done_when.is_none() {
             "whether the goal is fully done".to_owned()
@@ -315,7 +341,6 @@ pub fn pass_prompt(goal: &Goal, current: &Measurement) -> String {
             " Before the status line, judge {what} strictly, from the result as you leave it: `Done when: yes — <the evidence>` or `Done when: no — <what is left>`. It counts only once everything else above is met."
         );
     }
-    out
 }
 
 /// The goal in a few lines, for `/goal status` and the chat.
