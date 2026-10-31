@@ -187,164 +187,17 @@ pub fn compute(
             },
         );
     };
-    let mut tallies: BTreeMap<RootRelativePath, Tally> = BTreeMap::new();
-    let mut fix_total = 0;
-    let mut active: std::collections::BTreeSet<ContributorId> = std::collections::BTreeSet::new();
-    for (commit, paths) in commits.iter().zip(head_paths) {
-        if commit.is_merge() {
-            continue;
-        }
-        // Lines per analysed file in this commit, at HEAD paths.
-        let mut touched: BTreeMap<&RootRelativePath, u64> = BTreeMap::new();
-        for (change, head) in commit.changes.iter().zip(paths) {
-            if exclusions.excludes(head) || exclusions.excludes(&change.path) {
-                continue;
-            }
-            let lines = u64::from(change.lines_added.unwrap_or(0))
-                + u64::from(change.lines_removed.unwrap_or(0));
-            *touched.entry(head).or_default() += lines;
-        }
-        if touched.is_empty() {
-            continue;
-        }
-        let age = (now - commit.author_time).max(0);
-        let recent = age <= RECENT_DAYS * DAY;
-        let fix = age <= FIX_WINDOW_DAYS * DAY && commit.is_fix();
-        fix_total += u32::from(fix);
-        let weight = 0.5_f64.powf(age as f64 / DAY as f64 / HALF_LIFE_DAYS);
-        let entropy = if (2..=ENTROPY_MAX_FILES).contains(&touched.len()) {
-            let total: u64 = touched.values().sum();
-            let n = touched.len() as f64;
-            if total == 0 {
-                1.0
-            } else {
-                -touched
-                    .values()
-                    .filter(|l| **l > 0)
-                    .map(|l| {
-                        let p = *l as f64 / total as f64;
-                        p * p.log2()
-                    })
-                    .sum::<f64>()
-                    / n.log2()
-            }
-        } else {
-            0.0
-        };
-        if recent {
-            active.insert(commit.contributor.id.clone());
-        }
-        let together: Vec<RootRelativePath> = if (2..=ENTROPY_MAX_FILES).contains(&touched.len()) {
-            touched.keys().map(|p| (*p).clone()).collect()
-        } else {
-            Vec::new()
-        };
-        for (path, lines) in touched {
-            let t = tallies.entry(path.clone()).or_insert_with(|| Tally {
-                first: commit.author_time,
-                last: commit.author_time,
-                ..Default::default()
-            });
-            t.commits += 1;
-            t.first = t.first.min(commit.author_time);
-            t.last = t.last.max(commit.author_time);
-            t.decayed += weight * lines as f64 / LINES_PER_POINT;
-            t.entropy += entropy;
-            for partner in together.iter().filter(|p| *p != path) {
-                *t.partners.entry(partner.clone()).or_default() += 1;
-            }
-            let author = (
-                commit.contributor.id.clone(),
-                commit.contributor.name.clone(),
-            );
-            // Commits arrive newest first, so the first name seen is the newest spelling.
-            t.authors
-                .entry(author.0.clone())
-                .or_insert((author.1.clone(), 0))
-                .1 += 1;
-            if recent {
-                t.commits_recent += 1;
-                t.lines_recent += lines;
-                t.recent_authors.entry(author.0).or_insert((author.1, 0)).1 += 1;
-            }
-            if fix {
-                t.fixes += 1;
-                if t.fix_examples.len() < FIX_EXAMPLES {
-                    t.fix_examples.push(commit.id.clone());
-                }
-            }
-        }
-    }
-    let decayed: Vec<u32> = tallies
-        .values()
-        .map(|t| (t.decayed * 1000.0).round() as u32)
-        .collect();
-    let entropy: Vec<u32> = tallies
-        .values()
-        .map(|t| (t.entropy * 1000.0).round() as u32)
-        .collect();
-    let churn_pct = percentiles(&decayed);
-    let entropy_pct = percentiles(&entropy);
-    let fixes: Vec<u32> = tallies.values().map(|t| t.fixes).collect();
-    let fix_pct = percentiles(&fixes);
-    let partners: Vec<u32> = tallies
-        .values()
-        .map(|t| {
-            t.partners
-                .values()
-                .filter(|n| **n >= MIN_PARTNER_COMMITS)
-                .count() as u32
-        })
-        .collect();
-    let partner_pct = percentiles(&partners);
+    let walked = tally_commits(commits, head_paths, exclusions, now);
+    let ranks = Ranks::of(&walked.tallies);
     let mut hotspots = 0;
-    let signals: Vec<FileSignals> = tallies
+    let signals: Vec<FileSignals> = walked
+        .tallies
         .into_iter()
         .enumerate()
-        .map(|(i, (file, t))| {
-            let (owner, owner_share) = top(&t.authors, t.commits);
-            let owner_recent = owner
-                .as_ref()
-                .and_then(|o| t.recent_authors.get(&o.id))
-                .map_or(0, |(_, n)| n * 1000 / t.commits_recent.max(1));
-            let (recent_owner, recent_share) = top(&t.recent_authors, t.commits_recent);
-            let minor = t
-                .authors
-                .values()
-                .filter(|(_, c)| c * 1000 / t.commits.max(1) < MINOR_SHARE)
-                .count() as u32;
-            let hotspot = churn_pct[i] >= HOTSPOT_PERCENTILE
-                && t.commits_recent >= HOTSPOT_MIN_RECENT_COMMITS
-                && (decayed[i] >= HOTSPOT_MIN_DECAYED
-                    || t.commits_recent >= HOTSPOT_HIGH_RECENT_COMMITS);
-            hotspots += u32::from(hotspot);
-            FileSignals {
-                file,
-                commits: t.commits,
-                commits_recent: t.commits_recent,
-                lines_changed_recent: t.lines_recent,
-                fix_commits: t.fixes,
-                fix_examples: t.fix_examples,
-                decayed_churn_milli: decayed[i],
-                churn_percentile_per_mille: churn_pct[i],
-                hotspot,
-                change_entropy_milli: entropy[i],
-                change_entropy_percentile_per_mille: entropy_pct[i],
-                contributors: t.authors.len() as u32,
-                owner,
-                owner_share_per_mille: owner_share,
-                recent_owner,
-                recent_owner_share_per_mille: recent_share,
-                minor_contributors: minor,
-                bus_factor: bus_factor(&t.authors, t.commits),
-                fix_percentile_per_mille: fix_pct[i],
-                recent_contributors: t.recent_authors.len() as u32,
-                owner_recent_share_per_mille: owner_recent,
-                co_change_partners: partners[i],
-                co_change_percentile_per_mille: partner_pct[i],
-                age_days: ((now - t.first).max(0) / DAY) as u32,
-                idle_days: ((now - t.last).max(0) / DAY) as u32,
-            }
+        .map(|(i, (file, tally))| {
+            let signal = file_signals(file, tally, &ranks, i, now);
+            hotspots += u32::from(signal.hotspot);
+            signal
         })
         .collect();
     let summary = SignalSummary {
@@ -354,8 +207,235 @@ pub fn compute(
         recent_days: RECENT_DAYS as u32,
         fix_window_days: FIX_WINDOW_DAYS as u32,
         hotspots,
-        active_contributors_recent: active.len() as u32,
-        fix_commits: fix_total,
+        active_contributors_recent: walked.active.len() as u32,
+        fix_commits: walked.fix_total,
     };
     (signals, summary)
+}
+
+/// What walking every commit adds up to.
+struct Walked {
+    tallies: BTreeMap<RootRelativePath, Tally>,
+    fix_total: u32,
+    active: std::collections::BTreeSet<ContributorId>,
+}
+
+fn tally_commits(
+    commits: &[CommitFact],
+    head_paths: &[Vec<RootRelativePath>],
+    exclusions: &ExclusionSet,
+    now: i64,
+) -> Walked {
+    let mut walked = Walked {
+        tallies: BTreeMap::new(),
+        fix_total: 0,
+        active: std::collections::BTreeSet::new(),
+    };
+    for (commit, paths) in commits.iter().zip(head_paths) {
+        if commit.is_merge() {
+            continue;
+        }
+        let touched = touched_files(commit, paths, exclusions);
+        if touched.is_empty() {
+            continue;
+        }
+        let age = (now - commit.author_time).max(0);
+        let when = When {
+            recent: age <= RECENT_DAYS * DAY,
+            fix: age <= FIX_WINDOW_DAYS * DAY && commit.is_fix(),
+            weight: 0.5_f64.powf(age as f64 / DAY as f64 / HALF_LIFE_DAYS),
+        };
+        walked.fix_total += u32::from(when.fix);
+        if when.recent {
+            walked.active.insert(commit.contributor.id.clone());
+        }
+        record_commit(&mut walked.tallies, commit, touched, &when);
+    }
+    walked
+}
+
+/// Lines per analysed file in this commit, at HEAD paths.
+fn touched_files<'a>(
+    commit: &CommitFact,
+    paths: &'a [RootRelativePath],
+    exclusions: &ExclusionSet,
+) -> BTreeMap<&'a RootRelativePath, u64> {
+    let mut touched: BTreeMap<&RootRelativePath, u64> = BTreeMap::new();
+    for (change, head) in commit.changes.iter().zip(paths) {
+        if exclusions.excludes(head) || exclusions.excludes(&change.path) {
+            continue;
+        }
+        let lines = u64::from(change.lines_added.unwrap_or(0))
+            + u64::from(change.lines_removed.unwrap_or(0));
+        *touched.entry(head).or_default() += lines;
+    }
+    touched
+}
+
+/// How a commit counts: recent, a fix, and its weight after decay.
+struct When {
+    recent: bool,
+    fix: bool,
+    weight: f64,
+}
+
+/// Change entropy of one commit's spread over its files; zero unless it touches a few files.
+fn commit_entropy(touched: &BTreeMap<&RootRelativePath, u64>) -> f64 {
+    if !(2..=ENTROPY_MAX_FILES).contains(&touched.len()) {
+        return 0.0;
+    }
+    let total: u64 = touched.values().sum();
+    if total == 0 {
+        return 1.0;
+    }
+    let n = touched.len() as f64;
+    -touched
+        .values()
+        .filter(|l| **l > 0)
+        .map(|l| {
+            let p = *l as f64 / total as f64;
+            p * p.log2()
+        })
+        .sum::<f64>()
+        / n.log2()
+}
+
+fn record_commit(
+    tallies: &mut BTreeMap<RootRelativePath, Tally>,
+    commit: &CommitFact,
+    touched: BTreeMap<&RootRelativePath, u64>,
+    when: &When,
+) {
+    let entropy = commit_entropy(&touched);
+    let together: Vec<RootRelativePath> = if (2..=ENTROPY_MAX_FILES).contains(&touched.len()) {
+        touched.keys().map(|p| (*p).clone()).collect()
+    } else {
+        Vec::new()
+    };
+    for (path, lines) in touched {
+        let t = tallies.entry(path.clone()).or_insert_with(|| Tally {
+            first: commit.author_time,
+            last: commit.author_time,
+            ..Default::default()
+        });
+        t.commits += 1;
+        t.first = t.first.min(commit.author_time);
+        t.last = t.last.max(commit.author_time);
+        t.decayed += when.weight * lines as f64 / LINES_PER_POINT;
+        t.entropy += entropy;
+        for partner in together.iter().filter(|p| *p != path) {
+            *t.partners.entry(partner.clone()).or_default() += 1;
+        }
+        let (id, name) = (
+            commit.contributor.id.clone(),
+            commit.contributor.name.clone(),
+        );
+        // Commits arrive newest first, so the first name seen is the newest spelling.
+        t.authors.entry(id.clone()).or_insert((name.clone(), 0)).1 += 1;
+        if when.recent {
+            t.commits_recent += 1;
+            t.lines_recent += lines;
+            t.recent_authors.entry(id).or_insert((name, 0)).1 += 1;
+        }
+        if when.fix {
+            t.fixes += 1;
+            if t.fix_examples.len() < FIX_EXAMPLES {
+                t.fix_examples.push(commit.id.clone());
+            }
+        }
+    }
+}
+
+/// Each file's standing among the others, per measure, in the order of the tallies.
+struct Ranks {
+    decayed: Vec<u32>,
+    entropy: Vec<u32>,
+    churn_pct: Vec<u32>,
+    entropy_pct: Vec<u32>,
+    fix_pct: Vec<u32>,
+    partners: Vec<u32>,
+    partner_pct: Vec<u32>,
+}
+
+impl Ranks {
+    fn of(tallies: &BTreeMap<RootRelativePath, Tally>) -> Self {
+        let decayed: Vec<u32> = tallies
+            .values()
+            .map(|t| (t.decayed * 1000.0).round() as u32)
+            .collect();
+        let entropy: Vec<u32> = tallies
+            .values()
+            .map(|t| (t.entropy * 1000.0).round() as u32)
+            .collect();
+        let fixes: Vec<u32> = tallies.values().map(|t| t.fixes).collect();
+        let partners: Vec<u32> = tallies
+            .values()
+            .map(|t| {
+                t.partners
+                    .values()
+                    .filter(|n| **n >= MIN_PARTNER_COMMITS)
+                    .count() as u32
+            })
+            .collect();
+        Self {
+            churn_pct: percentiles(&decayed),
+            entropy_pct: percentiles(&entropy),
+            fix_pct: percentiles(&fixes),
+            partner_pct: percentiles(&partners),
+            decayed,
+            entropy,
+            partners,
+        }
+    }
+}
+
+fn file_signals(
+    file: RootRelativePath,
+    t: Tally,
+    ranks: &Ranks,
+    i: usize,
+    now: i64,
+) -> FileSignals {
+    let (owner, owner_share) = top(&t.authors, t.commits);
+    let owner_recent = owner
+        .as_ref()
+        .and_then(|o| t.recent_authors.get(&o.id))
+        .map_or(0, |(_, n)| n * 1000 / t.commits_recent.max(1));
+    let (recent_owner, recent_share) = top(&t.recent_authors, t.commits_recent);
+    let minor = t
+        .authors
+        .values()
+        .filter(|(_, c)| c * 1000 / t.commits.max(1) < MINOR_SHARE)
+        .count() as u32;
+    let hotspot = ranks.churn_pct[i] >= HOTSPOT_PERCENTILE
+        && t.commits_recent >= HOTSPOT_MIN_RECENT_COMMITS
+        && (ranks.decayed[i] >= HOTSPOT_MIN_DECAYED
+            || t.commits_recent >= HOTSPOT_HIGH_RECENT_COMMITS);
+    FileSignals {
+        file,
+        commits: t.commits,
+        commits_recent: t.commits_recent,
+        lines_changed_recent: t.lines_recent,
+        fix_commits: t.fixes,
+        fix_examples: t.fix_examples,
+        decayed_churn_milli: ranks.decayed[i],
+        churn_percentile_per_mille: ranks.churn_pct[i],
+        hotspot,
+        change_entropy_milli: ranks.entropy[i],
+        change_entropy_percentile_per_mille: ranks.entropy_pct[i],
+        contributors: t.authors.len() as u32,
+        owner,
+        owner_share_per_mille: owner_share,
+        recent_owner,
+        recent_owner_share_per_mille: recent_share,
+        minor_contributors: minor,
+        bus_factor: bus_factor(&t.authors, t.commits),
+        fix_percentile_per_mille: ranks.fix_pct[i],
+        recent_contributors: t.recent_authors.len() as u32,
+        owner_recent_share_per_mille: owner_recent,
+        co_change_partners: ranks.partners[i],
+        co_change_percentile_per_mille: ranks.partner_pct[i],
+        age_days: ((now - t.first).max(0) / DAY) as u32,
+        idle_days: ((now - t.last).max(0) / DAY) as u32,
+    }
 }
