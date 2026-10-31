@@ -1,9 +1,9 @@
-# PLAN: `harness-transport-websocket`
+# PLAN: `rusty-transport-websocket`
 
 ## Why this exists
 
-Same motivation as `harness-transport-ipc` (see that crate's `PLAN.md` for the full rationale and
-the shared `RpcRequest`/`RpcResponse`/`RpcHandler` contract in `harness-protocol::rpc` — read that
+Same motivation as `rusty-transport-ipc` (see that crate's `PLAN.md` for the full rationale and
+the shared `RpcRequest`/`RpcResponse`/`RpcHandler` contract in `rusty-protocol::rpc` — read that
 first, this file only covers what's specific to websocket). WebSocket is the transport for
 "IDE runs the harness remotely, or in a container/VM, or the IDE's extension host is a browser
 context (e.g. a web-based IDE, or a VS Code web extension)" — anywhere a Unix socket isn't
@@ -13,7 +13,7 @@ Currently a 3-line stub with no wire library.
 
 ## Design
 
-Reuses the exact `RpcRequest` / `RpcResponse` / `RpcHandler` types from `harness-protocol::rpc`
+Reuses the exact `RpcRequest` / `RpcResponse` / `RpcHandler` types from `rusty-protocol::rpc`
 (do not redefine them here). The only difference from the IPC crate is the framing and transport:
 
 - Each WebSocket **message** carries exactly one `serde_json`-encoded `RpcRequest` or
@@ -37,7 +37,7 @@ pub async fn serve(
 
 ```toml
 [dependencies]
-harness-protocol = { path = "../../harness-protocol" }
+rusty-protocol = { path = "../protocol" }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "macros"] }
 tokio-tungstenite = "0.24"
 futures = { workspace = true }
@@ -50,7 +50,7 @@ it isn't there yet.
 
 ## Implementation steps
 
-1. Do this *after* `harness-transport-ipc` lands the `harness-protocol::rpc` module — no need to
+1. Do this *after* `rusty-transport-ipc` lands the `rusty-protocol::rpc` module — no need to
    duplicate that design work.
 2. Add `tokio-tungstenite` to the workspace.
 3. Implement `serve()`: TCP accept loop → WS upgrade (`tokio_tungstenite::accept_async`) → split

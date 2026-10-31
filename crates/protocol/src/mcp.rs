@@ -2,7 +2,7 @@
 //!
 //! `rusty-tool-mcp` owns the real `McpServerConfig` type and the client
 //! that actually spawns/talks to a server — but that's an I/O-bearing
-//! `harness-tool-*` crate, and this crate must stay dependency-direction
+//! `rusty-tool-*` crate, and this crate must stay dependency-direction
 //! clean (no runtime, no I/O; see `xtask check-deps`), so it can't reuse
 //! that type directly. [`McpServerSpec`] is a plain, serializable mirror of
 //! the same fields, which is all `RpcRequestBody::CreateSession` needs to

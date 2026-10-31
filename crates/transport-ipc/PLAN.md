@@ -1,4 +1,4 @@
-# PLAN: `harness-transport-ipc`
+# PLAN: `rusty-transport-ipc`
 
 ## Why this exists
 
@@ -14,14 +14,14 @@ transports (`websocket` and `stdio` reference this plan instead of repeating it)
 
 ## Shared contract (defined once, used by all three transport crates)
 
-Add a new module `harness-protocol::rpc` (`crates/harness-protocol/src/rpc.rs`) with the
+Add a new module `rusty-protocol::rpc` (`crates/protocol/src/rpc.rs`) with the
 request/response envelope every transport speaks. This is the natural home since
-`harness-protocol` is already the crate every other piece depends on for wire types, and its
+`rusty-protocol` is already the crate every other piece depends on for wire types, and its
 types (`AgentEventEnvelope`, `SessionCommand`-equivalents, etc.) are already `Serialize`/
 `Deserialize`.
 
 ```rust
-// harness-protocol/src/rpc.rs
+// rusty-protocol/src/rpc.rs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub id: RequestCorrelationId,       // client-assigned, echoed back in RpcResponse
@@ -74,7 +74,7 @@ Also define the handler trait that decouples "how bytes move" (this crate) from
 "what a request means" (`apps/harnessd`):
 
 ```rust
-// harness-protocol/src/rpc.rs
+// rusty-protocol/src/rpc.rs
 #[async_trait]
 pub trait RpcHandler: Send + Sync {
     async fn handle(&self, session_id: Option<SessionId>, body: RpcRequestBody) -> RpcResponseBody;
@@ -83,7 +83,7 @@ pub trait RpcHandler: Send + Sync {
 ```
 
 `harnessd` implements `RpcHandler` by wrapping `Harness`/`SessionManager` (see
-`apps/harnessd/PLAN.md`). This crate only ever depends on `harness-protocol` for these types —
+`apps/harnessd/PLAN.md`). This crate only ever depends on `rusty-protocol` for these types —
 never on `harness-engine` or `harness-runtime` directly — so it stays a thin framing layer.
 
 ## This crate's job
@@ -110,7 +110,7 @@ never on `harness-engine` or `harness-runtime` directly — so it stays a thin f
 
 ```toml
 [dependencies]
-harness-protocol = { path = "../../harness-protocol" }
+rusty-protocol = { path = "../protocol" }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "sync", "macros"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -123,7 +123,7 @@ later, don't build it speculatively now).
 
 ## Implementation steps
 
-1. Add `rpc.rs` to `harness-protocol` (shared with websocket/stdio — do this once, first).
+1. Add `rpc.rs` to `rusty-protocol` (shared with websocket/stdio — do this once, first).
 2. Implement frame read/write helpers (`read_frame`, `write_frame`) — small, testable in
    isolation with an in-memory duplex (`tokio::io::duplex`).
 3. Implement `serve()` with the accept loop + per-connection dispatch task.
