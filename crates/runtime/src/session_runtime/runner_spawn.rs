@@ -20,7 +20,7 @@ use rusty_agent_core::agent::Agent;
 use rusty_protocol::commands::AgentCommand;
 use rusty_session_store::{SessionCommitter, SessionStore};
 
-use crate::agent_runner::{AgentRunner, AgentTask};
+use crate::agent_runner::{AgentRunner, AgentTask, RunnerServices};
 use crate::agent_supervisor::AgentSupervisor;
 use crate::cancellation::SessionCancellation;
 use crate::integration::IntegrationRegistry;
@@ -107,13 +107,15 @@ pub(super) fn spawn_runner(
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        workspace,
-        bridge_sink,
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: workspace,
+            event_sink: bridge_sink,
+            scheduler: scheduler,
+        },
         agent_cancel,
         live_state,
-        scheduler,
     )
     .with_supervision(agent_supervisor, integrations)
     .with_projection(projection)

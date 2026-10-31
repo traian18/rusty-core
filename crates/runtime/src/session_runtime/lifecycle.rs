@@ -120,8 +120,6 @@ impl SessionRuntime {
             &self.projection,
             self.workspace.as_ref(),
             sequence,
-            false,
-            0,
         );
         store.save_snapshot(snapshot).await
     }

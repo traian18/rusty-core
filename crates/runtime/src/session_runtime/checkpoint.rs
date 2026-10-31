@@ -38,8 +38,6 @@ impl CheckpointRequester for RuntimeCheckpointRequester {
             &self.projection,
             self.workspace.as_ref(),
             at_sequence,
-            false,
-            0,
         );
         let store = self.store.clone();
         tokio::spawn(async move {

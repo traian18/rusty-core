@@ -16,30 +16,34 @@ use crate::scheduler::Scheduler;
 use crate::session_runtime::{AgentProjectionTable, LiveStateTable};
 use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
 
+/// The host services an agent's runner works with.
+pub struct RunnerServices {
+    pub backend: Arc<dyn ExecutionBackend>,
+    pub tool_registry: Arc<dyn ToolRegistry>,
+    pub workspace: Arc<dyn Workspace>,
+    pub event_sink: Arc<dyn EventSink>,
+    pub scheduler: Arc<Scheduler>,
+}
+
 impl AgentRunner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: Agent,
         mut task: AgentTask,
-        backend: Arc<dyn ExecutionBackend>,
-        tool_registry: Arc<dyn ToolRegistry>,
-        workspace: Arc<dyn Workspace>,
-        event_sink: Arc<dyn EventSink>,
+        services: RunnerServices,
         cancel: CancellationToken,
         live_state: LiveStateTable,
-        scheduler: Arc<Scheduler>,
     ) -> Self {
         task.cancel = cancel.clone();
         Self {
             agent,
             task,
-            backend,
-            tool_registry,
-            workspace,
-            event_sink,
+            backend: services.backend,
+            tool_registry: services.tool_registry,
+            workspace: services.workspace,
+            event_sink: services.event_sink,
             agent_sequence: 0,
             cancel,
-            scheduler,
+            scheduler: services.scheduler,
             live_state,
             projection: None,
             committer: None,

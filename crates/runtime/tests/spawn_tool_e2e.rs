@@ -19,7 +19,7 @@ use rusty_protocol::ids::{
 };
 use rusty_protocol::tools::{AgentToolset, PermissionMode, ToolCall, ToolCapability, ToolPolicy};
 use rusty_protocol::usage::AgentBudget;
-use rusty_runtime::agent_runner::{AgentRunner, AgentTask};
+use rusty_runtime::agent_runner::{AgentRunner, AgentTask, RunnerServices};
 use rusty_runtime::agent_supervisor::AgentSupervisor;
 use rusty_runtime::cancellation::SessionCancellation;
 use rusty_runtime::integration::IntegrationRegistry;
@@ -167,13 +167,15 @@ fn bootstrap(
     let runner = AgentRunner::new(
         root,
         task,
-        backend,
-        tools,
-        workspace,
-        event_sink,
+        RunnerServices {
+            backend: backend,
+            tool_registry: tools,
+            workspace: workspace,
+            event_sink: event_sink,
+            scheduler: scheduler,
+        },
         root_cancel.clone(),
         LiveStateTable::default(),
-        scheduler,
     )
     .with_supervision(supervisor.clone(), integrations);
 

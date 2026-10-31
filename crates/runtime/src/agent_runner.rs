@@ -14,6 +14,7 @@ mod outcome;
 mod prompt_prefix;
 mod publishing;
 mod setup;
+pub use setup::RunnerServices;
 mod spawning;
 mod tool_request;
 mod tool_run;

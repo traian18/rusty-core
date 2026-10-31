@@ -16,8 +16,10 @@
 //! - **Session Manager ([`manager`])**: Unified coordinator implementing the contracts.
 //! - **Errors ([`errors`])**: Domain-specific error variants.
 
+mod behavior;
 pub mod contracts;
 pub mod errors;
+mod forwarding;
 pub mod manager;
 pub mod registry;
 pub mod restorer;

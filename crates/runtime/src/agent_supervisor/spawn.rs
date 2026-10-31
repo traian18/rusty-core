@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::budget::validate_child_budget;
 use super::host::SpawnHost;
 use super::{AgentHandle, AgentSupervisor, SpawnOutcome, SupervisorError};
-use crate::agent_runner::{AgentRunner, AgentTask};
+use crate::agent_runner::{AgentRunner, AgentTask, RunnerServices};
 use crate::session_runtime::LiveStateTable;
 use crate::traits::{ExecutionBackend, Workspace};
 
@@ -59,13 +59,15 @@ impl AgentSupervisor {
         let runner = AgentRunner::new(
             agent,
             task,
-            backend,
-            host.tools.clone(),
-            workspace.clone(),
-            host.events.clone(),
+            RunnerServices {
+                backend: backend,
+                tool_registry: host.tools.clone(),
+                workspace: workspace.clone(),
+                event_sink: host.events.clone(),
+                scheduler: host.scheduler.clone(),
+            },
             cancel.clone(),
             LiveStateTable::default(),
-            host.scheduler.clone(),
         )
         .with_supervision(self.clone(), Arc::new(host.integrations.clone()));
 

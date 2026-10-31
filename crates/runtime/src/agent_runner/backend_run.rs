@@ -60,18 +60,15 @@ pub(super) async fn forward_backend_events(
                     tracing::warn!(run_id = ?run_id, skipped = n, "backend event receiver lagged");
                 }
             },
-            permit = commands.reserve(), if !queued.is_empty() => match permit {
-                Ok(permit) => {
-                    let event = queued
-                        .pop_front()
-                        .expect("branch is guarded by !queued.is_empty()");
+            permit = commands.reserve(), if !queued.is_empty() => match (permit, queued.pop_front()) {
+                (Ok(permit), Some(event)) => {
                     terminal_forwarded |= matches!(
                         &event,
                         ExecutionEvent::Completed { .. } | ExecutionEvent::Error { .. }
                     );
                     permit.send(AgentCommand::BackendEvent { run_id, event });
                 }
-                Err(_) => break,
+                _ => break,
             },
         }
     }

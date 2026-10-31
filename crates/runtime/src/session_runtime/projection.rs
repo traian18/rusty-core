@@ -106,8 +106,6 @@ pub(crate) fn build_snapshot(
     projection: &AgentProjectionTable,
     workspace: &dyn Workspace,
     at_sequence: u64,
-    compacted: bool,
-    compaction_generation: u64,
 ) -> DurableSessionSnapshot {
     let agents = projection
         .lock_or_recover()
@@ -153,8 +151,8 @@ pub(crate) fn build_snapshot(
             integration_references,
             credential_profiles: Vec::new(),
             tool_policy_ids: Vec::new(),
-            compacted,
-            compaction_generation,
+            compacted: false,
+            compaction_generation: 0,
         },
     }
 }

@@ -218,13 +218,15 @@ async fn cancel_mid_flight_backend_call_transitions_to_cancelled() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     );
 
     let mut events_rx = runner.task.events.subscribe();
@@ -305,13 +307,15 @@ async fn long_lived_runner_accepts_a_second_start_run_after_completion() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     )
     .long_lived(true);
 
@@ -407,13 +411,15 @@ async fn cancel_is_processed_while_backend_waits_for_scheduler_capacity() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        Arc::new(FakeBackend::new().blocking_until_cancelled()),
-        Arc::new(FakeToolRegistry::new()),
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new().blocking_until_cancelled()),
+            tool_registry: Arc::new(FakeToolRegistry::new()),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel,
         live_state.clone(),
-        scheduler,
     );
 
     sender
@@ -484,13 +490,15 @@ async fn strict_commit_failure_terminates_with_truthful_failed_state() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        Arc::new(FakeBackend::new().blocking_until_cancelled()),
-        Arc::new(FakeToolRegistry::new()),
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new().blocking_until_cancelled()),
+            tool_registry: Arc::new(FakeToolRegistry::new()),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: Arc::new(Scheduler::new(SchedulerConfig::default())),
+        },
         CancellationToken::new(),
         live_state.clone(),
-        Arc::new(Scheduler::new(SchedulerConfig::default())),
     )
     .with_committer(committer)
     .long_lived(true);
@@ -563,13 +571,15 @@ async fn follow_up_queued_while_run_active_starts_after_first_completes() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     )
     .long_lived(true);
 
@@ -692,13 +702,15 @@ async fn follow_up_queued_while_run_active_starts_after_first_run_fails() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     )
     .long_lived(true);
 
@@ -813,13 +825,15 @@ async fn dispatch_rejects_a_forged_allow_for_an_unapproved_or_denied_tool() {
         let mut runner = AgentRunner::new(
             agent,
             task,
-            Arc::new(FakeBackend::new()),
-            Arc::new(registry),
-            Arc::new(FakeWorkspace::new()),
-            Arc::new(NoopSink),
+            RunnerServices {
+                backend: Arc::new(FakeBackend::new()),
+                tool_registry: Arc::new(registry),
+                workspace: Arc::new(FakeWorkspace::new()),
+                event_sink: Arc::new(NoopSink),
+                scheduler: Arc::new(Scheduler::new(SchedulerConfig::default())),
+            },
             CancellationToken::new(),
             Arc::new(Mutex::new(StdHashMap::new())),
-            Arc::new(Scheduler::new(SchedulerConfig::default())),
         );
         let call_id = ToolCallId::new();
         runner
@@ -891,13 +905,15 @@ async fn shell_exec_calls_are_bounded_by_max_concurrent_processes() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        Arc::new(FakeBackend::new()),
-        Arc::new(registry),
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new()),
+            tool_registry: Arc::new(registry),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel,
         live_state,
-        scheduler,
     );
 
     let first_call = rusty_protocol::ids::ToolCallId::new();
@@ -982,13 +998,15 @@ async fn hung_tool_call_times_out_with_error_result() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        Arc::new(FakeBackend::new()),
-        Arc::new(registry),
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new()),
+            tool_registry: Arc::new(registry),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         CancellationToken::new(),
         live_state,
-        scheduler,
     );
 
     let call_id = rusty_protocol::ids::ToolCallId::new();
@@ -1050,13 +1068,15 @@ async fn tool_can_ask_for_a_longer_call_limit_than_the_default() {
         let mut runner = AgentRunner::new(
             agent,
             task,
-            Arc::new(FakeBackend::new()),
-            Arc::new(registry),
-            Arc::new(FakeWorkspace::new()),
-            Arc::new(NoopSink),
+            RunnerServices {
+                backend: Arc::new(FakeBackend::new()),
+                tool_registry: Arc::new(registry),
+                workspace: Arc::new(FakeWorkspace::new()),
+                event_sink: Arc::new(NoopSink),
+                scheduler: scheduler,
+            },
             CancellationToken::new(),
             live_state,
-            scheduler,
         );
         let call_id = rusty_protocol::ids::ToolCallId::new();
         runner
@@ -1107,13 +1127,15 @@ async fn queued_follow_up_survives_runner_cancellation() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     )
     .long_lived(true);
 
@@ -1193,13 +1215,15 @@ async fn cancel_while_waiting_for_permission_transitions_to_cancelled() {
     let mut runner = AgentRunner::new(
         agent,
         task,
-        backend,
-        tool_registry,
-        Arc::new(FakeWorkspace::new()),
-        Arc::new(NoopSink),
+        RunnerServices {
+            backend: backend,
+            tool_registry: tool_registry,
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: scheduler,
+        },
         cancel.clone(),
         live_state.clone(),
-        scheduler,
     );
 
     sender
