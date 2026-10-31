@@ -33,6 +33,68 @@ pub(super) fn answer(cx: &Cx<'_>, target: Target) -> Result<Answer, Failure> {
     })
 }
 
+/// The figures a file's summary line states.
+struct FileCounts {
+    imports: usize,
+    internal: usize,
+    external: usize,
+    dependents: usize,
+    packages: usize,
+    relations: usize,
+}
+
+fn file_summary(path: &RootRelativePath, counts: &FileCounts) -> String {
+    let mut summary = format!(
+        "{} imports {} things ({} internal, {} external) and is imported by {} files in {} packages",
+        path_text(path),
+        counts.imports,
+        counts.internal,
+        counts.external,
+        counts.dependents,
+        counts.packages,
+    );
+    if counts.relations > 0 {
+        summary.push_str(&format!("; {} framework relations", counts.relations));
+    }
+    summary.push('.');
+    summary
+}
+
+/// Where to look next: what was cut off, the blast radius, a refresh when the file moved on.
+fn file_next(
+    path: &RootRelativePath,
+    budget: &Budget,
+    dependents: usize,
+    changed: Option<&'static str>,
+) -> Vec<Value> {
+    let mut follow = Vec::new();
+    if let Some(omitted) = budget.omitted().get("dependents") {
+        follow.push(next(
+            "repo_graph.dependents",
+            json!({"file": path_text(path), "limit": 50}),
+            format!("{omitted} more dependents"),
+        ));
+    }
+    if let Some(omitted) = budget.omitted().get("imports") {
+        follow.push(next(
+            "repo_graph.dependencies",
+            json!({"file": path_text(path), "limit": 50}),
+            format!("{omitted} more imports"),
+        ));
+    }
+    if dependents > 0 {
+        follow.push(context_next(
+            "blast_radius",
+            &path_text(path),
+            format!("what may break if {} changes", path_text(path)),
+        ));
+    }
+    if changed.is_some() {
+        follow.push(refresh_next("the file changed since the snapshot"));
+    }
+    follow
+}
+
 fn file(
     cx: &Cx<'_>,
     path: &RootRelativePath,
@@ -102,40 +164,16 @@ fn file(
     let language = super::support::profile_name(&indexed.profile);
     let gaps = super::support::gaps_for(&cx.capabilities, indexed.profile);
     let frameworks = facts.frameworks_for(path);
-    let mut summary = format!(
-        "{} imports {total_imports} things ({internal} internal, {external} external) and is imported by {total_dependents} files in {} packages",
-        path_text(path),
-        packages.len(),
-    );
-    if !relations.is_empty() {
-        summary.push_str(&format!("; {} framework relations", relations.len()));
-    }
-    summary.push('.');
-    let mut follow = Vec::new();
-    if let Some(omitted) = budget.omitted().get("dependents") {
-        follow.push(next(
-            "repo_graph.dependents",
-            json!({"file": path_text(path), "limit": 50}),
-            format!("{omitted} more dependents"),
-        ));
-    }
-    if let Some(omitted) = budget.omitted().get("imports") {
-        follow.push(next(
-            "repo_graph.dependencies",
-            json!({"file": path_text(path), "limit": 50}),
-            format!("{omitted} more imports"),
-        ));
-    }
-    if total_dependents > 0 {
-        follow.push(context_next(
-            "blast_radius",
-            &path_text(path),
-            format!("what may break if {} changes", path_text(path)),
-        ));
-    }
-    if changed.is_some() {
-        follow.push(refresh_next("the file changed since the snapshot"));
-    }
+    let counts = FileCounts {
+        imports: total_imports,
+        internal,
+        external,
+        dependents: total_dependents,
+        packages: packages.len(),
+        relations: relations.len(),
+    };
+    let summary = file_summary(path, &counts);
+    let follow = file_next(path, &budget, total_dependents, changed);
     Answer {
         status: readable_status(cx, changed, unresolved),
         target: file_target(cx, path, indexed.profile, indexed.package.as_ref()),

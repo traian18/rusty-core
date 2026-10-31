@@ -64,208 +64,249 @@ fn broad_type(type_text: &str) -> bool {
     )
 }
 
+/// The error-handling smell `node` is, by the language's idioms.
 pub fn error_smell(language: &LanguageId, node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
-    use ErrorSmell::*;
     // Keyword tokens share the kind name of the node they open.
     if !node.is_named() {
         return None;
     }
     match language {
-        LanguageId::Rust => match node.kind() {
-            "call_expression" => {
-                let function = node.child_by_field_name("function")?;
-                if function.kind() != "field_expression" {
-                    return None;
-                }
-                let field = text(function.child_by_field_name("field")?, source);
-                matches!(field, "unwrap" | "expect" | "unwrap_err" | "expect_err").then_some(Panic)
-            }
-            "macro_invocation" => {
-                let name = text(node.child_by_field_name("macro")?, source);
-                matches!(name, "panic" | "todo" | "unimplemented").then_some(Panic)
-            }
-            "let_declaration" => {
-                let head = text(node, source).trim_start();
-                let discards = head.starts_with("let _ =") || head.starts_with("let _:");
-                let value = node.child_by_field_name("value")?;
-                (discards && matches!(value.kind(), "call_expression" | "await_expression"))
-                    .then_some(IgnoredResult)
-            }
-            "match_arm" => {
-                let pattern = text(node.child_by_field_name("pattern")?, source);
-                let value = node.child_by_field_name("value")?;
-                let idle = value.kind() == "unit_expression"
-                    || (value.kind() == "block" && named(value).is_empty());
-                (pattern.starts_with("Err(") && idle).then_some(EmptyHandler)
-            }
-            _ => None,
-        },
-        LanguageId::Python => {
-            if node.kind() != "except_clause" {
+        LanguageId::Rust => rust_smell(node, source),
+        LanguageId::Python => python_smell(node, source),
+        LanguageId::JavaScript | LanguageId::TypeScript => javascript_script_smell(node, source),
+        LanguageId::Java => java_smell(node, source),
+        LanguageId::Kotlin => kotlin_smell(node, source),
+        LanguageId::CSharp => csharp_smell(node, source),
+        LanguageId::Php => php_smell(node, source),
+        LanguageId::Ruby => ruby_smell(node, source),
+        LanguageId::Go => go_smell(node, source),
+        LanguageId::Cpp => cpp_smell(node, source),
+    }
+}
+
+fn rust_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() != "field_expression" {
                 return None;
             }
-            let body = named(node).into_iter().find(|c| c.kind() == "block");
-            let kinds: Vec<_> = named(node)
-                .into_iter()
-                .filter(|c| c.kind() != "block")
-                .collect();
-            let reraises = body.is_some_and(|b| contains_kind(b, &["raise_statement"]));
-            if python_idle(body) {
-                return Some(EmptyHandler);
-            }
-            let bare = kinds.is_empty();
-            let wide = kinds
-                .iter()
-                .any(|k| broad_type(text(*k, source).split(" as ").next().unwrap_or("")));
-            ((bare || wide) && !reraises).then_some(BroadHandler)
+            let field = text(function.child_by_field_name("field")?, source);
+            matches!(field, "unwrap" | "expect" | "unwrap_err" | "expect_err").then_some(Panic)
         }
-        LanguageId::JavaScript | LanguageId::TypeScript => match node.kind() {
-            "catch_clause" => is_empty(node.child_by_field_name("body")).then_some(EmptyHandler),
-            "call_expression" => {
-                let function = node.child_by_field_name("function")?;
-                if function.kind() != "member_expression"
-                    || text(function.child_by_field_name("property")?, source) != "catch"
-                {
-                    return None;
-                }
-                let handler = node.child_by_field_name("arguments")?.named_child(0)?;
-                matches!(
-                    handler.kind(),
-                    "arrow_function" | "function_expression" | "function"
-                )
-                .then(|| is_empty(handler.child_by_field_name("body")))
-                .filter(|empty| *empty)
-                .map(|_| EmptyHandler)
-            }
-            _ => None,
-        },
-        LanguageId::Java => match node.kind() {
-            "catch_clause" => {
-                let body = node.child_by_field_name("body");
-                if is_empty(body) {
-                    return Some(EmptyHandler);
-                }
-                let kind = named(node)
-                    .into_iter()
-                    .find(|c| c.kind() == "catch_formal_parameter")
-                    .and_then(|p| named(p).into_iter().find(|c| c.kind() == "catch_type"))
-                    .map(|t| text(t, source))
-                    .unwrap_or("");
-                let wide = kind
-                    .split('|')
-                    .any(|t| broad_type(t.trim_start_matches("final ").trim()));
-                let rethrows = body.is_some_and(|b| contains_kind(b, &["throw_statement"]));
-                (wide && !rethrows).then_some(BroadHandler)
-            }
-            "method_invocation" => (text(node.child_by_field_name("name")?, source)
-                == "printStackTrace")
-                .then_some(Panic),
-            _ => None,
-        },
-        LanguageId::Kotlin => match node.kind() {
-            "catch_block" => {
-                let body = named(node).into_iter().find(|c| c.kind() == "block");
-                if is_empty(body) {
-                    return Some(EmptyHandler);
-                }
-                let wide = named(node)
-                    .iter()
-                    .any(|c| c.kind() == "user_type" && broad_type(text(*c, source)));
-                let rethrows = body
-                    .is_some_and(|b| contains_kind(b, &["throw_expression", "jump_expression"]));
-                (wide && !rethrows).then_some(BroadHandler)
-            }
-            "unary_expression" | "postfix_expression" => text(node, source)
-                .trim_end()
-                .ends_with("!!")
-                .then_some(Panic),
-            _ => None,
-        },
-        LanguageId::CSharp => {
-            if node.kind() != "catch_clause" {
+        "macro_invocation" => {
+            let name = text(node.child_by_field_name("macro")?, source);
+            matches!(name, "panic" | "todo" | "unimplemented").then_some(Panic)
+        }
+        "let_declaration" => {
+            let head = text(node, source).trim_start();
+            let discards = head.starts_with("let _ =") || head.starts_with("let _:");
+            let value = node.child_by_field_name("value")?;
+            (discards && matches!(value.kind(), "call_expression" | "await_expression"))
+                .then_some(IgnoredResult)
+        }
+        "match_arm" => {
+            let pattern = text(node.child_by_field_name("pattern")?, source);
+            let value = node.child_by_field_name("value")?;
+            let idle = value.kind() == "unit_expression"
+                || (value.kind() == "block" && named(value).is_empty());
+            (pattern.starts_with("Err(") && idle).then_some(EmptyHandler)
+        }
+        _ => None,
+    }
+}
+
+fn python_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    if node.kind() != "except_clause" {
+        return None;
+    }
+    let body = named(node).into_iter().find(|c| c.kind() == "block");
+    let kinds: Vec<_> = named(node)
+        .into_iter()
+        .filter(|c| c.kind() != "block")
+        .collect();
+    let reraises = body.is_some_and(|b| contains_kind(b, &["raise_statement"]));
+    if python_idle(body) {
+        return Some(EmptyHandler);
+    }
+    let bare = kinds.is_empty();
+    let wide = kinds
+        .iter()
+        .any(|k| broad_type(text(*k, source).split(" as ").next().unwrap_or("")));
+    ((bare || wide) && !reraises).then_some(BroadHandler)
+}
+
+fn javascript_script_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "catch_clause" => is_empty(node.child_by_field_name("body")).then_some(EmptyHandler),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            if function.kind() != "member_expression"
+                || text(function.child_by_field_name("property")?, source) != "catch"
+            {
                 return None;
             }
+            let handler = node.child_by_field_name("arguments")?.named_child(0)?;
+            matches!(
+                handler.kind(),
+                "arrow_function" | "function_expression" | "function"
+            )
+            .then(|| is_empty(handler.child_by_field_name("body")))
+            .filter(|empty| *empty)
+            .map(|_| EmptyHandler)
+        }
+        _ => None,
+    }
+}
+
+fn java_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "catch_clause" => {
             let body = node.child_by_field_name("body");
             if is_empty(body) {
                 return Some(EmptyHandler);
             }
-            let ty = named(node)
+            let kind = named(node)
                 .into_iter()
-                .find(|c| c.kind() == "catch_declaration")
-                .and_then(|d| d.child_by_field_name("type"))
-                .map(|t| text(t, source));
-            let wide = ty.is_none_or(broad_type);
-            let rethrows =
-                body.is_some_and(|b| contains_kind(b, &["throw_statement", "throw_expression"]));
+                .find(|c| c.kind() == "catch_formal_parameter")
+                .and_then(|p| named(p).into_iter().find(|c| c.kind() == "catch_type"))
+                .map(|t| text(t, source))
+                .unwrap_or("");
+            let wide = kind
+                .split('|')
+                .any(|t| broad_type(t.trim_start_matches("final ").trim()));
+            let rethrows = body.is_some_and(|b| contains_kind(b, &["throw_statement"]));
             (wide && !rethrows).then_some(BroadHandler)
         }
-        LanguageId::Php => match node.kind() {
-            "catch_clause" => {
-                let body = node.child_by_field_name("body");
-                if is_empty(body) {
-                    return Some(EmptyHandler);
-                }
-                let wide = node.child_by_field_name("type").is_some_and(|t| {
-                    t.named_children(&mut t.walk())
-                        .any(|n| broad_type(text(n, source)))
-                });
-                let rethrows = body.is_some_and(|b| contains_kind(b, &["throw_expression"]));
-                (wide && !rethrows).then_some(BroadHandler)
-            }
-            "error_suppression_expression" => Some(Panic),
-            _ => None,
-        },
-        LanguageId::Ruby => match node.kind() {
-            "rescue" => {
-                if node
-                    .child_by_field_name("body")
-                    .is_none_or(|b| named(b).is_empty())
-                {
-                    return Some(EmptyHandler);
-                }
-                let wide = node
-                    .child_by_field_name("exceptions")
-                    .is_some_and(|e| text(e, source).split(',').any(|t| t.trim() == "Exception"));
-                let rethrows =
-                    contains_kind(node, &["raise"]) || text(node, source).contains("raise");
-                (wide && !rethrows).then_some(BroadHandler)
-            }
-            "rescue_modifier" => Some(EmptyHandler),
-            _ => None,
-        },
-        LanguageId::Go => match node.kind() {
-            "assignment_statement" => {
-                let left = node.child_by_field_name("left")?;
-                let right = node.child_by_field_name("right")?;
-                let blank = named(left).iter().all(|l| text(*l, source) == "_");
-                (blank && named(right).iter().any(|r| r.kind() == "call_expression"))
-                    .then_some(IgnoredResult)
-            }
-            "if_statement" => {
-                let condition = text(node.child_by_field_name("condition")?, source);
-                (condition.contains("err != nil")
-                    && is_empty(node.child_by_field_name("consequence")))
-                .then_some(EmptyHandler)
-            }
-            "call_expression" => {
-                (text(node.child_by_field_name("function")?, source) == "panic").then_some(Panic)
-            }
-            _ => None,
-        },
-        LanguageId::Cpp => {
-            if node.kind() != "catch_clause" {
-                return None;
-            }
-            if is_empty(node.child_by_field_name("body")) {
+        "method_invocation" => {
+            (text(node.child_by_field_name("name")?, source) == "printStackTrace").then_some(Panic)
+        }
+        _ => None,
+    }
+}
+
+fn kotlin_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "catch_block" => {
+            let body = named(node).into_iter().find(|c| c.kind() == "block");
+            if is_empty(body) {
                 return Some(EmptyHandler);
             }
-            let catch_all = node
-                .child_by_field_name("parameters")
-                .is_some_and(|p| p.named_child_count() == 0);
-            let rethrows = text(node, source).contains("throw");
-            (catch_all && !rethrows).then_some(BroadHandler)
+            let wide = named(node)
+                .iter()
+                .any(|c| c.kind() == "user_type" && broad_type(text(*c, source)));
+            let rethrows =
+                body.is_some_and(|b| contains_kind(b, &["throw_expression", "jump_expression"]));
+            (wide && !rethrows).then_some(BroadHandler)
         }
+        "unary_expression" | "postfix_expression" => text(node, source)
+            .trim_end()
+            .ends_with("!!")
+            .then_some(Panic),
+        _ => None,
     }
+}
+
+fn csharp_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    if node.kind() != "catch_clause" {
+        return None;
+    }
+    let body = node.child_by_field_name("body");
+    if is_empty(body) {
+        return Some(EmptyHandler);
+    }
+    let ty = named(node)
+        .into_iter()
+        .find(|c| c.kind() == "catch_declaration")
+        .and_then(|d| d.child_by_field_name("type"))
+        .map(|t| text(t, source));
+    let wide = ty.is_none_or(broad_type);
+    let rethrows = body.is_some_and(|b| contains_kind(b, &["throw_statement", "throw_expression"]));
+    (wide && !rethrows).then_some(BroadHandler)
+}
+
+fn php_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "catch_clause" => {
+            let body = node.child_by_field_name("body");
+            if is_empty(body) {
+                return Some(EmptyHandler);
+            }
+            let wide = node.child_by_field_name("type").is_some_and(|t| {
+                t.named_children(&mut t.walk())
+                    .any(|n| broad_type(text(n, source)))
+            });
+            let rethrows = body.is_some_and(|b| contains_kind(b, &["throw_expression"]));
+            (wide && !rethrows).then_some(BroadHandler)
+        }
+        "error_suppression_expression" => Some(Panic),
+        _ => None,
+    }
+}
+
+fn ruby_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "rescue" => {
+            if node
+                .child_by_field_name("body")
+                .is_none_or(|b| named(b).is_empty())
+            {
+                return Some(EmptyHandler);
+            }
+            let wide = node
+                .child_by_field_name("exceptions")
+                .is_some_and(|e| text(e, source).split(',').any(|t| t.trim() == "Exception"));
+            let rethrows = contains_kind(node, &["raise"]) || text(node, source).contains("raise");
+            (wide && !rethrows).then_some(BroadHandler)
+        }
+        "rescue_modifier" => Some(EmptyHandler),
+        _ => None,
+    }
+}
+
+fn go_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    match node.kind() {
+        "assignment_statement" => {
+            let left = node.child_by_field_name("left")?;
+            let right = node.child_by_field_name("right")?;
+            let blank = named(left).iter().all(|l| text(*l, source) == "_");
+            (blank && named(right).iter().any(|r| r.kind() == "call_expression"))
+                .then_some(IgnoredResult)
+        }
+        "if_statement" => {
+            let condition = text(node.child_by_field_name("condition")?, source);
+            (condition.contains("err != nil") && is_empty(node.child_by_field_name("consequence")))
+                .then_some(EmptyHandler)
+        }
+        "call_expression" => {
+            (text(node.child_by_field_name("function")?, source) == "panic").then_some(Panic)
+        }
+        _ => None,
+    }
+}
+
+fn cpp_smell(node: Node<'_>, source: &[u8]) -> Option<ErrorSmell> {
+    use ErrorSmell::*;
+    if node.kind() != "catch_clause" {
+        return None;
+    }
+    if is_empty(node.child_by_field_name("body")) {
+        return Some(EmptyHandler);
+    }
+    let catch_all = node
+        .child_by_field_name("parameters")
+        .is_some_and(|p| p.named_child_count() == 0);
+    let rethrows = text(node, source).contains("throw");
+    (catch_all && !rethrows).then_some(BroadHandler)
 }
 
 /// Whether `function` is a test by the language's convention.

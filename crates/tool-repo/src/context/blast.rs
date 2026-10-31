@@ -213,20 +213,7 @@ pub(super) fn answer(cx: &Cx<'_>, target: Target) -> Result<Answer, Failure> {
         reached.tests.len(),
         reached.entry_points.len(),
     );
-    let mut follow = Vec::new();
-    if let Some(reason) = radius.truncation {
-        follow.push(next("repo_graph.impact", json!({"files": roots.iter().take(64).map(path_text).collect::<Vec<_>>(), "depth": cx.request.depth, "node_limit": 1000}), format!("the radius was cut by {reason}")));
-    }
-    if changed.is_some() {
-        follow.push(refresh_next("the file changed since the snapshot"));
-    }
-    if let Target::File { path, .. } = &target {
-        follow.push(context_next(
-            "connections",
-            &path_text(path),
-            "the direct imports and importers",
-        ));
-    }
+    let follow = next_steps(cx, &target, &roots, radius.truncation, changed);
     let language = profile.map(|p| super::support::profile_name(&p));
     let gaps = profile
         .map(|p| super::support::gaps_for(&cx.capabilities, p))
@@ -246,4 +233,29 @@ pub(super) fn answer(cx: &Cx<'_>, target: Target) -> Result<Answer, Failure> {
         git_snapshot: cx.signals.git_snapshot(),
         bounded: radius.truncation,
     })
+}
+
+/// Where to look next: the cut-off radius, a refresh, and the file's direct connections.
+fn next_steps(
+    cx: &Cx<'_>,
+    target: &Target,
+    roots: &[RootRelativePath],
+    truncation: Option<&'static str>,
+    changed: Option<&'static str>,
+) -> Vec<Value> {
+    let mut follow = Vec::new();
+    if let Some(reason) = truncation {
+        follow.push(next("repo_graph.impact", json!({"files": roots.iter().take(64).map(path_text).collect::<Vec<_>>(), "depth": cx.request.depth, "node_limit": 1000}), format!("the radius was cut by {reason}")));
+    }
+    if changed.is_some() {
+        follow.push(refresh_next("the file changed since the snapshot"));
+    }
+    if let Target::File { path, .. } = target {
+        follow.push(context_next(
+            "connections",
+            &path_text(path),
+            "the direct imports and importers",
+        ));
+    }
+    follow
 }
