@@ -46,6 +46,7 @@ pub(super) fn planner_input(
         "requirements": plan.requirements,
         "task": task,
         "completed_tasks": finished(progress),
+        "known_locations": known_locations(progress),
         "previous_attempt": progress.current,
     });
     let skip = queue_binding(request);
@@ -87,13 +88,14 @@ pub(super) fn builder_input(
         Value::Array(own_requirements(plan, task)),
     );
     input.insert("completed_tasks".into(), finished(progress));
+    input.insert("known_locations".into(), known_locations(progress));
     input.insert(
         "previous_attempt".into(),
         progress.current.clone().unwrap_or(Value::Null),
     );
     input.insert(
         "context_note".into(),
-        Value::String("The spec, the design and the earlier context went to the step planner; workflow_input.step_plan is what this task needs from them. When it leaves something out, read the code, or ask spec_context or request_research when they are offered.".into()),
+        Value::String("The spec, the design and the earlier context went to the step planner; workflow_input.step_plan is what this task needs from them, and its Material section quotes the design passages and the code as they were when it was planned. Use them instead of reading those again; read a file only for what the plan leaves out, or a part you changed and need to see again (your edits already show the lines they changed). known_locations lists where earlier tasks found things. When something is still missing, ask spec_context or request_research when they are offered.".into()),
     );
     let skip = queue_binding(request);
     if let Some(fields) = request.input.as_object() {
@@ -153,6 +155,36 @@ fn finished(progress: &Progress) -> Value {
             })
             .collect(),
     )
+}
+
+/// Most locations carried to a later task.
+const MAX_KNOWN_LOCATIONS: usize = 40;
+
+/// Where the finished tasks' builders and reviewers found things, newest
+/// first, each once: so a later task does not search for them again.
+fn known_locations(progress: &Progress) -> Value {
+    let mut seen = std::collections::HashSet::new();
+    let found: Vec<Value> = progress
+        .completed
+        .iter()
+        .chain(progress.repairs.iter())
+        .rev()
+        .flat_map(|done| {
+            ["build", "review"].into_iter().flat_map(move |report| {
+                done[report]["locations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        })
+        .filter(|location| {
+            location
+                .as_str()
+                .is_some_and(|text| seen.insert(text.to_owned()))
+        })
+        .take(MAX_KNOWN_LOCATIONS)
+        .collect();
+    Value::Array(found)
 }
 
 fn shorten(text: &str) -> String {

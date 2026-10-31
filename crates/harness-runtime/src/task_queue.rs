@@ -384,7 +384,9 @@ fn plan(value: &Value) -> Result<Plan, AgentExecutionError> {
 
 fn result_schema(review: bool) -> Value {
     let mut schema = json!({"type":"object","additionalProperties":false,"required":["status","summary"],"properties":{
-        "status":{"type":"string","enum":["complete","needs_repair","blocked_environment","blocked_user","checkpoint"]},"summary":{"type":"string","minLength":1}
+        "status":{"type":"string","enum":["complete","needs_repair","blocked_environment","blocked_user","checkpoint"]},"summary":{"type":"string","minLength":1},
+        // Carried to the later tasks' planners and builders (known_locations), so they do not search again.
+        "locations":{"type":"array","maxItems":12,"description":"Where the code this task is about lives, for the tasks after it: one line each, such as \"ContextPolicy::reading: rusty-core/crates/harness-context/src/policy.rs:128-150\".","items":{"type":"string","maxLength":240}}
     }});
     if review {
         schema["required"]
@@ -1095,7 +1097,12 @@ impl IsolatedSessionAgentExecutor {
         child.checkpoint = None;
         child.feedback.retain(|f| !is_user_change(&f.code));
         child.profile = Some(planner.profile.clone());
-        child.instructions = format!("{}\n\n{}", planner.instructions, split::FIT_INSTRUCTIONS);
+        child.instructions = format!(
+            "{}\n\n{}\n\n{}",
+            planner.instructions,
+            split::FIT_INSTRUCTIONS,
+            split::MATERIAL_INSTRUCTIONS
+        );
         if let Some(guidance) = guidance {
             child.instructions.push_str(&format!(
                 "\n\nThe task failed before, and the user asked for another try with this guidance; plan for it:\n{guidance}"

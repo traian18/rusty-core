@@ -40,6 +40,10 @@ pub(super) const FIT_INSTRUCTIONS: &str = "Before you plan, judge whether this t
 2. It is too big: reply with the heading `## Split`, then 2 to 5 steps in the order they must be done, each a section `### S1 — <short title>` naming its files (at most 4) and the exact command that checks it. Every step leaves the project compiling and its tests passing; a step that changes a shared type or hook also updates every caller. The first step is the smallest change that makes the rest possible. Together the steps meet every criterion of workflow_input.task; say which step covers which.
 3. It cannot be built without a decision only the person can make (the design relies on something that is not in the code and does not say how to create it, or the spec and the design allow two different results): reply with the heading `## Design gap`, then the question, the options with what each means for the code, and your recommended answer. Use it only when no careful reading of the design and the code settles the question: a detail you can settle from the code is yours to settle in the plan.";
 
+/// Appended to the step planner's instructions: the plan carries what the
+/// planner read, so the builder and the reviewer do not read it again.
+pub(super) const MATERIAL_INSTRUCTIONS: &str = "A step plan ends with a section `## Material`: what you read that the builder and the reviewer need, quoted so they do not read it again (they start with nothing else). Quote only the design and spec passages this task follows, and the code it changes or calls, each introduced by `path:start-end` and given exactly as in the file. Keep the section under about 6,000 characters: quote the lines that matter, never whole files, and name a location without quoting it when its content does not matter. workflow_input.known_locations lists where earlier tasks found things: use it instead of searching again.";
+
 /// What the step planner replied: a plan, steps to build instead, or a
 /// question for the person.
 #[derive(Debug, PartialEq)]

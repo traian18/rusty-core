@@ -150,3 +150,33 @@ fn the_planner_sees_everything_but_the_other_tasks() {
     assert_eq!(input["requirements"].as_array().unwrap().len(), 2);
     assert!(input["completed_tasks"][0].get("review").is_none());
 }
+
+#[test]
+fn later_tasks_get_where_earlier_ones_found_things_newest_first_and_once() {
+    let mut progress = progress();
+    progress.completed = vec![
+        json!({"task_id": "T1", "build": {"summary": "a", "locations": ["reading: policy.rs:128-150", "tests: policy.rs:238-335"]}, "review": {"summary": "ok"}}),
+        json!({"task_id": "T2", "build": {"summary": "b", "locations": ["backend: backend.rs:57-69"]}, "review": {"summary": "ok", "locations": ["reading: policy.rs:128-150"]}}),
+    ];
+    let planner = planner_input(&request(), &plan(), &task(), &progress);
+    assert_eq!(
+        planner["known_locations"],
+        json!([
+            "backend: backend.rs:57-69",
+            "reading: policy.rs:128-150",
+            "tests: policy.rs:238-335"
+        ])
+    );
+    let builder = builder_input(&request(), &plan(), &task(), &progress, true);
+    assert_eq!(builder["known_locations"], planner["known_locations"]);
+    assert!(builder["context_note"]
+        .as_str()
+        .unwrap()
+        .contains("Material section"));
+}
+
+#[test]
+fn the_planner_is_told_to_quote_what_the_builder_needs() {
+    assert!(super::super::split::MATERIAL_INSTRUCTIONS.contains("## Material"));
+    assert!(super::super::split::MATERIAL_INSTRUCTIONS.contains("known_locations"));
+}
