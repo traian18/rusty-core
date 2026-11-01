@@ -430,48 +430,18 @@ impl DefaultCallGraph {
         &self,
         files: &[(String, Arc<ExtractedFile>)],
     ) -> (Vec<CallableSymbol>, Vec<CallSite>) {
-        let mut callables = Vec::new();
-        let mut ids: BTreeMap<(String, u32), SymbolId> = BTreeMap::new();
-        for (path, file) in files {
-            for fact in &file.callables {
-                ids.insert(
-                    (path.clone(), fact.key),
-                    SymbolId(format!("{}:{}:{}", path, fact.key, fact.name)),
-                );
-            }
-        }
-        for (path, file) in files {
-            for fact in &file.callables {
-                let id = ids[&(path.clone(), fact.key)].clone();
-                let owner = match fact.parent {
-                    Some(parent) => ids.get(&(path.clone(), parent)).cloned(),
-                    None => fact
-                        .container
-                        .as_ref()
-                        .map(|name| SymbolId(format!("{}:owner:{}", path, name))),
-                };
-                callables.push(CallableSymbol {
-                    id,
-                    name: fact.name.clone(),
-                    qualified_name: qualified_name(file, fact),
-                    kind: fact.kind,
-                    language: file.language.clone(),
-                    span: SourceSpan {
-                        path: path.clone(),
-                        start_byte: fact.start,
-                        end_byte: fact.end,
-                    },
-                    owner,
-                });
-            }
-        }
-        callables.sort_by(|left, right| {
-            left.span
-                .path
-                .cmp(&right.span.path)
-                .then(left.span.start_byte.cmp(&right.span.start_byte))
-                .then(left.id.cmp(&right.id))
-        });
+        let ids = symbol_ids(files);
+        let callables = callable_symbols(files, &ids);
+        let calls = self.resolve_calls(files, &ids);
+        (callables, calls)
+    }
+
+    /// Every call site of every file, resolved by the language's resolver, in source order.
+    fn resolve_calls(
+        &self,
+        files: &[(String, Arc<ExtractedFile>)],
+        ids: &BTreeMap<(String, u32), SymbolId>,
+    ) -> Vec<CallSite> {
         let project = ProjectIndex::new(
             files
                 .iter()
@@ -508,18 +478,12 @@ impl DefaultCallGraph {
                     Some(resolver) => format!("{adapter_version}+{}", resolver.version()),
                     None => adapter_version.to_owned(),
                 };
-                calls.push(call_site(
-                    caller,
-                    SourceSpan {
-                        path: path.clone(),
-                        start_byte: fact.start,
-                        end_byte: fact.end,
-                    },
-                    outcome,
-                    &version,
-                    &ids,
-                    files,
-                ));
+                let span = SourceSpan {
+                    path: path.clone(),
+                    start_byte: fact.start,
+                    end_byte: fact.end,
+                };
+                calls.push(call_site(caller, span, outcome, &version, ids, files));
             }
         }
         calls.sort_by(|left, right| {
@@ -529,7 +493,7 @@ impl DefaultCallGraph {
                 .then(left.span.start_byte.cmp(&right.span.start_byte))
                 .then(left.caller.cmp(&right.caller))
         });
-        (callables, calls)
+        calls
     }
 }
 
@@ -739,4 +703,59 @@ fn count_resolutions(calls: &[CallSite], stats: &mut RefreshStats) {
             }
         }
     }
+}
+
+/// The id of every callable, by file and key.
+fn symbol_ids(files: &[(String, Arc<ExtractedFile>)]) -> BTreeMap<(String, u32), SymbolId> {
+    let mut ids = BTreeMap::new();
+    for (path, file) in files {
+        for fact in &file.callables {
+            ids.insert(
+                (path.clone(), fact.key),
+                SymbolId(format!("{}:{}:{}", path, fact.key, fact.name)),
+            );
+        }
+    }
+    ids
+}
+
+/// The callables of every file, sorted by file and position.
+fn callable_symbols(
+    files: &[(String, Arc<ExtractedFile>)],
+    ids: &BTreeMap<(String, u32), SymbolId>,
+) -> Vec<CallableSymbol> {
+    let mut callables = Vec::new();
+    for (path, file) in files {
+        for fact in &file.callables {
+            let id = ids[&(path.clone(), fact.key)].clone();
+            let owner = match fact.parent {
+                Some(parent) => ids.get(&(path.clone(), parent)).cloned(),
+                None => fact
+                    .container
+                    .as_ref()
+                    .map(|name| SymbolId(format!("{}:owner:{}", path, name))),
+            };
+            callables.push(CallableSymbol {
+                id,
+                name: fact.name.clone(),
+                qualified_name: qualified_name(file, fact),
+                kind: fact.kind,
+                language: file.language.clone(),
+                span: SourceSpan {
+                    path: path.clone(),
+                    start_byte: fact.start,
+                    end_byte: fact.end,
+                },
+                owner,
+            });
+        }
+    }
+    callables.sort_by(|left, right| {
+        left.span
+            .path
+            .cmp(&right.span.path)
+            .then(left.span.start_byte.cmp(&right.span.start_byte))
+            .then(left.id.cmp(&right.id))
+    });
+    callables
 }

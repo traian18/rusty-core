@@ -128,6 +128,49 @@ pub(crate) fn traverse(
     snapshot: &GraphSnapshot,
     request: &TraversalRequest,
 ) -> Result<TraversalResponse, CallGraphError> {
+    validate_traversal(snapshot, request)?;
+    let walk = walk(snapshot, request);
+    let mut node_positions: Vec<usize> = walk
+        .seen
+        .iter()
+        .filter_map(|id| snapshot.index.callable_by_id.get(id).copied())
+        .collect();
+    node_positions.sort_unstable();
+    let nodes: Vec<CallableSymbol> = node_positions
+        .into_iter()
+        .map(|position| snapshot.callables[position].clone())
+        .collect();
+    let edges: Vec<CallSite> = walk
+        .edge_positions
+        .into_iter()
+        .map(|position| snapshot.calls[position].clone())
+        .collect();
+    let nodes = page(nodes, None, request.limit, snapshot)?;
+    let edges = page(edges, None, request.limit, snapshot)?;
+    let mut truncated_by = Vec::new();
+    if walk.depth_cut {
+        truncated_by.push(TraversalLimit::Depth);
+    }
+    if nodes.metadata.truncated {
+        truncated_by.push(TraversalLimit::NodeLimit);
+    }
+    if edges.metadata.truncated {
+        truncated_by.push(TraversalLimit::EdgeLimit);
+    }
+    if walk.visit_cut {
+        truncated_by.push(TraversalLimit::VisitBudget);
+    }
+    Ok(TraversalResponse {
+        nodes,
+        edges,
+        truncated_by,
+    })
+}
+
+fn validate_traversal(
+    snapshot: &GraphSnapshot,
+    request: &TraversalRequest,
+) -> Result<(), CallGraphError> {
     validate_limit(request.limit)?;
     if request.depth > DEPTH_LIMIT {
         return Err(CallGraphError::LimitExceeded(format!(
@@ -148,95 +191,89 @@ pub(crate) fn traverse(
     for root in &request.roots {
         known_callable(snapshot, root)?;
     }
-    let mut seen: BTreeSet<SymbolId> = BTreeSet::new();
-    let mut edge_positions: BTreeSet<usize> = BTreeSet::new();
+    Ok(())
+}
+
+/// What a breadth-first walk from the roots reached, and which limits cut it short.
+struct Walk {
+    seen: BTreeSet<SymbolId>,
+    edge_positions: BTreeSet<usize>,
+    depth_cut: bool,
+    visit_cut: bool,
+}
+
+fn walk(snapshot: &GraphSnapshot, request: &TraversalRequest) -> Walk {
+    let mut walk = Walk {
+        seen: BTreeSet::new(),
+        edge_positions: BTreeSet::new(),
+        depth_cut: false,
+        visit_cut: false,
+    };
     let mut queue: VecDeque<(SymbolId, u32)> = request
         .roots
         .iter()
         .cloned()
         .map(|root| (root, 0))
         .collect();
-    let mut depth_cut = false;
-    let mut visit_cut = false;
     let mut expanded = 0usize;
-    let follow_callees = matches!(request.direction, Direction::Callees | Direction::Both);
-    let follow_callers = matches!(request.direction, Direction::Callers | Direction::Both);
     while let Some((id, depth)) = queue.pop_front() {
-        if !seen.insert(id.clone()) {
+        if !walk.seen.insert(id.clone()) {
             continue;
         }
         if expanded >= VISIT_LIMIT {
-            visit_cut = true;
+            walk.visit_cut = true;
             break;
         }
         expanded += 1;
-        let mut neighbours: Vec<SymbolId> = Vec::new();
-        if follow_callees {
-            for position in snapshot.index.by_caller.get(&id).into_iter().flatten() {
-                let call = &snapshot.calls[*position];
-                if !allows(&request.resolutions, call.resolution, true) {
-                    continue;
-                }
-                edge_positions.insert(*position);
-                neighbours.extend(call.target.iter().chain(call.candidates.iter()).cloned());
-            }
-        }
-        if follow_callers {
-            for position in snapshot.index.by_target.get(&id).into_iter().flatten() {
-                let call = &snapshot.calls[*position];
-                if !allows(&request.resolutions, call.resolution, false) {
-                    continue;
-                }
-                edge_positions.insert(*position);
-                neighbours.push(call.caller.clone());
-            }
-        }
-        neighbours.retain(|neighbour| snapshot.index.callable_by_id.contains_key(neighbour));
+        let neighbours = neighbours_of(snapshot, request, &id, &mut walk.edge_positions);
         if depth >= request.depth {
-            if neighbours.iter().any(|neighbour| !seen.contains(neighbour)) {
-                depth_cut = true;
+            if neighbours
+                .iter()
+                .any(|neighbour| !walk.seen.contains(neighbour))
+            {
+                walk.depth_cut = true;
             }
             continue;
         }
         for neighbour in neighbours {
-            if !seen.contains(&neighbour) {
+            if !walk.seen.contains(&neighbour) {
                 queue.push_back((neighbour, depth + 1));
             }
         }
     }
-    let mut node_positions: Vec<usize> = seen
-        .iter()
-        .filter_map(|id| snapshot.index.callable_by_id.get(id).copied())
-        .collect();
-    node_positions.sort_unstable();
-    let nodes: Vec<CallableSymbol> = node_positions
-        .into_iter()
-        .map(|position| snapshot.callables[position].clone())
-        .collect();
-    let edges: Vec<CallSite> = edge_positions
-        .into_iter()
-        .map(|position| snapshot.calls[position].clone())
-        .collect();
-    let nodes = page(nodes, None, request.limit, snapshot)?;
-    let edges = page(edges, None, request.limit, snapshot)?;
-    let mut truncated_by = Vec::new();
-    if depth_cut {
-        truncated_by.push(TraversalLimit::Depth);
+    walk
+}
+
+/// The callables one step from `id` in the requested direction, noting the edges followed.
+fn neighbours_of(
+    snapshot: &GraphSnapshot,
+    request: &TraversalRequest,
+    id: &SymbolId,
+    edge_positions: &mut BTreeSet<usize>,
+) -> Vec<SymbolId> {
+    let mut neighbours: Vec<SymbolId> = Vec::new();
+    if matches!(request.direction, Direction::Callees | Direction::Both) {
+        for position in snapshot.index.by_caller.get(id).into_iter().flatten() {
+            let call = &snapshot.calls[*position];
+            if !allows(&request.resolutions, call.resolution, true) {
+                continue;
+            }
+            edge_positions.insert(*position);
+            neighbours.extend(call.target.iter().chain(call.candidates.iter()).cloned());
+        }
     }
-    if nodes.metadata.truncated {
-        truncated_by.push(TraversalLimit::NodeLimit);
+    if matches!(request.direction, Direction::Callers | Direction::Both) {
+        for position in snapshot.index.by_target.get(id).into_iter().flatten() {
+            let call = &snapshot.calls[*position];
+            if !allows(&request.resolutions, call.resolution, false) {
+                continue;
+            }
+            edge_positions.insert(*position);
+            neighbours.push(call.caller.clone());
+        }
     }
-    if edges.metadata.truncated {
-        truncated_by.push(TraversalLimit::EdgeLimit);
-    }
-    if visit_cut {
-        truncated_by.push(TraversalLimit::VisitBudget);
-    }
-    Ok(TraversalResponse {
-        nodes,
-        edges,
-        truncated_by,
-    })
+    neighbours.retain(|neighbour| snapshot.index.callable_by_id.contains_key(neighbour));
+    neighbours
 }
 
 pub(crate) fn page<T: Clone>(
