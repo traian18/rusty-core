@@ -120,7 +120,13 @@ impl ImportResolver for JavaImportResolver {
             .collect();
         let max = context.limits.max_candidates;
         resolve_units(context, &PROFILES, |unit, fact| {
-            decide(unit, fact, &types, &packages, &declared, max)
+            let index = Index {
+                types: &types,
+                packages: &packages,
+                declared: &declared,
+                max,
+            };
+            decide(unit, fact, &index)
         })
     }
 }
@@ -140,69 +146,49 @@ fn lead(name: &str, n: usize) -> String {
     name.split('.').take(n).collect::<Vec<_>>().join(".")
 }
 
-fn decide(
-    unit: &SourceUnit,
-    fact: &ImportFact,
-    types: &BTreeMap<String, Vec<&RootRelativePath>>,
-    packages: &BTreeMap<String, Vec<&RootRelativePath>>,
-    declared: &BTreeMap<&str, HashSet<&str>>,
+/// What an import is matched against.
+struct Index<'a> {
+    types: &'a BTreeMap<String, Vec<&'a RootRelativePath>>,
+    packages: &'a BTreeMap<String, Vec<&'a RootRelativePath>>,
+    declared: &'a BTreeMap<&'a str, HashSet<&'a str>>,
     max: usize,
-) -> Decision {
-    let spelling = fact.spelling.as_str();
-    let pick = |files: &[&RootRelativePath]| -> Resolution {
+}
+
+impl Index<'_> {
+    /// One file is a resolved import; several are candidates.
+    fn pick(&self, files: &[&RootRelativePath]) -> Resolution {
         match files {
             [only] => found(only, None),
             many => Resolution::Possible {
-                candidates: many.iter().take(max).map(|f| (*f).clone()).collect(),
-                truncated: many.len() > max,
+                candidates: many.iter().take(self.max).map(|f| (*f).clone()).collect(),
+                truncated: many.len() > self.max,
             },
         }
-    };
-    if fact.glob
-        && fact.imported_name.as_deref() == Some("*")
-        && !fact.scope.iter().any(|s| s == "static")
-    {
-        // `import a.b.*;` names a package.
-        if let Some(files) = packages.get(spelling) {
-            return Decision::new(pick(files), "java.package_wildcard");
-        }
     }
-    if let Some(files) = types.get(spelling) {
-        let item = fact.imported_name.clone().filter(|n| n != "*");
-        let resolution = match pick(files) {
-            Resolution::ResolvedInternal { target_file, .. } => found(&target_file, item),
-            other => other,
-        };
-        return Decision::new(resolution, "java.type_by_package_declaration");
+}
+
+fn decide(unit: &SourceUnit, fact: &ImportFact, index: &Index<'_>) -> Decision {
+    if let Some(decision) = decide_internal(fact, index) {
+        return decision;
     }
-    // `a.b.Outer.Inner`: the longest prefix that is a top-level type.
-    let parts: Vec<&str> = spelling.split('.').collect();
-    for end in (2..parts.len()).rev() {
-        if let Some(files) = types.get(&parts[..end].join(".")) {
-            return Decision::new(pick(files), "java.nested_type");
-        }
-    }
-    if KOTLIN_STDLIB_PREFIXES
+    let spelling = fact.spelling.as_str();
+    let stdlib = if KOTLIN_STDLIB_PREFIXES
         .iter()
         .any(|p| spelling.starts_with(p))
     {
-        return Decision::new(
-            Resolution::DeclaredExternal {
-                package: format!("stdlib:{}", lead(spelling, 2)),
-            },
-            "kotlin.stdlib",
-        );
-    }
-    if STDLIB_PREFIXES.iter().any(|p| spelling.starts_with(p)) {
-        return Decision::new(
-            Resolution::DeclaredExternal {
-                package: format!("stdlib:{}", lead(spelling, 2)),
-            },
-            "java.stdlib",
-        );
+        Some("kotlin.stdlib")
+    } else if STDLIB_PREFIXES.iter().any(|p| spelling.starts_with(p)) {
+        Some("java.stdlib")
+    } else {
+        None
+    };
+    if let Some(rule) = stdlib {
+        let package = format!("stdlib:{}", lead(spelling, 2));
+        return Decision::new(Resolution::DeclaredExternal { package }, rule);
     }
     // A package of this repository whose type is missing.
-    if packages
+    if index
+        .packages
         .keys()
         .any(|p| spelling == p || spelling.starts_with(&format!("{p}.")))
     {
@@ -213,35 +199,8 @@ fn decide(
             "java.path_not_found",
         );
     }
-    let dependencies = unit
-        .package
-        .as_ref()
-        .and_then(|p| declared.get(p.0.as_str()));
-    // `kotlinx.coroutines` is published as `org.jetbrains.kotlinx:kotlinx-coroutines-core`.
-    let aliased = GROUP_ALIASES
-        .iter()
-        .find(|(prefix, _)| spelling.starts_with(prefix))
-        .map(|(_, group)| *group);
-    let matched = dependencies.and_then(|set| {
-        set.iter()
-            .filter_map(|coordinate| {
-                let group = coordinate.split(':').next()?;
-                if aliased == Some(group) {
-                    return Some((usize::MAX, *coordinate));
-                }
-                let shared = if spelling == group || spelling.starts_with(&format!("{group}.")) {
-                    group.split('.').count()
-                } else if lead(spelling, 2) == lead(group, 2) && group.split('.').count() >= 2 {
-                    2
-                } else {
-                    return None;
-                };
-                Some((shared, *coordinate))
-            })
-            .max_by_key(|(shared, coordinate)| (*shared, std::cmp::Reverse(coordinate.to_string())))
-    });
-    match matched {
-        Some((_, coordinate)) => Decision::new(
+    match declared_dependency(unit, spelling, index.declared) {
+        Some(coordinate) => Decision::new(
             Resolution::DeclaredExternal {
                 package: coordinate.to_owned(),
             },
@@ -254,4 +213,72 @@ fn decide(
             "java.undeclared_external",
         ),
     }
+}
+
+/// An import of a package or type declared in this repository, if it is one.
+fn decide_internal(fact: &ImportFact, index: &Index<'_>) -> Option<Decision> {
+    let spelling = fact.spelling.as_str();
+    if fact.glob
+        && fact.imported_name.as_deref() == Some("*")
+        && !fact.scope.iter().any(|s| s == "static")
+    {
+        // `import a.b.*;` names a package.
+        if let Some(files) = index.packages.get(spelling) {
+            return Some(Decision::new(index.pick(files), "java.package_wildcard"));
+        }
+    }
+    if let Some(files) = index.types.get(spelling) {
+        let item = fact.imported_name.clone().filter(|n| n != "*");
+        let resolution = match index.pick(files) {
+            Resolution::ResolvedInternal { target_file, .. } => found(&target_file, item),
+            other => other,
+        };
+        return Some(Decision::new(
+            resolution,
+            "java.type_by_package_declaration",
+        ));
+    }
+    // `a.b.Outer.Inner`: the longest prefix that is a top-level type.
+    let parts: Vec<&str> = spelling.split('.').collect();
+    for end in (2..parts.len()).rev() {
+        if let Some(files) = index.types.get(&parts[..end].join(".")) {
+            return Some(Decision::new(index.pick(files), "java.nested_type"));
+        }
+    }
+    None
+}
+
+/// The declared Maven or Gradle coordinate that best matches the import's group.
+fn declared_dependency<'a>(
+    unit: &SourceUnit,
+    spelling: &str,
+    declared: &BTreeMap<&str, HashSet<&'a str>>,
+) -> Option<&'a str> {
+    let dependencies = unit
+        .package
+        .as_ref()
+        .and_then(|p| declared.get(p.0.as_str()))?;
+    // `kotlinx.coroutines` is published as `org.jetbrains.kotlinx:kotlinx-coroutines-core`.
+    let aliased = GROUP_ALIASES
+        .iter()
+        .find(|(prefix, _)| spelling.starts_with(prefix))
+        .map(|(_, group)| *group);
+    dependencies
+        .iter()
+        .filter_map(|coordinate| {
+            let group = coordinate.split(':').next()?;
+            if aliased == Some(group) {
+                return Some((usize::MAX, *coordinate));
+            }
+            let shared = if spelling == group || spelling.starts_with(&format!("{group}.")) {
+                group.split('.').count()
+            } else if lead(spelling, 2) == lead(group, 2) && group.split('.').count() >= 2 {
+                2
+            } else {
+                return None;
+            };
+            Some((shared, *coordinate))
+        })
+        .max_by_key(|(shared, coordinate)| (*shared, std::cmp::Reverse(coordinate.to_string())))
+        .map(|(_, coordinate)| coordinate)
 }

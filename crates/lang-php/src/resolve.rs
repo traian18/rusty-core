@@ -118,7 +118,14 @@ impl ImportResolver for PhpImportResolver {
             .collect();
         let max = context.limits.max_candidates;
         resolve_units(context, &[LanguageProfile::Php], |unit, fact| {
-            decide(unit, fact, &classes, &namespaces, &files, &declared, max)
+            let index = Index {
+                classes: &classes,
+                namespaces: &namespaces,
+                files: &files,
+                declared: &declared,
+                max,
+            };
+            decide(unit, fact, &index)
         })
     }
 }
@@ -154,57 +161,28 @@ fn normalize(path: &Path) -> Option<std::path::PathBuf> {
     Some(parts.iter().collect())
 }
 
-fn decide(
-    unit: &SourceUnit,
-    fact: &ImportFact,
-    classes: &BTreeMap<String, Vec<&RootRelativePath>>,
-    namespaces: &BTreeMap<String, Vec<&RootRelativePath>>,
-    files: &HashSet<&RootRelativePath>,
-    declared: &BTreeMap<&str, HashSet<&str>>,
+/// What an import is matched against.
+struct Index<'a> {
+    classes: &'a BTreeMap<String, Vec<&'a RootRelativePath>>,
+    namespaces: &'a BTreeMap<String, Vec<&'a RootRelativePath>>,
+    files: &'a HashSet<&'a RootRelativePath>,
+    declared: &'a BTreeMap<&'a str, HashSet<&'a str>>,
     max: usize,
-) -> Decision {
+}
+
+fn decide(unit: &SourceUnit, fact: &ImportFact, index: &Index<'_>) -> Decision {
     if fact.form == ImportForm::Require {
-        if !fact.literal_specifier {
-            return Decision::new(
-                Resolution::DynamicOrUnsupported {
-                    reason: ImportReason::NonLiteralSpecifier,
-                },
-                "php.require_literal",
-            );
-        }
-        if fact.spelling.ends_with("vendor/autoload.php") {
-            return Decision::new(
-                Resolution::DeclaredExternal {
-                    package: "composer-autoload".into(),
-                },
-                "php.composer_autoload",
-            );
-        }
-        let joined = unit
-            .path
-            .as_path()
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join(fact.spelling.trim_start_matches('/'));
-        return match normalize(&joined)
-            .and_then(|p| RootRelativePath::new(p).ok())
-            .filter(|p| files.contains(p))
-        {
-            Some(target) => Decision::new(found(&[&target], max), "php.require_literal"),
-            None => Decision::new(
-                Resolution::Unresolved {
-                    reason: ImportReason::PathNotFound,
-                },
-                "php.path_not_found",
-            ),
-        };
+        return decide_require(unit, fact, index);
     }
     let name = fact.spelling.as_str();
-    if let Some(files) = classes.get(name) {
-        return Decision::new(found(files, max), "php.class_by_namespace_declaration");
+    if let Some(files) = index.classes.get(name) {
+        return Decision::new(
+            found(files, index.max),
+            "php.class_by_namespace_declaration",
+        );
     }
-    if let Some(files) = namespaces.get(name) {
-        return Decision::new(found(files, max), "php.namespace_declaration");
+    if let Some(files) = index.namespaces.get(name) {
+        return Decision::new(found(files, index.max), "php.namespace_declaration");
     }
     if !name.contains('\\') {
         return Decision::new(
@@ -216,7 +194,8 @@ fn decide(
     }
     let first = name.split('\\').next().unwrap_or("");
     // A namespace of this repository whose class is missing.
-    if namespaces
+    if index
+        .namespaces
         .keys()
         .any(|n| n.split('\\').next() == Some(first))
     {
@@ -227,38 +206,7 @@ fn decide(
             "php.path_not_found",
         );
     }
-    let dependencies = unit
-        .package
-        .as_ref()
-        .and_then(|p| declared.get(p.0.as_str()));
-    let lowered = first.to_lowercase();
-    let matched = dependencies.and_then(|set| {
-        let mut candidates: Vec<&str> = set
-            .iter()
-            .copied()
-            .filter(|pkg| {
-                let vendor = pkg.split('/').next().unwrap_or("");
-                vendor == lowered
-                    || NAMESPACE_PACKAGES.iter().any(|(ns, want)| {
-                        *ns == first
-                            && (pkg == want || (want.ends_with('/') && pkg.starts_with(want)))
-                    })
-            })
-            .collect();
-        candidates.sort();
-        // Prefer a package whose own name also appears in the namespace (monolog/monolog for Monolog\…).
-        let second = name
-            .split('\\')
-            .nth(1)
-            .map(str::to_lowercase)
-            .unwrap_or_default();
-        candidates
-            .iter()
-            .find(|p| p.split('/').nth(1) == Some(second.as_str()))
-            .or_else(|| candidates.first())
-            .copied()
-    });
-    match matched {
+    match declared_package(unit, name, first, index.declared) {
         Some(package) => Decision::new(
             Resolution::DeclaredExternal {
                 package: package.to_owned(),
@@ -272,4 +220,79 @@ fn decide(
             "php.undeclared_external",
         ),
     }
+}
+
+/// A literal `require` or `include`: the autoloader, or a file relative to the including one.
+fn decide_require(unit: &SourceUnit, fact: &ImportFact, index: &Index<'_>) -> Decision {
+    if !fact.literal_specifier {
+        return Decision::new(
+            Resolution::DynamicOrUnsupported {
+                reason: ImportReason::NonLiteralSpecifier,
+            },
+            "php.require_literal",
+        );
+    }
+    if fact.spelling.ends_with("vendor/autoload.php") {
+        return Decision::new(
+            Resolution::DeclaredExternal {
+                package: "composer-autoload".into(),
+            },
+            "php.composer_autoload",
+        );
+    }
+    let joined = unit
+        .path
+        .as_path()
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(fact.spelling.trim_start_matches('/'));
+    match normalize(&joined)
+        .and_then(|p| RootRelativePath::new(p).ok())
+        .filter(|p| index.files.contains(p))
+    {
+        Some(target) => Decision::new(found(&[&target], index.max), "php.require_literal"),
+        None => Decision::new(
+            Resolution::Unresolved {
+                reason: ImportReason::PathNotFound,
+            },
+            "php.path_not_found",
+        ),
+    }
+}
+
+/// The declared Composer package that provides the namespace `name` begins with `first`.
+fn declared_package<'a>(
+    unit: &SourceUnit,
+    name: &str,
+    first: &str,
+    declared: &BTreeMap<&str, HashSet<&'a str>>,
+) -> Option<&'a str> {
+    let dependencies = unit
+        .package
+        .as_ref()
+        .and_then(|p| declared.get(p.0.as_str()))?;
+    let lowered = first.to_lowercase();
+    let mut candidates: Vec<&str> = dependencies
+        .iter()
+        .copied()
+        .filter(|pkg| {
+            let vendor = pkg.split('/').next().unwrap_or("");
+            vendor == lowered
+                || NAMESPACE_PACKAGES.iter().any(|(ns, want)| {
+                    *ns == first && (pkg == want || (want.ends_with('/') && pkg.starts_with(want)))
+                })
+        })
+        .collect();
+    candidates.sort();
+    // Prefer a package whose own name also appears in the namespace (monolog/monolog for Monolog\…).
+    let second = name
+        .split('\\')
+        .nth(1)
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    candidates
+        .iter()
+        .find(|p| p.split('/').nth(1) == Some(second.as_str()))
+        .or_else(|| candidates.first())
+        .copied()
 }
