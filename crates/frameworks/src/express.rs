@@ -129,9 +129,32 @@ fn read_file(
     input: &FrameworkInput<'_>,
     output: &mut FrameworkOutput,
 ) {
-    let known = routers(root, source);
-    let locals = top_level_names(root, source);
-    walk(root, &mut |node| {
+    let reader = Reader {
+        package,
+        file,
+        source,
+        input,
+        known: routers(root, source),
+        locals: top_level_names(root, source),
+    };
+    walk(root, &mut |node| reader.route_call(node, output));
+}
+
+/// One file being read for Express routes.
+struct Reader<'a> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    source: &'a str,
+    input: &'a FrameworkInput<'a>,
+    /// Variables that are provably an Express app or router.
+    known: HashSet<String>,
+    locals: HashSet<String>,
+}
+
+impl Reader<'_> {
+    /// `app.get("/path", handler)` and its siblings on a known app or router.
+    fn route_call(&self, node: Node<'_>, output: &mut FrameworkOutput) {
+        let source = self.source;
         if node.kind() != "call_expression" {
             return;
         }
@@ -157,64 +180,79 @@ fn read_file(
         let mut cursor = arguments.walk();
         let args: Vec<Node<'_>> = arguments.named_children(&mut cursor).collect();
         // `app.get('name')` reads a setting; a route needs a path and at least one handler.
+        let (Some(path_node), Some(last)) = (args.first().copied(), args.last().copied()) else {
+            return;
+        };
         if args.len() < 2 {
             return;
         }
         let receiver = text(object, source);
-        let path_node = args[0];
         let looks_like_route = string_value(path_node, source).is_some_and(|p| p.starts_with('/'))
             || path_node.kind() == "array";
-        if !known.contains(receiver) || is_parameter(node, receiver, source) {
+        if !self.known.contains(receiver) || is_parameter(node, receiver, source) {
             if looks_like_route {
                 output.unresolved(
-                    file,
+                    self.file,
                     format!("`{receiver}.{method}({}, …)` looks like a route, but `{receiver}` is not provably an Express app or router; no relation emitted", text(path_node, source)),
                 );
             }
             return;
         }
-        let paths = match path_node.kind() {
-            "array" => {
-                let mut inner = path_node.walk();
-                let elements: Vec<Node<'_>> = path_node.named_children(&mut inner).collect();
-                let literals: Vec<String> = elements
-                    .iter()
-                    .filter_map(|e| string_value(*e, source))
-                    .collect();
-                if literals.len() != elements.len() {
-                    output.unresolved(file, format!("`{receiver}.{method}({}, …)` has a path list with computed entries; no relation emitted", text(path_node, source)));
-                    return;
-                }
-                literals
-            }
-            _ => {
-                match string_value(path_node, source) {
-                    Some(path) => vec![path],
-                    None => {
-                        output.unresolved(file, format!("`{receiver}.{method}({}, …)` has a computed path; no relation emitted", text(path_node, source)));
-                        return;
-                    }
-                }
-            }
+        let Some(paths) = self.paths_of(path_node, receiver, method, output) else {
+            return;
         };
-        let handler = resolve_handler(*args.last().unwrap(), file, source, &locals, input);
+        let handler = resolve_handler(last, self.file, source, &self.locals, self.input);
         for path in paths {
-            output.relate(FrameworkRelation::new(
-                ID,
-                Some(&package.id),
-                RelationDraft {
-                    kind: RelationKind::RouteRegisteredTo,
-                    rule: RULE,
-                    rule_version: VERSION,
-                    certainty: Certainty::Declared,
-                    from: file.clone(),
-                    to: handler.file.clone(),
-                    from_symbol: None,
-                    to_symbol: handler.symbol.clone(),
-                    label: format!("{} {path}", method.to_uppercase()),
-                    evidence: evidence(file, node, source),
-                },
-            ));
+            let draft = RelationDraft {
+                kind: RelationKind::RouteRegisteredTo,
+                rule: RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: self.file.clone(),
+                to: handler.file.clone(),
+                from_symbol: None,
+                to_symbol: handler.symbol.clone(),
+                label: format!("{} {path}", method.to_uppercase()),
+                evidence: evidence(self.file, node, source),
+            };
+            output.relate(FrameworkRelation::new(ID, Some(&self.package.id), draft));
         }
-    });
+    }
+
+    /// The literal path, or every entry of a path list; `None` (reported) when any is computed.
+    fn paths_of(
+        &self,
+        path_node: Node<'_>,
+        receiver: &str,
+        method: &str,
+        output: &mut FrameworkOutput,
+    ) -> Option<Vec<String>> {
+        let source = self.source;
+        if path_node.kind() == "array" {
+            let mut inner = path_node.walk();
+            let elements: Vec<Node<'_>> = path_node.named_children(&mut inner).collect();
+            let literals: Vec<String> = elements
+                .iter()
+                .filter_map(|e| string_value(*e, source))
+                .collect();
+            if literals.len() != elements.len() {
+                output.unresolved(self.file, format!("`{receiver}.{method}({}, …)` has a path list with computed entries; no relation emitted", text(path_node, source)));
+                return None;
+            }
+            return Some(literals);
+        }
+        match string_value(path_node, source) {
+            Some(path) => Some(vec![path]),
+            None => {
+                output.unresolved(
+                    self.file,
+                    format!(
+                        "`{receiver}.{method}({}, …)` has a computed path; no relation emitted",
+                        text(path_node, source)
+                    ),
+                );
+                None
+            }
+        }
+    }
 }
