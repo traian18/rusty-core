@@ -105,6 +105,23 @@ impl FrameworkAdapter for DjangoAdapter {
     }
 }
 
+/// Only entries of a `urlpatterns` list count; other calls named `path` are not routes.
+fn in_urlpatterns(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        let assigns = matches!(ancestor.kind(), "assignment" | "augmented_assignment");
+        if assigns
+            && ancestor
+                .child_by_field_name("left")
+                .is_some_and(|l| text(l, source) == "urlpatterns")
+        {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
 fn urls(
     package: &Package,
     file: &RootRelativePath,
@@ -128,29 +145,7 @@ fn urls(
         if !matches!(callee, "path" | "re_path" | "url") {
             return;
         }
-        // Only entries of a `urlpatterns` list count; other calls named `path` are not routes.
-        let mut in_patterns = false;
-        let mut current = node.parent();
-        while let Some(ancestor) = current {
-            if ancestor.kind() == "assignment"
-                && ancestor
-                    .child_by_field_name("left")
-                    .is_some_and(|l| text(l, source) == "urlpatterns")
-            {
-                in_patterns = true;
-                break;
-            }
-            if ancestor.kind() == "augmented_assignment"
-                && ancestor
-                    .child_by_field_name("left")
-                    .is_some_and(|l| text(l, source) == "urlpatterns")
-            {
-                in_patterns = true;
-                break;
-            }
-            current = ancestor.parent();
-        }
-        if !in_patterns {
+        if !in_urlpatterns(node, source) {
             return;
         }
         let (args, _) = call_arguments(node, source);
@@ -211,6 +206,47 @@ fn app_label(file: &RootRelativePath) -> String {
     }
 }
 
+/// What a model's inner `class Meta` says.
+struct ModelMeta {
+    db_table: Option<String>,
+    abstract_model: bool,
+}
+
+fn model_meta(class: Node<'_>, source: &str) -> ModelMeta {
+    let mut meta = ModelMeta {
+        db_table: None,
+        abstract_model: false,
+    };
+    let Some(body) = class.child_by_field_name("body") else {
+        return meta;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "class_definition"
+            || member.child_by_field_name("name").map(|n| text(n, source)) != Some("Meta")
+        {
+            continue;
+        }
+        walk(member, &mut |n| {
+            if n.kind() != "assignment" {
+                return;
+            }
+            let (Some(left), Some(right)) = (
+                n.child_by_field_name("left"),
+                n.child_by_field_name("right"),
+            ) else {
+                return;
+            };
+            match text(left, source) {
+                "db_table" => meta.db_table = string_value(right, source),
+                "abstract" => meta.abstract_model = text(right, source) == "True",
+                _ => {}
+            }
+        });
+    }
+    meta
+}
+
 fn models(
     package: &Package,
     file: &RootRelativePath,
@@ -238,34 +274,8 @@ fn models(
         {
             return;
         }
-        let mut db_table = None;
-        let mut abstract_model = false;
-        if let Some(body) = node.child_by_field_name("body") {
-            let mut cursor = body.walk();
-            for member in body.named_children(&mut cursor) {
-                if member.kind() != "class_definition"
-                    || member.child_by_field_name("name").map(|n| text(n, source)) != Some("Meta")
-                {
-                    continue;
-                }
-                walk(member, &mut |n| {
-                    if n.kind() != "assignment" {
-                        return;
-                    }
-                    let (Some(left), Some(right)) = (
-                        n.child_by_field_name("left"),
-                        n.child_by_field_name("right"),
-                    ) else {
-                        return;
-                    };
-                    match text(left, source) {
-                        "db_table" => db_table = string_value(right, source),
-                        "abstract" => abstract_model = text(right, source) == "True",
-                        _ => {}
-                    }
-                });
-            }
-        }
+        let meta = model_meta(node, source);
+        let (db_table, abstract_model) = (meta.db_table, meta.abstract_model);
         if abstract_model {
             return;
         }
