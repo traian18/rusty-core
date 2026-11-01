@@ -84,153 +84,18 @@ impl FrameworkAdapter for SymfonyAdapter {
             parsed.push((file, source, tree));
         }
         let index = class_index(&parsed);
-        let unique = |name: &str| {
-            index
-                .get(name)
-                .filter(|f| f.len() == 1)
-                .map(|f| f[0].clone())
-        };
-
         for (file, source, tree) in &parsed {
-            let root = tree.root_node();
-            let in_src = file
-                .as_path()
-                .starts_with(FrameworkInput::package_dir(package).join("src"));
-            for class in classes(root, source) {
-                let name_node = class.node.child_by_field_name("name").unwrap_or(class.node);
-                // Routes.
-                let prefixes = match class.attribute("Route") {
-                    None => vec![String::new()],
-                    Some(route) => {
-                        match route_path(route, source) {
-                            Some(path) => vec![path.unwrap_or_default()],
-                            None => {
-                                output.unresolved(file, format!("`{}` has a computed #[Route] path; its routes were not read", class.name));
-                                continue;
-                            }
-                        }
-                    }
-                };
-                for method in &class.methods {
-                    for route in method.attributes.iter().filter(|a| a.name == "Route") {
-                        let Some(path) = route_path(route, source) else {
-                            output.unresolved(
-                                file,
-                                format!(
-                                    "`{}::{}` has a computed #[Route] path; no relation emitted",
-                                    class.name, method.name
-                                ),
-                            );
-                            continue;
-                        };
-                        let verbs = route_methods(route, source);
-                        for prefix in &prefixes {
-                            for verb in &verbs {
-                                output.relate(FrameworkRelation::new(
-                                    ID,
-                                    Some(&package.id),
-                                    RelationDraft {
-                                        kind: RelationKind::RouteRegisteredTo,
-                                        rule: ROUTE_RULE,
-                                        rule_version: VERSION,
-                                        certainty: Certainty::Declared,
-                                        from: file.clone(),
-                                        to: Some(file.clone()),
-                                        from_symbol: Some(class.name.clone()),
-                                        to_symbol: Some(format!("{}.{}", class.name, method.name)),
-                                        label: format!(
-                                            "{verb} {}",
-                                            join(prefix, &path.clone().unwrap_or_default())
-                                        ),
-                                        evidence: evidence(file, route.node, source),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-                // Doctrine.
-                if let Some(entity) = class.attribute("Entity") {
-                    let table = class
-                        .attribute("Table")
-                        .and_then(|t| t.argument("name"))
-                        .and_then(|n| string_value(n, source));
-                    let (label, certainty) = match table {
-                        Some(name) => (name, Certainty::Declared),
-                        None => (snake_case(&class.name), Certainty::Convention),
-                    };
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::ModelMappedToTable,
-                            rule: ENTITY_RULE,
-                            rule_version: VERSION,
-                            certainty,
-                            from: file.clone(),
-                            to: None,
-                            from_symbol: Some(class.name.clone()),
-                            to_symbol: None,
-                            label,
-                            evidence: evidence(file, entity.node, source),
-                        },
-                    ));
-                }
-                // Console commands.
-                if let Some(command) = class.attribute("AsCommand") {
-                    if let Some(name) = command
-                        .argument("name")
-                        .or_else(|| command.first())
-                        .and_then(|n| string_value(n, source))
-                    {
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::CommandExposedAs,
-                                rule: COMMAND_RULE,
-                                rule_version: VERSION,
-                                certainty: Certainty::Declared,
-                                from: file.clone(),
-                                to: Some(file.clone()),
-                                from_symbol: None,
-                                to_symbol: Some(class.name.clone()),
-                                label: name,
-                                evidence: evidence(file, command.node, source),
-                            },
-                        ));
-                    }
-                }
-                // Autowiring.
-                if in_src && class.attribute("Entity").is_none() {
-                    if let Some(constructor) = class.constructor() {
-                        for parameter in &constructor.parameters {
-                            let Some(provider) = unique(&parameter.type_name) else {
-                                continue;
-                            };
-                            if &provider == file {
-                                continue;
-                            }
-                            output.relate(FrameworkRelation::new(
-                                ID,
-                                Some(&package.id),
-                                RelationDraft {
-                                    kind: RelationKind::ProviderInjectedInto,
-                                    rule: AUTOWIRE_RULE,
-                                    rule_version: VERSION,
-                                    certainty: Certainty::Convention,
-                                    from: provider,
-                                    to: Some(file.clone()),
-                                    from_symbol: Some(parameter.type_name.clone()),
-                                    to_symbol: Some(class.name.clone()),
-                                    label: parameter.type_name.clone(),
-                                    evidence: evidence(file, parameter.node, source),
-                                },
-                            ));
-                        }
-                    }
-                }
-                let _ = name_node;
+            let scan = ClassScan {
+                package,
+                file,
+                source,
+                index: &index,
+                in_src: file
+                    .as_path()
+                    .starts_with(FrameworkInput::package_dir(package).join("src")),
+            };
+            for class in classes(tree.root_node(), source) {
+                scan.class(&class, output);
             }
         }
         yaml_routes(
@@ -243,6 +108,179 @@ impl FrameworkAdapter for SymfonyAdapter {
             output,
         );
         Ok(())
+    }
+}
+
+/// One PHP file being read for Symfony conventions.
+struct ClassScan<'a> {
+    package: &'a Package,
+    file: &'a RootRelativePath,
+    source: &'a str,
+    index: &'a HashMap<String, Vec<RootRelativePath>>,
+    in_src: bool,
+}
+
+impl ClassScan<'_> {
+    fn unique(&self, name: &str) -> Option<RootRelativePath> {
+        self.index
+            .get(name)
+            .filter(|f| f.len() == 1)
+            .map(|f| f[0].clone())
+    }
+
+    fn relate(&self, draft: RelationDraft, output: &mut FrameworkOutput) {
+        output.relate(FrameworkRelation::new(ID, Some(&self.package.id), draft));
+    }
+
+    fn class(&self, class: &crate::php_common::Class<'_>, output: &mut FrameworkOutput) {
+        // A computed class-level route path means its routes were not read at all.
+        if !self.routes(class, output) {
+            return;
+        }
+        self.entity(class, output);
+        self.console_command(class, output);
+        self.autowiring(class, output);
+    }
+
+    /// `#[Route]` attributes on the class's methods, joined with the class-level prefix. False
+    /// when the class-level path is computed.
+    fn routes(&self, class: &crate::php_common::Class<'_>, output: &mut FrameworkOutput) -> bool {
+        let source = self.source;
+        let prefixes = match class.attribute("Route") {
+            None => vec![String::new()],
+            Some(route) => match route_path(route, source) {
+                Some(path) => vec![path.unwrap_or_default()],
+                None => {
+                    output.unresolved(
+                        self.file,
+                        format!(
+                            "`{}` has a computed #[Route] path; its routes were not read",
+                            class.name
+                        ),
+                    );
+                    return false;
+                }
+            },
+        };
+        for method in &class.methods {
+            for route in method.attributes.iter().filter(|a| a.name == "Route") {
+                let Some(path) = route_path(route, source) else {
+                    output.unresolved(
+                        self.file,
+                        format!(
+                            "`{}::{}` has a computed #[Route] path; no relation emitted",
+                            class.name, method.name
+                        ),
+                    );
+                    continue;
+                };
+                let path = path.unwrap_or_default();
+                for prefix in &prefixes {
+                    for verb in route_methods(route, source) {
+                        let draft = RelationDraft {
+                            kind: RelationKind::RouteRegisteredTo,
+                            rule: ROUTE_RULE,
+                            rule_version: VERSION,
+                            certainty: Certainty::Declared,
+                            from: self.file.clone(),
+                            to: Some(self.file.clone()),
+                            from_symbol: Some(class.name.clone()),
+                            to_symbol: Some(format!("{}.{}", class.name, method.name)),
+                            label: format!("{verb} {}", join(prefix, &path)),
+                            evidence: evidence(self.file, route.node, source),
+                        };
+                        self.relate(draft, output);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// A Doctrine `#[Entity]` maps to a table: the declared one, else the snake-cased name.
+    fn entity(&self, class: &crate::php_common::Class<'_>, output: &mut FrameworkOutput) {
+        let Some(entity) = class.attribute("Entity") else {
+            return;
+        };
+        let table = class
+            .attribute("Table")
+            .and_then(|t| t.argument("name"))
+            .and_then(|n| string_value(n, self.source));
+        let (label, certainty) = match table {
+            Some(name) => (name, Certainty::Declared),
+            None => (snake_case(&class.name), Certainty::Convention),
+        };
+        let draft = RelationDraft {
+            kind: RelationKind::ModelMappedToTable,
+            rule: ENTITY_RULE,
+            rule_version: VERSION,
+            certainty,
+            from: self.file.clone(),
+            to: None,
+            from_symbol: Some(class.name.clone()),
+            to_symbol: None,
+            label,
+            evidence: evidence(self.file, entity.node, self.source),
+        };
+        self.relate(draft, output);
+    }
+
+    /// `#[AsCommand(name: …)]` exposes a console command.
+    fn console_command(&self, class: &crate::php_common::Class<'_>, output: &mut FrameworkOutput) {
+        let Some(command) = class.attribute("AsCommand") else {
+            return;
+        };
+        let Some(name) = command
+            .argument("name")
+            .or_else(|| command.first())
+            .and_then(|n| string_value(n, self.source))
+        else {
+            return;
+        };
+        let draft = RelationDraft {
+            kind: RelationKind::CommandExposedAs,
+            rule: COMMAND_RULE,
+            rule_version: VERSION,
+            certainty: Certainty::Declared,
+            from: self.file.clone(),
+            to: Some(self.file.clone()),
+            from_symbol: None,
+            to_symbol: Some(class.name.clone()),
+            label: name,
+            evidence: evidence(self.file, command.node, self.source),
+        };
+        self.relate(draft, output);
+    }
+
+    /// Constructor parameters of a service in `src/` are autowired from the class they name.
+    fn autowiring(&self, class: &crate::php_common::Class<'_>, output: &mut FrameworkOutput) {
+        if !self.in_src || class.attribute("Entity").is_some() {
+            return;
+        }
+        let Some(constructor) = class.constructor() else {
+            return;
+        };
+        for parameter in &constructor.parameters {
+            let Some(provider) = self.unique(&parameter.type_name) else {
+                continue;
+            };
+            if &provider == self.file {
+                continue;
+            }
+            let draft = RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule: AUTOWIRE_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Convention,
+                from: provider,
+                to: Some(self.file.clone()),
+                from_symbol: Some(parameter.type_name.clone()),
+                to_symbol: Some(class.name.clone()),
+                label: parameter.type_name.clone(),
+                evidence: evidence(self.file, parameter.node, self.source),
+            };
+            self.relate(draft, output);
+        }
     }
 }
 
