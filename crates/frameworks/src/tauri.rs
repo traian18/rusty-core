@@ -62,126 +62,172 @@ impl FrameworkAdapter for TauriAdapter {
         cancel: &CancellationToken,
         output: &mut FrameworkOutput,
     ) -> Result<(), DiscoveryError> {
-        struct Parsed {
-            file: RootRelativePath,
-            source: String,
-            tree: tree_sitter::Tree,
-        }
-        let mut parsed = Vec::new();
-        for indexed in input.files_of(package) {
-            if cancel.is_cancelled() {
-                return Err(DiscoveryError::Cancelled);
-            }
-            if indexed.path.as_path().extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let Some(source) = input.read(&indexed.path) else {
-                continue;
-            };
-            if !source.contains("command") && !source.contains("generate_handler") {
-                continue;
-            }
-            let Some(tree) = parse_rust(&source) else {
-                continue;
-            };
-            parsed.push(Parsed {
-                file: indexed.path.clone(),
-                source,
-                tree,
-            });
-        }
-
-        // Where each command function is defined.
-        let mut commands: BTreeMap<String, Vec<RootRelativePath>> = BTreeMap::new();
+        let parsed = parse_files(package, input, cancel)?;
+        let commands = command_definitions(&parsed);
         for p in &parsed {
-            for function in functions(p.tree.root_node(), &p.source) {
-                if function.attribute(&["tauri::command", "command"]).is_some() {
-                    commands
-                        .entry(function.name.clone())
-                        .or_default()
-                        .push(p.file.clone());
-                }
-            }
-        }
-        let defines = |file: &RootRelativePath, name: &str| {
-            commands.get(name).is_some_and(|files| files.contains(file))
-        };
-
-        for p in &parsed {
-            let root = p.tree.root_node();
-            walk(root, &mut |node| {
-                if node.kind() != "macro_invocation" {
-                    return;
-                }
-                let Some(name) = node.child_by_field_name("macro") else {
-                    return;
-                };
-                if text(name, &p.source).rsplit("::").next() != Some("generate_handler") {
-                    return;
-                }
-                let Some(tokens) = node
-                    .named_children(&mut node.walk())
-                    .find(|n| n.kind() == "token_tree")
-                else {
-                    return;
-                };
-                for entry in entries(tokens, &p.source) {
-                    let command = entry.path.last().cloned().unwrap_or_default();
-                    let mut certainty = Certainty::Declared;
-                    let target = if entry.path.len() == 1 && defines(&p.file, &command) {
-                        Some(p.file.clone())
-                    } else if entry.path.len() == 1 {
-                        input
-                            .names
-                            .target(&p.file, &command)
-                            .filter(|f| defines(f, &command))
-                            .cloned()
-                    } else {
-                        input
-                            .names
-                            .target(&p.file, &entry.path[0])
-                            .filter(|f| defines(f, &command))
-                            .cloned()
-                    };
-                    let target =
-                        target.or_else(|| match commands.get(&command).map(Vec::as_slice) {
-                            Some([only]) => {
-                                certainty = Certainty::Convention;
-                                Some(only.clone())
-                            }
-                            _ => None,
-                        });
-                    let Some(target) = target else {
-                        output.unresolved(&p.file, format!("`{}` is listed in generate_handler! but no matching #[tauri::command] function was found", entry.path.join("::")));
-                        continue;
-                    };
-                    output.relate(FrameworkRelation::new(
-                        ID,
-                        Some(&package.id),
-                        RelationDraft {
-                            kind: RelationKind::CommandExposedAs,
-                            rule: RULE,
-                            rule_version: VERSION,
-                            certainty,
-                            from: p.file.clone(),
-                            to: Some(target),
-                            from_symbol: None,
-                            to_symbol: Some(command.clone()),
-                            label: command,
-                            evidence: RelationEvidence::new(
-                                &p.file,
-                                ByteSpan {
-                                    start: entry.start,
-                                    end: entry.end,
-                                },
-                                &p.source[entry.start..entry.end],
-                            ),
-                        },
-                    ));
-                }
+            let scan = FileScan {
+                package,
+                input,
+                parsed: p,
+                commands: &commands,
+            };
+            walk(p.tree.root_node(), &mut |node| {
+                scan.handler_macro(node, output)
             });
         }
         Ok(())
+    }
+}
+
+/// A Rust file that mentions Tauri commands, parsed.
+struct Parsed {
+    file: RootRelativePath,
+    source: String,
+    tree: tree_sitter::Tree,
+}
+
+fn parse_files(
+    package: &Package,
+    input: &FrameworkInput<'_>,
+    cancel: &CancellationToken,
+) -> Result<Vec<Parsed>, DiscoveryError> {
+    let mut parsed = Vec::new();
+    for indexed in input.files_of(package) {
+        if cancel.is_cancelled() {
+            return Err(DiscoveryError::Cancelled);
+        }
+        if indexed.path.as_path().extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Some(source) = input.read(&indexed.path) else {
+            continue;
+        };
+        if !source.contains("command") && !source.contains("generate_handler") {
+            continue;
+        }
+        let Some(tree) = parse_rust(&source) else {
+            continue;
+        };
+        parsed.push(Parsed {
+            file: indexed.path.clone(),
+            source,
+            tree,
+        });
+    }
+    Ok(parsed)
+}
+
+type Commands = BTreeMap<String, Vec<RootRelativePath>>;
+
+/// Where each `#[tauri::command]` function is defined.
+fn command_definitions(parsed: &[Parsed]) -> Commands {
+    let mut commands = Commands::new();
+    for p in parsed {
+        for function in functions(p.tree.root_node(), &p.source) {
+            if function.attribute(&["tauri::command", "command"]).is_some() {
+                commands
+                    .entry(function.name.clone())
+                    .or_default()
+                    .push(p.file.clone());
+            }
+        }
+    }
+    commands
+}
+
+/// One file being read for `generate_handler!` lists.
+struct FileScan<'a> {
+    package: &'a Package,
+    input: &'a FrameworkInput<'a>,
+    parsed: &'a Parsed,
+    commands: &'a Commands,
+}
+
+impl FileScan<'_> {
+    fn defines(&self, file: &RootRelativePath, name: &str) -> bool {
+        self.commands
+            .get(name)
+            .is_some_and(|files| files.contains(file))
+    }
+
+    /// Relates each command a `generate_handler![...]` lists to the function that defines it.
+    fn handler_macro(&self, node: Node<'_>, output: &mut FrameworkOutput) {
+        let p = self.parsed;
+        if node.kind() != "macro_invocation" {
+            return;
+        }
+        let Some(name) = node.child_by_field_name("macro") else {
+            return;
+        };
+        if text(name, &p.source).rsplit("::").next() != Some("generate_handler") {
+            return;
+        }
+        let Some(tokens) = node
+            .named_children(&mut node.walk())
+            .find(|n| n.kind() == "token_tree")
+        else {
+            return;
+        };
+        for entry in entries(tokens, &p.source) {
+            self.relate_entry(&entry, output);
+        }
+    }
+
+    fn relate_entry(&self, entry: &Entry, output: &mut FrameworkOutput) {
+        let p = self.parsed;
+        let command = entry.path.last().cloned().unwrap_or_default();
+        let mut certainty = Certainty::Declared;
+        let target = self.defining_file(entry, &command).or_else(|| {
+            match self.commands.get(&command).map(Vec::as_slice) {
+                Some([only]) => {
+                    certainty = Certainty::Convention;
+                    Some(only.clone())
+                }
+                _ => None,
+            }
+        });
+        let Some(target) = target else {
+            output.unresolved(&p.file, format!("`{}` is listed in generate_handler! but no matching #[tauri::command] function was found", entry.path.join("::")));
+            return;
+        };
+        let draft = RelationDraft {
+            kind: RelationKind::CommandExposedAs,
+            rule: RULE,
+            rule_version: VERSION,
+            certainty,
+            from: p.file.clone(),
+            to: Some(target),
+            from_symbol: None,
+            to_symbol: Some(command.clone()),
+            label: command,
+            evidence: RelationEvidence::new(
+                &p.file,
+                ByteSpan {
+                    start: entry.start,
+                    end: entry.end,
+                },
+                &p.source[entry.start..entry.end],
+            ),
+        };
+        output.relate(FrameworkRelation::new(ID, Some(&self.package.id), draft));
+    }
+
+    /// The file that defines the listed command, by its path as written.
+    fn defining_file(&self, entry: &Entry, command: &str) -> Option<RootRelativePath> {
+        let file = &self.parsed.file;
+        if entry.path.len() == 1 && self.defines(file, command) {
+            return Some(file.clone());
+        }
+        let name = if entry.path.len() == 1 {
+            command
+        } else {
+            &entry.path[0]
+        };
+        self.input
+            .names
+            .target(file, name)
+            .filter(|f| self.defines(f, command))
+            .cloned()
     }
 }
 
