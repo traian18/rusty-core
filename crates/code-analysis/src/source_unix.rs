@@ -205,59 +205,79 @@ fn walk(dir: &OwnedFd, rel: &str, depth: usize, scan: &mut Scan<'_>) -> Result<(
             continue;
         }
         if kind == libc::S_IFDIR {
-            match open_dir_at(dir.as_raw_fd(), &c_name, true) {
-                Ok(sub) => match fstat(&sub) {
-                    Ok(opened) if same_identity(&before, &opened) => {
-                        walk(&sub, &child, depth + 1, scan)?;
-                    }
-                    _ => diagnostic(
-                        scan,
-                        &child,
-                        "directory changed while it was being opened; directory skipped",
-                    ),
-                },
-                Err(error) => diagnostic(
-                    scan,
-                    &child,
-                    format!("directory rejected (changed or unreadable): {error}"),
-                ),
-            }
+            enter_directory(dir, &c_name, &child, &before, depth, scan)?;
             continue;
         }
-        if kind != libc::S_IFREG || !is_source(Path::new(&name)) {
-            continue;
+        if kind == libc::S_IFREG && is_source(Path::new(&name)) {
+            visit_source(dir, &c_name, &child, &before, scan);
         }
-        if scan.files.len() >= scan.max_files {
-            if !scan.file_limit_reported {
-                scan.file_limit_reported = true;
-                diagnostic(
-                    scan,
-                    &child,
-                    format!(
-                        "source file count limit ({}) skipped remaining entries",
-                        scan.max_files
-                    ),
-                );
-            }
-            continue;
-        }
-        if before.st_size as u64 > scan.limits.max_bytes as u64 {
-            diagnostic(
-                scan,
-                &child,
-                format!(
-                    "source file size limit ({}) exceeded",
-                    scan.limits.max_bytes
-                ),
-            );
-            continue;
-        }
-        if let Some(hook) = scan.hook {
-            hook(&child);
-        }
-        read_file(dir, &c_name, &child, &before, scan);
     }
     Ok(())
+}
+
+/// Descends into a subdirectory, provided it is still the directory that was inspected.
+fn enter_directory(
+    dir: &OwnedFd,
+    name: &CStr,
+    rel: &str,
+    before: &libc::stat,
+    depth: usize,
+    scan: &mut Scan<'_>,
+) -> Result<(), CallGraphError> {
+    match open_dir_at(dir.as_raw_fd(), name, true) {
+        Ok(sub) => match fstat(&sub) {
+            Ok(opened) if same_identity(before, &opened) => walk(&sub, rel, depth + 1, scan),
+            _ => {
+                diagnostic(
+                    scan,
+                    rel,
+                    "directory changed while it was being opened; directory skipped",
+                );
+                Ok(())
+            }
+        },
+        Err(error) => {
+            diagnostic(
+                scan,
+                rel,
+                format!("directory rejected (changed or unreadable): {error}"),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Reads a source file unless a limit says to skip it.
+fn visit_source(dir: &OwnedFd, name: &CStr, rel: &str, before: &libc::stat, scan: &mut Scan<'_>) {
+    if scan.files.len() >= scan.max_files {
+        if !scan.file_limit_reported {
+            scan.file_limit_reported = true;
+            diagnostic(
+                scan,
+                rel,
+                format!(
+                    "source file count limit ({}) skipped remaining entries",
+                    scan.max_files
+                ),
+            );
+        }
+        return;
+    }
+    if before.st_size as u64 > scan.limits.max_bytes as u64 {
+        diagnostic(
+            scan,
+            rel,
+            format!(
+                "source file size limit ({}) exceeded",
+                scan.limits.max_bytes
+            ),
+        );
+        return;
+    }
+    if let Some(hook) = scan.hook {
+        hook(rel);
+    }
+    read_file(dir, name, rel, before, scan);
 }
 
 fn read_file(dir: &OwnedFd, name: &CStr, rel: &str, before: &libc::stat, scan: &mut Scan<'_>) {
