@@ -219,6 +219,12 @@ cargo run -p harness -- \
 
 Every tool the server advertises is registered as `mcp.<name>.<tool>`, applies to every session for the rest of the run (including ones started later via the provider picker), and shows up in the transcript/activity log like any other tool call. This flag can't express environment variables, a working directory, or a non-default timeout — see the main [README's MCP servers section](../../README.md#mcp-servers) for the embedding API that can.
 
+### Cleaning up old runs
+
+`harness --cleanup` lists the sessions (idle 30 days or more) and subagent worktrees (idle 7 days or
+more) under the current directory with their sizes, asks `Remove these? [y/N]`, and removes them
+only on a `y`. Old task-queue checkpoints are pruned on their own when a workflow runs.
+
 ### Session storage
 
 Sessions are stored relative to the launch directory:

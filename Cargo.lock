@@ -882,6 +882,7 @@ dependencies = [
  "rusty-provider-github-copilot",
  "rusty-provider-openai",
  "rusty-session-store",
+ "rusty-workspace",
  "serde_json",
  "tokio",
  "unicode-width 0.2.0",

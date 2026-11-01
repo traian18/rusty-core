@@ -74,6 +74,9 @@ renamed into place, so a reader or a crash never sees a half-written file.
 
 ## Public API
 
+- `cleanup`: `scan` reports the old sessions, run stores and subagent worktrees under a workspace root
+  (how big, how long idle) and changes nothing; `apply` removes exactly the candidates of a report.
+  A host shows the report and applies only after the user confirms.
 - `Workspace`, `WorkspaceMode`, `WorkspaceError`: the contract and its vocabulary.
 - `FsWorkspace`, `ReadOnlyWorkspace`, `SnapshotWorkspace`, `WorktreeWorkspace`,
   `UnboundWorkspace`: the implementations.

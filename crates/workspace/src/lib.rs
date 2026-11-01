@@ -3,6 +3,7 @@
 //! The [`Workspace`] abstraction: how tools see files in a project, whether they live on disk, in
 //! a private copy, in a git worktree, or nowhere yet.
 
+pub mod cleanup;
 mod error;
 mod filesystem;
 mod listing;

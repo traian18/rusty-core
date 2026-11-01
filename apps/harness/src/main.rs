@@ -62,6 +62,11 @@ struct Args {
     /// nothing — no prompt text and two unused tools.
     #[arg(long)]
     no_skills: bool,
+
+    /// Report the old sessions and subagent worktrees under the current directory, ask before
+    /// removing them, and exit. Nothing is removed without a "y".
+    #[arg(long)]
+    cleanup: bool,
 }
 
 /// Parses one `--mcp-server` value.
@@ -129,6 +134,9 @@ fn supports_alternate_screen(term: Option<&str>) -> bool {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.cleanup {
+        return cleanup(&std::env::current_dir()?);
+    }
     let mcp_servers = args
         .mcp_servers
         .iter()
@@ -161,6 +169,30 @@ async fn main() -> Result<()> {
     let app_harness = AppHarness::new(workspace_root, mcp_servers, skills).await?;
     let mut controller = AppController::new(app_harness, options, initial_selection).await?;
     run(&mut terminal, &mut controller).await
+}
+
+/// Reports what old runs left in `root`, asks, and removes it only on a "y".
+fn cleanup(root: &std::path::Path) -> Result<()> {
+    use rusty_workspace::cleanup::{apply, scan, Policy};
+    let report = scan(root, &Policy::default());
+    println!("{}", report.render());
+    if report.candidates.is_empty() {
+        return Ok(());
+    }
+    print!("Remove these? [y/N] ");
+    io::Write::flush(&mut io::stdout())?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        println!("nothing removed");
+        return Ok(());
+    }
+    let removed = apply(root, &report);
+    println!("removed {} item(s)", removed.items);
+    for (candidate, reason) in &removed.failed {
+        eprintln!("could not remove {}: {reason}", candidate.path.display());
+    }
+    Ok(())
 }
 
 /// Draws and handles input until the user quits.
