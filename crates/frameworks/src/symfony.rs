@@ -332,8 +332,25 @@ fn yaml_routes(
         files.extend(input.list_files(&directory, extension));
     }
     files.sort();
-    // Fully qualified class name -> file, from `namespace` and class declarations.
-    let mut classes_by_fqn: HashMap<String, RootRelativePath> = HashMap::new();
+    let classes_by_fqn = classes_by_fqn(parsed);
+    for file in files {
+        if !file.as_path().to_string_lossy().contains("config/routes") {
+            continue;
+        }
+        let Some(source) = input.read(&file) else {
+            continue;
+        };
+        for block in route_blocks(&source) {
+            relate_yaml_route(package, &file, &source, &block, &classes_by_fqn, output);
+        }
+    }
+}
+
+/// Fully qualified class name to file, from `namespace` and class declarations.
+fn classes_by_fqn(
+    parsed: &[(RootRelativePath, String, tree_sitter::Tree)],
+) -> HashMap<String, RootRelativePath> {
+    let mut classes = HashMap::new();
     for (file, source, tree) in parsed {
         let mut namespace = String::new();
         walk(tree.root_node(), &mut |node: Node<'_>| match node.kind() {
@@ -345,100 +362,100 @@ fn yaml_routes(
             }
             "class_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    classes_by_fqn
-                        .insert(format!("{namespace}\\{}", text(name, source)), file.clone());
+                    classes.insert(format!("{namespace}\\{}", text(name, source)), file.clone());
                 }
             }
             _ => {}
         });
     }
-    for file in files {
-        let in_routes = file.as_path().to_string_lossy().contains("config/routes");
-        if !in_routes {
-            continue;
+    classes
+}
+
+/// A routes file as blocks: a key at column 0, then its indented lines, each with its offset.
+fn route_blocks(source: &str) -> Vec<Vec<(usize, &str)>> {
+    let mut offset = 0usize;
+    let mut block: Vec<(usize, &str)> = Vec::new();
+    let mut blocks: Vec<Vec<(usize, &str)>> = Vec::new();
+    for line in source.split_inclusive('\n') {
+        if !line.starts_with([' ', '\t'])
+            && !line.trim().is_empty()
+            && !line.starts_with('#')
+            && !block.is_empty()
+        {
+            blocks.push(std::mem::take(&mut block));
         }
-        let Some(source) = input.read(&file) else {
-            continue;
+        block.push((offset, line.trim_end()));
+        offset += line.len();
+    }
+    blocks.push(block);
+    blocks
+}
+
+/// The value of `key:` in a block, with the offset of its line.
+fn block_value(block: &[(usize, &str)], key: &str) -> Option<(usize, String)> {
+    block.iter().find_map(|(at, line)| {
+        line.trim_start()
+            .strip_prefix(&format!("{key}:"))
+            .map(|v| (*at, v.trim().trim_matches(['\'', '"']).to_owned()))
+    })
+}
+
+fn relate_yaml_route(
+    package: &Package,
+    file: &RootRelativePath,
+    source: &str,
+    block: &[(usize, &str)],
+    classes_by_fqn: &HashMap<String, RootRelativePath>,
+    output: &mut FrameworkOutput,
+) {
+    let (Some((path_at, path)), Some((_, controller))) =
+        (block_value(block, "path"), block_value(block, "controller"))
+    else {
+        return;
+    };
+    let (class, action) = controller
+        .split_once("::")
+        .map_or((controller.as_str(), None), |(c, a)| (c, Some(a)));
+    let target = classes_by_fqn.get(class.trim_start_matches('\\')).cloned();
+    let verbs: Vec<String> = block_value(block, "methods")
+        .map(|(_, v)| {
+            v.trim_matches(['[', ']'])
+                .split(',')
+                .map(|m| m.trim().trim_matches(['\'', '"']).to_uppercase())
+                .filter(|m| !m.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let verbs = if verbs.is_empty() {
+        vec!["ANY".to_owned()]
+    } else {
+        verbs
+    };
+    let simple = class.rsplit('\\').next().unwrap_or(class);
+    let line_end = path_at
+        + source[path_at..]
+            .find('\n')
+            .unwrap_or(source.len() - path_at);
+    for verb in verbs {
+        let draft = RelationDraft {
+            kind: RelationKind::RouteRegisteredTo,
+            rule: YAML_RULE,
+            rule_version: VERSION,
+            certainty: Certainty::Declared,
+            from: file.clone(),
+            to: target.clone(),
+            from_symbol: None,
+            to_symbol: Some(action.map_or(simple.to_owned(), |a| format!("{simple}.{a}"))),
+            label: format!("{verb} {}", join("", &path)),
+            evidence: RelationEvidence::new(
+                file,
+                ByteSpan {
+                    start: path_at,
+                    end: path_at + path.len(),
+                },
+                &source[path_at..line_end],
+            ),
         };
-        // Blocks: a key at column 0, then indented `path:`, `controller:` and `methods:` lines.
-        let mut offset = 0usize;
-        let mut block: Vec<(usize, &str)> = Vec::new();
-        let mut blocks: Vec<Vec<(usize, &str)>> = Vec::new();
-        for line in source.split_inclusive('\n') {
-            if !line.starts_with([' ', '\t'])
-                && !line.trim().is_empty()
-                && !line.starts_with('#')
-                && !block.is_empty()
-            {
-                blocks.push(std::mem::take(&mut block));
-            }
-            block.push((offset, line.trim_end()));
-            offset += line.len();
-        }
-        blocks.push(block);
-        for block in blocks {
-            let value = |key: &str| {
-                block.iter().find_map(|(at, line)| {
-                    line.trim_start()
-                        .strip_prefix(&format!("{key}:"))
-                        .map(|v| (*at, v.trim().trim_matches(['\'', '"']).to_owned()))
-                })
-            };
-            let (Some((path_at, path)), Some((_, controller))) =
-                (value("path"), value("controller"))
-            else {
-                continue;
-            };
-            let (class, action) = controller
-                .split_once("::")
-                .map_or((controller.as_str(), None), |(c, a)| (c, Some(a)));
-            let target = classes_by_fqn.get(class.trim_start_matches('\\')).cloned();
-            let verbs: Vec<String> = value("methods")
-                .map(|(_, v)| {
-                    v.trim_matches(['[', ']'])
-                        .split(',')
-                        .map(|m| m.trim().trim_matches(['\'', '"']).to_uppercase())
-                        .filter(|m| !m.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let verbs = if verbs.is_empty() {
-                vec!["ANY".to_owned()]
-            } else {
-                verbs
-            };
-            let simple = class.rsplit('\\').next().unwrap_or(class);
-            for verb in verbs {
-                output.relate(FrameworkRelation::new(
-                    ID,
-                    Some(&package.id),
-                    RelationDraft {
-                        kind: RelationKind::RouteRegisteredTo,
-                        rule: YAML_RULE,
-                        rule_version: VERSION,
-                        certainty: Certainty::Declared,
-                        from: file.clone(),
-                        to: target.clone(),
-                        from_symbol: None,
-                        to_symbol: Some(
-                            action.map_or(simple.to_owned(), |a| format!("{simple}.{a}")),
-                        ),
-                        label: format!("{verb} {}", join("", &path)),
-                        evidence: RelationEvidence::new(
-                            &file,
-                            ByteSpan {
-                                start: path_at,
-                                end: path_at + path.len(),
-                            },
-                            &source[path_at
-                                ..(path_at
-                                    + source[path_at..]
-                                        .find('\n')
-                                        .unwrap_or(source.len() - path_at))],
-                        ),
-                    },
-                ));
-            }
-        }
+        output.relate(FrameworkRelation::new(ID, Some(&package.id), draft));
     }
 }
