@@ -23,7 +23,8 @@ versions. The SDK re-exports a curated, documented subset under one name and add
 ## Key types and concepts
 
 - **`Client`**: builds sessions and reaches the engine for provider discovery.
-- **`Session`**: send a prompt, subscribe to events.
+- **`Session`**: `send`, `steer`, `follow_up`, `cancel`, `close`, `resolve_permission`, and
+  `events()` to subscribe. `Client` also lists and restores stored sessions.
 - **`SdkError`**: the one error type.
 - **Wire alternative**: non-Rust applications, or ones that want the engine in another process, run
   `harnessd` and speak the protocol (`sdk/typescript`, `schema/protocol-v2.schema.json`).
@@ -121,15 +122,13 @@ let session = Session::from(handle);
 
 ### What this SDK does not yet do
 
-- No `steer`, `follow_up`, or `close_session` operations (engine gap, not
-  just an SDK gap — see `sdk_plan.md` SDK-101).
-- No idempotent command IDs / admission responses (SDK-102).
+- No idempotent command IDs or admission responses: `send`, `steer`, `follow_up`, `cancel` and
+  `close` return only success or an error.
 - No model/credential registry wrapper beyond re-exporting the engine's
   existing provider discovery methods (`Client::engine().list_models(..)`).
 - No attachment support on `Session::send` (the engine's `send` always
   sends an empty attachment list today).
 
-These are tracked in [`../../sdk_plan.md`](../../sdk_plan.md) Phase 1–5 and
-are not silently worked around here — the goal of this crate is to make the
+These gaps are not silently worked around here — the goal of this crate is to make the
 current, real engine behavior easy to consume, not to paper over gaps with
 an API that promises more than the engine delivers.

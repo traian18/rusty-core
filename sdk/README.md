@@ -1,7 +1,6 @@
 # Rusty Harness SDKs
 
-This directory holds the application-agnostic SDKs described in
-[`../sdk_plan.md`](../sdk_plan.md): a small, documented, stable surface for
+This directory holds the application-agnostic SDKs: a small, documented, stable surface for
 integrating the Rusty agent harness into any host application, independent
 of any particular IDE or frontend.
 
@@ -9,7 +8,7 @@ of any particular IDE or frontend.
 |---|---|---|---|
 | [`rust/`](rust) (`rusty-harness-sdk`) | Rust | embedded (in-process `Harness`) | alpha, compiles against the current workspace |
 | [`typescript/`](typescript) (`@rusty/harness-sdk`) | TypeScript | managed stdio sidecar today; WebSocket/IPC planned | alpha, source-only, not yet built/published |
-| `java/` | Java | managed sidecar / connected daemon | not started (`sdk_plan.md` SDK-302) |
+| `java/` | Java | managed sidecar / connected daemon | not started |
 
 ## Shared contract
 
@@ -21,21 +20,17 @@ contract is described in
 [`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json).
 
 The Rust SDK and the TypeScript SDK are hand-written against that contract
-today. `sdk_plan.md` (SDK-201) tracks generating both from one annotated
-source of truth instead of maintaining three parallel copies by hand — do
-not treat the current duplication as a long-term design choice.
+today. Generating both from one annotated source of truth would be better
+than maintaining parallel copies by hand — do not treat the current
+duplication as a long-term design choice.
 
 ## Honesty about maturity
 
 These SDKs wrap a real, working engine and daemon (see the workspace
-[`README.md`](../README.md)), but neither the engine nor the wire protocol
-has yet closed the gaps tracked in [`../upgrade_rusty.md`](../upgrade_rusty.md)
-(multi-turn admission semantics, production snapshot/replay, real restore
-dependency resolution, typed RPC errors, session discovery/restore over the
-wire). The SDKs surface those gaps in their own documentation rather than
-hiding them behind a nicer API. Do not present either SDK as feature-complete
-until the relevant `sdk_plan.md` phase and `upgrade_rusty.md` item are both
-closed.
+[`README.md`](../README.md)). The wire protocol has typed errors, admission results with command
+ids, and session listing and restore, but the SDKs are still hand-written and alpha: neither is
+published, and each lists what it does not yet do in its own documentation rather than hiding it
+behind a nicer API. Do not present either SDK as feature-complete.
 
 ## Where to start
 
@@ -43,5 +38,3 @@ closed.
 - Everything else (IDEs, CLIs, servers, other languages via the daemon):
   [`typescript/README.md`](typescript/README.md), and the raw protocol
   reference in [`../schema/protocol-v2.schema.json`](../schema/protocol-v2.schema.json).
-- The full production roadmap, phases, and release gates:
-  [`../sdk_plan.md`](../sdk_plan.md).

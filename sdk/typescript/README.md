@@ -23,7 +23,7 @@ The Rust DTOs are authoritative. The language-neutral mirror is
 The only transport shipped today is a managed stdio sidecar: the SDK spawns
 `harnessd --stdio` as a child process and owns its lifecycle (see
 [`StdioSidecarTransport`](src/transport.ts) — WebSocket/Unix/Windows IPC
-transports are planned, not yet implemented, per `sdk_plan.md` SDK-301/303).
+transports are planned, not yet implemented).
 
 ```ts
 import { HarnessClient, StdioSidecarTransport } from "@rusty/harness-sdk";
@@ -57,7 +57,7 @@ for what's replayable.
 
 Connect [MCP](https://modelcontextprotocol.io) servers over stdio by passing
 `mcpServers` to `createSession` — the wire-shaped mirror of Rust's
-`McpServerSpec` (see `crates/rusty-protocol/src/mcp.rs` and the main
+`McpServerSpec` (see `crates/protocol/src/mcp.rs` and the main
 [README's MCP servers section](../../README.md#mcp-servers)):
 
 ```ts
