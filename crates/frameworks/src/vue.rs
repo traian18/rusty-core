@@ -68,166 +68,169 @@ impl FrameworkAdapter for VueAdapter {
     ) -> Result<(), DiscoveryError> {
         let directory = FrameworkInput::package_dir(package);
         let sfc_files = input.list_files(&directory, "vue");
-        let sfcs: HashSet<RootRelativePath> = sfc_files.iter().cloned().collect();
-        let scripts: HashSet<RootRelativePath> =
-            input.imports.files.iter().map(|f| f.path.clone()).collect();
-        let source_root = directory.join("src");
-
+        let files = Files {
+            sfcs: sfc_files.iter().cloned().collect(),
+            scripts: input.imports.files.iter().map(|f| f.path.clone()).collect(),
+            source_root: directory.join("src"),
+        };
         for file in &sfc_files {
             if cancel.is_cancelled() {
                 return Err(DiscoveryError::Cancelled);
             }
-            let Some(source) = input.read(file) else {
-                continue;
-            };
-            let blocks = blocks(&source);
-            let Some(template) = blocks.iter().find(|b| b.tag == "template") else {
-                continue;
-            };
-            let mut bindings: HashMap<String, (RootRelativePath, bool)> = HashMap::new();
-            for script in blocks.iter().filter(|b| b.tag == "script") {
-                let Some(tree) = parse_typescript(&source[script.start..script.end]) else {
-                    continue;
-                };
-                imports_of(
-                    tree.root_node(),
-                    &source[script.start..script.end],
-                    file,
-                    &sfcs,
-                    &scripts,
-                    &source_root,
-                    output,
-                    &mut bindings,
-                );
-            }
-            let mut seen = HashSet::new();
-            for (tag, offset) in element_tags(&source[template.start..template.end]) {
-                let Some((binding, (target, convention))) = bindings
-                    .iter()
-                    .find(|(name, _)| tag == **name || tag == kebab(name))
-                else {
-                    continue;
-                };
-                if !seen.insert(binding.clone()) {
-                    continue;
-                }
-                let start = template.start + offset;
-                let end = source[start..]
-                    .find('>')
-                    .map_or(source.len(), |i| start + i + 1);
-                output.relate(FrameworkRelation::new(
-                    ID,
-                    Some(&package.id),
-                    RelationDraft {
-                        kind: RelationKind::ComponentRenders,
-                        rule: RENDER_RULE,
-                        rule_version: VERSION,
-                        certainty: if *convention {
-                            Certainty::Convention
-                        } else {
-                            Certainty::Declared
-                        },
-                        from: file.clone(),
-                        to: Some(target.clone()),
-                        from_symbol: None,
-                        to_symbol: Some(binding.clone()),
-                        label: format!("<{tag} />"),
-                        evidence: RelationEvidence::new(
-                            file,
-                            ByteSpan { start, end },
-                            &source[start..end],
-                        ),
-                    },
-                ));
+            if let Some(source) = input.read(file) {
+                relate_renders(package, &files, file, &source, output);
             }
         }
-
-        // Router entries in script files.
         for indexed in input.files_of(package) {
             if cancel.is_cancelled() {
                 return Err(DiscoveryError::Cancelled);
             }
-            if !is_script(&indexed.path) {
-                continue;
-            }
-            let Some(source) = input.read(&indexed.path) else {
-                continue;
-            };
-            if !source.contains("vue-router") {
-                continue;
-            }
-            let Some(tree) = parse_script(&indexed.path, &source) else {
-                continue;
-            };
-            let root = tree.root_node();
-            let file = &indexed.path;
-            let mut bindings = HashMap::new();
-            imports_of(
-                root,
-                &source,
-                file,
-                &sfcs,
-                &scripts,
-                &source_root,
-                output,
-                &mut bindings,
-            );
-            let table = route_table(root, &source, &["component"]);
-            for message in table.skipped {
-                output.unresolved(file, message);
-            }
-            for route in table.routes {
-                let (target, symbol, convention) = match &route.target {
-                    Target::Name(name) => match bindings.get(name) {
-                        Some((path, convention)) => {
-                            (Some(path.clone()), Some(name.clone()), *convention)
-                        }
-                        None => (
-                            input.names.target(file, name).cloned(),
-                            Some(name.clone()),
-                            false,
-                        ),
-                    },
-                    Target::Lazy(specifier) => {
-                        let (path, convention) =
-                            resolve_specifier(specifier, file, &sfcs, &scripts, &source_root);
-                        (path, None, convention)
-                    }
-                    Target::Other(node) => {
-                        output.unresolved(
-                            file,
-                            format!(
-                                "route `{}` names a component this reader does not follow (`{}`)",
-                                route.path,
-                                text(*node, &source)
-                            ),
-                        );
-                        continue;
-                    }
-                };
-                output.relate(FrameworkRelation::new(
-                    ID,
-                    Some(&package.id),
-                    RelationDraft {
-                        kind: RelationKind::RouteRegisteredTo,
-                        rule: ROUTE_RULE,
-                        rule_version: VERSION,
-                        certainty: if convention {
-                            Certainty::Convention
-                        } else {
-                            Certainty::Declared
-                        },
-                        from: file.clone(),
-                        to: target,
-                        from_symbol: None,
-                        to_symbol: symbol,
-                        label: format!("ROUTE {}", route.path),
-                        evidence: evidence(file, route.node, &source),
-                    },
-                ));
+            if is_script(&indexed.path) {
+                relate_routes(package, input, &files, &indexed.path, output);
             }
         }
         Ok(())
+    }
+}
+
+/// What a Vue package's imports resolve against.
+struct Files {
+    sfcs: HashSet<RootRelativePath>,
+    scripts: HashSet<RootRelativePath>,
+    source_root: std::path::PathBuf,
+}
+
+/// Local name to (file, whether the match is by convention) for imported components.
+type Bindings = HashMap<String, (RootRelativePath, bool)>;
+
+fn certainty(convention: bool) -> Certainty {
+    if convention {
+        Certainty::Convention
+    } else {
+        Certainty::Declared
+    }
+}
+
+/// A component renders the imported components its template uses as elements.
+fn relate_renders(
+    package: &Package,
+    files: &Files,
+    file: &RootRelativePath,
+    source: &str,
+    output: &mut FrameworkOutput,
+) {
+    let blocks = blocks(source);
+    let Some(template) = blocks.iter().find(|b| b.tag == "template") else {
+        return;
+    };
+    let mut bindings = Bindings::new();
+    for script in blocks.iter().filter(|b| b.tag == "script") {
+        let body = &source[script.start..script.end];
+        let Some(tree) = parse_typescript(body) else {
+            continue;
+        };
+        imports_of(files, tree.root_node(), body, file, output, &mut bindings);
+    }
+    let mut seen = HashSet::new();
+    for (tag, offset) in element_tags(&source[template.start..template.end]) {
+        let Some((binding, (target, convention))) = bindings
+            .iter()
+            .find(|(name, _)| tag == **name || tag == kebab(name))
+        else {
+            continue;
+        };
+        if !seen.insert(binding.clone()) {
+            continue;
+        }
+        let start = template.start + offset;
+        let end = source[start..]
+            .find('>')
+            .map_or(source.len(), |i| start + i + 1);
+        let draft = RelationDraft {
+            kind: RelationKind::ComponentRenders,
+            rule: RENDER_RULE,
+            rule_version: VERSION,
+            certainty: certainty(*convention),
+            from: file.clone(),
+            to: Some(target.clone()),
+            from_symbol: None,
+            to_symbol: Some(binding.clone()),
+            label: format!("<{tag} />"),
+            evidence: RelationEvidence::new(file, ByteSpan { start, end }, &source[start..end]),
+        };
+        output.relate(FrameworkRelation::new(ID, Some(&package.id), draft));
+    }
+}
+
+/// Router entries of a script that uses `vue-router`.
+fn relate_routes(
+    package: &Package,
+    input: &FrameworkInput<'_>,
+    files: &Files,
+    file: &RootRelativePath,
+    output: &mut FrameworkOutput,
+) {
+    let Some(source) = input.read(file) else {
+        return;
+    };
+    if !source.contains("vue-router") {
+        return;
+    }
+    let Some(tree) = parse_script(file, &source) else {
+        return;
+    };
+    let root = tree.root_node();
+    let mut bindings = Bindings::new();
+    imports_of(files, root, &source, file, output, &mut bindings);
+    let table = route_table(root, &source, &["component"]);
+    for message in table.skipped {
+        output.unresolved(file, message);
+    }
+    for route in table.routes {
+        let (target, symbol, convention) = match &route.target {
+            Target::Name(name) => match bindings.get(name) {
+                Some((path, convention)) => (Some(path.clone()), Some(name.clone()), *convention),
+                None => (
+                    input.names.target(file, name).cloned(),
+                    Some(name.clone()),
+                    false,
+                ),
+            },
+            Target::Lazy(specifier) => {
+                let (path, convention) = resolve_specifier(
+                    specifier,
+                    file,
+                    &files.sfcs,
+                    &files.scripts,
+                    &files.source_root,
+                );
+                (path, None, convention)
+            }
+            Target::Other(node) => {
+                output.unresolved(
+                    file,
+                    format!(
+                        "route `{}` names a component this reader does not follow (`{}`)",
+                        route.path,
+                        text(*node, &source)
+                    ),
+                );
+                continue;
+            }
+        };
+        let draft = RelationDraft {
+            kind: RelationKind::RouteRegisteredTo,
+            rule: ROUTE_RULE,
+            rule_version: VERSION,
+            certainty: certainty(convention),
+            from: file.clone(),
+            to: target,
+            from_symbol: None,
+            to_symbol: symbol,
+            label: format!("ROUTE {}", route.path),
+            evidence: evidence(file, route.node, &source),
+        };
+        output.relate(FrameworkRelation::new(ID, Some(&package.id), draft));
     }
 }
 
@@ -353,17 +356,15 @@ fn resolve_specifier(
 
 /// Collects `local name -> file` for imports that resolve to a component file, and reports
 /// `.vue` imports through an alias this reader does not know.
-#[allow(clippy::too_many_arguments)]
 fn imports_of(
+    files: &Files,
     root: Node<'_>,
     source: &str,
     file: &RootRelativePath,
-    sfcs: &HashSet<RootRelativePath>,
-    scripts: &HashSet<RootRelativePath>,
-    source_root: &std::path::Path,
     output: &mut FrameworkOutput,
-    bindings: &mut HashMap<String, (RootRelativePath, bool)>,
+    bindings: &mut Bindings,
 ) {
+    let (sfcs, scripts, source_root) = (&files.sfcs, &files.scripts, &files.source_root);
     walk(root, &mut |node| {
         if node.kind() != "import_statement" {
             return;
