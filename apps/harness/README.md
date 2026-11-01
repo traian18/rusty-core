@@ -61,7 +61,7 @@ State and rendering helpers have unit tests; the engine is tested elsewhere. Run
 
 ## In the workspace
 
-- **Depends on:** `rusty-engine`, `rusty-protocol`, `rusty-provider-anthropic`, `rusty-provider-codex`, `rusty-provider-github-copilot`, `rusty-provider-openai`, `rusty-session-store`
+- **Depends on:** `rusty-engine`, `rusty-protocol`, `rusty-provider-anthropic`, `rusty-provider-codex`, `rusty-provider-github-copilot`, `rusty-provider-openai`, `rusty-session-store`, `rusty-workspace`
 - **Used by:** nothing else in the workspace
 
 ## Must never

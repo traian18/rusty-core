@@ -119,7 +119,7 @@ read-only and snapshot views have small tests next to them. Run `cargo test -p r
 ## In the workspace
 
 - **Depends on:** nothing else in the workspace
-- **Used by:** `rusty-engine`, `rusty-harness-sdk`, `rusty-runtime`, `rusty-skills`, `rusty-tool-filesystem`, `rusty-tool-shell`, `rusty-workflow-runtime`
+- **Used by:** `harness`, `rusty-engine`, `rusty-harness-sdk`, `rusty-runtime`, `rusty-skills`, `rusty-tool-filesystem`, `rusty-tool-shell`, `rusty-workflow-runtime`
 
 ## Must never
 
