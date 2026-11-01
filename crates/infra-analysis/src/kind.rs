@@ -107,8 +107,21 @@ pub fn maybe_yaml_family(path: &str) -> bool {
 
 /// The kind of `path`, using the start of its `text` to tell YAML families apart.
 pub fn classify(path: &str, text: &str) -> Option<InfraKind> {
-    let name = file_name(path);
-    let lower = name.to_ascii_lowercase();
+    let lower = file_name(path).to_ascii_lowercase();
+    if let Some(kind) = kind_by_name(&lower) {
+        return Some(kind);
+    }
+    if is_repo_config(&lower) {
+        return Some(InfraKind::RepoConfig);
+    }
+    if !is_yaml_name(&lower) {
+        return text.starts_with("#!").then(|| shebang_kind(text)).flatten();
+    }
+    yaml_kind_by_location(path, &lower).or_else(|| yaml_kind_by_content(path, text))
+}
+
+/// Kinds a file name alone decides.
+fn kind_by_name(lower: &str) -> Option<InfraKind> {
     if lower == "dockerfile"
         || lower.starts_with("dockerfile.")
         || lower.ends_with(".dockerfile")
@@ -132,6 +145,11 @@ pub fn classify(path: &str, text: &str) -> Option<InfraKind> {
     if lower.ends_with(".sh") || lower.ends_with(".bash") {
         return Some(InfraKind::Shell);
     }
+    None
+}
+
+/// Files that configure the repository itself, or hold secrets that must not be in it.
+fn is_repo_config(lower: &str) -> bool {
     let secret_file = lower.ends_with(".tfstate")
         || lower.ends_with(".tfstate.backup")
         || lower == ".env"
@@ -143,19 +161,17 @@ pub fn classify(path: &str, text: &str) -> Option<InfraKind> {
         || lower.ends_with(".key")
         || lower == "id_rsa"
         || lower == "id_ed25519";
-    if secret_file
+    secret_file
         || lower == ".gitignore"
         || lower == "codeowners"
         || lower == "dependabot.yml"
         || lower == "dependabot.yaml"
         || lower == "renovate.json"
         || lower == ".gitattributes"
-    {
-        return Some(InfraKind::RepoConfig);
-    }
-    if !is_yaml_name(&lower) {
-        return text.starts_with("#!").then(|| shebang_kind(text)).flatten();
-    }
+}
+
+/// YAML families decided by where the file lives or what it is called.
+fn yaml_kind_by_location(path: &str, lower: &str) -> Option<InfraKind> {
     if in_dir(path, ".github/workflows")
         || (in_dir(path, ".github/actions") && lower.starts_with("action."))
     {
@@ -177,6 +193,11 @@ pub fn classify(path: &str, text: &str) -> Option<InfraKind> {
     if lower == "chart.yaml" || lower == "chart.yml" {
         return Some(InfraKind::Helm);
     }
+    None
+}
+
+/// YAML families decided by the start of the file.
+fn yaml_kind_by_content(path: &str, text: &str) -> Option<InfraKind> {
     let head = &text[..text.len().min(4096)];
     if head.contains("AWSTemplateFormatVersion") || head.contains("Type: AWS::") {
         return Some(InfraKind::CloudFormation);
