@@ -205,109 +205,17 @@ impl DefaultCallGraph {
             files_discovered: files.len() as u32,
             ..RefreshStats::default()
         };
-        let mut extracted = Vec::new();
         let mut diagnostics = discovery_diagnostics;
-        let mut live_keys = BTreeSet::new();
-        for file in &files {
-            check_cancelled(cancel)?;
-            // Parsing is synchronous; yield so other tasks and cancellation stay responsive.
-            tokio::task::yield_now().await;
-            stats.source_bytes += file.bytes.len() as u64;
-            let Some(adapter) = self.adapters.adapter_for_path(&file.path) else {
-                stats.files_skipped += 1;
-                continue;
-            };
-            let text = match std::str::from_utf8(&file.bytes) {
-                Ok(text) => text,
-                Err(error) => {
-                    diagnostics.push(Diagnostic {
-                        path: Some(file.path.clone()),
-                        message: format!("invalid UTF-8 source: {error}"),
-                    });
-                    stats.files_skipped += 1;
-                    continue;
-                }
-            };
-            let key = (
-                file.path.clone(),
-                file.hash.clone(),
-                adapter.version().to_owned(),
-            );
-            // Facts staged by an earlier attempt that failed before publishing are reusable too.
-            let cached = {
-                let committed = self.extraction_cache.lock().map_err(|_| {
-                    CallGraphError::DependencyFailure("extraction cache lock poisoned".into())
-                })?;
-                match committed.get(&key) {
-                    Some(facts) => Some(facts.clone()),
-                    None => self
-                        .staged_cache
-                        .lock()
-                        .map_err(|_| {
-                            CallGraphError::DependencyFailure("staged cache lock poisoned".into())
-                        })?
-                        .get(&key)
-                        .cloned(),
-                }
-            };
-            let facts = if let Some(facts) = cached {
-                stats.cache_hits += 1;
-                facts
-            } else {
-                stats.cache_misses += 1;
-                match adapter.extract(&file.path, text) {
-                    Ok(facts) => {
-                        let facts = Arc::new(facts);
-                        self.staged_cache
-                            .lock()
-                            .map_err(|_| {
-                                CallGraphError::DependencyFailure(
-                                    "staged cache lock poisoned".into(),
-                                )
-                            })?
-                            .insert(key.clone(), facts.clone());
-                        facts
-                    }
-                    Err(CallGraphError::LimitExceeded(message))
-                    | Err(CallGraphError::InvalidRequest(message)) => {
-                        diagnostics.push(Diagnostic {
-                            path: Some(file.path.clone()),
-                            message: format!("analysis limit rejected the file: {message}"),
-                        });
-                        stats.files_skipped += 1;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            live_keys.insert(key);
-            stats.files_analyzed += 1;
-            diagnostics.extend(facts.diagnostics.clone());
-            extracted.push((file.path.clone(), facts));
-        }
+        let (extracted, live_keys) = self
+            .extract_files(&files, &mut stats, &mut diagnostics, cancel)
+            .await?;
         check_cancelled(cancel)?;
         tokio::task::yield_now().await;
         let (callables, calls) = self.resolve(&extracted);
         check_cancelled(cancel)?;
         stats.callables = callables.len() as u32;
         stats.calls = calls.len() as u32;
-        for call in &calls {
-            match call.resolution {
-                Resolution::Resolved => stats.resolved += 1,
-                Resolution::Possible => stats.possible += 1,
-                Resolution::Unresolved => {
-                    stats.unresolved += 1;
-                    let reason = call
-                        .evidence
-                        .as_ref()
-                        .map_or("unknown", |evidence| evidence.rule_id.as_str());
-                    *stats
-                        .unresolved_by_reason
-                        .entry(reason.to_owned())
-                        .or_default() += 1;
-                }
-            }
-        }
+        count_resolutions(&calls, &mut stats);
         stats.limits_triggered = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.message.contains("limit"))
@@ -339,6 +247,113 @@ impl DefaultCallGraph {
             stats,
         });
         Ok((snapshot, live_keys))
+    }
+
+    /// The facts of every file an adapter understands, and the cache keys they live under.
+    async fn extract_files(
+        &self,
+        files: &[SourceFile],
+        stats: &mut RefreshStats,
+        diagnostics: &mut Vec<Diagnostic>,
+        cancel: &CancellationToken,
+    ) -> Result<
+        (
+            Vec<(String, Arc<ExtractedFile>)>,
+            BTreeSet<ExtractionCacheKey>,
+        ),
+        CallGraphError,
+    > {
+        let mut extracted = Vec::new();
+        let mut live_keys = BTreeSet::new();
+        for file in files {
+            check_cancelled(cancel)?;
+            // Parsing is synchronous; yield so other tasks and cancellation stay responsive.
+            tokio::task::yield_now().await;
+            stats.source_bytes += file.bytes.len() as u64;
+            let Some((key, facts)) = self.facts_of(file, stats, diagnostics)? else {
+                continue;
+            };
+            live_keys.insert(key);
+            stats.files_analyzed += 1;
+            diagnostics.extend(facts.diagnostics.clone());
+            extracted.push((file.path.clone(), facts));
+        }
+        Ok((extracted, live_keys))
+    }
+
+    /// One file's facts, from the cache or freshly extracted. `None` when the file is skipped,
+    /// with the reason recorded.
+    fn facts_of(
+        &self,
+        file: &SourceFile,
+        stats: &mut RefreshStats,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<Option<(ExtractionCacheKey, Arc<ExtractedFile>)>, CallGraphError> {
+        let Some(adapter) = self.adapters.adapter_for_path(&file.path) else {
+            stats.files_skipped += 1;
+            return Ok(None);
+        };
+        let text = match std::str::from_utf8(&file.bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                diagnostics.push(Diagnostic {
+                    path: Some(file.path.clone()),
+                    message: format!("invalid UTF-8 source: {error}"),
+                });
+                stats.files_skipped += 1;
+                return Ok(None);
+            }
+        };
+        let key = (
+            file.path.clone(),
+            file.hash.clone(),
+            adapter.version().to_owned(),
+        );
+        if let Some(facts) = self.cached_facts(&key)? {
+            stats.cache_hits += 1;
+            return Ok(Some((key, facts)));
+        }
+        stats.cache_misses += 1;
+        match adapter.extract(&file.path, text) {
+            Ok(facts) => {
+                let facts = Arc::new(facts);
+                self.staged_cache
+                    .lock()
+                    .map_err(|_| poisoned("staged cache"))?
+                    .insert(key.clone(), facts.clone());
+                Ok(Some((key, facts)))
+            }
+            Err(CallGraphError::LimitExceeded(message))
+            | Err(CallGraphError::InvalidRequest(message)) => {
+                diagnostics.push(Diagnostic {
+                    path: Some(file.path.clone()),
+                    message: format!("analysis limit rejected the file: {message}"),
+                });
+                stats.files_skipped += 1;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Facts committed earlier, or staged by an attempt that failed before publishing.
+    fn cached_facts(
+        &self,
+        key: &ExtractionCacheKey,
+    ) -> Result<Option<Arc<ExtractedFile>>, CallGraphError> {
+        let committed = self
+            .extraction_cache
+            .lock()
+            .map_err(|_| poisoned("extraction cache"))?;
+        if let Some(facts) = committed.get(key) {
+            return Ok(Some(facts.clone()));
+        }
+        Ok(self
+            .staged_cache
+            .lock()
+            .map_err(|_| poisoned("staged cache"))?
+            .get(key)
+            .cloned())
     }
 
     /// Deterministic identity of the analysed inputs and the analysis rules.
@@ -548,8 +563,48 @@ fn call_site(
     ids: &BTreeMap<(String, u32), SymbolId>,
     files: &[(String, Arc<ExtractedFile>)],
 ) -> CallSite {
-    let definition_span = |target: &TargetRef| {
-        files
+    let site = SiteBuilder {
+        caller,
+        span,
+        version,
+        ids,
+        files,
+    };
+    match outcome {
+        Outcome::Resolved {
+            target,
+            rule,
+            explanation,
+            span,
+        } => site.resolved(target, rule, explanation, span),
+        Outcome::Possible {
+            targets,
+            rule,
+            explanation,
+            span,
+        } => site.possible(targets, rule, explanation, span),
+        Outcome::Unresolved { rule, explanation } => site.unresolved(rule, explanation, None, None),
+        Outcome::External {
+            name,
+            rule,
+            explanation,
+            span,
+        } => site.unresolved(rule, explanation, span, Some(name)),
+    }
+}
+
+/// What a call site's outcome is turned into a [`CallSite`] with.
+struct SiteBuilder<'a> {
+    caller: SymbolId,
+    span: SourceSpan,
+    version: &'a str,
+    ids: &'a BTreeMap<(String, u32), SymbolId>,
+    files: &'a [(String, Arc<ExtractedFile>)],
+}
+
+impl SiteBuilder<'_> {
+    fn definition_span(&self, target: &TargetRef) -> Option<SourceSpan> {
+        self.files
             .iter()
             .find(|(path, _)| *path == target.path)
             .and_then(|(_, file)| file.callable(target.key))
@@ -558,102 +613,98 @@ fn call_site(
                 start_byte: callable.start,
                 end_byte: callable.end,
             })
-    };
-    let evidence = |rule: &str, explanation: String, span: Option<SourceSpan>| Evidence {
-        rule_id: rule.into(),
-        adapter_version: version.into(),
-        explanation,
-        span,
-    };
-    let site = |target, resolution, evidence, candidates, truncated, external| CallSite {
-        caller: caller.clone(),
-        span: span.clone(),
-        target,
-        resolution,
-        evidence: Some(evidence),
-        candidates,
-        candidates_truncated: truncated,
-        external,
-    };
-    match outcome {
-        Outcome::Resolved {
-            target,
-            rule,
+    }
+
+    fn evidence(&self, rule: &str, explanation: String, span: Option<SourceSpan>) -> Evidence {
+        Evidence {
+            rule_id: rule.into(),
+            adapter_version: self.version.into(),
             explanation,
-            span: evidence_span,
-        } => match ids.get(&(target.path.clone(), target.key)) {
-            Some(id) => site(
-                Some(id.clone()),
-                Resolution::Resolved,
-                evidence(
-                    rule,
-                    explanation,
-                    evidence_span.or_else(|| definition_span(&target)),
-                ),
-                Vec::new(),
-                false,
-                None,
-            ),
-            None => site(
-                None,
-                Resolution::Unresolved,
-                evidence(
+            span,
+        }
+    }
+
+    fn site(
+        &self,
+        target: Option<SymbolId>,
+        resolution: Resolution,
+        evidence: Evidence,
+    ) -> CallSite {
+        CallSite {
+            caller: self.caller.clone(),
+            span: self.span.clone(),
+            target,
+            resolution,
+            evidence: Some(evidence),
+            candidates: Vec::new(),
+            candidates_truncated: false,
+            external: None,
+        }
+    }
+
+    fn resolved(
+        &self,
+        target: TargetRef,
+        rule: &str,
+        explanation: String,
+        span: Option<SourceSpan>,
+    ) -> CallSite {
+        match self.ids.get(&(target.path.clone(), target.key)) {
+            Some(id) => {
+                let span = span.or_else(|| self.definition_span(&target));
+                let evidence = self.evidence(rule, explanation, span);
+                self.site(Some(id.clone()), Resolution::Resolved, evidence)
+            }
+            None => {
+                let evidence = self.evidence(
                     "missing-target",
                     "the resolver named a callable that is not in this snapshot".into(),
-                    Some(span.clone()),
-                ),
-                Vec::new(),
-                false,
-                None,
-            ),
-        },
-        Outcome::Possible {
-            targets,
-            rule,
-            explanation,
-            span: evidence_span,
-        } => {
-            let all: Vec<SymbolId> = targets
-                .iter()
-                .filter_map(|target| ids.get(&(target.path.clone(), target.key)).cloned())
-                .collect();
-            let truncated = all.len() > CANDIDATE_LIMIT;
-            let candidates = all.into_iter().take(CANDIDATE_LIMIT).collect();
-            let explanation = if truncated {
-                format!("{explanation} (candidate list truncated at {CANDIDATE_LIMIT})")
-            } else {
-                explanation
-            };
-            site(
-                None,
-                Resolution::Possible,
-                evidence(rule, explanation, evidence_span.or(Some(span.clone()))),
-                candidates,
-                truncated,
-                None,
-            )
+                    Some(self.span.clone()),
+                );
+                self.site(None, Resolution::Unresolved, evidence)
+            }
         }
-        Outcome::Unresolved { rule, explanation } => site(
-            None,
-            Resolution::Unresolved,
-            evidence(rule, explanation, Some(span.clone())),
-            Vec::new(),
-            false,
-            None,
-        ),
-        Outcome::External {
-            name,
-            rule,
-            explanation,
-            span: evidence_span,
-        } => site(
-            None,
-            Resolution::Unresolved,
-            evidence(rule, explanation, evidence_span.or(Some(span.clone()))),
-            Vec::new(),
-            false,
-            Some(name),
-        ),
+    }
+
+    fn possible(
+        &self,
+        targets: Vec<TargetRef>,
+        rule: &str,
+        explanation: String,
+        span: Option<SourceSpan>,
+    ) -> CallSite {
+        let all: Vec<SymbolId> = targets
+            .iter()
+            .filter_map(|target| self.ids.get(&(target.path.clone(), target.key)).cloned())
+            .collect();
+        let truncated = all.len() > CANDIDATE_LIMIT;
+        let candidates = all.into_iter().take(CANDIDATE_LIMIT).collect();
+        let explanation = if truncated {
+            format!("{explanation} (candidate list truncated at {CANDIDATE_LIMIT})")
+        } else {
+            explanation
+        };
+        let evidence = self.evidence(rule, explanation, span.or(Some(self.span.clone())));
+        CallSite {
+            candidates,
+            candidates_truncated: truncated,
+            ..self.site(None, Resolution::Possible, evidence)
+        }
+    }
+
+    /// An unresolved call, optionally to a named external target.
+    fn unresolved(
+        &self,
+        rule: &str,
+        explanation: String,
+        span: Option<SourceSpan>,
+        external: Option<String>,
+    ) -> CallSite {
+        let evidence = self.evidence(rule, explanation, span.or(Some(self.span.clone())));
+        CallSite {
+            external,
+            ..self.site(None, Resolution::Unresolved, evidence)
+        }
     }
 }
 
@@ -662,5 +713,30 @@ fn check_cancelled(cancel: &CancellationToken) -> Result<(), CallGraphError> {
         Err(CallGraphError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+fn poisoned(what: &str) -> CallGraphError {
+    CallGraphError::DependencyFailure(format!("{what} lock poisoned"))
+}
+
+/// Counts resolved, possible and unresolved calls, and why the unresolved ones are.
+fn count_resolutions(calls: &[CallSite], stats: &mut RefreshStats) {
+    for call in calls {
+        match call.resolution {
+            Resolution::Resolved => stats.resolved += 1,
+            Resolution::Possible => stats.possible += 1,
+            Resolution::Unresolved => {
+                stats.unresolved += 1;
+                let reason = call
+                    .evidence
+                    .as_ref()
+                    .map_or("unknown", |evidence| evidence.rule_id.as_str());
+                *stats
+                    .unresolved_by_reason
+                    .entry(reason.to_owned())
+                    .or_default() += 1;
+            }
+        }
     }
 }
