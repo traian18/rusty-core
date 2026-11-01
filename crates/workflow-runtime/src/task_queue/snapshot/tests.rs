@@ -223,3 +223,43 @@ fn an_undone_attempt_keeps_its_diff() {
         "{cut}"
     );
 }
+
+#[test]
+fn pruning_removes_old_runs_checkpoints_and_keeps_the_current_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let repo = repo_with_commit(root);
+    take(root, "old-run/T1-start");
+    take(root, "old-run/T1-accepted");
+    take(root, "current-run/T1-start");
+    let ref_count = |repo: &Repository| {
+        repo.references()
+            .unwrap()
+            .flatten()
+            .filter(|r| {
+                r.name()
+                    .is_ok_and(|n| n.starts_with("refs/rusty/checkpoints/"))
+            })
+            .count()
+    };
+    assert_eq!(ref_count(&repo), 3);
+
+    // Nothing is older than a day.
+    assert_eq!(prune_checkpoints(root, 1, None), Pruned::default());
+    assert_eq!(ref_count(&repo), 3);
+
+    // With a cutoff in the future everything is old, except the run being worked on.
+    let future = i64::MAX / 2;
+    let pruned = prune::prune_older_than(root, future, Some("current-run"));
+    assert_eq!(
+        pruned,
+        Pruned {
+            refs: 2,
+            repositories: 1
+        }
+    );
+    assert_eq!(ref_count(&repo), 1);
+    assert!(repo
+        .find_reference("refs/rusty/checkpoints/current-run/T1-start")
+        .is_ok());
+}

@@ -13,6 +13,7 @@ mod task_queue;
 /// the task queue's, also used by hosts that run their own passes (goal loops).
 pub mod workspace_snapshot {
     pub use crate::task_queue::snapshot::{
-        fingerprint, patch, take, undo_to, RepoSnapshot, Snapshot, Undone,
+        fingerprint, patch, prune_checkpoints, take, undo_to, Pruned, RepoSnapshot, Snapshot,
+        Undone, DEFAULT_MAX_AGE_DAYS,
     };
 }

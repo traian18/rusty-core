@@ -9,10 +9,14 @@
 //! first snapshots the attempt itself, so nothing is lost: the attempt's
 //! changes stay reachable under their own ref.
 
+mod prune;
+
 use std::path::{Path, PathBuf};
 
 use git2::{Delta, DiffOptions, IndexAddOption, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
+
+pub use prune::{prune_checkpoints, Pruned, DEFAULT_MAX_AGE_DAYS};
 
 /// One repository's recorded tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
