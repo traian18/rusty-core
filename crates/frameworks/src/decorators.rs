@@ -210,6 +210,16 @@ struct Known<'t> {
     class: Class<'t>,
 }
 
+/// A script file that mentions decorators or `inject(`, parsed.
+struct Parsed {
+    file: RootRelativePath,
+    source: String,
+    tree: tree_sitter::Tree,
+}
+
+/// The classes of every parsed file.
+type PerFile<'a> = Vec<(&'a RootRelativePath, &'a str, Vec<Known<'a>>)>;
+
 /// Provider-injection relations for one package: a constructor parameter typed with an
 /// `@Injectable` class defined in the package becomes `provider_injected_into`. Parameters with an
 /// explicit `@Inject(...)` token are reported, not followed.
@@ -219,11 +229,34 @@ pub fn injections(
     rules: &InjectionRules,
     output: &mut FrameworkOutput,
 ) {
-    struct Parsed {
-        file: RootRelativePath,
-        source: String,
-        tree: tree_sitter::Tree,
+    let parsed = parse_candidates(package, input);
+    let per_file: PerFile<'_> = parsed
+        .iter()
+        .map(|p| {
+            let known = classes(p.tree.root_node(), &p.source)
+                .into_iter()
+                .map(|class| Known { class })
+                .collect();
+            (&p.file, p.source.as_str(), known)
+        })
+        .collect();
+    let scan = Scan {
+        package,
+        input,
+        rules,
+        per_file: &per_file,
+    };
+    for (file, source, known) in &per_file {
+        for item in known {
+            let class = &item.class;
+            if rules.consumers.iter().any(|d| class.decorator(d).is_some()) {
+                scan.consumer(file, source, class, output);
+            }
+        }
     }
+}
+
+fn parse_candidates(package: &Package, input: &FrameworkInput<'_>) -> Vec<Parsed> {
     let mut parsed = Vec::new();
     for indexed in input.files_of(package) {
         if !is_script(&indexed.path) {
@@ -244,104 +277,117 @@ pub fn injections(
             tree,
         });
     }
-    let per_file: Vec<(&RootRelativePath, &str, Vec<Known<'_>>)> = parsed
-        .iter()
-        .map(|p| {
-            (
-                &p.file,
-                p.source.as_str(),
-                classes(p.tree.root_node(), &p.source)
-                    .into_iter()
-                    .map(|class| Known { class })
-                    .collect(),
-            )
-        })
-        .collect();
-    let is_injectable = |file: &RootRelativePath, name: &str| {
-        per_file.iter().any(|(path, _, known)| {
+    parsed
+}
+
+/// What is injected into a class: its type name, where it was written, and whether the token is
+/// explicit or computed (so it is reported and not followed).
+type Injected<'t> = (Option<String>, Node<'t>, bool);
+
+struct Scan<'a> {
+    package: &'a Package,
+    input: &'a FrameworkInput<'a>,
+    rules: &'a InjectionRules,
+    per_file: &'a PerFile<'a>,
+}
+
+impl Scan<'_> {
+    fn is_injectable(&self, file: &RootRelativePath, name: &str) -> bool {
+        self.per_file.iter().any(|(path, _, known)| {
             *path == file
-                && known
-                    .iter()
-                    .any(|k| k.class.name == name && k.class.decorator(rules.injectable).is_some())
+                && known.iter().any(|k| {
+                    k.class.name == name && k.class.decorator(self.rules.injectable).is_some()
+                })
         })
-    };
-    for (file, source, known) in &per_file {
-        for item in known {
-            let class = &item.class;
-            if !rules.consumers.iter().any(|d| class.decorator(d).is_some()) {
+    }
+
+    fn defines(&self, file: &RootRelativePath, name: &str) -> bool {
+        self.per_file
+            .iter()
+            .any(|(path, _, k)| *path == file && k.iter().any(|c| c.class.name == name))
+    }
+
+    /// Relates each injectable provider a consumer class receives to the class.
+    fn consumer(
+        &self,
+        file: &RootRelativePath,
+        source: &str,
+        class: &Class<'_>,
+        output: &mut FrameworkOutput,
+    ) {
+        for (type_name, node, explicit) in self.injected(source, class) {
+            if explicit {
+                output.unresolved(
+                    file,
+                    format!("`{}` injects with an explicit or computed token (`{}`); no relation emitted", class.name, text(node, source)),
+                );
                 continue;
             }
-            // Constructor parameters, then `inject(Type)` calls anywhere in the class body.
-            let mut injected: Vec<(Option<String>, Node<'_>, bool)> = Vec::new();
-            if let Some(constructor) = class.constructor() {
-                for parameter in &constructor.parameters {
-                    let explicit = parameter.decorators.iter().any(|d| d.name == "Inject");
-                    injected.push((parameter.type_name.clone(), parameter.node, explicit));
-                }
+            let Some(type_name) = type_name else {
+                continue;
+            };
+            let provider_file = if self.defines(file, &type_name) {
+                Some(file.clone())
+            } else {
+                self.input.names.target(file, &type_name).cloned()
+            };
+            let Some(provider_file) = provider_file else {
+                continue;
+            };
+            if !self.is_injectable(&provider_file, &type_name) {
+                continue;
             }
-            if let Some(function) = rules.inject_function {
-                walk(class.node, &mut |node| {
-                    if node.kind() != "call_expression" {
-                        return;
-                    }
-                    let Some(callee) = node.child_by_field_name("function") else {
-                        return;
-                    };
-                    if text(callee, source) != function {
-                        return;
-                    }
-                    let argument = node
-                        .child_by_field_name("arguments")
-                        .and_then(|a| a.named_child(0));
-                    match argument {
-                        Some(argument) if argument.kind() == "identifier" => {
-                            injected.push((Some(text(argument, source).to_owned()), node, false));
-                        }
-                        _ => injected.push((None, node, true)),
-                    }
-                });
-            }
-            for (type_name, node, explicit) in injected {
-                if explicit {
-                    output.unresolved(
-                        file,
-                        format!("`{}` injects with an explicit or computed token (`{}`); no relation emitted", class.name, text(node, source)),
-                    );
-                    continue;
-                }
-                let Some(type_name) = &type_name else {
-                    continue;
-                };
-                let provider_file = if per_file.iter().any(|(path, _, k)| {
-                    path == file && k.iter().any(|c| c.class.name == *type_name)
-                }) {
-                    Some((*file).clone())
-                } else {
-                    input.names.target(file, type_name).cloned()
-                };
-                let Some(provider_file) = provider_file else {
-                    continue;
-                };
-                if !is_injectable(&provider_file, type_name) {
-                    continue;
-                }
-                output.relate(FrameworkRelation::new(
-                    rules.framework,
-                    Some(&package.id),
-                    RelationDraft {
-                        kind: RelationKind::ProviderInjectedInto,
-                        rule: rules.rule,
-                        rule_version: rules.version,
-                        certainty: Certainty::Declared,
-                        from: provider_file,
-                        to: Some((*file).clone()),
-                        from_symbol: Some(type_name.clone()),
-                        to_symbol: Some(class.name.clone()),
-                        label: type_name.clone(),
-                        evidence: evidence(file, node, source),
-                    },
-                ));
+            let draft = RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule: self.rules.rule,
+                rule_version: self.rules.version,
+                certainty: Certainty::Declared,
+                from: provider_file,
+                to: Some(file.clone()),
+                from_symbol: Some(type_name.clone()),
+                to_symbol: Some(class.name.clone()),
+                label: type_name,
+                evidence: evidence(file, node, source),
+            };
+            output.relate(FrameworkRelation::new(
+                self.rules.framework,
+                Some(&self.package.id),
+                draft,
+            ));
+        }
+    }
+
+    /// Constructor parameters, then `inject(Type)` calls anywhere in the class body.
+    fn injected<'c>(&self, source: &str, class: &'c Class<'_>) -> Vec<Injected<'c>> {
+        let mut injected: Vec<Injected<'c>> = Vec::new();
+        if let Some(constructor) = class.constructor() {
+            for parameter in &constructor.parameters {
+                let explicit = parameter.decorators.iter().any(|d| d.name == "Inject");
+                injected.push((parameter.type_name.clone(), parameter.node, explicit));
             }
         }
+        if let Some(function) = self.rules.inject_function {
+            walk(class.node, &mut |node| {
+                if node.kind() != "call_expression" {
+                    return;
+                }
+                let Some(callee) = node.child_by_field_name("function") else {
+                    return;
+                };
+                if text(callee, source) != function {
+                    return;
+                }
+                let argument = node
+                    .child_by_field_name("arguments")
+                    .and_then(|a| a.named_child(0));
+                match argument {
+                    Some(argument) if argument.kind() == "identifier" => {
+                        injected.push((Some(text(argument, source).to_owned()), node, false));
+                    }
+                    _ => injected.push((None, node, true)),
+                }
+            });
+        }
+        injected
     }
 }
