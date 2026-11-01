@@ -78,139 +78,183 @@ impl FrameworkAdapter for FastApiAdapter {
                 continue;
             };
             let root = tree.root_node();
-            let locals = local_names(root, &source);
-            // receiver -> prefix, for the variables that are provably a FastAPI app or router.
-            let mut receivers: HashMap<String, String> = HashMap::new();
-            for (name, (callee, call)) in assignments(root, &source) {
-                if callee == "FastAPI" {
-                    receivers.insert(name, String::new());
-                } else if callee == "APIRouter" {
-                    let (_, kwargs) = crate::py_items::call_arguments(call, &source);
-                    let prefix = kwargs
-                        .iter()
-                        .find(|(k, _)| k == "prefix")
-                        .and_then(|(_, v)| string_value(*v, &source))
-                        .unwrap_or_default();
-                    receivers.insert(name, prefix);
-                }
-            }
-            for function in functions(root, &source) {
-                for decorator in &function.decorators {
-                    let Some(receiver) = decorator.receiver.as_deref() else {
-                        continue;
-                    };
-                    let is_route =
-                        METHODS.contains(&decorator.name.as_str()) || decorator.name == "api_route";
-                    if !is_route {
-                        continue;
-                    }
-                    let path_node = decorator
-                        .args
-                        .first()
-                        .copied()
-                        .or_else(|| decorator.kwarg("path"));
-                    let Some(prefix) = receivers.get(receiver) else {
-                        if path_node
-                            .and_then(|n| string_value(n, &source))
-                            .is_some_and(|p| p.starts_with('/'))
-                            && !receiver.contains('.')
-                        {
-                            output.unresolved(&file, format!("`@{receiver}.{}` looks like a route, but `{receiver}` is not provably a FastAPI app or router; no relation emitted", decorator.name));
-                        }
-                        continue;
-                    };
-                    let Some(path) = path_node.and_then(|n| string_value(n, &source)) else {
-                        output.unresolved(
-                            &file,
-                            format!(
-                                "`@{receiver}.{}` on `{}` has a computed path; no relation emitted",
-                                decorator.name, function.name
-                            ),
-                        );
-                        continue;
-                    };
-                    let methods: Vec<String> = if decorator.name == "api_route" {
-                        let listed: Vec<String> = decorator
-                            .kwarg("methods")
-                            .map(|list| {
-                                let mut cursor = list.walk();
-                                list.named_children(&mut cursor)
-                                    .filter_map(|m| string_value(m, &source))
-                                    .map(|m| m.to_uppercase())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if listed.is_empty() {
-                            vec!["GET".into()]
-                        } else {
-                            listed
-                        }
-                    } else {
-                        vec![decorator.name.to_uppercase()]
-                    };
-                    for method in methods {
-                        output.relate(FrameworkRelation::new(
-                            ID,
-                            Some(&package.id),
-                            RelationDraft {
-                                kind: RelationKind::RouteRegisteredTo,
-                                rule: ROUTE_RULE,
-                                rule_version: VERSION,
-                                certainty: Certainty::Declared,
-                                from: file.clone(),
-                                to: Some(file.clone()),
-                                from_symbol: None,
-                                to_symbol: Some(function.name.clone()),
-                                label: format!("{method} {}", join_path(prefix, &path)),
-                                evidence: evidence(&file, decorator.node, &source),
-                            },
-                        ));
-                    }
+            let scan = FileScan {
+                package,
+                input,
+                file: &file,
+                source: &source,
+                locals: local_names(root, &source),
+                receivers: receivers_of(root, &source),
+            };
+            scan.routes(root, output);
+        }
+        Ok(())
+    }
+}
+
+/// Variables that are provably a FastAPI app (empty prefix) or router (its `prefix`).
+fn receivers_of(root: tree_sitter::Node<'_>, source: &str) -> HashMap<String, String> {
+    let mut receivers = HashMap::new();
+    for (name, (callee, call)) in assignments(root, source) {
+        if callee == "FastAPI" {
+            receivers.insert(name, String::new());
+        } else if callee == "APIRouter" {
+            let (_, kwargs) = crate::py_items::call_arguments(call, source);
+            let prefix = kwargs
+                .iter()
+                .find(|(k, _)| k == "prefix")
+                .and_then(|(_, v)| string_value(*v, source))
+                .unwrap_or_default();
+            receivers.insert(name, prefix);
+        }
+    }
+    receivers
+}
+
+/// The HTTP methods of an `api_route(methods=[…])` list; `GET` when there is none.
+fn api_route_methods(list: Option<tree_sitter::Node<'_>>, source: &str) -> Vec<String> {
+    let listed: Vec<String> = list
+        .map(|list| {
+            let mut cursor = list.walk();
+            list.named_children(&mut cursor)
+                .filter_map(|m| string_value(m, source))
+                .map(|m| m.to_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    if listed.is_empty() {
+        vec!["GET".into()]
+    } else {
+        listed
+    }
+}
+
+/// One Python file being read for FastAPI routes.
+struct FileScan<'a> {
+    package: &'a Package,
+    input: &'a FrameworkInput<'a>,
+    file: &'a rusty_repo_model::repository_intelligence::RootRelativePath,
+    source: &'a str,
+    locals: std::collections::HashSet<String>,
+    receivers: HashMap<String, String>,
+}
+
+impl FileScan<'_> {
+    fn routes(&self, root: tree_sitter::Node<'_>, output: &mut FrameworkOutput) {
+        for function in functions(root, self.source) {
+            for decorator in &function.decorators {
+                if self.route(&function, decorator, output) {
                     if let Some(parameters) = function.parameters {
-                        walk(parameters, &mut |node| {
-                            if node.kind() != "call" {
-                                return;
-                            }
-                            let Some(callee) = node.child_by_field_name("function") else {
-                                return;
-                            };
-                            if text(callee, &source).rsplit('.').next() != Some("Depends") {
-                                return;
-                            }
-                            let Some(provider) = node
-                                .child_by_field_name("arguments")
-                                .and_then(|a| a.named_child(0))
-                                .filter(|a| matches!(a.kind(), "identifier" | "attribute"))
-                            else {
-                                return;
-                            };
-                            let (Some(provider_file), Some(name)) =
-                                resolve_view(provider, &file, &source, &locals, input)
-                            else {
-                                return;
-                            };
-                            let name = name.as_str();
-                            output.relate(FrameworkRelation::new(
-                                ID,
-                                Some(&package.id),
-                                RelationDraft {
-                                    kind: RelationKind::ProviderInjectedInto,
-                                    rule: DEPENDS_RULE,
-                                    rule_version: VERSION,
-                                    certainty: Certainty::Declared,
-                                    from: provider_file,
-                                    to: Some(file.clone()),
-                                    from_symbol: Some(name.to_owned()),
-                                    to_symbol: Some(function.name.clone()),
-                                    label: name.to_owned(),
-                                    evidence: evidence(&file, node, &source),
-                                },
-                            ));
-                        });
+                        self.dependencies(parameters, &function.name, output);
                     }
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Relates one route decorator to its function. False when it is not a route of a known app
+    /// or router (or has a computed path), with the reason reported where it matters.
+    fn route(
+        &self,
+        function: &crate::py_items::Function<'_>,
+        decorator: &crate::py_items::Decorator<'_>,
+        output: &mut FrameworkOutput,
+    ) -> bool {
+        let Some(receiver) = decorator.receiver.as_deref() else {
+            return false;
+        };
+        let is_route = METHODS.contains(&decorator.name.as_str()) || decorator.name == "api_route";
+        if !is_route {
+            return false;
+        }
+        let path_node = decorator
+            .args
+            .first()
+            .copied()
+            .or_else(|| decorator.kwarg("path"));
+        let path = path_node.and_then(|n| string_value(n, self.source));
+        let Some(prefix) = self.receivers.get(receiver) else {
+            if path.as_deref().is_some_and(|p| p.starts_with('/')) && !receiver.contains('.') {
+                output.unresolved(self.file, format!("`@{receiver}.{}` looks like a route, but `{receiver}` is not provably a FastAPI app or router; no relation emitted", decorator.name));
+            }
+            return false;
+        };
+        let Some(path) = path else {
+            output.unresolved(
+                self.file,
+                format!(
+                    "`@{receiver}.{}` on `{}` has a computed path; no relation emitted",
+                    decorator.name, function.name
+                ),
+            );
+            return false;
+        };
+        let methods: Vec<String> = if decorator.name == "api_route" {
+            api_route_methods(decorator.kwarg("methods"), self.source)
+        } else {
+            vec![decorator.name.to_uppercase()]
+        };
+        for method in methods {
+            let draft = RelationDraft {
+                kind: RelationKind::RouteRegisteredTo,
+                rule: ROUTE_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: self.file.clone(),
+                to: Some(self.file.clone()),
+                from_symbol: None,
+                to_symbol: Some(function.name.clone()),
+                label: format!("{method} {}", join_path(prefix, &path)),
+                evidence: evidence(self.file, decorator.node, self.source),
+            };
+            output.relate(FrameworkRelation::new(ID, Some(&self.package.id), draft));
+        }
+        true
+    }
+
+    /// `Depends(provider)` in a route's parameters: the provider is injected into the route.
+    fn dependencies(
+        &self,
+        parameters: tree_sitter::Node<'_>,
+        route: &str,
+        output: &mut FrameworkOutput,
+    ) {
+        let source = self.source;
+        walk(parameters, &mut |node| {
+            if node.kind() != "call" {
+                return;
+            }
+            let Some(callee) = node.child_by_field_name("function") else {
+                return;
+            };
+            if text(callee, source).rsplit('.').next() != Some("Depends") {
+                return;
+            }
+            let Some(provider) = node
+                .child_by_field_name("arguments")
+                .and_then(|a| a.named_child(0))
+                .filter(|a| matches!(a.kind(), "identifier" | "attribute"))
+            else {
+                return;
+            };
+            let (Some(provider_file), Some(name)) =
+                resolve_view(provider, self.file, source, &self.locals, self.input)
+            else {
+                return;
+            };
+            let draft = RelationDraft {
+                kind: RelationKind::ProviderInjectedInto,
+                rule: DEPENDS_RULE,
+                rule_version: VERSION,
+                certainty: Certainty::Declared,
+                from: provider_file,
+                to: Some(self.file.clone()),
+                from_symbol: Some(name.clone()),
+                to_symbol: Some(route.to_owned()),
+                label: name,
+                evidence: evidence(self.file, node, source),
+            };
+            output.relate(FrameworkRelation::new(ID, Some(&self.package.id), draft));
+        });
     }
 }
