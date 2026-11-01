@@ -627,7 +627,17 @@ fn minimal_apis(
     unique: &dyn Fn(&str) -> Option<RootRelativePath>,
     output: &mut FrameworkOutput,
 ) {
-    // `var app = builder.Build();` and `var api = app.MapGroup("/x");` give receivers with prefixes.
+    let receivers = minimal_receivers(root, source);
+    if receivers.is_empty() {
+        return;
+    }
+    walk(root, &mut |node| {
+        minimal_route(package, file, node, source, &receivers, unique, output)
+    });
+}
+
+/// `var app = builder.Build();` and `var api = app.MapGroup("/x");` give receivers with prefixes.
+fn minimal_receivers(root: Node<'_>, source: &str) -> HashMap<String, String> {
     let mut receivers: HashMap<String, String> = HashMap::new();
     walk(root, &mut |node| {
         if node.kind() != "variable_declarator" {
@@ -663,81 +673,89 @@ fn minimal_apis(
             }
         }
     });
-    if receivers.is_empty() {
+    receivers
+}
+
+/// `app.MapGet("/path", handler)` and its siblings on a known receiver.
+fn minimal_route(
+    package: &Package,
+    file: &RootRelativePath,
+    node: Node<'_>,
+    source: &str,
+    receivers: &HashMap<String, String>,
+    unique: &dyn Fn(&str) -> Option<RootRelativePath>,
+    output: &mut FrameworkOutput,
+) {
+    if node.kind() != "invocation_expression" {
         return;
     }
-    walk(root, &mut |node| {
-        if node.kind() != "invocation_expression" {
-            return;
+    let Some(function) = node
+        .child_by_field_name("function")
+        .filter(|f| f.kind() == "member_access_expression")
+    else {
+        return;
+    };
+    let method = function
+        .child_by_field_name("name")
+        .map(|n| text(n, source))
+        .unwrap_or("");
+    let Some((_, verb)) = MAPS.iter().find(|(name, _)| *name == method) else {
+        return;
+    };
+    let object = function
+        .child_by_field_name("expression")
+        .map(|o| text(o, source))
+        .unwrap_or("");
+    let Some(prefix) = receivers.get(object) else {
+        return;
+    };
+    let arguments = argument_nodes(node);
+    let (Some(pattern), Some(handler)) = (arguments.first(), arguments.last()) else {
+        return;
+    };
+    let Some(pattern) = first_string(*pattern, source) else {
+        output.unresolved(
+            file,
+            format!(
+                "`{object}.{method}({}, …)` has a computed pattern; no relation emitted",
+                text(*pattern, source)
+            ),
+        );
+        return;
+    };
+    let (target, symbol) = match handler.kind() {
+        "lambda_expression" | "anonymous_method_expression" => (Some(file.clone()), None),
+        "member_access_expression" => {
+            let class = handler
+                .child_by_field_name("expression")
+                .map(|e| text(e, source).to_owned())
+                .unwrap_or_default();
+            (
+                unique(&class),
+                handler
+                    .child_by_field_name("name")
+                    .map(|n| text(n, source).to_owned()),
+            )
         }
-        let Some(function) = node
-            .child_by_field_name("function")
-            .filter(|f| f.kind() == "member_access_expression")
-        else {
-            return;
-        };
-        let method = function
-            .child_by_field_name("name")
-            .map(|n| text(n, source))
-            .unwrap_or("");
-        let Some((_, verb)) = MAPS.iter().find(|(name, _)| *name == method) else {
-            return;
-        };
-        let object = function
-            .child_by_field_name("expression")
-            .map(|o| text(o, source))
-            .unwrap_or("");
-        let Some(prefix) = receivers.get(object) else {
-            return;
-        };
-        let arguments = argument_nodes(node);
-        let (Some(pattern), Some(handler)) = (arguments.first(), arguments.last()) else {
-            return;
-        };
-        let Some(pattern) = first_string(*pattern, source) else {
-            output.unresolved(
-                file,
-                format!(
-                    "`{object}.{method}({}, …)` has a computed pattern; no relation emitted",
-                    text(*pattern, source)
-                ),
-            );
-            return;
-        };
-        let (target, symbol) = match handler.kind() {
-            "lambda_expression" | "anonymous_method_expression" => (Some(file.clone()), None),
-            "member_access_expression" => {
-                let class = handler
-                    .child_by_field_name("expression")
-                    .map(|e| text(e, source).to_owned())
-                    .unwrap_or_default();
-                (
-                    unique(&class),
-                    handler
-                        .child_by_field_name("name")
-                        .map(|n| text(n, source).to_owned()),
-                )
-            }
-            "identifier" => (Some(file.clone()), Some(text(*handler, source).to_owned())),
-            _ => (None, None),
-        };
-        output.relate(FrameworkRelation::new(
-            ID,
-            Some(&package.id),
-            RelationDraft {
-                kind: RelationKind::RouteRegisteredTo,
-                rule: MINIMAL_RULE,
-                rule_version: VERSION,
-                certainty: Certainty::Declared,
-                from: file.clone(),
-                to: target,
-                from_symbol: None,
-                to_symbol: symbol,
-                label: format!("{verb} {}", join_plain(prefix, &pattern)),
-                evidence: evidence(file, node, source),
-            },
-        ));
-    });
+        "identifier" => (Some(file.clone()), Some(text(*handler, source).to_owned())),
+        _ => (None, None),
+    };
+    output.relate(FrameworkRelation::new(
+        ID,
+        Some(&package.id),
+        RelationDraft {
+            kind: RelationKind::RouteRegisteredTo,
+            rule: MINIMAL_RULE,
+            rule_version: VERSION,
+            certainty: Certainty::Declared,
+            from: file.clone(),
+            to: target,
+            from_symbol: None,
+            to_symbol: symbol,
+            label: format!("{verb} {}", join_plain(prefix, &pattern)),
+            evidence: evidence(file, node, source),
+        },
+    ));
 }
 
 fn argument_nodes<'t>(call: Node<'t>) -> Vec<Node<'t>> {
