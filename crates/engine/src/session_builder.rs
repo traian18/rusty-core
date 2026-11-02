@@ -117,6 +117,8 @@ pub struct SessionBuilder {
     /// Orchestration support for the started session — see
     /// [`orchestration`](Self::orchestration).
     orchestration: Option<crate::orchestration::OrchestrationConfig>,
+    /// Outbound credential handling applied at the final backend boundary.
+    secret_shield_policy: crate::secret_shield::SecretShieldPolicy,
     /// Host profile registry; defaults to the built-ins only.
     profiles: Option<crate::profiles::ProfilesConfig>,
     /// The profile the root agent starts with — see [`profile`](Self::profile).
@@ -155,6 +157,7 @@ impl SessionBuilder {
             optional_mcp_servers: Default::default(),
             skills: None,
             orchestration: None,
+            secret_shield_policy: crate::secret_shield::SecretShieldPolicy::Mask,
             profiles: None,
             profile: None,
             workspace_profiles: None,
@@ -237,6 +240,10 @@ impl SessionBuilder {
             tool_registry.as_ref(),
             self.execution_policy.as_ref(),
         );
+        let backend = Arc::new(crate::secret_shield::SecretShieldBackend::new(
+            backend,
+            self.secret_shield_policy,
+        ));
         let backend = assembly::advertise_tools(backend, &root_toolset, persisted_selection);
         // An unbound session used to fall back to `FakeWorkspace`, an
         // in-memory store: `fs.read` reported "not found" for files that

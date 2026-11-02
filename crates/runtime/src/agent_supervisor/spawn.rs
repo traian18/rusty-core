@@ -60,7 +60,7 @@ impl AgentSupervisor {
             agent,
             task,
             RunnerServices {
-                backend: backend,
+                backend,
                 tool_registry: host.tools.clone(),
                 workspace: workspace.clone(),
                 event_sink: host.events.clone(),

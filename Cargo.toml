@@ -101,6 +101,7 @@ schemars = "0.8"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
+regex = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 git2 = "0.21"
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -8,6 +8,7 @@ pub mod harness;
 pub mod orchestration;
 pub mod profiles;
 pub mod providers;
+pub mod secret_shield;
 pub mod session_builder;
 mod tool_factory;
 pub mod validation;

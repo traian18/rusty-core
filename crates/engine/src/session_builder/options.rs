@@ -31,6 +31,15 @@ impl SessionBuilder {
         Ok(self)
     }
 
+    /// Set how credential-shaped content is handled before model dispatch.
+    pub fn secret_shield_policy(
+        mut self,
+        policy: crate::secret_shield::SecretShieldPolicy,
+    ) -> Self {
+        self.secret_shield_policy = policy;
+        self
+    }
+
     /// Set the session tool registry.
     pub fn tools(mut self, tool_registry: Arc<dyn ToolRegistry>) -> Self {
         self.tool_registry = Some(tool_registry);

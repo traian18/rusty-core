@@ -60,8 +60,6 @@ pub(crate) struct GateContext {
     pub session_id: String,
 }
 
-/// Run every check in order and return one verdict per check, plus the
-
 /// Run every check in order and return one verdict per check, plus the usage of any model requests
 /// the evaluators made.
 pub(crate) async fn evaluate(
