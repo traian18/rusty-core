@@ -12,6 +12,9 @@ use rusty_protocol::ids::MessageId;
 use rusty_runtime::traits::Workspace;
 
 use crate::compaction::{drop_prefix, elide_tool_results, truncation_note, Retention};
+use crate::observability::{
+    CompactionMode, CompactionPhase, CompactionTelemetry, ContextObserver, MeasurementStage,
+};
 use crate::policy::{ContextBudget, ContextDecision, ContextPolicy, TokenEstimate};
 use crate::provider::ContextProvider;
 
@@ -73,6 +76,7 @@ pub struct PolicyDrivenCompactionProvider {
     fallback_max_chars: usize,
     retention: Retention,
     last_compaction: Mutex<Option<CompactionRecord>>,
+    observer: Option<ContextObserver>,
     compaction_count: AtomicU64,
 }
 
@@ -105,8 +109,15 @@ impl PolicyDrivenCompactionProvider {
             fallback_max_chars,
             retention: Retention::default(),
             last_compaction: Mutex::new(None),
+            observer: None,
             compaction_count: AtomicU64::new(0),
         }
+    }
+
+    /// Attach bounded, non-blocking context telemetry.
+    pub fn with_observer(mut self, observer: ContextObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// The most recent compaction decision this provider instance made, if
@@ -164,6 +175,58 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
         workspace: &dyn Workspace,
     ) -> ExecutionRequest {
         let request = self.inner.assemble(request, workspace).await;
+        let before = estimate_tokens(&request).tokens;
+        let triggered = match self
+            .policy
+            .evaluate(self.context_window, estimate_tokens(&request))
+        {
+            ContextDecision::CompactBeforeRequest { .. } => true,
+            ContextDecision::Unavailable { .. } if self.context_window.is_none() => {
+                total_chars_of(&request) > self.fallback_max_chars
+            }
+            _ => false,
+        };
+        let telemetry = CompactionTelemetry {
+            observer: self.observer.clone(),
+            conversation_id: request.messages.first().map(|m| m.id),
+            operation_id: MessageId::new(),
+            mode: CompactionMode::Standard,
+        };
+        if let Some(observer) = &self.observer {
+            observer.measure(
+                &request,
+                self.policy,
+                self.context_window,
+                MeasurementStage::BeforeCompaction,
+            );
+        }
+        if triggered {
+            telemetry.update(CompactionPhase::Started, Some(before), None);
+        }
+        let request = self.prepare(request);
+        if triggered {
+            let after = estimate_tokens(&request).tokens;
+            let phase = if after < before {
+                CompactionPhase::Completed
+            } else {
+                CompactionPhase::NoChange
+            };
+            telemetry.update(phase, Some(before), Some(after));
+        }
+        if let Some(observer) = &self.observer {
+            observer.measure(
+                &request,
+                self.policy,
+                self.context_window,
+                MeasurementStage::AfterCompaction,
+            );
+        }
+        request
+    }
+}
+
+impl PolicyDrivenCompactionProvider {
+    fn prepare(&self, request: ExecutionRequest) -> ExecutionRequest {
         let Some(context_window) = self.context_window else {
             return self.compact_without_window(request);
         };

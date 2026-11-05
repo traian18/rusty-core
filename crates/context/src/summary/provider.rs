@@ -17,6 +17,7 @@ use rusty_runtime::traits::Workspace;
 
 use crate::compaction::{drop_prefix, truncation_note, Retention};
 use crate::importance::ImportanceJudge;
+use crate::observability::{CompactionMode, CompactionPhase, CompactionTelemetry, ContextObserver};
 use crate::policy::{ContextDecision, ContextPolicy};
 use crate::provider::ContextProvider;
 use crate::providers::estimate_tokens;
@@ -43,6 +44,7 @@ pub struct SummarizingCompactionProvider {
     pub(super) retention: Retention,
     pub(super) states: States,
     pub(super) tasks: Mutex<Vec<JoinHandle<()>>>,
+    pub(super) observer: Option<ContextObserver>,
     pub(super) summaries_applied: AtomicU64,
 }
 
@@ -71,8 +73,16 @@ impl SummarizingCompactionProvider {
             retention: Retention::default(),
             states: Arc::default(),
             tasks: Mutex::new(Vec::new()),
+            observer: None,
             summaries_applied: AtomicU64::new(0),
         }
+    }
+
+    /// Attach telemetry for background judging, summary readiness and application.
+    /// Attach the same observer to the fallback provider for input measurements.
+    pub fn with_observer(mut self, observer: ContextObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Activate an importance judge (e.g. [`JevImportanceJudge`]): essential
@@ -134,7 +144,8 @@ impl SummarizingCompactionProvider {
     }
 
     fn apply_ready_summary(&self, key: MessageId, request: &mut ExecutionRequest) {
-        let (retention, summary, covered) = {
+        let before = estimate_tokens(request).tokens;
+        let (retention, summary, covered, telemetry) = {
             let states = self.states.lock_or_recover();
             let Some(state) = states.get(&key) else {
                 return;
@@ -146,6 +157,7 @@ impl SummarizingCompactionProvider {
                 self.retention_with_verdicts(Some(state)),
                 state.summary.clone(),
                 covered,
+                state.telemetry.clone(),
             )
         };
         // History that no longer contains the covered message was rewritten;
@@ -165,6 +177,13 @@ impl SummarizingCompactionProvider {
         );
         if dropped > 0 {
             self.summaries_applied.fetch_add(1, Ordering::Relaxed);
+            if let Some(telemetry) = telemetry {
+                telemetry.update(
+                    CompactionPhase::Applied,
+                    Some(before),
+                    Some(estimate_tokens(request).tokens),
+                );
+            }
         }
     }
 
@@ -211,6 +230,13 @@ impl SummarizingCompactionProvider {
             }
             state.in_flight = true;
         }
+        let telemetry = CompactionTelemetry {
+            observer: self.observer.clone(),
+            conversation_id: Some(key),
+            operation_id: MessageId::new(),
+            mode: CompactionMode::Smart,
+        };
+        telemetry.update(CompactionPhase::Started, None, None);
         let flight = Flight {
             states: self.states.clone(),
             key,
@@ -220,7 +246,7 @@ impl SummarizingCompactionProvider {
         let judge = self.judge.clone();
         let handle = tokio::spawn(async move {
             let _flight = flight;
-            summarize_in_background(states, key, summarizer, judge, plan).await;
+            summarize_in_background(states, key, summarizer, judge, plan, telemetry).await;
         });
         let mut tasks = self.tasks.lock_or_recover();
         tasks.retain(|task| !task.is_finished());

@@ -53,6 +53,7 @@ pub fn allows_tool(policy: &ExecutionPolicy, name: &str) -> bool {
 
 /// `agent_spawn` is here, not behind a skill grant: delegating to a read-only child is part of every
 /// run. What a child may do is bounded by the spawn tool itself (read-only by default, not delegatable).
+/// `rusty_docs` reads documentation the IDE ships, never the workspace or the network.
 fn is_unconditionally_allowed(name: &str) -> bool {
     matches!(
         name,
@@ -63,6 +64,7 @@ fn is_unconditionally_allowed(name: &str) -> bool {
             | "job_output"
             | "spec_tasks_check"
             | "agent_spawn"
+            | "rusty_docs"
     ) || crate::tool_alias::ALWAYS_ADMITTED.contains(&name)
 }
 

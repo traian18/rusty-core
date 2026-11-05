@@ -9,6 +9,7 @@ use rusty_protocol::messages::AgentMessage;
 
 #[derive(Default)]
 pub(super) struct SummaryState {
+    pub(super) telemetry: Option<crate::observability::CompactionTelemetry>,
     pub(super) summary: Option<String>,
     /// Last message the summary (and verdicts) account for.
     pub(super) covered_through: Option<MessageId>,

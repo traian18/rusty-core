@@ -124,6 +124,119 @@ fn big_history() -> Vec<AgentMessage> {
 }
 
 #[tokio::test]
+async fn telemetry_reports_judge_counts_ready_and_later_application() {
+    use crate::observability::{CompactionPhase, ContextEvent, ContextObserver};
+    let observer = ContextObserver::new(64);
+    let mut events = observer.subscribe();
+    let history = big_history();
+    let provider = provider(
+        Arc::new(FakeSummarizer {
+            seen: Mutex::default(),
+            fail: false,
+        }),
+        50_000,
+    )
+    .with_importance_judge(Arc::new(FakeJudge {
+        essential: history[1].id,
+        disposable: history[2].id,
+    }))
+    .with_observer(observer);
+    let ws = FakeWorkspace::new();
+    provider.assemble(request(history.clone()), &ws).await;
+    provider.wait_for_background().await;
+    let mut updates = Vec::new();
+    while let Ok(ContextEvent::Compaction(update)) = events.try_recv() {
+        updates.push(update);
+    }
+    assert_eq!(
+        updates.iter().map(|u| u.phase.clone()).collect::<Vec<_>>(),
+        vec![
+            CompactionPhase::Started,
+            CompactionPhase::Judging { candidates: 5 },
+            CompactionPhase::Judged {
+                essential: 1,
+                useful: 3,
+                disposable: 1
+            },
+            CompactionPhase::Summarizing { messages: 3 },
+            CompactionPhase::Ready,
+        ]
+    );
+    let operation = updates[0].operation_id;
+    assert!(updates
+        .iter()
+        .all(|u| u.operation_id == operation && u.conversation_id == Some(history[0].id)));
+    provider.assemble(request(history), &ws).await;
+    let ContextEvent::Compaction(applied) = events.try_recv().unwrap() else {
+        panic!("expected application");
+    };
+    assert_eq!(applied.operation_id, operation);
+    assert_eq!(applied.phase, CompactionPhase::Applied);
+    assert!(applied.after_tokens < applied.before_tokens);
+    provider.wait_for_background().await;
+}
+
+#[tokio::test]
+async fn telemetry_reports_standard_measurements_and_unknown_limits() {
+    use crate::observability::{ContextEvent, ContextObserver, MeasurementStage};
+    for window in [Some(50_000), None] {
+        let observer = ContextObserver::new(32);
+        let mut events = observer.subscribe();
+        let provider = PolicyDrivenCompactionProvider::new(
+            Arc::new(ChainedContextProvider::new(vec![])),
+            ContextPolicy::default(),
+            window,
+            1,
+            10_000,
+        )
+        .with_observer(observer);
+        provider
+            .assemble(request(big_history()), &FakeWorkspace::new())
+            .await;
+        let mut measurements = Vec::new();
+        let mut updates = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ContextEvent::Measured(m) => measurements.push(m),
+                ContextEvent::Compaction(u) => updates.push(u),
+            }
+        }
+        assert_eq!(measurements.len(), 2);
+        assert_eq!(measurements[0].stage, MeasurementStage::BeforeCompaction);
+        assert_eq!(measurements[1].stage, MeasurementStage::AfterCompaction);
+        assert!(measurements[1].estimated_input_tokens < measurements[0].estimated_input_tokens);
+        assert_eq!(measurements[1].pressure_percent.is_some(), window.is_some());
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].operation_id, updates[1].operation_id);
+    }
+}
+
+#[tokio::test]
+async fn telemetry_reports_summary_failure_without_provider_details() {
+    use crate::observability::{CompactionPhase, ContextEvent, ContextObserver};
+    let observer = ContextObserver::new(32);
+    let mut events = observer.subscribe();
+    let provider = provider(
+        Arc::new(FakeSummarizer {
+            seen: Mutex::default(),
+            fail: true,
+        }),
+        50_000,
+    )
+    .with_observer(observer);
+    provider
+        .assemble(request(big_history()), &FakeWorkspace::new())
+        .await;
+    provider.wait_for_background().await;
+    let mut phases = Vec::new();
+    while let Ok(ContextEvent::Compaction(update)) = events.try_recv() {
+        phases.push(update.phase);
+    }
+    assert_eq!(phases.last(), Some(&CompactionPhase::Failed));
+    assert!(!phases.contains(&CompactionPhase::Ready));
+}
+
+#[tokio::test]
 async fn summary_is_built_in_background_and_applied_next_request() {
     let summarizer = Arc::new(FakeSummarizer {
         seen: Mutex::default(),

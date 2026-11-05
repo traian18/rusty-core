@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod compaction;
 pub mod importance;
+pub mod observability;
 pub mod policy;
 pub mod provider;
 pub mod providers;

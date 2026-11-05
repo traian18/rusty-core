@@ -162,6 +162,22 @@ fn the_repository_tools_every_model_gets_survive_any_policy() {
 }
 
 #[test]
+fn rusty_docs_is_allowed_without_any_grant_in_every_mode() {
+    for mode in [
+        ExecutionMode::Execute,
+        ExecutionMode::Plan,
+        ExecutionMode::Virtual,
+    ] {
+        let policy = ExecutionPolicy {
+            mode,
+            enabled_tools: vec![],
+            allowed_mcp_servers: vec![],
+        };
+        assert!(allows_tool(&policy, "rusty_docs"), "{mode:?}");
+    }
+}
+
+#[test]
 fn decide_is_allowed_without_any_grant_in_every_mode() {
     for mode in [
         ExecutionMode::Execute,
