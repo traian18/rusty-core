@@ -49,6 +49,11 @@ impl Queue<'_> {
         self.record_build(task, &built, &status, &before, repair)
             .await?;
         if status == "checkpoint" || status == "needs_repair" {
+            // A stuck step of a split names what blocks it: plan the rest again instead of
+            // building the same step text.
+            if status == "checkpoint" {
+                self.replan_stuck_step(task).await?;
+            }
             return Ok(Attempt::Retry(Ended::Unfinished));
         }
         // A check that cannot run here (no network, a missing tool) does not stop the work: the
@@ -63,7 +68,7 @@ impl Queue<'_> {
         let cancel = self.context.cancellation.clone();
         let checked = self
             .executor
-            .check_after_build(&mut self.progress, &cancel)
+            .check_after_build(&self.progress, &cancel)
             .await;
         if !checked.added.is_empty() {
             self.progress

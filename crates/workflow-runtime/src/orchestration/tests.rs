@@ -1886,6 +1886,33 @@ mod isolated_session {
     }
 
     #[tokio::test]
+    async fn a_step_that_gets_stuck_is_planned_again_instead_of_built_again() {
+        let (state, sent, result) = planned_queue_run(
+            "replan-stuck-step",
+            vec![
+                json!("Too big.\n## Split\n### S1 — Add the field\nbackend.rs\n### S2 — Publish at dispatch\nagent_runner.rs"),
+                json!({"status":"complete","summary":"step done"}),
+                json!({"status":"checkpoint","summary":"The change breaks session_runtime/tests.rs, which this step does not name."}),
+                json!("### S2 — Publish at dispatch and update the event-order test\nagent_runner.rs, session_runtime/tests.rs"),
+                json!({"status":"complete","summary":"step done"}),
+                json!({"status":"complete","summary":"inspected","criteria":[{"id":"C1","evidence":"agent_runner.rs:40"}]}),
+            ],
+        )
+        .await;
+        assert_eq!(state.status, OrchestrationStatus::Completed, "{result}");
+        assert_eq!(sent.len(), 6, "split, S1, stuck S2, replan, new S2, review");
+        let replan = prompt_of(&sent[3]);
+        assert!(replan.contains("got stuck on one of them"), "{replan}");
+        assert!(
+            replan.contains("does not name"),
+            "the builder's account reaches the planner"
+        );
+        let rebuilt = prompt_of(&sent[4]);
+        assert!(rebuilt.contains("Do only step 2 now"));
+        assert!(rebuilt.contains("update the event-order test"), "{rebuilt}");
+    }
+
+    #[tokio::test]
     async fn a_planner_that_finds_a_design_gap_stops_the_task_before_any_build() {
         let (state, sent, result) = planned_queue_run(
             "design-gap",

@@ -22,7 +22,7 @@ Rules for the steps:
 1. 2 to 5 steps, in the order they must be done.
 2. Every step leaves the project compiling and its existing tests passing. Never a step that adds a structure without wiring its first caller to it: change the structure and migrate its callers in the same step, or keep the old path working until a later step removes it.
 3. The first step is the smallest change that makes the rest possible (usually: change the shared type or hook and update every caller so it compiles, with no behaviour change).
-4. Name the files of each step and how to check it (the exact command).
+4. Name the files of each step and how to check it (the exact command). A step's files include every file its check needs to pass, such as an existing test the change breaks or a shared type it must change.
 5. Together the steps meet every criterion of workflow_input.task; say which step covers which criterion.
 6. Use what the undone attempt learned: if it found the real difficulty, put it in a step of its own.
 
@@ -37,7 +37,7 @@ Read the code you need with your read tools; change nothing. Reply with one sect
 /// stop it on a decision only the person can make.
 pub(super) const FIT_INSTRUCTIONS: &str = "Before you plan, judge whether this task fits one builder session: it changes at most 4 files (tests included), and nothing is left to discover or decide. Then reply in exactly one of these three shapes:
 1. It fits: your whole reply is the step plan, as described above.
-2. It is too big: reply with the heading `## Split`, then 2 to 5 steps in the order they must be done, each a section `### S1 — <short title>` naming its files (at most 4) and the exact command that checks it. Every step leaves the project compiling and its tests passing; a step that changes a shared type or hook also updates every caller. The first step is the smallest change that makes the rest possible. Together the steps meet every criterion of workflow_input.task; say which step covers which.
+2. It is too big: reply with the heading `## Split`, then 2 to 5 steps in the order they must be done, each a section `### S1 — <short title>` naming its files (at most 4) and the exact command that checks it. A step's files include every file its check needs to pass: an existing test the change breaks (a test that asserts the exact events, output or order the change alters), a shared type or trait it must change. When that takes a step past 4 files, split it further rather than leave a needed file out. Every step leaves the project compiling and its tests passing; a step that changes a shared type or hook also updates every caller. The first step is the smallest change that makes the rest possible. Together the steps meet every criterion of workflow_input.task; say which step covers which.
 3. It cannot be built without a decision only the person can make (the design relies on something that is not in the code and does not say how to create it, or the spec and the design allow two different results): reply with the heading `## Design gap`, then the question, the options with what each means for the code, and your recommended answer. Use it only when no careful reading of the design and the code settles the question: a detail you can settle from the code is yours to settle in the plan.";
 
 /// Appended to the step planner's instructions: the plan carries what the
@@ -87,6 +87,11 @@ pub(super) fn record_split(progress: &mut Progress, task: &Task, steps: &[String
 /// `## S<n>`, `### Step <n>`) section with its heading. Empty when the
 /// reply has fewer than two or more than five.
 pub(super) fn parse_steps(reply: &str) -> Vec<String> {
+    parse_steps_within(reply, MIN_STEPS, MAX_STEPS)
+}
+
+/// The step sections of `reply`, or none when there are fewer than `min` or more than `max`.
+pub(super) fn parse_steps_within(reply: &str, min: usize, max: usize) -> Vec<String> {
     let mut steps: Vec<String> = Vec::new();
     for line in reply.lines() {
         if is_step_heading(line) {
@@ -100,7 +105,7 @@ pub(super) fn parse_steps(reply: &str) -> Vec<String> {
         .into_iter()
         .map(|step| step.trim().to_owned())
         .collect();
-    if (MIN_STEPS..=MAX_STEPS).contains(&steps.len()) {
+    if (min..=max).contains(&steps.len()) {
         steps
     } else {
         Vec::new()
@@ -131,7 +136,7 @@ pub(super) fn step_instructions(steps: &[String], index: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "\n\nThis task was split into {} smaller steps, each small enough for one session. Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step.\n\nAll steps:\n{all}\n\nYour step:\n{}",
+        "\n\nThis task was split into {} smaller steps, each small enough for one session. Do only step {} now; the steps before it are done. When you finish, the project must compile and its existing tests must pass. Return complete when this step is done; the review of the whole task comes after the last step. The files your step names are its scope. If its check cannot pass without changing a file it does not name (a shared type, an existing test your change breaks), do not change that file and do not widen the scope yourself: return checkpoint, and say in the summary which file the step needs and why. The workflow then plans the remaining steps again with it.\n\nAll steps:\n{all}\n\nYour step:\n{}",
         steps.len(),
         index + 1,
         steps[index]

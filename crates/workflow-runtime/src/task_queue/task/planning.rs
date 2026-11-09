@@ -7,7 +7,7 @@ use crate::orchestration::{is_user_change, AgentExecutionError};
 use crate::task_queue::model::Task;
 use crate::task_queue::queue::Queue;
 use crate::task_queue::scope::is_read_only;
-use crate::task_queue::{brief, planner_watchdog, split};
+use crate::task_queue::{brief, planner_watchdog, replan, split};
 
 /// A step plan (or none), or the question a decision only the person can make comes down to.
 pub(super) type Planned = Result<Option<String>, String>;
@@ -105,6 +105,27 @@ impl Queue<'_> {
             ));
         }
         Ok(text)
+    }
+
+    /// Plans the stuck step of a split task again, with the builder's account of what blocks it,
+    /// so the next attempt does not build the same step text. True when the steps were replaced.
+    pub(super) async fn replan_stuck_step(
+        &mut self,
+        task: &Task,
+    ) -> Result<bool, AgentExecutionError> {
+        if !replan::can_replan(&self.progress, task) {
+            return Ok(false);
+        }
+        self.executor
+            .replan_split(
+                self.request,
+                self.plan,
+                task,
+                &mut self.progress,
+                self.context,
+                self.usage,
+            )
+            .await
     }
 
     /// Tries to split a stuck task into smaller steps, once per task. True when it was split.

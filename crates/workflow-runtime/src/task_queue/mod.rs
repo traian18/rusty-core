@@ -16,6 +16,7 @@ mod model;
 mod plan;
 mod queue;
 mod recovery;
+mod replan;
 mod resume;
 mod scope;
 pub(crate) mod snapshot;
