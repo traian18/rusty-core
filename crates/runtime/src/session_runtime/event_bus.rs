@@ -79,6 +79,9 @@ pub struct SessionEventBus {
     /// Monotonically increasing session-level sequence counter. Used only
     /// when events arrive without a committer-assigned sequence.
     session_sequence: AtomicU64,
+
+    /// The session's retained lifecycle events, filled by its runners before they broadcast.
+    lifecycle: super::LifecycleRetention,
 }
 
 impl SessionEventBus {
@@ -89,7 +92,13 @@ impl SessionEventBus {
             receivers: Mutex::new(Vec::new()),
             subscriber_sender,
             session_sequence: AtomicU64::new(0),
+            lifecycle: super::LifecycleRetention::default(),
         }
+    }
+
+    /// The session's lifecycle retention, shared with every runner of the session.
+    pub fn lifecycle_retention(&self) -> super::LifecycleRetention {
+        self.lifecycle.clone()
     }
 
     /// Register a new agent's event source with the bus.

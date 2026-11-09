@@ -104,6 +104,7 @@ pub(super) fn spawn_runner(
         external_sink: Some(event_sink),
     });
 
+    let observation_bindings = backend.observation_bindings().unwrap_or_default();
     let mut runner = AgentRunner::new(
         agent,
         task,
@@ -117,6 +118,8 @@ pub(super) fn spawn_runner(
         agent_cancel,
         live_state,
     )
+    .with_observation_bindings(observation_bindings)
+    .with_lifecycle_retention(event_bus.lifecycle_retention())
     .with_supervision(agent_supervisor, integrations)
     .with_projection(projection)
     .long_lived(is_root);

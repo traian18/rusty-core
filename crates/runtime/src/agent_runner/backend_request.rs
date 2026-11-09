@@ -3,6 +3,7 @@
 use rusty_agent_core::transcript::validate_transcript;
 use rusty_protocol::backend::ExecutionRequest;
 use rusty_protocol::events::AgentEvent;
+use tokio_util::sync::CancellationToken;
 
 use super::backend_run::{invalid_request, BackendRun};
 use super::mailbox::deliver;
@@ -43,12 +44,52 @@ impl AgentRunner {
                 return;
             }
         }
-        let token = self.cancel.child_token();
+        let token = CancellationToken::new();
+        let request_start_order = self.request_start_order;
+        let Some(next_order) = request_start_order.checked_add(1) else {
+            deliver(
+                &self.task.commands_tx,
+                invalid_request(
+                    request.run_id,
+                    request.request_id,
+                    "request start order exhausted".into(),
+                ),
+            )
+            .await;
+            return;
+        };
+        self.request_start_order = next_order;
+        let binding = super::backend_run::BindingGuard::register(
+            self.observation_bindings.clone(),
+            crate::traits::RequestObservationBinding {
+                session_id: self.agent.session_id,
+                agent_id: self.agent.id,
+                parent_agent_id: self.agent.parent_id,
+                run_id: request.run_id,
+                request_id: request.request_id,
+                request_start_order,
+                publisher: super::observation_publisher::publisher(
+                    self.task.observation_tx.clone(),
+                ),
+                session_cancellation: self.cancel.clone(),
+            },
+        );
+        if !self
+            .emit(AgentEvent::ContextRequestStarted {
+                request_id: request.request_id,
+                request_start_order,
+                model: request.params.model.clone(),
+            })
+            .await
+        {
+            return;
+        }
         self.backend_tokens.insert(request.run_id, token.clone());
         BackendRun {
             backend: self.backend.clone(),
             scheduler: self.scheduler.clone(),
             commands: self.task.commands_tx.clone(),
+            binding,
             runner_cancel: self.cancel.clone(),
             token,
         }

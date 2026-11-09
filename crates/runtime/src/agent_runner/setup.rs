@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusty_agent_core::agent::Agent;
-use tokio_util::sync::CancellationToken;
-
 use rusty_protocol::commands::{AgentError, AgentResult};
 use rusty_session_store::SessionCommitter;
+use tokio_util::sync::CancellationToken;
 
 use super::{AgentRunner, AgentSupervision, AgentTask};
 use crate::agent_supervisor::AgentSupervisor;
 use crate::integration::IntegrationRegistry;
 use crate::scheduler::Scheduler;
 use crate::session_runtime::{AgentProjectionTable, LiveStateTable};
-use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
+use crate::traits::{
+    EventSink, ExecutionBackend, RequestObservationBindings, ToolRegistry, Workspace,
+};
 
 /// The host services an agent's runner works with.
 pub struct RunnerServices {
@@ -34,6 +35,9 @@ impl AgentRunner {
         live_state: LiveStateTable,
     ) -> Self {
         task.cancel = cancel.clone();
+        // A runner built without a session still shares the registry its backend's context
+        // wrapper reads, so its requests are observed.
+        let observation_bindings = services.backend.observation_bindings().unwrap_or_default();
         Self {
             agent,
             task,
@@ -56,7 +60,26 @@ impl AgentRunner {
             fatal_error: false,
             long_lived: false,
             prompt_prefix: Default::default(),
+            request_start_order: 0,
+            observation_bindings,
+            lifecycle_retention: None,
         }
+    }
+
+    /// Shares the session's request observation bindings, which the context wrapper reads.
+    pub fn with_observation_bindings(mut self, bindings: RequestObservationBindings) -> Self {
+        self.observation_bindings = bindings;
+        self
+    }
+
+    /// Retains this runner's committed lifecycle events for the session's recovery, before they
+    /// are broadcast.
+    pub fn with_lifecycle_retention(
+        mut self,
+        retention: crate::session_runtime::LifecycleRetention,
+    ) -> Self {
+        self.lifecycle_retention = Some(retention);
+        self
     }
 
     /// Enables production interpretation of `SpawnAgent` and `CancelChild`.

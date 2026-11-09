@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { HarnessClient } from "../client.js";
-import type { RpcRequest, RpcResponse, UserInput } from "../types.js";
+import type { AgentEvent, AgentEventEnvelope, CompactionOutcome, ContextUnavailableReason, RpcRequest, RpcResponse, UserInput } from "../types.js";
 import type { Transport } from "../transport.js";
 
 const SESSION_ID = "00000000-0000-0000-0000-000000000001";
@@ -157,6 +157,79 @@ test("attachment bytes use serde Vec<u8> JSON arrays", () => {
     attachments: [{ mime_type: "text/plain", data: [104, 105] }],
   } satisfies UserInput;
   assert.deepEqual(JSON.parse(JSON.stringify(input)), input);
+});
+
+function visibilityEnvelope(eventId: string, sequence: number, event: AgentEvent): AgentEventEnvelope {
+  return {
+    event_id: eventId, session_id: SESSION_ID, agent_id: "agent-1", parent_agent_id: null,
+    run_id: "run-1", agent_sequence: sequence, session_sequence: sequence,
+    timestamp: "2025-01-01T00:00:00Z", visibility: "User", event,
+  } satisfies AgentEventEnvelope;
+}
+
+test("context visibility wire fixtures preserve request and update order", () => {
+  const reasons: ContextUnavailableReason[] = ["unknown_model_window", "unusable_input_budget", "model_window_mismatch"];
+  const started = visibilityEnvelope("start", 1, { ContextRequestStarted: { request_id: "request-1", request_start_order: 1, model: "model-1" } });
+  const available = visibilityEnvelope("available", 3, { ContextUpdated: {
+    request_id: "request-2", request_start_order: 2, model: null,
+    availability: { available: { estimated_input_tokens: 10, input_budget: 20, model_window: 30, remaining_input_tokens: 10, usage_percent: 65535 } },
+    compaction_started: false, compaction_ended: false,
+  } });
+  const unavailable = reasons.map((reason, index) => visibilityEnvelope(`unavailable-${index}`, 4 + index, { ContextUpdated: {
+    request_id: "request-2", request_start_order: 2, model: null, availability: { unavailable: { reason } },
+    compaction_started: false, compaction_ended: false,
+  } }));
+  const fixtures = [available, started, ...unavailable];
+  const wire = JSON.parse(JSON.stringify(fixtures));
+  assert.deepEqual(fixtures, wire);
+  assert.deepEqual(wire[0].event, { ContextUpdated: {
+    request_id: "request-2", request_start_order: 2, model: null,
+    availability: { available: { estimated_input_tokens: 10, input_budget: 20, model_window: 30, remaining_input_tokens: 10, usage_percent: 65535 } },
+    compaction_started: false, compaction_ended: false,
+  } });
+  assert.deepEqual(wire[1].event, { ContextRequestStarted: { request_id: "request-1", request_start_order: 1, model: "model-1" } });
+  assert.deepEqual(wire.slice(2).map((item: AgentEventEnvelope) => (item.event as { ContextUpdated: { availability: unknown } }).ContextUpdated.availability), reasons.map((reason) => ({ unavailable: { reason } })));
+  assert.deepEqual(wire.map((item: AgentEventEnvelope) => item.agent_sequence), [3, 1, 4, 5, 6]);
+  assert.equal(wire[0].event.ContextUpdated.request_start_order, 2);
+  assert.equal(wire[1].event.ContextRequestStarted.request_start_order, 1);
+  assert.equal(wire[0].session_id, SESSION_ID);
+  assert.equal(wire[0].agent_id, "agent-1");
+  assert.equal(wire[0].run_id, "run-1");
+});
+
+test("compaction visibility wire fixtures correlate overlapping operations and redelivery", () => {
+  const request = { request_id: "request-1", request_start_order: 1 };
+  const standard = { ...request, operation_id: "operation-standard", compaction_type: "standard" as const };
+  const background = { ...request, operation_id: "operation-background", compaction_type: "background_summary" as const };
+  const fixtures = [
+    visibilityEnvelope("event-1", 1, { CompactionStarted: { ...standard, before_estimated_input_tokens: 20, compaction_started: true, compaction_ended: false } }),
+    visibilityEnvelope("event-2", 2, { CompactionStarted: { ...background, compaction_started: true, compaction_ended: false } }),
+    visibilityEnvelope("event-3", 3, { CompactionFinished: { ...background, outcome: "success", compaction_started: false, compaction_ended: true } }),
+    visibilityEnvelope("event-4", 4, { CompactionFinished: { ...standard, outcome: "success", before_estimated_input_tokens: 20, after_estimated_input_tokens: 10, compaction_started: false, compaction_ended: true } }),
+  ];
+  const serialized = JSON.stringify(fixtures);
+  const wire = JSON.parse(serialized);
+  assert.deepEqual(fixtures, wire);
+  assert.deepEqual(wire.map((item: AgentEventEnvelope) => [item.event_id, item.session_id, item.agent_id, item.run_id, item.agent_sequence, item.session_sequence]), [
+    ["event-1", SESSION_ID, "agent-1", "run-1", 1, 1], ["event-2", SESSION_ID, "agent-1", "run-1", 2, 2],
+    ["event-3", SESSION_ID, "agent-1", "run-1", 3, 3], ["event-4", SESSION_ID, "agent-1", "run-1", 4, 4],
+  ]);
+  assert.deepEqual(wire.map((item: AgentEventEnvelope) => Object.keys(item.event)[0]), ["CompactionStarted", "CompactionStarted", "CompactionFinished", "CompactionFinished"]);
+  assert.equal(wire[0].event.CompactionStarted.operation_id, wire[3].event.CompactionFinished.operation_id);
+  assert.equal(wire[1].event.CompactionStarted.operation_id, wire[2].event.CompactionFinished.operation_id);
+  assert.deepEqual(wire[1].event.CompactionStarted, { ...background, compaction_started: true, compaction_ended: false });
+  assert.deepEqual(wire[2].event.CompactionFinished, { ...background, outcome: "success", compaction_started: false, compaction_ended: true });
+  assert.deepEqual(wire[3].event.CompactionFinished, { ...standard, outcome: "success", before_estimated_input_tokens: 20, after_estimated_input_tokens: 10, compaction_started: false, compaction_ended: true });
+  const unsuccessful: CompactionOutcome[] = ["failure", "cancelled"];
+  for (const outcome of unsuccessful) {
+    const fixture = visibilityEnvelope(outcome, 5, { CompactionFinished: { ...standard, outcome, compaction_started: false, compaction_ended: true } });
+    const payload = JSON.parse(JSON.stringify(fixture)).event.CompactionFinished;
+    assert.deepEqual(payload, { ...standard, outcome, compaction_started: false, compaction_ended: true });
+    assert.equal("after_estimated_input_tokens" in payload, false);
+  }
+  const redelivered = JSON.parse(serialized)[2];
+  assert.deepEqual(redelivered, wire[2]);
+  assert.deepEqual([redelivered.event_id, redelivered.session_id, redelivered.agent_id, redelivered.run_id, redelivered.agent_sequence, redelivered.event.CompactionFinished.operation_id], ["event-3", SESSION_ID, "agent-1", "run-1", 3, "operation-background"]);
 });
 
 test("createSession forwards skill permissions and refuses an older harness", async () => {

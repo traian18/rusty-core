@@ -57,6 +57,7 @@ mod delegation;
 mod event_bus;
 mod inspect;
 mod lifecycle;
+mod lifecycle_retention;
 mod live_state;
 mod projection;
 mod restoration;
@@ -65,6 +66,7 @@ mod types;
 
 pub use assembly::SessionHost;
 pub use event_bus::SessionEventBus;
+pub use lifecycle_retention::{is_lifecycle, LifecycleRecovery, LifecycleRetention};
 pub use live_state::{AgentLiveState, LiveStateTable};
 pub use projection::AgentProjectionTable;
 pub use restoration::RestoreError;

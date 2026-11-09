@@ -52,6 +52,10 @@ pub(super) fn apply_event(
         | AgentEvent::UsageUpdated { .. }
         | AgentEvent::PromptPrefixChanged { .. }
         | AgentEvent::BackendRequestStarted { .. }
+        | AgentEvent::ContextRequestStarted { .. }
+        | AgentEvent::ContextUpdated { .. }
+        | AgentEvent::CompactionStarted { .. }
+        | AgentEvent::CompactionFinished { .. }
         | AgentEvent::AssistantMessageStarted { .. }
         | AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::ReasoningDelta { .. }

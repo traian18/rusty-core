@@ -376,3 +376,140 @@ async fn tool_call_arguments_count_towards_the_budget() {
         "a 5k-char write must push the history over a 1k budget"
     );
 }
+
+// -----------------------------------------------------------------------
+// Observation: forwarding and standard compaction lifecycles
+// -----------------------------------------------------------------------
+
+mod observed {
+    use super::*;
+    use crate::testing::{observation, RecordingPublisher};
+    use rusty_protocol::events::{AgentEvent, CompactionOutcome, CompactionType};
+
+    fn over_budget_request() -> ExecutionRequest {
+        let mut request = empty_request();
+        request.messages = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                };
+                long_message(role, 6_000)
+            })
+            .collect();
+        request
+    }
+
+    #[tokio::test]
+    async fn a_chain_hands_the_observation_to_the_compactor_inside_it() {
+        let compactor = Arc::new(policy_provider(Some(50_000), 1, 10_000));
+        let chain = ChainedContextProvider::new(vec![
+            Arc::new(StaticSystemPromptProvider::new("first")),
+            compactor,
+        ]);
+        let publisher = RecordingPublisher::new();
+        let request = over_budget_request();
+        let observed = observation(request.request_id, None, publisher.clone());
+        chain
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        let lifecycle = publisher.lifecycle();
+        assert_eq!(lifecycle.len(), 2);
+        assert_eq!(lifecycle[0].1, CompactionType::Standard);
+        assert_eq!(lifecycle[1].2, Some(CompactionOutcome::Success));
+        assert_eq!(lifecycle[0].3, lifecycle[1].3);
+    }
+
+    #[tokio::test]
+    async fn no_work_reports_no_operation() {
+        let provider = policy_provider(Some(1_000_000), 2, 10_000);
+        let publisher = RecordingPublisher::new();
+        let mut request = empty_request();
+        request.messages = vec![text_message(MessageRole::User, "hi")];
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        assert!(publisher.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn standard_compaction_reports_before_and_after_counts() {
+        let provider = policy_provider(Some(50_000), 1, 10_000);
+        let publisher = RecordingPublisher::new();
+        let request = over_budget_request();
+        let observed = observation(request.request_id, None, publisher.clone());
+        let compacted = provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        let events = publisher.events();
+        let AgentEvent::CompactionStarted {
+            before_estimated_input_tokens: Some(before),
+            request_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected a start with a before count, got {events:?}");
+        };
+        assert_eq!(*request_id, observed.origin.request_id);
+        let AgentEvent::CompactionFinished {
+            after_estimated_input_tokens: Some(after),
+            outcome: CompactionOutcome::Success,
+            ..
+        } = &events[1]
+        else {
+            panic!("expected a successful finish, got {events:?}");
+        };
+        assert!(after < before);
+        assert_eq!(*after, crate::providers::estimate_tokens(&compacted).tokens);
+    }
+
+    #[tokio::test]
+    async fn the_unknown_window_fallback_is_reported_as_standard_compaction() {
+        let provider = policy_provider(None, 1, 100);
+        let publisher = RecordingPublisher::new();
+        let request = over_budget_request();
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        let lifecycle = publisher.lifecycle();
+        assert_eq!(lifecycle.len(), 2, "{lifecycle:?}");
+        assert!(lifecycle[0].0 && lifecycle[0].1 == CompactionType::Standard);
+    }
+
+    #[tokio::test]
+    async fn compaction_in_a_cancelled_session_finishes_cancelled_without_an_after_count() {
+        let provider = policy_provider(Some(50_000), 1, 10_000);
+        let publisher = RecordingPublisher::new();
+        let request = over_budget_request();
+        let observed = observation(request.request_id, None, publisher.clone());
+        observed.session_cancellation.cancel();
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        let events = publisher.events();
+        assert!(matches!(
+            events[1],
+            AgentEvent::CompactionFinished {
+                outcome: CompactionOutcome::Cancelled,
+                after_estimated_input_tokens: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncation_reports_its_work_too() {
+        let base = Arc::new(StaticSystemPromptProvider::new("noop"));
+        let provider = TruncatingCompactionProvider::new(base, 100, 1);
+        let publisher = RecordingPublisher::new();
+        let request = over_budget_request();
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        assert_eq!(publisher.lifecycle().len(), 2);
+    }
+}

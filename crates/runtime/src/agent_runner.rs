@@ -10,6 +10,7 @@ mod children;
 mod completion;
 mod dispatch;
 mod mailbox;
+mod observation_publisher;
 mod outcome;
 mod prompt_prefix;
 mod publishing;
@@ -40,7 +41,9 @@ pub use children::AgentSupervision;
 
 use crate::scheduler::Scheduler;
 use crate::session_runtime::{AgentProjectionTable, LiveStateTable};
-use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
+use crate::traits::{
+    EventSink, ExecutionBackend, RequestObservationBindings, ToolRegistry, Workspace,
+};
 
 /// Mailbox and control handles for one agent.
 pub struct AgentTask {
@@ -50,6 +53,8 @@ pub struct AgentTask {
     pub commands_tx: mpsc::Sender<AgentCommand>,
     pub events: broadcast::Sender<AgentEventEnvelope>,
     pub cancel: CancellationToken,
+    observation_tx: mpsc::UnboundedSender<observation_publisher::Publication>,
+    observation_rx: mpsc::UnboundedReceiver<observation_publisher::Publication>,
 }
 
 impl AgentTask {
@@ -66,12 +71,15 @@ impl AgentTask {
     ) -> (Self, mpsc::Sender<AgentCommand>) {
         let (commands_tx, commands) = mpsc::channel(command_capacity);
         let (events, _) = broadcast::channel(event_capacity);
+        let (observation_tx, observation_rx) = mpsc::unbounded_channel();
         let task = Self {
             id,
             commands,
             commands_tx: commands_tx.clone(),
             events,
             cancel: CancellationToken::new(),
+            observation_tx,
+            observation_rx,
         };
         (task, commands_tx)
     }
@@ -133,6 +141,12 @@ pub struct AgentRunner {
     /// single assigned task completes.
     long_lived: bool,
     prompt_prefix: prompt_prefix::PromptPrefixWatch,
+    /// Agent-scoped ordering for qualifying context request starts.
+    pub(crate) request_start_order: u64,
+    /// Session-owned request bindings consumed by context wrappers.
+    pub(crate) observation_bindings: RequestObservationBindings,
+    /// Where committed lifecycle events are kept for the open session's recovery.
+    lifecycle_retention: Option<crate::session_runtime::LifecycleRetention>,
 }
 
 impl AgentRunner {
@@ -170,6 +184,15 @@ impl AgentRunner {
             }
 
             let command = tokio::select! {
+                publication = self.task.observation_rx.recv() => {
+                    if let Some(publication) = publication {
+                        let published = self
+                            .emit_observation(publication.event, publication.run_id)
+                            .await;
+                        let _ = publication.result.send(published);
+                    }
+                    continue;
+                },
                 command = self.task.commands.recv() => command?,
                 _ = self.cancel.cancelled() => {
                     self.cancel_run().await;

@@ -218,6 +218,10 @@ fn event_variant_name(event: &AgentEvent) -> &'static str {
         AgentEvent::StateChanged { .. } => "StateChanged",
         AgentEvent::RunStarted { .. } => "RunStarted",
         AgentEvent::BackendRequestStarted { .. } => "BackendRequestStarted",
+        AgentEvent::ContextRequestStarted { .. } => "ContextRequestStarted",
+        AgentEvent::ContextUpdated { .. } => "ContextUpdated",
+        AgentEvent::CompactionStarted { .. } => "CompactionStarted",
+        AgentEvent::CompactionFinished { .. } => "CompactionFinished",
         AgentEvent::AssistantMessageStarted { .. } => "AssistantMessageStarted",
         AgentEvent::AssistantTextDelta { .. } => "AssistantTextDelta",
         AgentEvent::ReasoningDelta { .. } => "ReasoningDelta",
@@ -291,6 +295,10 @@ fn event_matches_pattern(event: &AgentEvent, pattern: &EventPattern) -> bool {
         // For events without additional fields, just the variant match is enough.
         AgentEvent::RunStarted { .. }
         | AgentEvent::BackendRequestStarted { .. }
+        | AgentEvent::ContextRequestStarted { .. }
+        | AgentEvent::ContextUpdated { .. }
+        | AgentEvent::CompactionStarted { .. }
+        | AgentEvent::CompactionFinished { .. }
         | AgentEvent::AssistantMessageStarted { .. }
         | AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::ReasoningDelta { .. }

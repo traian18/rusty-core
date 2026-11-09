@@ -16,7 +16,7 @@ jev-http = ["dep:reqwest"]
 async-trait = { workspace = true }
 rusty-protocol = { path = "../protocol" }
 rusty-runtime = { path = "../runtime" }
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
 tokio-util = { workspace = true }

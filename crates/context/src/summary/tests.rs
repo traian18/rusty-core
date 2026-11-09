@@ -390,3 +390,169 @@ async fn later_passes_continue_after_the_covered_boundary() {
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[1], (Some("SUMMARY".to_string()), 3));
 }
+
+mod observed {
+    use super::*;
+    use crate::testing::{observation, RecordingPublisher};
+    use rusty_protocol::events::{CompactionOutcome, CompactionType};
+
+    /// Blocks until released, so a test can act while the summary is in flight.
+    struct GatedSummarizer {
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl Summarizer for GatedSummarizer {
+        async fn summarize(
+            &self,
+            _: Option<&str>,
+            _: &[AgentMessage],
+        ) -> Result<String, SummarizeError> {
+            let _permit = self.gate.acquire().await.expect("gate open");
+            Ok("SUMMARY".into())
+        }
+    }
+
+    fn summaries(publisher: &RecordingPublisher) -> Vec<(bool, Option<CompactionOutcome>, String)> {
+        publisher
+            .lifecycle()
+            .into_iter()
+            .filter(|(_, kind, _, _)| *kind == CompactionType::BackgroundSummary)
+            .map(|(started, _, outcome, id)| (started, outcome, id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_ready_summary_is_reported_apart_from_the_fallback_compaction() {
+        let provider = provider(
+            Arc::new(FakeSummarizer {
+                seen: Mutex::default(),
+                fail: false,
+            }),
+            50_000,
+        );
+        let publisher = RecordingPublisher::new();
+        let request = request(big_history());
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        provider.wait_for_background().await;
+        let summary = summaries(&publisher);
+        assert_eq!(summary.len(), 2);
+        assert!(summary[0].0);
+        assert_eq!(summary[1].1, Some(CompactionOutcome::Success));
+        assert_eq!(summary[0].2, summary[1].2);
+        let standard: Vec<_> = publisher
+            .lifecycle()
+            .into_iter()
+            .filter(|(_, kind, _, _)| *kind == CompactionType::Standard)
+            .collect();
+        assert_eq!(
+            standard.len(),
+            2,
+            "the synchronous fallback is its own operation"
+        );
+        assert_ne!(standard[0].3, summary[0].2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_does_not_report_success() {
+        let provider = provider(
+            Arc::new(FakeSummarizer {
+                seen: Mutex::default(),
+                fail: true,
+            }),
+            50_000,
+        );
+        let publisher = RecordingPublisher::new();
+        let request = request(big_history());
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        provider.wait_for_background().await;
+        assert_eq!(summaries(&publisher)[1].1, Some(CompactionOutcome::Failure));
+    }
+
+    #[tokio::test]
+    async fn closing_the_session_cancels_a_pending_summary() {
+        let summarizer = Arc::new(GatedSummarizer {
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let noop: Arc<dyn ContextProvider> = Arc::new(ChainedContextProvider::new(vec![]));
+        let fallback = Arc::new(PolicyDrivenCompactionProvider::new(
+            noop,
+            ContextPolicy::default(),
+            Some(50_000),
+            1,
+            10_000,
+        ));
+        let provider = SummarizingCompactionProvider::new(
+            Arc::new(StaticSystemPromptProvider::new("")),
+            fallback,
+            summarizer,
+            ContextPolicy::default(),
+            Some(50_000),
+            1,
+        );
+        let publisher = RecordingPublisher::new();
+        let request = request(big_history());
+        let observed = observation(request.request_id, None, publisher.clone());
+        provider
+            .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+            .await;
+        // The request is assembled and settles while its summary is still pending.
+        while summaries(&publisher).is_empty() {
+            tokio::task::yield_now().await;
+        }
+        observed.session_cancellation.cancel();
+        provider.wait_for_background().await;
+        let summary = summaries(&publisher);
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[1].1, Some(CompactionOutcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn overlapping_summaries_of_two_conversations_keep_their_own_ids() {
+        let summarizer = Arc::new(GatedSummarizer {
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let noop: Arc<dyn ContextProvider> = Arc::new(ChainedContextProvider::new(vec![]));
+        let fallback = Arc::new(PolicyDrivenCompactionProvider::new(
+            noop,
+            ContextPolicy::default(),
+            Some(50_000),
+            1,
+            10_000,
+        ));
+        let provider = SummarizingCompactionProvider::new(
+            Arc::new(StaticSystemPromptProvider::new("")),
+            fallback,
+            summarizer.clone(),
+            ContextPolicy::default(),
+            Some(50_000),
+            1,
+        );
+        let publisher = RecordingPublisher::new();
+        for _ in 0..2 {
+            let request = request(big_history());
+            let observed = observation(request.request_id, None, publisher.clone());
+            provider
+                .assemble_with_observation(request, &FakeWorkspace::new(), &observed)
+                .await;
+        }
+        while summaries(&publisher).len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        summarizer.gate.add_permits(2);
+        provider.wait_for_background().await;
+        let summary = summaries(&publisher);
+        assert_eq!(summary.len(), 4);
+        let starts: Vec<_> = summary.iter().filter(|s| s.0).map(|s| &s.2).collect();
+        assert_ne!(starts[0], starts[1]);
+        for start in starts {
+            assert_eq!(summary.iter().filter(|s| &s.2 == start).count(), 2);
+        }
+    }
+}

@@ -16,10 +16,11 @@ use crate::observability::{
     CompactionMode, CompactionPhase, CompactionTelemetry, ContextObserver, MeasurementStage,
 };
 use crate::policy::{ContextBudget, ContextDecision, ContextPolicy, TokenEstimate};
-use crate::provider::ContextProvider;
-
-/// Prepends a fixed instruction string to the system prompt — the
+use crate::provider::{ContextObservation, ContextProvider};
 use crate::providers::truncating::message_char_len;
+use crate::visibility::outcome_of;
+use crate::visibility::CompactionOperation;
+use rusty_protocol::events::CompactionType;
 
 /// A record of one compaction decision, kept for observability.
 ///
@@ -175,6 +176,31 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
         workspace: &dyn Workspace,
     ) -> ExecutionRequest {
         let request = self.inner.assemble(request, workspace).await;
+        self.compact_observed(request, None).await
+    }
+
+    /// As `assemble`, reporting the compaction as one standard operation when it has work to do,
+    /// including the unknown-window fallback.
+    async fn assemble_with_observation(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+        observation: &ContextObservation,
+    ) -> ExecutionRequest {
+        let request = self
+            .inner
+            .assemble_with_observation(request, workspace, observation)
+            .await;
+        self.compact_observed(request, Some(observation)).await
+    }
+}
+
+impl PolicyDrivenCompactionProvider {
+    async fn compact_observed(
+        &self,
+        request: ExecutionRequest,
+        observation: Option<&ContextObservation>,
+    ) -> ExecutionRequest {
         let before = estimate_tokens(&request).tokens;
         let triggered = match self
             .policy
@@ -200,18 +226,28 @@ impl ContextProvider for PolicyDrivenCompactionProvider {
                 MeasurementStage::BeforeCompaction,
             );
         }
+        let operation = match (triggered, observation) {
+            (true, Some(observation)) => {
+                CompactionOperation::start(observation, CompactionType::Standard, Some(before))
+                    .await
+            }
+            _ => None,
+        };
         if triggered {
             telemetry.update(CompactionPhase::Started, Some(before), None);
         }
         let request = self.prepare(request);
+        let after = estimate_tokens(&request).tokens;
         if triggered {
-            let after = estimate_tokens(&request).tokens;
             let phase = if after < before {
                 CompactionPhase::Completed
             } else {
                 CompactionPhase::NoChange
             };
             telemetry.update(phase, Some(before), Some(after));
+        }
+        if let Some(operation) = operation {
+            operation.finish(outcome_of(observation), Some(after)).await;
         }
         if let Some(observer) = &self.observer {
             observer.measure(

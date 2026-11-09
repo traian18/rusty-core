@@ -170,10 +170,21 @@ export interface AgentUsageSnapshot {
 export type EventVisibility = "User" | "Developer" | "Internal";
 export type AgentOutcome = "Success" | "Cancelled" | "Failed";
 
+export type ContextUnavailableReason = "unknown_model_window" | "unusable_input_budget" | "model_window_mismatch";
+export type ContextAvailability =
+  | { available: { estimated_input_tokens: number; input_budget: number; model_window: number; remaining_input_tokens: number; usage_percent: number } }
+  | { unavailable: { reason: ContextUnavailableReason } };
+export type CompactionType = "standard" | "background_summary";
+export type CompactionOutcome = "success" | "failure" | "cancelled";
+
 export type AgentEvent =
   | { StateChanged: { from: AgentStatus; to: AgentStatus } }
   | { RunStarted: { run_id: RunId } }
   | { BackendRequestStarted: { request_id: RequestId } }
+  | { ContextRequestStarted: { request_id: RequestId; request_start_order: number; model: string | null } }
+  | { ContextUpdated: { request_id: RequestId; request_start_order: number; model: string | null; availability: ContextAvailability; compaction_started: boolean; compaction_ended: boolean } }
+  | { CompactionStarted: { request_id: RequestId; request_start_order: number; operation_id: string; compaction_type: CompactionType; before_estimated_input_tokens?: number; compaction_started: boolean; compaction_ended: boolean } }
+  | { CompactionFinished: { request_id: RequestId; request_start_order: number; operation_id: string; compaction_type: CompactionType; outcome: CompactionOutcome; before_estimated_input_tokens?: number; after_estimated_input_tokens?: number; compaction_started: boolean; compaction_ended: boolean } }
   /** Opt-in, ephemeral effective request trace; redact before persistence. */
   | { ModelRequestPrepared: { request: Record<string, unknown> } }
   | { AssistantMessageStarted: { message_id: MessageId } }

@@ -8,9 +8,7 @@ use rusty_protocol::backend::ExecutionRequest;
 
 use rusty_runtime::traits::Workspace;
 
-use crate::provider::ContextProvider;
-
-/// Prepends a fixed instruction string to the system prompt — the
+use crate::provider::{ContextObservation, ContextProvider};
 
 /// Composes a sequence of providers, running each in order — e.g.
 /// `WorkspaceInfoProvider` then `TruncatingCompactionProvider`.
@@ -33,6 +31,22 @@ impl ContextProvider for ChainedContextProvider {
     ) -> ExecutionRequest {
         for provider in &self.providers {
             request = provider.assemble(request, workspace).await;
+        }
+        request
+    }
+
+    /// Every provider in the chain gets the request's observation, so a compactor anywhere in it
+    /// can report its work.
+    async fn assemble_with_observation(
+        &self,
+        mut request: ExecutionRequest,
+        workspace: &dyn Workspace,
+        observation: &ContextObservation,
+    ) -> ExecutionRequest {
+        for provider in &self.providers {
+            request = provider
+                .assemble_with_observation(request, workspace, observation)
+                .await;
         }
         request
     }

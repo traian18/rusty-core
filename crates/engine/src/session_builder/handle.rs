@@ -174,6 +174,16 @@ impl SessionHandle {
         self.client.snapshot()
     }
 
+    /// The compaction lifecycle events this open session retained after `cursor` (`0`: all of
+    /// them), with the cursor to ask from next; unavailable once the session closed. Used to
+    /// recover events a lagging subscription missed.
+    pub fn recover_lifecycle(
+        &self,
+        cursor: u64,
+    ) -> rusty_runtime::session_runtime::LifecycleRecovery {
+        self.client.recover_lifecycle(cursor)
+    }
+
     pub fn context_inspection(&self) -> ContextInspection {
         let context = self.client.snapshot().context;
         ContextInspection {

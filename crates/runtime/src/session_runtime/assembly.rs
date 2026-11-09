@@ -7,10 +7,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use async_trait::async_trait;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use rusty_agent_core::agent::Agent;
+use rusty_protocol::backend::{
+    BackendCapabilities, BackendDescriptor, ExecutionError, ExecutionEvent, ExecutionRequest,
+    ExecutionResult,
+};
 use rusty_protocol::commands::AgentCommand;
 use rusty_protocol::ids::{AgentId, SessionId};
 use rusty_session_store::{SessionCommitter, SessionStore};
@@ -20,7 +25,9 @@ use crate::cancellation::SessionCancellation;
 use crate::integration::IntegrationRegistry;
 use crate::locks::MutexExt;
 use crate::scheduler::{Scheduler, SchedulerConfig};
-use crate::traits::{EventSink, ExecutionBackend, ToolRegistry, Workspace};
+use crate::traits::{
+    EventSink, ExecutionBackend, RequestObservationBindings, ToolRegistry, Workspace,
+};
 
 use super::checkpoint::RuntimeCheckpointRequester;
 use super::event_bus::SessionEventBus;
@@ -29,6 +36,35 @@ use super::projection::{stored_agent_state, AgentProjectionTable};
 use super::runner_spawn::{spawn_runner, RunnerSpawnArgs};
 use super::types::SessionState;
 use super::{SessionRuntime, SessionStatus};
+
+struct SessionBackend {
+    inner: Arc<dyn ExecutionBackend>,
+    bindings: RequestObservationBindings,
+}
+
+#[async_trait]
+impl ExecutionBackend for SessionBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn observation_bindings(&self) -> Option<RequestObservationBindings> {
+        Some(self.bindings.clone())
+    }
+
+    async fn execute(
+        &self,
+        request: ExecutionRequest,
+        sink: broadcast::Sender<ExecutionEvent>,
+        cancel: CancellationToken,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        self.inner.execute(request, sink, cancel).await
+    }
+}
 
 /// The host services a session runs on, shared by every agent in it.
 pub struct SessionHost {
@@ -82,13 +118,18 @@ impl SessionRuntime {
         let agent_supervisor = AgentSupervisor::new(session_id, cancellation.clone());
         let (event_bus, bus_cancel) = start_event_bus();
         let live_state: LiveStateTable = Arc::new(Mutex::new(HashMap::new()));
+        let observation_bindings = host.backend.observation_bindings().unwrap_or_default();
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(SessionBackend {
+            inner: host.backend.clone(),
+            bindings: observation_bindings.clone(),
+        });
 
         let spawn = |agent: Agent| {
             let is_root = agent.id == root_agent_id;
             spawn_runner(RunnerSpawnArgs {
                 agent,
                 is_root,
-                backend: host.backend.clone(),
+                backend: backend.clone(),
                 tool_registry: host.tool_registry.clone(),
                 workspace: host.workspace.clone(),
                 event_sink: host.event_sink.clone(),
@@ -116,7 +157,7 @@ impl SessionRuntime {
             state: Mutex::new(state),
             cancellation,
             event_bus,
-            default_backend: host.backend,
+            default_backend: backend,
             workspace: host.workspace,
             tool_registry: host.tool_registry,
             event_sink: host.event_sink,
@@ -195,4 +236,48 @@ fn spawn_all(
         let _ = spawn(agent.clone());
     }
     started
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::FakeBackend;
+    use crate::traits::{RequestObservationBinding, RequestObservationPublisher};
+    use rusty_protocol::events::AgentEvent;
+    use rusty_protocol::ids::{RequestId, RunId};
+
+    struct Publisher;
+
+    #[async_trait]
+    impl RequestObservationPublisher for Publisher {
+        async fn publish(&self, _: AgentEvent, _: RunId) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn session_backend_exposes_shared_request_keyed_bindings() {
+        let bindings = RequestObservationBindings::default();
+        let backend = SessionBackend {
+            inner: Arc::new(FakeBackend::new()),
+            bindings: bindings.clone(),
+        };
+        let first = backend.observation_bindings().expect("session registry");
+        let second = backend.observation_bindings().expect("session registry");
+        let request_id = RequestId::new();
+        first.register(RequestObservationBinding {
+            session_id: SessionId::new(),
+            agent_id: AgentId::new(),
+            parent_agent_id: None,
+            run_id: RunId::new(),
+            request_id,
+            request_start_order: 1,
+            publisher: Arc::new(Publisher),
+            session_cancellation: CancellationToken::new(),
+        });
+        assert!(second.get(request_id).is_some());
+        assert!(second.get(RequestId::new()).is_none());
+        second.remove(request_id);
+        assert!(bindings.get(request_id).is_none());
+    }
 }

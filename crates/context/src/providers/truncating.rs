@@ -11,9 +11,11 @@ use rusty_runtime::traits::Workspace;
 
 use crate::compaction::{drop_prefix, elide_tool_results, truncation_note, Retention};
 
-use crate::provider::ContextProvider;
-
-/// Prepends a fixed instruction string to the system prompt — the
+use crate::provider::{ContextObservation, ContextProvider};
+use crate::providers::estimate_tokens;
+use crate::visibility::outcome_of;
+use crate::visibility::CompactionOperation;
+use rusty_protocol::events::CompactionType;
 
 /// Wraps another provider; when the transcript's rough character count
 /// exceeds `max_chars`, drops all but the most recent `keep_recent` messages
@@ -80,17 +82,47 @@ impl ContextProvider for TruncatingCompactionProvider {
         request: ExecutionRequest,
         workspace: &dyn Workspace,
     ) -> ExecutionRequest {
-        let mut request = self.inner.assemble(request, workspace).await;
+        let request = self.inner.assemble(request, workspace).await;
+        self.compact(request)
+    }
 
-        let total_chars: usize = request.messages.iter().map(message_char_len).sum();
-        if total_chars <= self.max_chars {
+    /// As `assemble`, reporting the compaction as one standard operation when it has work to do.
+    async fn assemble_with_observation(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+        observation: &ContextObservation,
+    ) -> ExecutionRequest {
+        let request = self
+            .inner
+            .assemble_with_observation(request, workspace, observation)
+            .await;
+        if total_chars_of(&request) <= self.max_chars {
+            return request;
+        }
+        let before = estimate_tokens(&request).tokens;
+        let operation =
+            CompactionOperation::start(observation, CompactionType::Standard, Some(before)).await;
+        let request = self.compact(request);
+        if let Some(operation) = operation {
+            let after = estimate_tokens(&request).tokens;
+            operation
+                .finish(outcome_of(Some(observation)), Some(after))
+                .await;
+        }
+        request
+    }
+}
+
+impl TruncatingCompactionProvider {
+    fn compact(&self, mut request: ExecutionRequest) -> ExecutionRequest {
+        if total_chars_of(&request) <= self.max_chars {
             return request;
         }
 
         // Tier 1: shrink old tool output before discarding any turn.
         elide_tool_results(&mut request.messages, self.keep_recent, &self.retention);
-        let total_chars: usize = request.messages.iter().map(message_char_len).sum();
-        if total_chars <= self.max_chars {
+        if total_chars_of(&request) <= self.max_chars {
             return request;
         }
 
@@ -103,4 +135,8 @@ impl ContextProvider for TruncatingCompactionProvider {
         );
         request
     }
+}
+
+fn total_chars_of(request: &ExecutionRequest) -> usize {
+    request.messages.iter().map(message_char_len).sum()
 }

@@ -20,6 +20,287 @@ use crate::workspace::FakeWorkspace;
 
 use super::*;
 
+struct BindingBackend {
+    bindings: crate::traits::RequestObservationBindings,
+    seen: tokio::sync::mpsc::UnboundedSender<(RequestId, u64, SessionId, AgentId, RunId)>,
+    fail: RequestId,
+}
+
+#[async_trait::async_trait]
+impl crate::traits::ExecutionBackend for BindingBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        BackendDescriptor {
+            id: BackendId::new(),
+            name: "binding".into(),
+            description: String::new(),
+            capabilities: BackendCapabilities::default(),
+        }
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
+    async fn execute(
+        &self,
+        request: rusty_protocol::backend::ExecutionRequest,
+        _sink: broadcast::Sender<ExecutionEvent>,
+        _cancel: CancellationToken,
+    ) -> Result<ExecutionResult, rusty_protocol::backend::ExecutionError> {
+        let binding = self
+            .bindings
+            .get(request.request_id)
+            .expect("request binding");
+        self.seen
+            .send((
+                request.request_id,
+                binding.request_start_order,
+                binding.session_id,
+                binding.agent_id,
+                binding.run_id,
+            ))
+            .unwrap();
+        if request.request_id == self.fail {
+            return Err(rusty_protocol::backend::ExecutionError::BackendError {
+                message: "failed".into(),
+                code: "TEST".into(),
+            });
+        }
+        Ok(ExecutionResult {
+            request_id: request.request_id,
+            usage: Default::default(),
+            cost: Default::default(),
+            finish_reason: "stop".into(),
+        })
+    }
+}
+
+fn observation_request() -> rusty_protocol::backend::ExecutionRequest {
+    rusty_protocol::backend::ExecutionRequest {
+        request_id: RequestId::new(),
+        run_id: RunId::new(),
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: vec![],
+        extended_thinking: false,
+        params: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_starts_precede_reversed_admission_and_cleanup() {
+    let agent_id = AgentId::new();
+    let session_id = SessionId::new();
+    let first = observation_request();
+    let second = observation_request();
+    let queued = observation_request();
+    let bindings = crate::traits::RequestObservationBindings::default();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let blocked = Arc::new(Scheduler::new(SchedulerConfig {
+        max_concurrent_backend_requests: 1,
+        ..SchedulerConfig::default()
+    }));
+    let permit = blocked.acquire_backend_permit().await;
+    let (task, _sender) = AgentTask::new(agent_id);
+    let mut runner = AgentRunner::new(
+        test_agent(agent_id, session_id),
+        task,
+        RunnerServices {
+            backend: Arc::new(BindingBackend {
+                bindings: bindings.clone(),
+                seen: seen_tx,
+                fail: second.request_id,
+            }),
+            tool_registry: Arc::new(FakeToolRegistry::new()),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: blocked.clone(),
+        },
+        CancellationToken::new(),
+        Arc::new(Mutex::new(StdHashMap::new())),
+    )
+    .with_observation_bindings(bindings.clone());
+    let mut events = runner.task.events.subscribe();
+    runner.execute_backend(first.clone()).await;
+    runner.scheduler = Arc::new(Scheduler::new(SchedulerConfig::default()));
+    runner.execute_backend(second.clone()).await;
+    let starts: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|e| match e.event {
+            AgentEvent::ContextRequestStarted {
+                request_id,
+                request_start_order,
+                ..
+            } => Some((request_id, request_start_order)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, vec![(first.request_id, 0), (second.request_id, 1)]);
+    assert!(bindings.get(first.request_id).is_some());
+    let observed = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observed,
+        (second.request_id, 1, session_id, agent_id, second.run_id)
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while bindings.get(second.request_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bindings.get(first.request_id).is_some());
+    drop(permit);
+    let observed = tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observed,
+        (first.request_id, 0, session_id, agent_id, first.run_id)
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while bindings.get(first.request_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let permit = blocked.acquire_backend_permit().await;
+    runner.scheduler = blocked;
+    runner.execute_backend(queued.clone()).await;
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|e| matches!(e.event, AgentEvent::ContextRequestStarted { request_id, request_start_order: 2, .. } if request_id == queued.request_id)));
+    assert!(bindings.get(queued.request_id).is_some());
+    runner.backend_tokens.get(&queued.run_id).unwrap().cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while bindings.get(queued.request_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(permit);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), seen_rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+/// A background summary may finish after its run settled: its observation is still published,
+/// under the run that started it, and nothing is published once the runner is gone.
+#[tokio::test]
+async fn a_late_observation_keeps_its_originating_run() {
+    let agent_id = AgentId::new();
+    let (task, _sender) = AgentTask::new(agent_id);
+    let mut runner = AgentRunner::new(
+        test_agent(agent_id, SessionId::new()),
+        task,
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new()),
+            tool_registry: Arc::new(FakeToolRegistry::new()),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: Arc::new(Scheduler::new(SchedulerConfig::default())),
+        },
+        CancellationToken::new(),
+        Arc::new(Mutex::new(StdHashMap::new())),
+    );
+    assert_eq!(runner.agent.state.active_run, None, "no run is active");
+    let mut events = runner.task.events.subscribe();
+    let publisher = observation_publisher::publisher(runner.task.observation_tx.clone());
+    let origin = RunId::new();
+    let finish = AgentEvent::CompactionFinished {
+        request_id: RequestId::new(),
+        request_start_order: 0,
+        operation_id: "op".into(),
+        compaction_type: rusty_protocol::events::CompactionType::BackgroundSummary,
+        outcome: rusty_protocol::events::CompactionOutcome::Success,
+        before_estimated_input_tokens: None,
+        after_estimated_input_tokens: None,
+        compaction_started: false,
+        compaction_ended: true,
+    };
+    let late = tokio::spawn({
+        let publisher = publisher.clone();
+        let finish = finish.clone();
+        async move { publisher.publish(finish, origin).await }
+    });
+    let _ = tokio::time::timeout(Duration::from_millis(100), runner.next_command()).await;
+    assert!(late.await.unwrap(), "the late finish was published");
+    let envelope = events.try_recv().expect("published envelope");
+    assert_eq!(envelope.run_id, Some(origin));
+    assert!(matches!(
+        envelope.event,
+        AgentEvent::CompactionFinished { .. }
+    ));
+    drop(runner);
+    assert!(
+        !publisher.publish(finish, origin).await,
+        "a closed runner publishes nothing"
+    );
+}
+
+/// Committed lifecycle events are kept for recovery before they are broadcast, even with
+/// nobody subscribed; other events are not.
+#[tokio::test]
+async fn committed_lifecycle_events_are_retained_for_recovery() {
+    let agent_id = AgentId::new();
+    let (task, _sender) = AgentTask::new(agent_id);
+    let retention = crate::session_runtime::LifecycleRetention::default();
+    let mut runner = AgentRunner::new(
+        test_agent(agent_id, SessionId::new()),
+        task,
+        RunnerServices {
+            backend: Arc::new(FakeBackend::new()),
+            tool_registry: Arc::new(FakeToolRegistry::new()),
+            workspace: Arc::new(FakeWorkspace::new()),
+            event_sink: Arc::new(NoopSink),
+            scheduler: Arc::new(Scheduler::new(SchedulerConfig::default())),
+        },
+        CancellationToken::new(),
+        Arc::new(Mutex::new(StdHashMap::new())),
+    )
+    .with_lifecycle_retention(retention.clone());
+    let started = AgentEvent::CompactionStarted {
+        request_id: RequestId::new(),
+        request_start_order: 0,
+        operation_id: "op".into(),
+        compaction_type: rusty_protocol::events::CompactionType::Standard,
+        before_estimated_input_tokens: Some(10),
+        compaction_started: true,
+        compaction_ended: false,
+    };
+    assert!(runner.emit(started).await);
+    assert!(
+        runner
+            .emit(AgentEvent::RunStarted {
+                run_id: RunId::new()
+            })
+            .await
+    );
+    let crate::session_runtime::LifecycleRecovery::Recovered {
+        envelopes,
+        high_water,
+    } = retention.recover(0)
+    else {
+        panic!("the session is open");
+    };
+    assert_eq!(high_water, 1);
+    assert!(matches!(
+        envelopes[0].event,
+        AgentEvent::CompactionStarted { .. }
+    ));
+    assert_eq!(envelopes[0].agent_id, agent_id);
+    retention.close();
+    assert!(matches!(
+        retention.recover(0),
+        crate::session_runtime::LifecycleRecovery::Unavailable
+    ));
+}
+
 #[tokio::test]
 async fn send_command_through_mailbox() {
     let (mut task, sender) = AgentTask::new(AgentId::new());
@@ -219,11 +500,11 @@ async fn cancel_mid_flight_backend_call_transitions_to_cancelled() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),
@@ -308,11 +589,11 @@ async fn long_lived_runner_accepts_a_second_start_run_after_completion() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),
@@ -416,7 +697,7 @@ async fn cancel_is_processed_while_backend_waits_for_scheduler_capacity() {
             tool_registry: Arc::new(FakeToolRegistry::new()),
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel,
         live_state.clone(),
@@ -572,11 +853,11 @@ async fn follow_up_queued_while_run_active_starts_after_first_completes() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),
@@ -703,11 +984,11 @@ async fn follow_up_queued_while_run_active_starts_after_first_run_fails() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),
@@ -910,7 +1191,7 @@ async fn shell_exec_calls_are_bounded_by_max_concurrent_processes() {
             tool_registry: Arc::new(registry),
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel,
         live_state,
@@ -1003,7 +1284,7 @@ async fn hung_tool_call_times_out_with_error_result() {
             tool_registry: Arc::new(registry),
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         CancellationToken::new(),
         live_state,
@@ -1073,7 +1354,7 @@ async fn tool_can_ask_for_a_longer_call_limit_than_the_default() {
                 tool_registry: Arc::new(registry),
                 workspace: Arc::new(FakeWorkspace::new()),
                 event_sink: Arc::new(NoopSink),
-                scheduler: scheduler,
+                scheduler,
             },
             CancellationToken::new(),
             live_state,
@@ -1128,11 +1409,11 @@ async fn queued_follow_up_survives_runner_cancellation() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),
@@ -1216,11 +1497,11 @@ async fn cancel_while_waiting_for_permission_transitions_to_cancelled() {
         agent,
         task,
         RunnerServices {
-            backend: backend,
-            tool_registry: tool_registry,
+            backend,
+            tool_registry,
             workspace: Arc::new(FakeWorkspace::new()),
             event_sink: Arc::new(NoopSink),
-            scheduler: scheduler,
+            scheduler,
         },
         cancel.clone(),
         live_state.clone(),

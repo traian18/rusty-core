@@ -13,7 +13,9 @@ use rusty_protocol::ids::ToolId;
 use rusty_protocol::tools::{AgentToolset, ExecutionPolicy, ToolCapability};
 use rusty_runtime::session_client::SessionClient;
 use rusty_runtime::session_runtime::SessionCommand;
-use rusty_runtime::traits::{ExecutionBackend, ToolRegistry, Workspace};
+use rusty_runtime::traits::{
+    ExecutionBackend, RequestObservationBindings, ToolRegistry, Workspace,
+};
 use rusty_runtime::IntegrationRegistry;
 use rusty_skills::{SkillCatalog, SkillsConfig, SkillsContextProvider};
 use rusty_tool_api::{ToolDescriptor, ToolExecutor};
@@ -236,15 +238,17 @@ pub(super) fn assemble_context(
     skills: Option<Arc<dyn ContextProvider>>,
     caller: Option<Arc<dyn ContextProvider>>,
     factory: Option<ContextProviderFactory>,
+    observation_bindings: RequestObservationBindings,
+    trusted_model_window: Option<rusty_context::provider::TrustedModelWindow>,
 ) -> Arc<dyn ExecutionBackend> {
     let factory_provider = factory.map(|factory| factory(backend.clone()));
     let caller = chain(caller, factory_provider);
     match chain(skills, caller) {
-        Some(provider) => Arc::new(rusty_context::ContextAssemblingBackend::new(
-            backend,
-            provider,
-            workspace.clone(),
-        )),
+        Some(provider) => Arc::new(
+            rusty_context::ContextAssemblingBackend::new(backend, provider, workspace.clone())
+                .with_observation_bindings(observation_bindings)
+                .with_trusted_model_window(trusted_model_window),
+        ),
         None => backend,
     }
 }

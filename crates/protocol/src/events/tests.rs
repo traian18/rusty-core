@@ -148,6 +148,236 @@ fn envelope_roundtrip() {
 // AgentEvent variant round-trip serialization
 // -----------------------------------------------------------------------
 
+#[test]
+fn visibility_event_wire_contract() {
+    let request_id = RequestId::new();
+    let start = envelope_for(AgentEvent::ContextRequestStarted {
+        request_id,
+        request_start_order: 2,
+        model: Some("model".into()),
+    });
+    let value = serde_json::to_value(&start).unwrap();
+    assert_eq!(
+        value["event"]["ContextRequestStarted"],
+        serde_json::json!({
+            "request_id": request_id, "request_start_order": 2, "model": "model"
+        })
+    );
+    let decoded: AgentEventEnvelope = serde_json::from_value(value).unwrap();
+    assert!(
+        matches!(decoded.event, AgentEvent::ContextRequestStarted { request_id: id, request_start_order: 2, model: Some(model) } if id == request_id && model == "model")
+    );
+
+    let available = ContextAvailability::Available {
+        estimated_input_tokens: 10,
+        input_budget: 20,
+        model_window: 30,
+        remaining_input_tokens: 10,
+        usage_percent: u16::MAX,
+    };
+    let update = envelope_for(AgentEvent::ContextUpdated {
+        request_id,
+        request_start_order: 2,
+        model: None,
+        availability: available,
+        compaction_started: false,
+        compaction_ended: false,
+    });
+    let value = serde_json::to_value(&update).unwrap();
+    assert_eq!(
+        value["event"]["ContextUpdated"],
+        serde_json::json!({
+            "request_id": request_id, "request_start_order": 2, "model": null,
+            "availability": {"available": {"estimated_input_tokens": 10, "input_budget": 20,
+                "model_window": 30, "remaining_input_tokens": 10, "usage_percent": 65535}},
+            "compaction_started": false, "compaction_ended": false
+        })
+    );
+    let decoded: AgentEventEnvelope = serde_json::from_value(value).unwrap();
+    assert!(
+        matches!(decoded.event, AgentEvent::ContextUpdated { availability, .. } if availability == available)
+    );
+}
+
+#[test]
+fn visibility_enum_wire_contract() {
+    for (reason, tag) in [
+        (
+            ContextUnavailableReason::UnknownModelWindow,
+            "unknown_model_window",
+        ),
+        (
+            ContextUnavailableReason::UnusableInputBudget,
+            "unusable_input_budget",
+        ),
+        (
+            ContextUnavailableReason::ModelWindowMismatch,
+            "model_window_mismatch",
+        ),
+    ] {
+        let availability = ContextAvailability::Unavailable { reason };
+        let value = serde_json::to_value(availability).unwrap();
+        assert_eq!(value, serde_json::json!({"unavailable": {"reason": tag}}));
+        assert_eq!(
+            serde_json::from_value::<ContextAvailability>(value).unwrap(),
+            availability
+        );
+    }
+    for (kind, tag) in [
+        (CompactionType::Standard, "standard"),
+        (CompactionType::BackgroundSummary, "background_summary"),
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), tag);
+        assert_eq!(
+            serde_json::from_value::<CompactionType>(serde_json::json!(tag)).unwrap(),
+            kind
+        );
+    }
+    for (outcome, tag) in [
+        (CompactionOutcome::Success, "success"),
+        (CompactionOutcome::Failure, "failure"),
+        (CompactionOutcome::Cancelled, "cancelled"),
+    ] {
+        assert_eq!(serde_json::to_value(outcome).unwrap(), tag);
+        assert_eq!(
+            serde_json::from_value::<CompactionOutcome>(serde_json::json!(tag)).unwrap(),
+            outcome
+        );
+    }
+}
+
+#[test]
+fn visibility_operation_identity_and_order_roundtrip() {
+    let request_id = RequestId::new();
+    let operations = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    ];
+    let mut base = envelope_for(AgentEvent::ContextRequestStarted {
+        request_id,
+        request_start_order: 1,
+        model: None,
+    });
+    base.run_id = Some(RunId::new());
+    let events = [
+        AgentEvent::CompactionStarted {
+            request_id,
+            request_start_order: 1,
+            operation_id: operations[0].into(),
+            compaction_type: CompactionType::Standard,
+            before_estimated_input_tokens: Some(42),
+            compaction_started: true,
+            compaction_ended: false,
+        },
+        AgentEvent::CompactionStarted {
+            request_id,
+            request_start_order: 1,
+            operation_id: operations[1].into(),
+            compaction_type: CompactionType::BackgroundSummary,
+            before_estimated_input_tokens: None,
+            compaction_started: true,
+            compaction_ended: false,
+        },
+        AgentEvent::CompactionFinished {
+            request_id,
+            request_start_order: 1,
+            operation_id: operations[1].into(),
+            compaction_type: CompactionType::BackgroundSummary,
+            outcome: CompactionOutcome::Success,
+            before_estimated_input_tokens: None,
+            after_estimated_input_tokens: None,
+            compaction_started: false,
+            compaction_ended: true,
+        },
+        AgentEvent::CompactionFinished {
+            request_id,
+            request_start_order: 1,
+            operation_id: operations[0].into(),
+            compaction_type: CompactionType::Standard,
+            outcome: CompactionOutcome::Failure,
+            before_estimated_input_tokens: Some(42),
+            after_estimated_input_tokens: None,
+            compaction_started: false,
+            compaction_ended: true,
+        },
+    ];
+    let mut values = Vec::new();
+    for (index, event) in events.into_iter().enumerate() {
+        let mut env = base.clone();
+        env.event_id = EventId::new();
+        env.agent_sequence = index as u64 + 1;
+        env.session_sequence = Some(index as u64 + 10);
+        env.event = event;
+        let value = serde_json::to_value(&env).unwrap();
+        let decoded: AgentEventEnvelope = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.event_id, env.event_id);
+        assert_eq!(decoded.session_id, base.session_id);
+        assert_eq!(decoded.agent_id, base.agent_id);
+        assert_eq!(decoded.run_id, base.run_id);
+        assert_eq!(decoded.agent_sequence, env.agent_sequence);
+        assert_eq!(decoded.session_sequence, env.session_sequence);
+        values.push(value);
+    }
+    let start_a = &values[0]["event"]["CompactionStarted"];
+    let start_b = &values[1]["event"]["CompactionStarted"];
+    let finish_b = &values[2]["event"]["CompactionFinished"];
+    let finish_a = &values[3]["event"]["CompactionFinished"];
+    assert_eq!(start_a["operation_id"], finish_a["operation_id"]);
+    assert_eq!(start_b["operation_id"], finish_b["operation_id"]);
+    assert_ne!(start_a["operation_id"], start_b["operation_id"]);
+    assert_ne!(values[0]["event_id"], values[3]["event_id"]);
+    assert_eq!(start_a["request_id"], serde_json::json!(request_id));
+    assert_eq!(start_a["request_start_order"], 1);
+    assert_eq!(start_a["before_estimated_input_tokens"], 42);
+    assert_eq!(start_a["compaction_type"], "standard");
+    assert_eq!(start_a["compaction_started"], true);
+    assert_eq!(start_a["compaction_ended"], false);
+    assert_eq!(finish_b["compaction_type"], "background_summary");
+    assert_eq!(finish_b["outcome"], "success");
+    assert_eq!(finish_a["outcome"], "failure");
+    assert_eq!(finish_a["compaction_started"], false);
+    assert_eq!(finish_a["compaction_ended"], true);
+    assert!(start_b.get("before_estimated_input_tokens").is_none());
+    assert!(finish_b.get("before_estimated_input_tokens").is_none());
+    assert!(finish_b.get("after_estimated_input_tokens").is_none());
+    assert!(finish_a.get("after_estimated_input_tokens").is_none());
+    let redelivery: AgentEventEnvelope = serde_json::from_value(values[0].clone()).unwrap();
+    assert_eq!(serde_json::to_value(redelivery).unwrap(), values[0]);
+}
+
+#[test]
+fn visibility_out_of_order_updates_preserve_orders() {
+    let first = RequestId::new();
+    let second = RequestId::new();
+    let mut values = Vec::new();
+    for (request_id, order, sequence) in [(first, 1, 3), (second, 2, 2), (first, 1, 1)] {
+        let mut env = envelope_for(AgentEvent::ContextUpdated {
+            request_id,
+            request_start_order: order,
+            model: None,
+            availability: ContextAvailability::Unavailable {
+                reason: ContextUnavailableReason::UnknownModelWindow,
+            },
+            compaction_started: false,
+            compaction_ended: false,
+        });
+        env.agent_sequence = sequence;
+        let decoded: AgentEventEnvelope =
+            serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        if let AgentEvent::ContextUpdated {
+            request_id,
+            request_start_order,
+            ..
+        } = decoded.event
+        {
+            values.push((request_id, request_start_order, decoded.agent_sequence));
+        } else {
+            panic!("expected context update");
+        }
+    }
+    assert_eq!(values, [(first, 1, 3), (second, 2, 2), (first, 1, 1)]);
+}
+
 /// Helper: create a minimal envelope for testing event serialization.
 fn envelope_for(event: AgentEvent) -> AgentEventEnvelope {
     AgentEventEnvelope {

@@ -208,10 +208,18 @@ async fn session_send_subscribe_e2e() {
     //   2. AssistantTextDelta("world!")
     //   3. Completed
 
-    // Filter out StateChanged events to see the core sequence.
+    // Filter out StateChanged events, and the context observations every
+    // dispatched request now adds, to see the core sequence.
     let core_events: Vec<&AgentEvent> = all_events
         .iter()
-        .filter(|e| !matches!(e, AgentEvent::StateChanged { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                AgentEvent::StateChanged { .. }
+                    | AgentEvent::ContextRequestStarted { .. }
+                    | AgentEvent::ContextUpdated { .. }
+            )
+        })
         .collect();
 
     assert!(

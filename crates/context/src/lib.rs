@@ -14,6 +14,9 @@ pub mod provider;
 pub mod providers;
 pub mod summary;
 pub mod superseded;
+#[cfg(test)]
+mod testing;
+mod visibility;
 
 pub use backend::ContextAssemblingBackend;
 #[cfg(feature = "jev-http")]

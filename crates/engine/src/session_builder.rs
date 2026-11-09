@@ -103,6 +103,9 @@ pub struct SessionBuilder {
     /// Like `context_provider`, but built from the session's resolved
     /// backend — see [`context_provider_with_backend`](Self::context_provider_with_backend).
     context_factory: Option<ContextProviderFactory>,
+    /// The resolved model and window estimates are reported against — see
+    /// [`trusted_model_window`](Self::trusted_model_window).
+    trusted_model_window: Option<rusty_context::provider::TrustedModelWindow>,
     /// Session-level default execution params (model, max_tokens,
     /// temperature, reasoning, ...) applied immediately after the session
     /// starts — see [`execution_params`](Self::execution_params).
@@ -152,6 +155,7 @@ impl SessionBuilder {
             session_manager: None,
             context_provider: None,
             context_factory: None,
+            trusted_model_window: None,
             execution_params: None,
             mcp_servers: Vec::new(),
             optional_mcp_servers: Default::default(),
@@ -255,12 +259,15 @@ impl SessionBuilder {
         let workspace: Arc<dyn rusty_runtime::traits::Workspace> = self
             .workspace
             .unwrap_or_else(|| Arc::new(rusty_workspace::UnboundWorkspace::new()));
+        let observation_bindings = rusty_runtime::traits::RequestObservationBindings::default();
         let backend = assembly::assemble_context(
             backend,
             &workspace,
             skills_provider,
             self.context_provider,
             self.context_factory,
+            observation_bindings.clone(),
+            self.trusted_model_window,
         );
 
         let (event_tx, _) = broadcast::channel(256);

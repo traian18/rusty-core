@@ -19,8 +19,10 @@ use crate::compaction::{drop_prefix, truncation_note, Retention};
 use crate::importance::ImportanceJudge;
 use crate::observability::{CompactionMode, CompactionPhase, CompactionTelemetry, ContextObserver};
 use crate::policy::{ContextDecision, ContextPolicy};
-use crate::provider::ContextProvider;
+use crate::provider::{ContextObservation, ContextProvider};
 use crate::providers::estimate_tokens;
+use crate::visibility::CompactionOperation;
+use rusty_protocol::events::{CompactionOutcome, CompactionType};
 
 use crate::summary::background::{summarize_in_background, summary_message, task_description};
 use crate::summary::state::{Flight, Plan, States, SummaryState};
@@ -221,7 +223,7 @@ impl SummarizingCompactionProvider {
         })
     }
 
-    fn spawn(&self, key: MessageId, plan: Plan) {
+    fn spawn(&self, key: MessageId, plan: Plan, observation: Option<ContextObservation>) {
         {
             let mut states = self.states.lock_or_recover();
             let state = states.entry(key).or_default();
@@ -246,11 +248,57 @@ impl SummarizingCompactionProvider {
         let judge = self.judge.clone();
         let handle = tokio::spawn(async move {
             let _flight = flight;
-            summarize_in_background(states, key, summarizer, judge, plan, telemetry).await;
+            let work = summarize_in_background(states, key, summarizer, judge, plan, telemetry);
+            let Some(observation) = observation else {
+                work.await;
+                return;
+            };
+            report_summary(&observation, work).await;
         });
         let mut tasks = self.tasks.lock_or_recover();
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
+    }
+}
+
+impl SummarizingCompactionProvider {
+    /// Applies a ready summary and decides whether a new background pass starts: planned on the
+    /// untouched history (applying a summary removes the boundary message), but only scheduled
+    /// if the request is still under pressure once the ready summary is in.
+    fn prepare(
+        &self,
+        mut request: ExecutionRequest,
+    ) -> (ExecutionRequest, Option<(MessageId, Plan)>) {
+        let Some(key) = request.messages.first().map(|m| m.id) else {
+            return (request, None);
+        };
+        let plan = if self.pressured(&request) {
+            self.plan(key, &request)
+        } else {
+            None
+        };
+        self.apply_ready_summary(key, &mut request);
+        let plan = plan.filter(|_| self.pressured(&request));
+        (request, plan.map(|plan| (key, plan)))
+    }
+}
+
+/// Runs a background summary as one reported operation: its start when the work begins, then
+/// ready, failed, or cancelled when the session is cancelled first. Ready means the summary can
+/// be applied to a later request, not that it was.
+async fn report_summary(
+    observation: &ContextObservation,
+    work: impl std::future::Future<Output = bool>,
+) {
+    let operation =
+        CompactionOperation::start(observation, CompactionType::BackgroundSummary, None).await;
+    let outcome = tokio::select! {
+        biased;
+        _ = observation.session_cancellation.cancelled() => CompactionOutcome::Cancelled,
+        ready = work => if ready { CompactionOutcome::Success } else { CompactionOutcome::Failure },
+    };
+    if let Some(operation) = operation {
+        operation.finish(outcome, None).await;
     }
 }
 
@@ -261,24 +309,32 @@ impl ContextProvider for SummarizingCompactionProvider {
         request: ExecutionRequest,
         workspace: &dyn Workspace,
     ) -> ExecutionRequest {
-        let mut request = self.inner.assemble(request, workspace).await;
-        let Some(key) = request.messages.first().map(|m| m.id) else {
-            return self.fallback.assemble(request, workspace).await;
-        };
-        // Plan on the untouched history (applying a summary removes the
-        // boundary message), but only schedule if the request is still under
-        // pressure once the ready summary is in.
-        let plan = if self.pressured(&request) {
-            self.plan(key, &request)
-        } else {
-            None
-        };
-        self.apply_ready_summary(key, &mut request);
-        if let Some(plan) = plan {
-            if self.pressured(&request) {
-                self.spawn(key, plan);
-            }
+        let request = self.inner.assemble(request, workspace).await;
+        let (request, start) = self.prepare(request);
+        if let Some((key, plan)) = start {
+            self.spawn(key, plan, None);
         }
         self.fallback.assemble(request, workspace).await
+    }
+
+    /// As `assemble`; a background summary it starts reports its own start and finish, with the
+    /// request that started it as its origin, separately from the fallback's standard compaction.
+    async fn assemble_with_observation(
+        &self,
+        request: ExecutionRequest,
+        workspace: &dyn Workspace,
+        observation: &ContextObservation,
+    ) -> ExecutionRequest {
+        let request = self
+            .inner
+            .assemble_with_observation(request, workspace, observation)
+            .await;
+        let (request, start) = self.prepare(request);
+        if let Some((key, plan)) = start {
+            self.spawn(key, plan, Some(observation.clone()));
+        }
+        self.fallback
+            .assemble_with_observation(request, workspace, observation)
+            .await
     }
 }

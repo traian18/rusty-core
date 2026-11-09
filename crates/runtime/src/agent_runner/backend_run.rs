@@ -14,7 +14,38 @@ use rusty_protocol::ids::{RequestId, RunId};
 
 use super::mailbox::deliver;
 use crate::scheduler::Scheduler;
-use crate::traits::ExecutionBackend;
+use crate::traits::{
+    ExecutionBackend, RequestObservationBinding, RequestObservationBindings,
+    RequestObservationPublisher,
+};
+
+pub(super) struct BindingGuard {
+    bindings: RequestObservationBindings,
+    request_id: RequestId,
+    publisher: Arc<dyn RequestObservationPublisher>,
+}
+
+impl BindingGuard {
+    pub(super) fn register(
+        bindings: RequestObservationBindings,
+        binding: RequestObservationBinding,
+    ) -> Self {
+        let guard = Self {
+            bindings: bindings.clone(),
+            request_id: binding.request_id,
+            publisher: binding.publisher.clone(),
+        };
+        bindings.register(binding);
+        guard
+    }
+}
+
+impl Drop for BindingGuard {
+    fn drop(&mut self) {
+        self.bindings
+            .remove_if_publisher(self.request_id, &self.publisher);
+    }
+}
 
 /// Capacity of the broadcast sink a backend streams one request's events
 /// into. A `broadcast` channel overwrites its oldest entry once the producer
@@ -95,14 +126,15 @@ pub(super) struct BackendRun {
     pub(super) backend: Arc<dyn ExecutionBackend>,
     pub(super) scheduler: Arc<Scheduler>,
     pub(super) commands: mpsc::Sender<AgentCommand>,
-    /// The runner's token: forwarding stops when the runner stops.
+    pub(super) binding: BindingGuard,
+    /// The runner's token: stops when the runner stops.
     pub(super) runner_cancel: CancellationToken,
     /// This run's token: cancels the request itself.
     pub(super) token: CancellationToken,
 }
 
 impl BackendRun {
-    /// A forwarding task relays streamed events to the mailbox while a
+    /// A forwarding task relays streamed events into the mailbox while a
     /// driver task holds the scheduler permits and runs the request.
     pub(super) fn start(self, request: ExecutionRequest) {
         let (event_tx, event_rx) = broadcast::channel(BACKEND_EVENT_BUFFER);
@@ -130,17 +162,20 @@ impl BackendRun {
         // are also run-cancellable, so a queued request cannot survive a
         // cancellation and execute later.
         let _global_permit = tokio::select! {
-            permit = self.scheduler.acquire_backend_permit() => permit,
+            biased;
             _ = self.token.cancelled() => return,
+            permit = self.scheduler.acquire_backend_permit() => permit,
         };
         let _backend_guard = tokio::select! {
-            guard = self.scheduler.acquire_backend_specific_permit(backend_id) => guard,
+            biased;
             _ = self.token.cancelled() => return,
+            guard = self.scheduler.acquire_backend_specific_permit(backend_id) => guard,
         };
         let outcome = self
             .backend
             .execute(request, event_tx, self.token.clone())
             .await;
+        drop(self.binding);
         // A forwarder that panicked relayed nothing we can count on, so the
         // terminal event is synthesized then too.
         let terminal_forwarded = forward_handle.await.unwrap_or(false);
@@ -152,5 +187,59 @@ impl BackendRun {
             Err(error) => ExecutionEvent::Error { request_id, error },
         };
         deliver(&self.commands, AgentCommand::BackendEvent { run_id, event }).await;
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rusty_protocol::events::AgentEvent;
+    use rusty_protocol::ids::{AgentId, SessionId};
+
+    struct Publisher;
+
+    #[async_trait]
+    impl RequestObservationPublisher for Publisher {
+        async fn publish(&self, _: AgentEvent, _: RunId) -> bool {
+            true
+        }
+    }
+
+    fn binding(request_id: RequestId, order: u64) -> RequestObservationBinding {
+        RequestObservationBinding {
+            session_id: SessionId::new(),
+            agent_id: AgentId::new(),
+            parent_agent_id: None,
+            run_id: RunId::new(),
+            request_id,
+            request_start_order: order,
+            publisher: Arc::new(Publisher),
+            session_cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn dropping_guard_does_not_remove_a_replacement() {
+        let bindings = RequestObservationBindings::default();
+        let request_id = RequestId::new();
+        let guard = BindingGuard::register(bindings.clone(), binding(request_id, 0));
+        bindings.register(binding(request_id, 1));
+        drop(guard);
+        assert_eq!(
+            bindings
+                .get(request_id)
+                .map(|entry| entry.request_start_order),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn dropping_guard_removes_its_own_binding() {
+        let bindings = RequestObservationBindings::default();
+        let request_id = RequestId::new();
+        let guard = BindingGuard::register(bindings.clone(), binding(request_id, 0));
+        drop(guard);
+        assert!(bindings.get(request_id).is_none());
     }
 }

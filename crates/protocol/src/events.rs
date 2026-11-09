@@ -47,6 +47,48 @@ pub enum AgentOutcome {
     Failed,
 }
 
+/// Availability of the final request's context estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextAvailability {
+    /// An estimate and its input budget are available.
+    Available {
+        estimated_input_tokens: u64,
+        input_budget: u64,
+        model_window: u64,
+        remaining_input_tokens: u64,
+        usage_percent: u16,
+    },
+    /// An estimate cannot be reported for the given reason.
+    Unavailable { reason: ContextUnavailableReason },
+}
+
+/// Why a context estimate is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextUnavailableReason {
+    UnknownModelWindow,
+    UnusableInputBudget,
+    ModelWindowMismatch,
+}
+
+/// The kind of compaction operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionType {
+    Standard,
+    BackgroundSummary,
+}
+
+/// The result of a compaction operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionOutcome {
+    Success,
+    Failure,
+    Cancelled,
+}
+
 // ---------------------------------------------------------------------------
 // AgentEventEnvelope
 // ---------------------------------------------------------------------------
@@ -126,6 +168,52 @@ pub enum AgentEvent {
     BackendRequestStarted {
         /// The identifier of the backend request.
         request_id: RequestId,
+    },
+
+    /// A context-producing request began, ordered within its agent.
+    ContextRequestStarted {
+        request_id: RequestId,
+        request_start_order: u64,
+        model: Option<String>,
+    },
+
+    /// Final assembled request estimate. Publishers set both flags to false.
+    ContextUpdated {
+        request_id: RequestId,
+        request_start_order: u64,
+        model: Option<String>,
+        availability: ContextAvailability,
+        compaction_started: bool,
+        compaction_ended: bool,
+    },
+
+    /// Compaction began. Publishers use a unique UUID-formatted operation ID,
+    /// set flags to (true, false), and omit background measurements.
+    CompactionStarted {
+        request_id: RequestId,
+        request_start_order: u64,
+        operation_id: String,
+        compaction_type: CompactionType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_estimated_input_tokens: Option<u64>,
+        compaction_started: bool,
+        compaction_ended: bool,
+    },
+
+    /// Compaction finished. Publishers set flags to (false, true), omit
+    /// background measurements, and omit the after count unless successful.
+    CompactionFinished {
+        request_id: RequestId,
+        request_start_order: u64,
+        operation_id: String,
+        compaction_type: CompactionType,
+        outcome: CompactionOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_estimated_input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_estimated_input_tokens: Option<u64>,
+        compaction_started: bool,
+        compaction_ended: bool,
     },
 
     /// The backend started producing a new assistant message.

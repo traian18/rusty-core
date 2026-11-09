@@ -135,10 +135,15 @@ async fn session_prompt_produces_ordered_event_stream() {
     }
 
     // ── Assert ──────────────────────────────────
-    // Filter out StateChanged events to see the core sequence.
+    // Filter out StateChanged and context starts to see the core sequence.
     let core_events: Vec<&AgentEvent> = all_events
         .iter()
-        .filter(|e| !matches!(e, AgentEvent::StateChanged { .. }))
+        .filter(|e| {
+            !matches!(
+                e,
+                AgentEvent::StateChanged { .. } | AgentEvent::ContextRequestStarted { .. }
+            )
+        })
         .collect();
 
     // Expected core events after StateChanged filtering:

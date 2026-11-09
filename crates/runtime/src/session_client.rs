@@ -168,6 +168,12 @@ impl SessionClient {
     /// on every call. Immediately after `send(Prompt)` this reflects an
     /// in-flight status (e.g. `Running`); once the run completes it reflects
     /// `Completed` (or `Failed`) with populated usage.
+    /// The compaction lifecycle events this open session retained after `cursor`, so a
+    /// subscriber that missed some can recover them; unavailable once the session closed.
+    pub fn recover_lifecycle(&self, cursor: u64) -> crate::session_runtime::LifecycleRecovery {
+        self.runtime.recover_lifecycle(cursor)
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         let runtime_snapshot = self.runtime.state_snapshot();
         let live = self

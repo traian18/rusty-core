@@ -4,7 +4,7 @@
 use crate::locks::MutexExt;
 use rusty_protocol::effects::SessionMutation;
 use rusty_protocol::events::{AgentEvent, AgentEventEnvelope, AgentOutcome, EventVisibility};
-use rusty_protocol::ids::{EventId, Timestamp};
+use rusty_protocol::ids::{EventId, RunId, Timestamp};
 use rusty_session_store::SessionCommitter;
 
 use super::AgentRunner;
@@ -13,8 +13,20 @@ impl AgentRunner {
     /// Emits `event`; `false` when it could not be committed, which fails
     /// the session (see [`Self::commit_and_publish`]).
     pub(super) async fn emit(&mut self, event: AgentEvent) -> bool {
+        let run_id = self.agent.state.active_run;
+        self.emit_for_run(event, run_id).await
+    }
+
+    /// Emits a context observation of a request of `run_id`: under that run, also once it has
+    /// settled or another run is active (a background summary finishing late), through the same
+    /// sequencing and commit boundary as every other event.
+    pub(super) async fn emit_observation(&mut self, event: AgentEvent, run_id: RunId) -> bool {
+        self.emit_for_run(event, Some(run_id)).await
+    }
+
+    async fn emit_for_run(&mut self, event: AgentEvent, run_id: Option<RunId>) -> bool {
         self.record_outcome(&event);
-        let envelope = self.envelope(event);
+        let envelope = self.envelope(event, run_id);
 
         // RC-301: when the session's authoritative committer is configured,
         // every event flows through the one commit boundary — the sequencer
@@ -46,13 +58,13 @@ impl AgentRunner {
         entry.last_outcome = Some(outcome);
     }
 
-    fn envelope(&mut self, event: AgentEvent) -> AgentEventEnvelope {
+    fn envelope(&mut self, event: AgentEvent, run_id: Option<RunId>) -> AgentEventEnvelope {
         let envelope = AgentEventEnvelope {
             event_id: EventId::new(),
             session_id: self.agent.session_id,
             agent_id: self.agent.id,
             parent_agent_id: self.agent.parent_id,
-            run_id: self.agent.state.active_run,
+            run_id,
             agent_sequence: self.agent_sequence,
             session_sequence: None,
             timestamp: Timestamp::now(),
@@ -107,6 +119,10 @@ impl AgentRunner {
     }
 
     fn publish(&self, envelope: AgentEventEnvelope) {
+        // Kept before either lossy broadcast below, so a subscriber can recover it.
+        if let Some(retention) = &self.lifecycle_retention {
+            retention.retain(&envelope);
+        }
         // The agent's own channel only has receivers while someone watches
         // this agent directly; the session sink below always gets the event.
         if self.task.events.send(envelope.clone()).is_err() {

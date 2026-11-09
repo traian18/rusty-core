@@ -22,7 +22,7 @@ pub(super) async fn summarize_in_background(
     judge: Option<Arc<dyn ImportanceJudge>>,
     plan: Plan,
     telemetry: CompactionTelemetry,
-) {
+) -> bool {
     let with_state = |f: &mut dyn FnMut(&mut SummaryState)| {
         let mut states = states.lock_or_recover();
         f(states.entry(key).or_default());
@@ -51,7 +51,7 @@ pub(super) async fn summarize_in_background(
             // and the next soft-pressure request retries.
             Err(_) => {
                 telemetry.update(CompactionPhase::Failed, None, None);
-                return;
+                return false;
             }
         }
     };
@@ -61,6 +61,7 @@ pub(super) async fn summarize_in_background(
         state.telemetry = Some(telemetry.clone());
     });
     telemetry.update(CompactionPhase::Ready, None, None);
+    true
 }
 
 fn classified_candidates(

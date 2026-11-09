@@ -95,6 +95,13 @@ impl SessionRuntime {
     pub fn shutdown(&self) {
         self.cancellation.cancel();
         self.bus_cancel.cancel();
+        self.event_bus.lifecycle_retention().close();
+    }
+
+    /// The compaction lifecycle events this open session retained after `cursor` (see
+    /// [`LifecycleRetention`](super::LifecycleRetention)); unavailable once it closed.
+    pub fn recover_lifecycle(&self, cursor: u64) -> super::LifecycleRecovery {
+        self.event_bus.lifecycle_retention().recover(cursor)
     }
 
     /// Writes a truthful snapshot of the session at its last committed

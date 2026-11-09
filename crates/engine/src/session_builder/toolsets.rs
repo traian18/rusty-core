@@ -44,6 +44,17 @@ impl SessionBuilder {
         self
     }
 
+    /// The session's resolved model and its known context window. The context wrapper reports a
+    /// request's estimated input budget only for requests on this model; without it every
+    /// estimate is unavailable.
+    pub fn trusted_model_window(mut self, model: impl Into<String>, model_window: u64) -> Self {
+        self.trusted_model_window = Some(rusty_context::provider::TrustedModelWindow {
+            model: model.into(),
+            model_window,
+        });
+        self
+    }
+
     /// Register an `AgentToolset` into the session.
     ///
     /// This is an alternative to [`tools`](Self::tools) that takes a
