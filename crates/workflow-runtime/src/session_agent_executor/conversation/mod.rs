@@ -29,7 +29,8 @@ use crate::orchestration::{
 };
 use rusty_protocol::events::AgentEvent;
 
-/// What woke the loop.
+/// What woke the loop. One lives only until it is matched, so its size does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Wake {
     Cancelled,
     HardStop,

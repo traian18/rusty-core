@@ -349,7 +349,8 @@ impl HarnessRpcHandler {
 
     /// Decides whether a mutation may run: its session must match, it must not be a repeat of an
     /// answered command or conflict with the expected revision, and the session must be open.
-    /// `Err` is the answer to send instead.
+    /// `Err` is the answer to send instead; it is sent at once, so its size does not matter.
+    #[allow(clippy::result_large_err)]
     fn admit(
         &self,
         outer_session_id: Option<SessionId>,

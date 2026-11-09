@@ -9,8 +9,6 @@ use rusty_runtime::traits::Workspace;
 use crate::provider::ContextProvider;
 
 /// Prepends a fixed instruction string to the system prompt — the
-
-/// Prepends a fixed instruction string to the system prompt — the
 /// IDE-integration equivalent of a `CLAUDE.md`: a static project/product
 /// instruction set that every request should carry.
 pub struct StaticSystemPromptProvider {

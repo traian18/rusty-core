@@ -8,8 +8,6 @@ use rusty_runtime::traits::Workspace;
 
 use crate::provider::ContextProvider;
 
-/// Prepends a fixed instruction string to the system prompt — the
-
 /// Appends a short workspace summary (root path + a shallow file listing) to
 /// the system prompt so the agent has basic orientation without spending a
 /// tool round-trip on "where am I."
