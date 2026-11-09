@@ -33,6 +33,7 @@ use conversation::Conversation;
 use prompt::PromptOptions;
 use watchdog::Watchdog;
 
+pub(crate) use rate_limit::is_transport_failure;
 pub use research::RESEARCH_TOOL;
 
 /// Executes every orchestration attempt in a fresh session.

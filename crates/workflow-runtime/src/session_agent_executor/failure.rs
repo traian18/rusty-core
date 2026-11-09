@@ -62,6 +62,16 @@ mod tests {
         assert_eq!(usage_limit.retry_reason, None);
         assert_eq!(usage_limit.code, "usage_limit");
         assert!(usage_limit.message.contains("resets_at="));
+        // As it reaches the agent from `ExecutionError` (whole seconds): the 2026-11-09 runs
+        // retried this as a short limit three times.
+        assert_eq!(
+            classify_failure(error(
+                "BACKEND_ERROR",
+                "RateLimited { retry_after: Some(8200) }"
+            ))
+            .code,
+            "usage_limit"
+        );
         assert_eq!(
             classify_failure(error("BACKEND_ERROR", "Timeout")).retry_reason,
             Some(RetryReason::BackendTimeout)

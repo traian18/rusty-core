@@ -6,6 +6,7 @@
 
 use rusty_workflow_core::{OrchestrationError, StructuredOutputMode};
 
+use super::rate_limit;
 use super::research::RESEARCH_TOOL;
 use crate::markdown_reply;
 use crate::orchestration::{is_user_change, AgentExecutionError, AgentStepRequest};
@@ -64,7 +65,7 @@ fn add_rejections(prompt: &mut String, request: &AgentStepRequest) {
     let rejections: Vec<_> = request
         .feedback
         .iter()
-        .filter(|item| !from_user(item))
+        .filter(|item| !from_user(item) && !rate_limit::is_transport_failure(item))
         .collect();
     if rejections.is_empty() {
         return;

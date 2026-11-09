@@ -169,3 +169,23 @@ fn a_retried_step_sees_what_its_last_attempt_did_and_handed_on() {
     assert!(text.contains("- Changed: src/lib.rs"));
     assert!(text.contains("Implemented the parser fix."));
 }
+
+#[test]
+fn an_attempt_the_provider_interrupted_is_not_called_a_failure_of_the_work() {
+    let mut error = rusty_workflow_core::OrchestrationError::new(
+        "BACKEND_ERROR",
+        "RateLimited { retry_after: Some(30) }",
+    );
+    error.retry_reason = Some(rusty_workflow_core::RetryReason::BackendRateLimited);
+    let mut step = StepRun::default();
+    step.attempts.push(StepAttempt {
+        attempt: 1,
+        status: AttemptStatus::Failed,
+        output: None,
+        error: Some(error),
+        details: Default::default(),
+    });
+    let text = previous_attempt(&step).unwrap();
+    assert!(text.contains("interrupted by the model provider"), "{text}");
+    assert!(!text.contains("RateLimited"), "{text}");
+}

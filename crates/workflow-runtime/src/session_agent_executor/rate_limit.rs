@@ -19,9 +19,13 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const USAGE_LIMIT: &str = "usage_limit";
 
 /// The provider's advertised wait in a `RateLimited { retry_after: Some(…) }`
-/// message (a `Duration` in its debug form: `16743s`, `1.5s`, `250ms`).
+/// message: a `Duration` in its debug form (`16743s`, `1.5s`, `250ms`), or the
+/// whole seconds `ExecutionError::RateLimited` carries (`8200`).
 pub(crate) fn advertised_wait(message: &str) -> Option<Duration> {
     let value = message.split("Some(").nth(1)?.split(')').next()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
     let at = value.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
     let (number, unit) = value.split_at(at);
     let number: f64 = number.parse().ok()?;
@@ -56,6 +60,18 @@ fn in_words(wait: Duration) -> String {
     }
 }
 
+/// Whether `error` is the model provider interrupting the step (a rate or usage limit, a
+/// timeout) rather than anything wrong with the work: such a failure is no reason for the next
+/// attempt to change what it does, so it is never shown to a step as a rejection.
+pub(crate) fn is_transport_failure(error: &rusty_workflow_core::OrchestrationError) -> bool {
+    use rusty_workflow_core::RetryReason;
+    error.code == USAGE_LIMIT
+        || matches!(
+            error.retry_reason,
+            Some(RetryReason::BackendRateLimited | RetryReason::BackendTimeout)
+        )
+}
+
 /// Waits before a step that hit a short rate limit is retried: the
 /// provider's advertised wait, else half a minute, at most [`MAX_STEP_WAIT`].
 pub(crate) async fn wait_before_retry(message: &str, cancel: &CancellationToken) {
@@ -88,6 +104,27 @@ mod tests {
             Some(Duration::from_millis(1500))
         );
         assert_eq!(wait("RateLimited { retry_after: None }"), None);
+        // `ExecutionError::RateLimited` carries whole seconds, without a unit.
+        assert_eq!(
+            wait("RateLimited { retry_after: Some(8200) }"),
+            Some(Duration::from_secs(8200))
+        );
+    }
+
+    #[test]
+    fn only_provider_interruptions_are_transport_failures() {
+        use rusty_workflow_core::{OrchestrationError, RetryReason};
+        let mut limited = OrchestrationError::new("BACKEND_ERROR", "RateLimited");
+        limited.retry_reason = Some(RetryReason::BackendRateLimited);
+        assert!(is_transport_failure(&limited));
+        assert!(is_transport_failure(&OrchestrationError::new(
+            USAGE_LIMIT,
+            "resets"
+        )));
+        assert!(!is_transport_failure(&OrchestrationError::new(
+            "verification_failed",
+            "C1 unmet"
+        )));
     }
 
     #[test]

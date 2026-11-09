@@ -57,6 +57,9 @@ pub(crate) fn previous_attempt(step: &StepRun) -> Option<String> {
         match (&attempt.status, &attempt.error) {
             (AttemptStatus::Succeeded, _) => "finished and handed its result on".to_owned(),
             (AttemptStatus::Cancelled, _) => "was cancelled".to_owned(),
+            (_, Some(error)) if crate::session_agent_executor::is_transport_failure(error) => {
+                "was interrupted by the model provider (a rate limit or timeout) before it finished; nothing was found wrong with its work".to_owned()
+            }
             (_, Some(error)) => format!("failed: [{}] {}", error.code, clip(&error.message, 600)),
             _ => "failed".to_owned(),
         }
