@@ -104,9 +104,9 @@ tracing = "0.1"
 regex = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 git2 = "0.21"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.24"
+r2d2_sqlite = "0.36"
 clap = { version = "4", features = ["derive"] }
 tokio-tungstenite = "0.24"
 html2text = "0.12"
