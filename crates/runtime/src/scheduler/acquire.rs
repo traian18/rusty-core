@@ -9,7 +9,7 @@ impl Scheduler {
     /// Acquires a permit for creating a new session.
     ///
     /// Blocks until the number of active sessions is below
-    /// [`SchedulerConfig::max_active_sessions`].
+    /// [`super::SchedulerConfig::max_active_sessions`].
     pub async fn acquire_session_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
         self.permits.acquire_session().await
     }
@@ -34,7 +34,7 @@ impl Scheduler {
     /// Acquires a permit for executing a backend (LLM) request.
     ///
     /// Blocks until the number of in-flight backend requests is below
-    /// [`SchedulerConfig::max_concurrent_backend_requests`].
+    /// [`super::SchedulerConfig::max_concurrent_backend_requests`].
     pub async fn acquire_backend_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
         self.permits.acquire_backend().await
     }
@@ -52,7 +52,7 @@ impl Scheduler {
     /// Acquires a permit for executing a tool.
     ///
     /// Blocks until the number of in-flight tool executions is below
-    /// [`SchedulerConfig::max_concurrent_tool_executions`].
+    /// [`super::SchedulerConfig::max_concurrent_tool_executions`].
     pub async fn acquire_tool_permit(self: &Arc<Self>) -> OwnedSemaphorePermit {
         self.permits.acquire_tool().await
     }

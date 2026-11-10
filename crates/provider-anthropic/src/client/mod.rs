@@ -94,13 +94,13 @@ impl ModelClient for AnthropicClient {
     /// Execute a streaming request against the Anthropic Messages API.
     ///
     /// This method:
-    /// 1. Converts the [`ModelRequest`] into an [`AnthropicRequest`] using
+    /// 1. Converts the [`ModelRequest`] into an [`AnthropicRequest`](crate::wire::AnthropicRequest) using
     ///    the conversion functions from [`wire`](crate::wire).
     /// 2. Sends an HTTP POST to `{config.base_url}/v1/messages` with the
     ///    required Anthropic headers (`x-api-key`, `anthropic-version`,
     ///    `content-type`).
     /// 3. On success (HTTP 2xx), parses the SSE response body using
-    ///    [`AnthropicSseParser`] and forwards each parsed [`ModelEvent`](rusty_model_backend::events::ModelEvent)
+    ///    [`AnthropicSseParser`](crate::wire::AnthropicSseParser) and forwards each parsed [`ModelEvent`](rusty_model_backend::events::ModelEvent)
     ///    through the bounded `events` channel.
     /// 4. On HTTP 429, reads the `retry-after-ms` header and returns
     ///    [`ModelError::RateLimited`].

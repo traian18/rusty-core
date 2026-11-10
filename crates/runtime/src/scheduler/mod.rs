@@ -14,7 +14,7 @@
 //! (requests per minute, tokens per minute).
 //!
 //! Each semaphore is backed by a `tokio::sync::Semaphore` and exposes
-//! `acquire_*_permit` methods that return an [`OwnedSemaphorePermit`].
+//! `acquire_*_permit` methods that return an [`OwnedSemaphorePermit`](tokio::sync::OwnedSemaphorePermit).
 //! The permit is `Drop`-based: when it goes out of scope the semaphore slot
 //! is automatically released, so callers never need to remember to release it
 //! manually.
@@ -94,7 +94,7 @@ mod cancellation_tests;
 ///
 /// A thin facade composing `GlobalPermits` (the five capacity semaphores)
 /// and `BackendLimiters` (per-backend concurrency and rate limiting).
-/// Every method below acquires an [`OwnedSemaphorePermit`] (or a
+/// Every method below acquires an [`OwnedSemaphorePermit`](tokio::sync::OwnedSemaphorePermit) (or a
 /// [`BackendPermitGuard`]) that is independent of any borrow on `self`,
 /// so permits can be moved into spawned [`tokio::spawn`] tasks without
 /// lifetime headaches.

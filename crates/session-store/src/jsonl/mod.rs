@@ -1,4 +1,4 @@
-//! A [`SessionStore`] that keeps each session in its own append-only `<session id>.jsonl` file.
+//! A [`SessionStore`](crate::store::SessionStore) that keeps each session in its own append-only `<session id>.jsonl` file.
 //!
 //! It needs no database, which makes it the store for hosts that only ever run a handful of
 //! sessions. See `record` for the file format and crash recovery, and `writer` for how appends are

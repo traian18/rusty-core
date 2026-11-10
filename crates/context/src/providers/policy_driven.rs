@@ -55,7 +55,7 @@ pub struct CompactionRecord {
 /// `ContextPolicy::evaluate` whether that's proceed / schedule-background /
 /// compact-now pressure against the model's real context window, and only
 /// then drops trailing messages down to the policy's `target_tokens` — as
-/// opposed to [`TruncatingCompactionProvider`]'s fixed `max_chars` cutoff,
+/// opposed to [`TruncatingCompactionProvider`](crate::providers::TruncatingCompactionProvider)'s fixed `max_chars` cutoff,
 /// which has no notion of *which* model it's assembling for.
 ///
 /// `context_window` is supplied at construction (from the session's chosen

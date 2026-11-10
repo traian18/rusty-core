@@ -11,7 +11,7 @@ use crate::session_manager::registry::ActiveSessionRegistry;
 /// Central session coordinator managing multi-session lifecycle, durable restoration,
 /// and runtime capacity.
 ///
-/// Implements the [`SessionRegistry`], [`SessionLifecycle`], and [`SessionRestorer`] contracts
+/// Implements the [`SessionRegistry`](super::SessionRegistry), [`SessionLifecycle`](super::SessionLifecycle), and [`SessionRestorer`](super::SessionRestorer) contracts
 /// while encapsulating underlying sub-systems (storage, registry, scheduling, supervision).
 pub struct SessionManager {
     pub(super) registry: ActiveSessionRegistry,

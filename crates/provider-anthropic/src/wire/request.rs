@@ -18,7 +18,7 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
     /// Carries the effort level for adaptive thinking -- see
-    /// [`resolve_adaptive_thinking`].
+    /// [`resolve_adaptive_thinking`](super::thinking::resolve_adaptive_thinking).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<AnthropicOutputConfig>,
     /// Set only when emulating structured output — see

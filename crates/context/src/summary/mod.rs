@@ -2,7 +2,7 @@
 //!
 //! [`SummarizingCompactionProvider`] never blocks a request on a model call.
 //! Under soft pressure it starts a background task that (optionally) asks an
-//! [`ImportanceJudge`] which old messages matter, then summarizes the rest,
+//! [`ImportanceJudge`](crate::importance::ImportanceJudge) which old messages matter, then summarizes the rest,
 //! folding in the previous summary so nothing is summarized twice. A finished
 //! summary is applied on a later request; until one is ready, or if the
 //! summarizer fails, the cheap tiers in the fallback provider keep the
