@@ -932,3 +932,28 @@ fn inclusive_usage_is_a_pure_aggregate() {
     assert_eq!(summary.self_usage.total_tokens.value(), None);
     assert_eq!(root.usage.records.len(), before);
 }
+
+#[test]
+fn a_child_inherits_the_parent_s_execution_params_under_the_spawn_s_overrides() {
+    use rusty_protocol::backend::{ExecutionParams, ReasoningEffort};
+    // The 2026-11-12 traces: children spawned without `model` ran on codex's fallback model
+    // instead of the parent's and failed at once.
+    let parent = ExecutionParams {
+        model: Some("gpt-6.1-terra".into()),
+        max_tokens: Some(128_000),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        ..ExecutionParams::default()
+    };
+    let inherited = super::spawn::inherited_params(&parent, &ExecutionParams::default());
+    assert_eq!(inherited.model.as_deref(), Some("gpt-6.1-terra"));
+    assert_eq!(inherited.max_tokens, Some(128_000));
+    assert_eq!(inherited.reasoning_effort, Some(ReasoningEffort::Medium));
+
+    let overrides = ExecutionParams {
+        model: Some("gpt-6-luna".into()),
+        ..ExecutionParams::default()
+    };
+    let overridden = super::spawn::inherited_params(&parent, &overrides);
+    assert_eq!(overridden.model.as_deref(), Some("gpt-6-luna"));
+    assert_eq!(overridden.max_tokens, Some(128_000));
+}

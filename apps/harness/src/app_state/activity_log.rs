@@ -76,9 +76,14 @@ fn log_message_event(event: &AgentEvent) -> Option<String> {
             agent_id,
             tool_call_id,
         } => Some(child_spawn_summary(*agent_id, *tool_call_id)),
-        AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
-            Some(format!("child agent {agent_id:?} completed: {outcome:?}"))
-        }
+        AgentEvent::ChildAgentCompleted {
+            agent_id,
+            outcome,
+            error,
+        } => Some(match error {
+            Some(error) => format!("child agent {agent_id:?} completed: {outcome:?} ({error})"),
+            None => format!("child agent {agent_id:?} completed: {outcome:?}"),
+        }),
         AgentEvent::BehaviorRuleFired {
             profile,
             rule_id,

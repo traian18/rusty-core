@@ -132,7 +132,7 @@ fn task_pass(out: &mut String, goal: &Goal) {
     } else {
         let _ = writeln!(
             out,
-            "1. Carry on with the plan above: first call update_todos with it as it stands (keep the closed steps, add steps you have found, cancel a step only with the reason in its text), then take the next open steps."
+            "1. Carry on with the plan above: first call update_todos with it as it stands (keep the closed steps, add steps you have found, cancel a step only when it turned out to be unnecessary, with the reason in its text — never because it is large, risky or has a wide blast radius; a pass that cancels more steps than it completes has them reopened), then take the next open steps."
         );
     }
     let _ = writeln!(
@@ -145,7 +145,7 @@ fn task_pass(out: &mut String, goal: &Goal) {
     );
     let _ = write!(
         out,
-        "4. Do not end the pass while steps are open and you can still make progress. The goal ends only when every step is closed, the checks you ran pass and your judgement below is yes, so claim no more than the result shows.\n\nEnd with `Next: <the step the next pass should take first>`, then `Status: done` when this pass's work is finished, or `Status: blocked — <what only the user can provide>`."
+        "4. Do not end the pass while steps are open and you can still make progress. The goal ends only when every step is closed, the checks you ran pass and your judgement below is yes, so claim no more than the result shows.\n\nEnd with `Next: <the step the next pass should take first>`, then `Status: done` when this pass's work is finished, or `Status: blocked — <the question only the user can answer>`: a decision, a credential or a value that is neither in the code nor in its history. Work that is large, risky, spans several files or passes through an unfinished state is not a blocker: build it step by step. After the pass a reviewer reads its diff, checks and plan and decides whether the goal is done, goes on or is blocked; your own claims are not evidence to it, so leave the result in the code."
     );
 }
 
@@ -188,7 +188,7 @@ fn this_pass(out: &mut String, goal: &Goal, current: &Measurement) {
     );
     let _ = write!(
         out,
-        "4. Do not end the pass while planned items are unfinished and you can still make progress. The host measures the scope after you finish and decides whether the goal is met, so do not claim it is; a pass that makes the measurement worse is undone.\n\nEnd with `Next: <what the next pass should take on first>`, then `Status: done` when this pass's work is finished, or `Status: blocked — <what only the user can provide>`."
+        "4. Do not end the pass while planned items are unfinished and you can still make progress. The host measures the scope after you finish and decides whether the goal is met, so do not claim it is; a pass that makes the measurement worse is undone.\n\nEnd with `Next: <what the next pass should take on first>`, then `Status: done` when this pass's work is finished, or `Status: blocked — <the question only the user can answer>`: a decision, a credential or a value that is neither in the code nor in its history. Work that is large, risky, spans several files or passes through an unfinished state is not a blocker: build it step by step. After the pass a reviewer reads its diff, checks and plan and decides whether the goal is done, goes on or is blocked; your own claims are not evidence to it, so leave the result in the code."
     );
 }
 
@@ -322,8 +322,12 @@ fn earlier_passes_section(out: &mut String, goal: &Goal) {
             };
             let _ = writeln!(out, "- pass {}: {}{note}", entry.pass, entry.summary);
         }
-        if let Some(next) = goal.journal.last().and_then(|e| e.next.as_deref()) {
-            let _ = writeln!(out, "\nThe last pass left this for you: {next}");
+        let last = goal.journal.last();
+        if let Some(review) = last.and_then(|e| e.review.as_deref()) {
+            let _ = writeln!(out, "\nThe reviewer on the last pass: {review}");
+        }
+        if let Some(next) = last.and_then(|e| e.next.as_deref()) {
+            let _ = writeln!(out, "\nTake this first: {next}");
         }
     }
 }

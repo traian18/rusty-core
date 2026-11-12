@@ -190,7 +190,7 @@
         },
         "ChildAgentCompleted": {
           "type": "object", "required": ["agent_id", "outcome"],
-          "properties": { "agent_id": { "$ref": "#/definitions/AgentId" }, "outcome": { "$ref": "#/definitions/AgentOutcome" } }
+          "properties": { "agent_id": { "$ref": "#/definitions/AgentId" }, "outcome": { "$ref": "#/definitions/AgentOutcome" }, "error": { "type": "string" } }
         },
         "Failed": {
           "type": "object", "required": ["error"],

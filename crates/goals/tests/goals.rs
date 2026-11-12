@@ -1,7 +1,7 @@
 use rusty_goals::{
     decide, pass_prompt, record, status_text, CheckOutcome, FileMeasure, FindingSummary, Goal,
-    GoalStatus, GuidelineSummary, Measurement, PassReport, PlanStep, Severity, StepStatus, Targets,
-    Verdict,
+    GoalStatus, GuidelineSummary, Measurement, PassReport, PlanStep, Review, ReviewVerdict,
+    Severity, StepStatus, Targets, Verdict,
 };
 
 fn finding(severity: Severity) -> FindingSummary {
@@ -134,6 +134,12 @@ fn passes_without_progress_pause_the_goal() {
         Verdict::Continue
     );
     assert_eq!(goal.stalled, 1);
+    pass(
+        &mut goal,
+        measured(5.0, vec![finding(Severity::High)], true, "a"),
+        PassReport::default(),
+    );
+    assert_eq!(goal.stalled, 2);
     assert_eq!(
         pass(
             &mut goal,
@@ -189,6 +195,7 @@ fn the_budget_pauses_and_a_blocker_blocks() {
     assert_eq!(goal.passes, 12);
     assert!(status_text(&goal).contains("12 pass(es)"));
     let same = measured(7.4, vec![], true, "same");
+    pass(&mut goal, same.clone(), PassReport::default());
     pass(&mut goal, same.clone(), PassReport::default());
     assert_eq!(
         pass(&mut goal, same, PassReport::default()),
@@ -399,7 +406,7 @@ fn a_pass_is_told_to_plan_a_share_of_the_work_list_and_hand_over() {
     pass(&mut goal, files(&list, "b"), report);
     let prompt = pass_prompt(&goal, goal.last.as_ref().unwrap());
     assert!(
-        prompt.contains("The last pass left this for you: split task_queue.rs"),
+        prompt.contains("Take this first: split task_queue.rs"),
         "{prompt}"
     );
 }
@@ -535,4 +542,194 @@ fn a_scope_in_words_is_given_to_the_pass_to_work_out() {
         prompt.contains("Measured on: the files you change."),
         "{prompt}"
     );
+}
+
+#[test]
+fn a_pass_that_cancels_its_plan_is_not_blocked_and_its_steps_are_reopened() {
+    // The 2026-11-12 traces: every step cancelled as too risky to patch, then `Status: blocked —
+    // implementation was not completed in this pass`, and the goal stopped after one pass.
+    let mut goal = Goal::new(
+        "g5".into(),
+        "Finish the security implementation".into(),
+        "t0".into(),
+    );
+    goal.baseline = Some(files(&[], "a"));
+    let report = PassReport {
+        agent_status: Some("blocked — implementation was not completed in this pass".into()),
+        plan: vec![
+            step("Coordinated session revocation", StepStatus::Cancelled),
+            step("CSRF protection", StepStatus::Cancelled),
+            step("Remove debug logging", StepStatus::Completed),
+        ],
+        ..PassReport::default()
+    };
+    let decision = decide(&goal, &files(&[], "b"), &report);
+    assert_eq!(decision.verdict, Verdict::Continue);
+    assert!(
+        decision
+            .unmet
+            .iter()
+            .any(|u| u.target == "the plan is done, not cancelled"
+                && u.detail
+                    .contains("Coordinated session revocation; CSRF protection")),
+        "{:?}",
+        decision.unmet
+    );
+    assert!(
+        decision.reason.contains("cancelled its plan"),
+        "{}",
+        decision.reason
+    );
+
+    assert_eq!(pass(&mut goal, files(&[], "b"), report), Verdict::Continue);
+    assert_eq!(goal.status, GoalStatus::Running);
+    let statuses: Vec<StepStatus> = goal.plan.iter().map(|s| s.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            StepStatus::Pending,
+            StepStatus::Pending,
+            StepStatus::Completed
+        ]
+    );
+    let prompt = pass_prompt(&goal, goal.last.as_ref().unwrap());
+    assert!(prompt.contains("[ ] CSRF protection"), "{prompt}");
+    assert!(
+        prompt
+            .contains("spans several files or passes through an unfinished state is not a blocker"),
+        "{prompt}"
+    );
+
+    // A real blocker on a plan that is being worked still blocks.
+    let blocked = PassReport {
+        agent_status: Some("blocked — needs the production SMTP host".into()),
+        plan: vec![
+            step("Coordinated session revocation", StepStatus::Completed),
+            step("CSRF protection", StepStatus::Completed),
+            step("Configure SMTP", StepStatus::Pending),
+        ],
+        ..PassReport::default()
+    };
+    assert_eq!(pass(&mut goal, files(&[], "c"), blocked), Verdict::Blocked);
+}
+
+fn review(verdict: ReviewVerdict, reason: &str, next_step: Option<&str>) -> Option<Review> {
+    Some(Review {
+        verdict,
+        reason: reason.into(),
+        next_step: next_step.map(Into::into),
+    })
+}
+
+#[test]
+fn the_reviewer_decides_done_and_blocked_and_its_next_step_leads_the_next_pass() {
+    let mut goal = Goal::new("g6".into(), "Finish the security work".into(), "t0".into());
+    goal.baseline = Some(files(&[], "a"));
+    let open = vec![
+        step("Session revocation", StepStatus::InProgress),
+        step("CSRF protection", StepStatus::Pending),
+    ];
+
+    // The agent says blocked and judges itself done; the reviewer sees code to write.
+    let report = PassReport {
+        agent_status: Some("blocked — cannot be patched in isolation".into()),
+        done_when_met: Some(true),
+        plan: open.clone(),
+        edited: 2,
+        review: review(
+            ReviewVerdict::Continue,
+            "refresh rotation is still two separate Redis calls",
+            Some("make rotation one Lua script in RefreshTokenService"),
+        ),
+        ..PassReport::default()
+    };
+    let decision = decide(&goal, &files(&[], "b"), &report);
+    assert_eq!(decision.verdict, Verdict::Continue);
+    assert!(
+        decision.reason.contains("the reviewer found it can go on"),
+        "{}",
+        decision.reason
+    );
+    pass(&mut goal, files(&[], "b"), report);
+    // Edited code on a plan being worked is progress, though no step closed.
+    assert_eq!(goal.stalled, 0);
+    let prompt = pass_prompt(&goal, goal.last.as_ref().unwrap());
+    assert!(
+        prompt.contains("Take this first: make rotation one Lua script in RefreshTokenService"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "The reviewer on the last pass: refresh rotation is still two separate Redis calls"
+        ),
+        "{prompt}"
+    );
+
+    // The same reason again is a stall, edits or not; three in a row pause the goal.
+    let again = || PassReport {
+        plan: open.clone(),
+        edited: 1,
+        review: review(
+            ReviewVerdict::Continue,
+            "Refresh rotation is still two separate Redis calls.",
+            None,
+        ),
+        ..PassReport::default()
+    };
+    pass(&mut goal, files(&[], "c"), again());
+    pass(&mut goal, files(&[], "d"), again());
+    assert_eq!(goal.stalled, 2);
+    assert_eq!(
+        pass(&mut goal, files(&[], "e"), again()),
+        Verdict::NoProgress
+    );
+
+    // Only the reviewer blocks, and only it judges the result done.
+    let mut goal = Goal::new("g7".into(), "Finish the security work".into(), "t0".into());
+    goal.baseline = Some(files(&[], "a"));
+    let blocked = PassReport {
+        plan: open.clone(),
+        review: review(
+            ReviewVerdict::Blocked,
+            "needs the browser-facing origin",
+            None,
+        ),
+        ..PassReport::default()
+    };
+    assert_eq!(pass(&mut goal, files(&[], "b"), blocked), Verdict::Blocked);
+    assert_eq!(
+        goal.reason.as_deref(),
+        Some("Blocked: needs the browser-facing origin")
+    );
+
+    let mut goal = Goal::new("g8".into(), "Finish the security work".into(), "t0".into());
+    goal.baseline = Some(files(&[], "a"));
+    let closed = vec![
+        step("Session revocation", StepStatus::Completed),
+        step("CSRF protection", StepStatus::Completed),
+    ];
+    let self_judged = PassReport {
+        done_when_met: Some(true),
+        plan: closed.clone(),
+        review: review(
+            ReviewVerdict::Continue,
+            "CSRF filter is not registered",
+            None,
+        ),
+        ..PassReport::default()
+    };
+    assert_eq!(
+        pass(&mut goal, files(&[], "b"), self_judged),
+        Verdict::Continue
+    );
+    let reviewed = PassReport {
+        plan: closed,
+        review: review(
+            ReviewVerdict::Done,
+            "both are in the diff and the build passes",
+            None,
+        ),
+        ..PassReport::default()
+    };
+    assert_eq!(pass(&mut goal, files(&[], "c"), reviewed), Verdict::Done);
 }

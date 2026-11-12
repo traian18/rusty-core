@@ -310,6 +310,9 @@ pub enum AgentEvent {
         agent_id: AgentId,
         /// The outcome of the child's run.
         outcome: AgentOutcome,
+        /// Why the child failed, when it did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     /// The agent encountered an unrecoverable error.

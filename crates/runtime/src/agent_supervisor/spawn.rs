@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use rusty_agent_core::agent::Agent;
 use rusty_agent_core::capabilities::AgentCapabilities;
-use rusty_protocol::backend::{BackendBinding, BackendDescriptor, BackendReference};
+use rusty_protocol::backend::{
+    BackendBinding, BackendDescriptor, BackendReference, ExecutionParams,
+};
 use rusty_protocol::commands::{AgentCommand, AgentResult};
 use rusty_protocol::effects::{BackendPolicy, SpawnAgentSpec, SpawnMode, WorkspacePolicy};
 use rusty_protocol::events::{AgentEvent, AgentEventEnvelope, EventVisibility};
@@ -194,7 +196,8 @@ impl AgentSupervisor {
         // `model` argument) apply before the child's first run; see
         // `SpawnAgentSpec::execution_params` for why this is a plain state assignment rather than
         // going through `BackendPolicy::Explicit`.
-        agent.state.execution_params = spec.execution_params.clone();
+        agent.state.execution_params =
+            inherited_params(&parent.state.execution_params, &spec.execution_params);
         agent.state.behavior = behavior;
         Ok(agent)
     }
@@ -230,6 +233,35 @@ impl AgentSupervisor {
             let _ = result_tx.send(result);
         });
         (start, RunningChild { join, result })
+    }
+}
+
+/// The parent's execution params with the spawn's overrides on top. A child used to start from
+/// the spec alone, so without a `model` argument it ran on the integration's fallback model (for
+/// codex a stale `gpt-5.5`, which the backend refused at once) and lost the parent's max_tokens
+/// and reasoning effort. The response format is the spec's only: a parent's structured-output
+/// contract is not the child's.
+pub(super) fn inherited_params(
+    parent: &ExecutionParams,
+    overrides: &ExecutionParams,
+) -> ExecutionParams {
+    ExecutionParams {
+        model: overrides.model.clone().or_else(|| parent.model.clone()),
+        max_tokens: overrides.max_tokens.or(parent.max_tokens),
+        temperature: overrides.temperature.or(parent.temperature),
+        stop_sequences: if overrides.stop_sequences.is_empty() {
+            parent.stop_sequences.clone()
+        } else {
+            overrides.stop_sequences.clone()
+        },
+        reasoning_effort: overrides.reasoning_effort.or(parent.reasoning_effort),
+        extended_thinking: overrides.extended_thinking.or(parent.extended_thinking),
+        response_format: overrides.response_format.clone(),
+        provider_options: if overrides.provider_options.is_null() {
+            parent.provider_options.clone()
+        } else {
+            overrides.provider_options.clone()
+        },
     }
 }
 

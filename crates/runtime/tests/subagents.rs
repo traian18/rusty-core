@@ -374,7 +374,10 @@ async fn test_root_spawns_two_concurrent_children() {
         let effects = root.apply(AgentCommand::ChildCompleted { agent_id, result });
         for effect in effects {
             if let rusty_protocol::effects::AgentEffect::Emit {
-                event: AgentEvent::ChildAgentCompleted { agent_id, outcome },
+                event:
+                    AgentEvent::ChildAgentCompleted {
+                        agent_id, outcome, ..
+                    },
             } = effect
             {
                 markers.push((agent_id, outcome));

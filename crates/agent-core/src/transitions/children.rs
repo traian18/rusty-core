@@ -21,6 +21,7 @@ impl Agent {
             event: AgentEvent::ChildAgentCompleted {
                 agent_id,
                 outcome: AgentOutcome::Success,
+                error: None,
             },
         }];
         if self.state.children.is_empty() && self.state.status == AgentStatus::WaitingForChildren {
@@ -53,11 +54,13 @@ impl Agent {
         error: AgentError,
     ) -> Vec<AgentEffect> {
         self.state.children.retain(|child| *child != agent_id);
+        let message = format!("{}: {}", error.code, error.message);
         self.state.last_error = Some(error);
         let mut effects = vec![AgentEffect::Emit {
             event: AgentEvent::ChildAgentCompleted {
                 agent_id,
                 outcome: AgentOutcome::Failed,
+                error: Some(message),
             },
         }];
         if self.state.children.is_empty() && self.state.status == AgentStatus::WaitingForChildren {

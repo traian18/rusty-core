@@ -2,7 +2,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    contract::{Goal, GoalStatus, JournalEntry, PlanStep, StepStatus, Verdict},
+    contract::{
+        Goal, GoalStatus, JournalEntry, PlanStep, Review, ReviewVerdict, StepStatus, Verdict,
+    },
     measurement::{Measurement, Unmet},
     progress::{broke, compare, Progress},
 };
@@ -24,6 +26,31 @@ pub struct PassReport {
     /// The pass's to-do list as it ended; empty when it kept none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan: Vec<PlanStep>,
+    /// The reviewer's verdict on the pass. When there is one it decides done and blocked; the
+    /// agent's own `Status:` and `Done when:` lines count only without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<Review>,
+    /// Files the pass changed.
+    #[serde(default)]
+    pub edited: u32,
+}
+
+impl PassReport {
+    fn review_says(&self, verdict: ReviewVerdict) -> bool {
+        self.review.as_ref().is_some_and(|r| r.verdict == verdict)
+    }
+}
+
+/// The same words, ignoring case, spacing and punctuation.
+fn same_reason(a: &str, b: &str) -> bool {
+    let words = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (words(a), words(b));
+    !a.is_empty() && a == b
 }
 
 /// Steps of `plan` that are done.
@@ -31,6 +58,23 @@ fn completed(plan: &[PlanStep]) -> usize {
     plan.iter()
         .filter(|s| s.status == StepStatus::Completed)
         .count()
+}
+
+/// The cancelled steps of `plan` when the pass dropped the work instead of doing it: more steps
+/// cancelled than completed, and two or more, or one with nothing completed. Models cancelled
+/// whole plans as "too large" or "risky" and reported blocked; a step is cancelled only when it
+/// turned out to be unnecessary.
+pub(crate) fn dropped(plan: &[PlanStep]) -> Vec<&PlanStep> {
+    let cancelled: Vec<&PlanStep> = plan
+        .iter()
+        .filter(|s| s.status == StepStatus::Cancelled)
+        .collect();
+    let done = completed(plan);
+    if cancelled.len() > done && (cancelled.len() >= 2 || done == 0) {
+        cancelled
+    } else {
+        Vec::new()
+    }
 }
 
 /// What a task goal misses besides its targets: a plan, every step of it closed, and every check
@@ -51,6 +95,18 @@ fn task_unmet(goal: &Goal, plan: &[PlanStep], now: &Measurement) -> Vec<Unmet> {
         out.push(Unmet {
             target: "the plan is finished".into(),
             detail: format!("{} step(s) left: {}", open.len(), open.join("; ")),
+        });
+    }
+    let dropped = dropped(plan);
+    if !dropped.is_empty() {
+        let steps: Vec<&str> = dropped.iter().map(|s| s.content.as_str()).collect();
+        out.push(Unmet {
+            target: "the plan is done, not cancelled".into(),
+            detail: format!(
+                "{} step(s) were cancelled without being done and are reopened: {}",
+                steps.len(),
+                steps.join("; ")
+            ),
         });
     }
     for check in now.failing_checks().filter(|c| c.ran) {
@@ -96,18 +152,21 @@ fn blocked(report: &PassReport) -> Option<String> {
 
 /// The next state of `goal` after a pass measured `now`. Done only on the measurement (and the
 /// judge, for `done_when`), never on the agent's word.
-/// A task moves by its plan: more steps done, or fewer failing checks. New code may score lower
-/// than the old, so only a broken check or more guideline errors make it worse.
+/// A task moves by its plan: more steps done, fewer failing checks, or code changed while the
+/// plan was worked (a large step can take more than one pass). New code may score lower than the
+/// old, so only a broken check or more guideline errors make it worse.
 fn task_progress(
     before: &Measurement,
     now: &Measurement,
     plan: &[PlanStep],
     kept: &[PlanStep],
+    edited: bool,
 ) -> Progress {
     if broke(before, now) {
         Progress::Worse
     } else if completed(plan) > completed(kept)
         || now.failing_checks().count() < before.failing_checks().count()
+        || (edited && dropped(plan).is_empty())
     {
         Progress::Better
     } else {
@@ -138,10 +197,19 @@ pub fn decide(goal: &Goal, now: &Measurement, report: &PassReport) -> Decision {
     };
     let progress = match before {
         None => Progress::Better,
-        Some(before) if goal.is_task() => task_progress(before, now, plan, &goal.plan),
+        Some(before) if goal.is_task() => {
+            task_progress(before, now, plan, &goal.plan, report.edited > 0)
+        }
         Some(before) => compare(before, now, &goal.targets),
     };
-    let stalled = if progress == Progress::Better {
+    // The reviewer giving the same reason as last time is a stall, whatever else moved.
+    let repeated = report.review.as_ref().is_some_and(|r| {
+        goal.journal
+            .last()
+            .and_then(|e| e.review.as_deref())
+            .is_some_and(|last| same_reason(last, &r.reason))
+    });
+    let stalled = if progress == Progress::Better && !repeated {
         0
     } else {
         goal.stalled + 1
@@ -155,8 +223,12 @@ pub fn decide(goal: &Goal, now: &Measurement, report: &PassReport) -> Decision {
         reason,
         summary: summary.clone(),
     };
+    let judged_done = match &report.review {
+        Some(review) => Some(review.verdict == ReviewVerdict::Done),
+        None => report.done_when_met,
+    };
     if unmet.is_empty() {
-        match (goal.done_when(), report.done_when_met) {
+        match (goal.done_when(), judged_done) {
             (None, _) | (Some(_), Some(true)) => {
                 let reason = if goal.is_task() {
                     "The plan is finished, the checks pass and the result was judged done."
@@ -168,7 +240,15 @@ pub fn decide(goal: &Goal, now: &Measurement, report: &PassReport) -> Decision {
             (Some(_), _) => {}
         }
     }
-    if let Some(what) = blocked(report) {
+    // With a reviewer, only its verdict blocks. Without one, a pass that cancelled its plan is not
+    // blocked: it stopped, and it goes on with the steps reopened.
+    let claimed_block = blocked(report);
+    let dropped_plan = !dropped(plan).is_empty();
+    let block = match &report.review {
+        Some(review) => (review.verdict == ReviewVerdict::Blocked).then(|| review.reason.clone()),
+        None => claimed_block.clone().filter(|_| !dropped_plan),
+    };
+    if let Some(what) = block {
         let reason = if what.is_empty() {
             "The agent reported a blocker.".to_owned()
         } else {
@@ -204,6 +284,17 @@ pub fn decide(goal: &Goal, now: &Measurement, report: &PassReport) -> Decision {
         );
     }
     let reason = match (goal.done_when(), unmet.is_empty(), &report.judge_reason) {
+        _ if report.review_says(ReviewVerdict::Continue) && claimed_block.is_some() => format!(
+            "The agent reported blocked; the reviewer found it can go on: {}",
+            report.review.as_ref().map_or("", |r| r.reason.as_str())
+        ),
+        _ if report.review_says(ReviewVerdict::Continue) => format!(
+            "Not done yet: {}",
+            report.review.as_ref().map_or("", |r| r.reason.as_str())
+        ),
+        _ if dropped_plan && claimed_block.is_some() => {
+            "The pass reported blocked but cancelled its plan instead of working it; the steps are reopened.".to_owned()
+        }
         (Some(_), true, Some(why)) => format!("Measured targets met; not done yet: {why}"),
         _ => format!("{} target(s) left.", unmet.len().max(1)),
     };
@@ -225,6 +316,13 @@ pub fn record(
         if !report.plan.is_empty() {
             goal.plan = report.plan.clone();
         }
+        if decision.status != GoalStatus::Done && !dropped(&goal.plan).is_empty() {
+            for step in &mut goal.plan {
+                if step.status == StepStatus::Cancelled {
+                    step.status = StepStatus::Pending;
+                }
+            }
+        }
     }
     goal.status = decision.status;
     goal.reason = (decision.status != GoalStatus::Running).then(|| decision.reason.clone());
@@ -235,6 +333,11 @@ pub fn record(
         verdict: decision.verdict,
         summary: decision.summary.clone(),
         agent_status: report.agent_status.clone(),
-        next: report.next.clone(),
+        next: report
+            .review
+            .as_ref()
+            .and_then(|r| r.next_step.clone())
+            .or_else(|| report.next.clone()),
+        review: report.review.as_ref().map(|r| r.reason.clone()),
     });
 }

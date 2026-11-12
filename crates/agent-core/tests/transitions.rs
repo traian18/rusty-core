@@ -749,7 +749,7 @@ fn child_commands_do_not_crash_parent_state() {
 
     let failed_child = AgentId::new();
     agent.state.children.push(failed_child);
-    agent.apply(AgentCommand::ChildFailed {
+    let effects = agent.apply(AgentCommand::ChildFailed {
         agent_id: failed_child,
         error: AgentError {
             message: "failed".into(),
@@ -757,6 +757,17 @@ fn child_commands_do_not_crash_parent_state() {
             details: None,
         },
     });
+    // The reason reaches the event, so a trace shows why the child failed.
+    assert!(matches!(
+        &effects[0],
+        AgentEffect::Emit {
+            event: AgentEvent::ChildAgentCompleted {
+                outcome: AgentOutcome::Failed,
+                error: Some(error),
+                ..
+            }
+        } if error == "CHILD: failed"
+    ));
     assert!(agent.state.children.is_empty());
     assert_eq!(agent.state.status, AgentStatus::Idle);
 }

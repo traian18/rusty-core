@@ -244,7 +244,7 @@ impl Default for Budget {
     fn default() -> Self {
         Self {
             max_passes: None,
-            no_progress_passes: 2,
+            no_progress_passes: 3,
         }
     }
 }
@@ -277,7 +277,31 @@ pub struct JournalEntry {
     /// The agent's own status line, when it gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<String>,
-    /// What the agent left for the next pass (its `Next:` line).
+    /// What the next pass takes first: the reviewer's next step, else the agent's `Next:` line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    /// The reviewer's reason for its verdict on this pass, when one reviewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
+}
+
+/// A reviewer's verdict on a pass: a separate model call without tools that reads the pass's
+/// diff, checks and plan against the goal. The agent's own claims are not evidence to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub verdict: ReviewVerdict,
+    /// The evidence the goal is met, what is missing, or what only the user can provide.
+    pub reason: String,
+    /// The next concrete step, for `continue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Done,
+    Continue,
+    /// Only for what the user alone can provide (a decision, a credential, a manual step).
+    Blocked,
 }

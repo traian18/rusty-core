@@ -126,7 +126,9 @@ impl EventTranscript {
             AgentEvent::ChildAgentSpawned { agent_id, .. } => {
                 self.ensure_child(transcript, *agent_id);
             }
-            AgentEvent::ChildAgentCompleted { agent_id, outcome } => {
+            AgentEvent::ChildAgentCompleted {
+                agent_id, outcome, ..
+            } => {
                 self.complete_child(transcript, *agent_id, *outcome);
             }
             _ => return false,

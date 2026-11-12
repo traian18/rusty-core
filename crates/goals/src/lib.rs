@@ -23,8 +23,8 @@ mod progress;
 mod prompt;
 
 pub use contract::{
-    Budget, Goal, GoalStatus, JournalEntry, PlanStep, StepStatus, Targets, Verdict,
-    GOAL_SCHEMA_VERSION,
+    Budget, Goal, GoalStatus, JournalEntry, PlanStep, Review, ReviewVerdict, StepStatus, Targets,
+    Verdict, GOAL_SCHEMA_VERSION,
 };
 pub use decision::{decide, record, Decision, PassReport};
 pub use measurement::{

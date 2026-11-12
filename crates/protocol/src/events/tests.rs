@@ -671,7 +671,8 @@ fn event_child_agent_completed_roundtrip() {
     let agent_id = crate::ids::AgentId::new();
     let event = AgentEvent::ChildAgentCompleted {
         agent_id,
-        outcome: AgentOutcome::Success,
+        outcome: AgentOutcome::Failed,
+        error: Some("PROVIDER_ERROR: model not supported".into()),
     };
     let env = envelope_for(event);
     let json = serde_json::to_string(&env).expect("serialize");
@@ -680,9 +681,14 @@ fn event_child_agent_completed_roundtrip() {
         AgentEvent::ChildAgentCompleted {
             agent_id: aid,
             outcome,
+            error,
         } => {
             assert_eq!(aid, agent_id);
-            assert_eq!(outcome, AgentOutcome::Success);
+            assert_eq!(outcome, AgentOutcome::Failed);
+            assert_eq!(
+                error.as_deref(),
+                Some("PROVIDER_ERROR: model not supported")
+            );
         }
         other => panic!("expected ChildAgentCompleted, got {other:?}"),
     }
@@ -800,6 +806,7 @@ fn all_event_variants_roundtrip() {
         AgentEvent::ChildAgentCompleted {
             agent_id: crate::ids::AgentId::new(),
             outcome: AgentOutcome::Success,
+            error: None,
         },
         AgentEvent::Failed {
             error: AgentError {
